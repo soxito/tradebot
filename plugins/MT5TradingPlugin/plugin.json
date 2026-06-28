@@ -1,0 +1,34 @@
+{
+  "name": "MT5 Trading Plugin",
+  "slug": "mt5",
+  "version": "1.0.0",
+  "description": "MetaTrader 5 integration via mtapi-io REST API. Multi-account management, live positions/orders, aggregation, risk overlays, copy-trading simulation, and backtesting bridge.",
+  "author": "TradeBot",
+  "requires": { "python": ">=3.12", "tradebot": ">=0.1.0" },
+  "service_provider": "backend.router",
+  "provides": {
+    "routes": ["backend/router.py"],
+    "models": ["backend/models.py"],
+    "migrations": ["backend/migrations/"],
+    "pages": ["frontend/pages/"],
+    "overlays": true,
+    "scheduled_jobs": ["mt5_sync_accounts", "mt5_sync_positions"]
+  },
+  "permissions": [
+    "mt5.accounts.manage",
+    "mt5.orders.view",
+    "mt5.orders.trade",
+    "mt5.copy_sim.use",
+    "mt5.replay.use",
+    "mt5.risk_overlay.view"
+  ],
+  "settings_keys": [
+    "mt5.api_url",
+    "mt5.poll_interval_seconds",
+    "mt5.enable_aggregation",
+    "mt5.enable_copy_sim",
+    "mt5.enable_trade_replay",
+    "mt5.max_accounts_per_user",
+    "mt5.overlay_heatmap_enabled"
+  ]
+}

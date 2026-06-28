@@ -1,0 +1,40 @@
+# graphify ignore — keeps the knowledge graph focused on source code
+
+# Python bytecode and venv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+backend/.venv/
+
+# Node / frontend build artefacts
+frontend/node_modules/
+frontend/.next/
+frontend/build/
+frontend/dist/
+
+# Large data JSON files (not source code)
+pinescripts.json
+fallback_pinescripts.json
+list.json
+overview.json
+rug.json
+run_once.json
+scripts.json
+stats.json
+backend/response.json
+frontend/output_1h.json
+frontend/output_m15.json
+
+# Logs
+logs/
+*.log
+backend/logs/
+
+# graphify output (avoid self-referencing)
+graphify-out/
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo

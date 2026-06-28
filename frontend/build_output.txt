@@ -1,0 +1,54 @@
+
+> tradebot-frontend@0.1.0 build
+> next build
+
+⚠ Warning: Next.js inferred your workspace root, but it may not be correct.
+ We detected multiple lockfiles and selected the directory of /Users/sakhilematsimela/package-lock.json as the root directory.
+ To silence this warning, set `turbopack.root` in your Next.js config, or consider removing one of the lockfiles if it's not needed.
+   See https://nextjs.org/docs/app/api-reference/config/next-config-js/turbopack#root-directory for more information.
+ Detected additional lockfiles: 
+   * /Users/sakhilematsimela/Sites/tradebot/frontend/package-lock.json
+
+▲ Next.js 16.2.3 (Turbopack)
+- Environments: .env.local
+
+  Running TypeScript ...
+  Finished TypeScript in 4.2s ...
+  Creating an optimized production build ...
+✓ Compiled successfully in 1811ms
+  Collecting page data using 11 workers ...
+  Generating static pages using 11 workers (0/24) ...
+  Generating static pages using 11 workers (6/24) 
+  Generating static pages using 11 workers (12/24) 
+  Generating static pages using 11 workers (18/24) 
+✓ Generating static pages using 11 workers (24/24) in 143ms
+  Finalizing page optimization ...
+
+Route (pages)
+┌ ○ /
+├   /_app
+├ ○ /404
+├ ○ /agents
+├ ○ /ai-agents-admin
+├ ○ /ai-analysis
+├ ○ /custom-agents
+├ ○ /delistings
+├ ○ /futures
+├ ○ /history
+├ ○ /insights
+├ ○ /mt5-copy-sim
+├ ○ /mt5-live
+├ ○ /mt5-replay
+├ ○ /pump-monitor
+├ ○ /rug-pulled
+├ ○ /sentiment
+├ ○ /settings
+├ ○ /signals
+├ ○ /smart-money-concepts
+├ ○ /sniper-signals
+├ ○ /strategies
+├ ○ /trading
+└ ○ /trending
+
+○  (Static)  prerendered as static content
+

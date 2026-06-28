@@ -1,0 +1,1 @@
+{"nodes": [{"id": "claude_v3_claims_authorizer_claimsauthorizeragent", "label": "V3 Claims Authorizer Agent", "file_type": "document", "source_file": ".github/agents/claude-v3-claims-authorizer.agent.md", "source_location": null, "source_url": null, "captured_at": null, "author": null, "contributor": null}], "edges": [], "hyperedges": []}

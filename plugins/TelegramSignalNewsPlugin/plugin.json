@@ -1,0 +1,33 @@
+{
+  "name": "Telegram Signal & News Plugin",
+  "slug": "telegram",
+  "version": "1.0.0",
+  "description": "Telegram channel ingestion for trading signals and market news with selectable sources, polling, dedupe, and structured extraction.",
+  "author": "TradeBot",
+  "requires": { "python": ">=3.12", "tradebot": ">=0.1.0" },
+  "service_provider": "backend.router",
+  "provides": {
+    "routes": ["backend/router.py"],
+    "models": ["backend/models.py"],
+    "migrations": ["backend/migrations/"],
+    "pages": ["frontend/pages/"],
+    "overlays": false,
+    "scheduled_jobs": ["telegram_poll_sources"]
+  },
+  "permissions": [
+    "telegram.sources.manage",
+    "telegram.poll.run",
+    "telegram.messages.view"
+  ],
+  "settings_keys": [
+    "telegram.api_id",
+    "telegram.api_hash",
+    "telegram.bot_token",
+    "telegram.mcp_chat_id",
+    "telegram.mcp_server_url",
+    "telegram.poll_limit",
+    "telegram.poll_interval_seconds",
+    "telegram.enable_llm_fallback",
+    "telegram.llm_model"
+  ]
+}

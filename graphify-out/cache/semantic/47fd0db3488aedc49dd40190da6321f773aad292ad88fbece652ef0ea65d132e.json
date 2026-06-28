@@ -1,0 +1,1 @@
+{"nodes": [{"id": "claude_templates_memory_coordinator_memorycoordinatoragent", "label": "Memory Coordination Specialist Agent", "file_type": "document", "source_file": ".github/agents/claude-templates-memory-coordinator.agent.md", "source_location": null, "source_url": null, "captured_at": null, "author": null, "contributor": null}], "edges": [], "hyperedges": []}

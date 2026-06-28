@@ -1,0 +1,36 @@
+{
+  "name": "AI Market Analyst",
+  "slug": "ai-analyst",
+  "version": "1.0.0",
+  "description": "AI-powered market analysis using OpenAI Responses API (GPT-5.2). Agent profiles, smart limit order proposals, risk policy engine, TradingView chart overlays.",
+  "author": "TradeBot",
+  "requires": { "python": ">=3.12", "tradebot": ">=0.1.0" },
+  "service_provider": "backend.router",
+  "provides": {
+    "routes": ["backend/router.py"],
+    "models": ["backend/models.py"],
+    "migrations": ["backend/migrations/"],
+    "pages": ["frontend/pages/"],
+    "overlays": true,
+    "scheduled_jobs": []
+  },
+  "permissions": [
+    "ai.agents.manage",
+    "ai.decisions.view",
+    "ai.trade.use",
+    "ai.trade.autoplace",
+    "ai.trade.paper"
+  ],
+  "settings_keys": [
+    "ai.openai_model",
+    "ai.default_reasoning_effort",
+    "ai.default_verbosity",
+    "ai.max_output_tokens",
+    "ai.rate_limit_per_minute",
+    "ai.providers_file",
+    "ai.providers_json",
+    "ai.routing_strategy",
+    "ai.routing_fallback",
+    "ai.provider_timeout_s"
+  ]
+}

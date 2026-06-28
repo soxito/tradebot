@@ -1,0 +1,106 @@
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: tradebot-postgres
+    environment:
+      TZ: Africa/Johannesburg
+      POSTGRES_USER: tradebot
+      POSTGRES_PASSWORD: tradebot_password
+      POSTGRES_DB: tradebot
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tradebot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: tradebot-redis
+    environment:
+      TZ: Africa/Johannesburg
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # FastAPI Backend
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: tradebot-backend
+    env_file:
+      - .env
+    environment:
+      TZ: Africa/Johannesburg
+      PYTHONPATH: /app:/
+      START_WORKERS_IN_API: "false"
+    ports:
+      - "8080:8000"
+    volumes:
+      - ./backend:/app
+      - ./plugins:/plugins
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Dedicated worker runtime (scheduler + trading loops)
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: tradebot-worker
+    env_file:
+      - .env
+    environment:
+      TZ: Africa/Johannesburg
+      PYTHONPATH: /app:/
+      START_WORKERS_IN_API: "true"
+    command: ["python", "-m", "app.workers.runner"]
+    volumes:
+      - ./backend:/app
+      - ./plugins:/plugins
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Next.js Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: tradebot-frontend
+    environment:
+      - TZ=Africa/Johannesburg
+      - NEXT_PUBLIC_API_URL=http://localhost:8080/api/v1
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    depends_on:
+      - backend
+      - worker
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
