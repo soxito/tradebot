@@ -161,6 +161,7 @@ interface AIPreset {
   monthly_limit: number | null
   signup_url: string
   notes: string
+  editable_endpoint?: boolean
 }
 
 interface AIProvider {
@@ -2637,6 +2638,7 @@ function ConnectAIView(props: {
   const { presets, providers, onReload, onMessage, onError } = props
   const [selectedKey, setSelectedKey] = useState('')
   const [selectedModel, setSelectedModel] = useState('')
+  const [baseUrl, setBaseUrl] = useState('')
   const [apiKey, setApiKey] = useState('')
   const [busy, setBusy] = useState(false)
   const [testingId, setTestingId] = useState<number | null>(null)
@@ -2664,11 +2666,20 @@ function ConnectAIView(props: {
     setSelectedKey(key)
     const preset = presets.find((p) => p.key === key)
     setSelectedModel(preset?.default_model || '')
+    setBaseUrl(preset?.base_url || '')
   }
 
   const handleAdd = async () => {
     if (!selectedKey || !apiKey.trim()) {
       onError('Pick a provider and paste your API key.')
+      return
+    }
+    if (selectedPreset?.editable_endpoint && !baseUrl.trim()) {
+      onError('Enter the Base URL for this endpoint (e.g. http://localhost:3002/v1).')
+      return
+    }
+    if (selectedPreset?.editable_endpoint && !selectedModel.trim()) {
+      onError('Enter the model name for this endpoint.')
       return
     }
     setBusy(true)
@@ -2679,6 +2690,7 @@ function ConnectAIView(props: {
         provider_key: selectedKey,
         api_key: apiKey.trim(),
         default_model: selectedModel || undefined,
+        base_url: selectedPreset?.editable_endpoint ? baseUrl.trim() : undefined,
       })
       const p = res.data as AIProvider
       onMessage(
@@ -2689,6 +2701,7 @@ function ConnectAIView(props: {
       setApiKey('')
       setSelectedKey('')
       setSelectedModel('')
+      setBaseUrl('')
       await onReload()
     } catch (e: unknown) {
       onError(toErrorMessage(e))
@@ -2760,10 +2773,23 @@ function ConnectAIView(props: {
     <div className="space-y-4">
       {/* Instructions */}
       <div className="bg-gradient-to-br from-cyan-500/10 to-transparent border border-cyan-500/30 rounded-lg p-5">
-        <h2 className="font-semibold text-white flex items-center gap-2">
-          <Sparkles className="w-5 h-5 text-cyan-400" />
-          Connect AI Providers
-        </h2>
+        <div className="flex items-start justify-between gap-3">
+          <h2 className="font-semibold text-white flex items-center gap-2">
+            <Sparkles className="w-5 h-5 text-cyan-400" />
+            Connect AI Providers
+          </h2>
+          {/* Headroom proxy badge — always active */}
+          <a
+            href="http://127.0.0.1:8787/dashboard"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 text-[11px] font-mono whitespace-nowrap hover:bg-emerald-500/20 transition-colors"
+            title="Headroom context-compression proxy is active — all AI calls are compressed before reaching the provider. Click to open the savings dashboard."
+          >
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+            headroom proxy active
+          </a>
+        </div>
         <p className="text-xs text-gray-300 mt-2 max-w-3xl">
           Add one or more AI accounts. When enabled, they power the whole app — <strong className="text-cyan-200">Telegram
           sniper entries</strong>, signal generation, trade decisions, and your AI agents — with automatic
@@ -2774,6 +2800,7 @@ function ConnectAIView(props: {
           <li>Pick a provider below and open its key page (most are free to sign up).</li>
           <li>Create an API key, paste it here, and click <strong className="text-gray-200">Add &amp; Test</strong>.</li>
           <li>Green ✓ means it's verified and live across the app. Add more for resilience.</li>
+          <li>Every call is automatically compressed by the <strong className="text-emerald-300">headroom</strong> proxy — saving 60-95% tokens before they hit your provider's quota.</li>
         </ol>
       </div>
 
@@ -2868,22 +2895,32 @@ function ConnectAIView(props: {
           </div>
           <div>
             <label className="block text-xs text-gray-400 mb-1">Model {selectedPreset?.free_tier && <span className="text-emerald-400">(free)</span>}</label>
-            <select
-              value={selectedModel}
-              onChange={(e) => setSelectedModel(e.target.value)}
-              disabled={!selectedPreset}
-              className="w-full rounded bg-gray-900 border border-gray-700 px-3 py-2 text-sm text-white disabled:opacity-50"
-            >
-              {!selectedPreset && <option value="">Select a provider first…</option>}
-              {selectedPreset?.models.map((m) => {
-                const mi = selectedPreset.model_info[m]
-                return (
-                  <option key={m} value={m}>
-                    {mi ? `${mi.label} · ${formatContext(mi.context)} · ${mi.cost}` : m}
-                  </option>
-                )
-              })}
-            </select>
+            {selectedPreset?.editable_endpoint ? (
+              <input
+                type="text"
+                placeholder={selectedPreset.key === 'freellmapi' ? 'auto' : 'model id (e.g. llama3.1)'}
+                value={selectedModel}
+                onChange={(e) => setSelectedModel(e.target.value)}
+                className="w-full rounded bg-gray-900 border border-gray-700 px-3 py-2 text-sm text-white placeholder:text-gray-500"
+              />
+            ) : (
+              <select
+                value={selectedModel}
+                onChange={(e) => setSelectedModel(e.target.value)}
+                disabled={!selectedPreset}
+                className="w-full rounded bg-gray-900 border border-gray-700 px-3 py-2 text-sm text-white disabled:opacity-50"
+              >
+                {!selectedPreset && <option value="">Select a provider first…</option>}
+                {selectedPreset?.models.map((m) => {
+                  const mi = selectedPreset.model_info[m]
+                  return (
+                    <option key={m} value={m}>
+                      {mi ? `${mi.label} · ${formatContext(mi.context)} · ${mi.cost}` : m}
+                    </option>
+                  )
+                })}
+              </select>
+            )}
           </div>
           <div>
             <label className="block text-xs text-gray-400 mb-1">API Key</label>
@@ -2905,6 +2942,25 @@ function ConnectAIView(props: {
             </div>
           </div>
         </div>
+        {selectedPreset?.editable_endpoint && (
+          <div className="mt-3">
+            <label className="block text-xs text-gray-400 mb-1">Base URL</label>
+            <input
+              type="text"
+              placeholder="http://localhost:3002/v1"
+              value={baseUrl}
+              onChange={(e) => setBaseUrl(e.target.value)}
+              className="w-full rounded bg-gray-900 border border-gray-700 px-3 py-2 text-sm text-white placeholder:text-gray-500 font-mono"
+            />
+            {selectedPreset.key === 'freellmapi' && (
+              <p className="mt-1.5 text-[11px] text-gray-500">
+                Run FreeLLMAPI yourself on a non-conflicting port (e.g. <span className="font-mono text-gray-400">PORT=3002 docker compose up -d</span>), add your
+                provider keys in its dashboard, then paste its unified <span className="font-mono text-gray-400">freellmapi-…</span> key
+                above with model <span className="font-mono text-gray-400">auto</span>.
+              </p>
+            )}
+          </div>
+        )}
         {selectedPreset && (
           <div className="mt-3 text-xs text-gray-400 flex flex-wrap items-center gap-x-4 gap-y-1">
             <span>

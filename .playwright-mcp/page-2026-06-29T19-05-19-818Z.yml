@@ -1,0 +1,216 @@
+- generic [active] [ref=e1]:
+  - generic [ref=e3]:
+    - complementary [ref=e4]:
+      - generic [ref=e5]:
+        - img [ref=e6]
+        - generic [ref=e9]: TradeBot
+      - navigation [ref=e10]:
+        - link "Dashboard" [ref=e11] [cursor=pointer]:
+          - /url: /
+          - img [ref=e12]
+          - generic [ref=e17]: Dashboard
+        - link "Trading" [ref=e18] [cursor=pointer]:
+          - /url: /trading
+          - img [ref=e19]
+          - generic [ref=e22]: Trading
+        - link "Futures" [ref=e23] [cursor=pointer]:
+          - /url: /futures
+          - img [ref=e24]
+          - generic [ref=e28]: Futures
+        - link "Signals" [ref=e29] [cursor=pointer]:
+          - /url: /signals
+          - img [ref=e30]
+          - generic [ref=e36]: Signals
+        - link "Telegram Signals" [ref=e37] [cursor=pointer]:
+          - /url: /telegram-signals
+          - img [ref=e38]
+          - generic [ref=e40]: Telegram Signals
+        - link "Trending" [ref=e41] [cursor=pointer]:
+          - /url: /trending
+          - img [ref=e42]
+          - generic [ref=e45]: Trending
+        - link "Strategies" [ref=e46] [cursor=pointer]:
+          - /url: /strategies
+          - img [ref=e47]
+          - generic [ref=e49]: Strategies
+        - link "Sentiment" [ref=e50] [cursor=pointer]:
+          - /url: /sentiment
+          - img [ref=e51]
+          - generic [ref=e61]: Sentiment
+        - link "Pump Monitor" [ref=e62] [cursor=pointer]:
+          - /url: /pump-monitor
+          - img [ref=e63]
+          - generic [ref=e68]: Pump Monitor
+        - link "Rug Pulled" [ref=e69] [cursor=pointer]:
+          - /url: /rug-pulled
+          - img [ref=e70]
+          - generic [ref=e75]: Rug Pulled
+        - link "Sniper Signals" [ref=e76] [cursor=pointer]:
+          - /url: /sniper-signals
+          - img [ref=e77]
+          - generic [ref=e79]: Sniper Signals
+        - link "Smart Money Concepts" [ref=e80] [cursor=pointer]:
+          - /url: /smart-money-concepts
+          - img [ref=e81]
+          - generic [ref=e85]: Smart Money Concepts
+        - link "Delistings" [ref=e86] [cursor=pointer]:
+          - /url: /delistings
+          - img [ref=e87]
+          - generic [ref=e89]: Delistings
+        - link "AI Agents" [ref=e90] [cursor=pointer]:
+          - /url: /agents
+          - img [ref=e91]
+          - generic [ref=e94]: AI Agents
+        - link "Custom Agents" [ref=e95] [cursor=pointer]:
+          - /url: /custom-agents
+          - img [ref=e96]
+          - generic [ref=e99]: Custom Agents
+        - link "Agent Paul" [ref=e100] [cursor=pointer]:
+          - /url: /agent-paul
+          - img [ref=e101]
+          - generic [ref=e105]: Agent Paul
+        - link "Intelligence" [ref=e106] [cursor=pointer]:
+          - /url: /intelligence
+          - img [ref=e107]
+          - generic [ref=e112]: Intelligence
+        - link "Vault" [ref=e113] [cursor=pointer]:
+          - /url: /vault
+          - img [ref=e114]
+          - generic [ref=e117]: Vault
+        - link "Insights" [ref=e118] [cursor=pointer]:
+          - /url: /insights
+          - img [ref=e119]
+          - generic [ref=e122]: Insights
+        - link "MT5 Live" [ref=e123] [cursor=pointer]:
+          - /url: /mt5-live
+          - img [ref=e124]
+          - generic [ref=e126]: MT5 Live
+        - link "MT5 Replay" [ref=e127] [cursor=pointer]:
+          - /url: /mt5-replay
+          - img [ref=e128]
+          - generic [ref=e131]: MT5 Replay
+        - link "MT5 Copy Sim" [ref=e132] [cursor=pointer]:
+          - /url: /mt5-copy-sim
+          - img [ref=e133]
+          - generic [ref=e136]: MT5 Copy Sim
+        - link "AI Analyst" [ref=e137] [cursor=pointer]:
+          - /url: /ai-analysis
+          - img [ref=e138]
+          - generic [ref=e140]: AI Analyst
+        - link "Telegram" [ref=e141] [cursor=pointer]:
+          - /url: /telegram
+          - img [ref=e142]
+          - generic [ref=e144]: Telegram
+        - link "AI Profiles" [ref=e145] [cursor=pointer]:
+          - /url: /ai-agents-admin
+          - img [ref=e146]
+          - generic [ref=e149]: AI Profiles
+        - link "Trade History" [ref=e150] [cursor=pointer]:
+          - /url: /history
+          - img [ref=e151]
+          - generic [ref=e155]: Trade History
+        - link "Binary Engine" [ref=e156] [cursor=pointer]:
+          - /url: /binary-engine
+          - img [ref=e157]
+          - generic [ref=e159]: Binary Engine
+        - link "Settings" [ref=e160] [cursor=pointer]:
+          - /url: /settings
+          - img [ref=e161]
+          - generic [ref=e164]: Settings
+      - button "Collapse sidebar" [ref=e165] [cursor=pointer]:
+        - img [ref=e166]
+    - generic [ref=e169]:
+      - banner [ref=e170]:
+        - heading "Binary Engine" [level=1] [ref=e172]
+        - generic "API connected" [ref=e173]:
+          - generic [ref=e175]: Connected
+      - main [ref=e176]:
+        - generic [ref=e177]:
+          - generic [ref=e178]:
+            - generic [ref=e179]:
+              - img [ref=e181]
+              - generic [ref=e183]:
+                - heading "Binary Engine Studio" [level=1] [ref=e184]
+                - paragraph [ref=e185]: Voice Recognition · Speaker ID · Real-time Frequency Analysis
+            - generic [ref=e186]:
+              - img [ref=e187]
+              - text: Extension not detected
+          - generic [ref=e194]:
+            - button "Start microphone" [ref=e195] [cursor=pointer]:
+              - img [ref=e196]
+              - text: Start microphone
+            - generic [ref=e199]: MIC NOT STARTED
+            - generic [ref=e201]:
+              - text: "Energy:"
+              - generic [ref=e202]: 0.0%
+            - generic [ref=e203]: "Brain: not loaded"
+          - generic [ref=e204]:
+            - button "Binary Engine" [ref=e205] [cursor=pointer]:
+              - img [ref=e206]
+              - text: Binary Engine
+            - button "Voice Profile" [ref=e208] [cursor=pointer]:
+              - img [ref=e209]
+              - text: Voice Profile
+            - button "Vocabulary" [ref=e211] [cursor=pointer]:
+              - img [ref=e212]
+              - text: Vocabulary
+            - button "Codecs & Plugins" [ref=e222] [cursor=pointer]:
+              - img [ref=e223]
+              - text: Codecs & Plugins
+            - button "Deepgram Agent" [ref=e226] [cursor=pointer]:
+              - img [ref=e227]
+              - text: Deepgram Agent
+          - generic [ref=e231]:
+            - generic [ref=e232]:
+              - generic [ref=e233]:
+                - heading "Real-time Frequency Spectrum" [level=2] [ref=e234]:
+                  - img [ref=e235]
+                  - text: Real-time Frequency Spectrum
+                - generic [ref=e236]: 16-band FFT @ 20fps
+              - generic [ref=e238]:
+                - generic [ref=e241]: "63"
+                - generic [ref=e244]: "125"
+                - generic [ref=e247]: "250"
+                - generic [ref=e250]: "500"
+                - generic [ref=e253]: 1k
+                - generic [ref=e256]: 2k
+                - generic [ref=e259]: 4k
+                - generic [ref=e262]: 8k
+                - generic [ref=e265]: 12k
+                - generic [ref=e268]: 16k
+                - generic [ref=e271]: 20k
+                - generic [ref=e274]: 22k
+                - generic [ref=e277]: env
+                - generic [ref=e280]: env
+                - generic [ref=e283]: env
+                - generic [ref=e286]: env
+              - generic [ref=e287]:
+                - generic [ref=e288]: Your voice
+                - generic [ref=e290]: Other audio
+                - generic [ref=e292]: JARVIS speaking
+                - generic [ref=e294]: Silence
+            - generic [ref=e296]:
+              - generic [ref=e297]:
+                - heading "Speaker Identification" [level=2] [ref=e298]:
+                  - img [ref=e299]
+                  - text: Speaker Identification
+                - generic [ref=e301]:
+                  - img [ref=e302]
+                  - text: No voice profile. Calibrate to enable speaker ID.
+              - generic [ref=e304]:
+                - heading "Voice Brain Vault" [level=2] [ref=e305]:
+                  - img [ref=e306]
+                  - text: Voice Brain Vault
+                - generic [ref=e316]:
+                  - generic [ref=e317]: "Words learned: 0"
+                  - generic [ref=e318]: "Sessions: 0"
+                  - generic [ref=e319]: "Profile: none"
+                - button "Sync Brain to Vault" [ref=e320] [cursor=pointer]:
+                  - img [ref=e321]
+                  - text: Sync Brain to Vault
+                - button "Reload from Vault" [ref=e325] [cursor=pointer]:
+                  - img [ref=e326]
+                  - text: Reload from Vault
+    - button "Open PAUL JARVIS assistant" [ref=e329] [cursor=pointer]:
+      - img [ref=e330]
+  - alert [ref=e333]

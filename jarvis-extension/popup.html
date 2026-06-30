@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>JARVIS Voice Assistant</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --cyan:    #06b6d4;
+      --purple:  #8b5cf6;
+      --green:   #22c55e;
+      --red:     #ef4444;
+      --amber:   #f59e0b;
+      --bg:      #080e1a;
+      --surface: #0f172a;
+      --card:    #1a2236;
+      --border:  rgba(255,255,255,.07);
+      --text:    #e2e8f0;
+      --muted:   #64748b;
+      --subtle:  #94a3b8;
+    }
+    * { box-sizing:border-box; margin:0; padding:0; }
+    body {
+      width: 400px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: 0;
+      overflow-x: hidden;
+    }
+
+    /* ── Header gradient ───────────────────────────────────────────────────── */
+    .header {
+      background: linear-gradient(135deg, #0c1428 0%, #131b30 50%, #0f1b2e 100%);
+      border-bottom: 1px solid var(--border);
+      padding: 14px 16px 12px;
+      position: relative;
+      overflow: hidden;
+    }
+    .header::before {
+      content: '';
+      position: absolute; top: -40px; right: -40px;
+      width: 120px; height: 120px;
+      background: radial-gradient(circle, rgba(6,182,212,.15) 0%, transparent 70%);
+      pointer-events: none;
+    }
+    .header::after {
+      content: '';
+      position: absolute; bottom: -30px; left: 20px;
+      width: 80px; height: 80px;
+      background: radial-gradient(circle, rgba(139,92,246,.1) 0%, transparent 70%);
+      pointer-events: none;
+    }
+    .header-top { display:flex; align-items:center; gap:10px; position:relative; }
+    .logo-ring {
+      width: 40px; height: 40px; border-radius: 50%;
+      background: linear-gradient(135deg, var(--cyan), var(--purple));
+      display: flex; align-items: center; justify-content: center;
+      font-size: 20px; flex-shrink: 0;
+      box-shadow: 0 0 16px rgba(6,182,212,.3);
+    }
+    .header-info { flex: 1; }
+    .header-title { font-size: 15px; font-weight: 700; letter-spacing: .02em; }
+    .header-sub { font-size: 10px; color: var(--muted); margin-top: 1px; }
+    .version-badge {
+      background: rgba(139,92,246,.2);
+      border: 1px solid rgba(139,92,246,.4);
+      color: #c4b5fd;
+      border-radius: 20px; padding: 2px 8px;
+      font-size: 10px; font-weight: 600;
+      cursor: pointer; position: relative;
+      transition: background .15s;
+    }
+    .version-badge:hover { background: rgba(139,92,246,.35); }
+    .version-badge.update-available {
+      background: rgba(245,158,11,.2);
+      border-color: rgba(245,158,11,.5);
+      color: #fbbf24;
+      animation: pulse-badge 2s infinite;
+    }
+    @keyframes pulse-badge {
+      0%,100%{box-shadow:0 0 0 0 rgba(245,158,11,0)}
+      50%{box-shadow:0 0 0 4px rgba(245,158,11,.2)}
+    }
+    .update-dot {
+      display:none; width:6px; height:6px; border-radius:50%;
+      background:#f59e0b; position:absolute; top:-2px; right:-2px;
+    }
+    .version-badge.update-available .update-dot { display:block; }
+
+    /* ── Status pill ───────────────────────────────────────────────────────── */
+    .status-row {
+      display: flex; align-items: center; gap: 8px;
+      margin-top: 10px; position: relative;
+    }
+    .status-pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: rgba(255,255,255,.05);
+      border: 1px solid var(--border);
+      border-radius: 20px; padding: 4px 10px;
+      font-size: 11px; color: var(--subtle);
+      transition: all .2s;
+    }
+    .status-pill.listening {
+      background: rgba(34,197,94,.08);
+      border-color: rgba(34,197,94,.3);
+      color: #86efac;
+    }
+    .status-pill.error {
+      background: rgba(239,68,68,.08);
+      border-color: rgba(239,68,68,.3);
+      color: #fca5a5;
+    }
+    .pulse-dot {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: var(--muted); flex-shrink: 0;
+    }
+    .pulse-dot.on {
+      background: var(--green);
+      box-shadow: 0 0 6px var(--green);
+      animation: pulse-dot 1.5s infinite;
+    }
+    .pulse-dot.err { background: var(--red); }
+    @keyframes pulse-dot { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.5;transform:scale(.8)} }
+
+    /* ── Section / card ────────────────────────────────────────────────────── */
+    .content { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .card-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 8px 12px 6px;
+      border-bottom: 1px solid var(--border);
+    }
+    .card-title {
+      font-size: 10px; font-weight: 600; color: var(--muted);
+      text-transform: uppercase; letter-spacing: .06em;
+      display: flex; align-items: center; gap: 5px;
+    }
+    .card-body { padding: 8px 12px; }
+
+    /* ── Toggles ───────────────────────────────────────────────────────────── */
+    .toggle-grid { display: flex; flex-direction: column; gap: 1px; }
+    .toggle-row {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 7px 12px;
+    }
+    .toggle-row:not(:last-child) { border-bottom: 1px solid rgba(255,255,255,.04); }
+    .toggle-label { font-size: 11px; color: var(--text); display:flex; align-items:center; gap:6px; }
+    .toggle-label .emoji { font-size: 13px; }
+    .switch {
+      position: relative; width: 36px; height: 19px;
+      background: #2d3748; border-radius: 10px;
+      cursor: pointer; transition: background .2s; border: none;
+      flex-shrink: 0;
+    }
+    .switch.on { background: var(--cyan); }
+    .switch.purple.on { background: var(--purple); }
+    .switch.green.on  { background: var(--green); }
+    .switch::after {
+      content:''; position:absolute; top:2px; left:2px;
+      width:15px; height:15px; border-radius:50%;
+      background:#fff; transition:transform .2s;
+      box-shadow: 0 1px 3px rgba(0,0,0,.4);
+    }
+    .switch.on::after { transform:translateX(17px); }
+
+    /* ── Avatar picker ─────────────────────────────────────────────────────── */
+    .avatar-grid { display:flex; gap:8px; padding: 10px 12px; justify-content:center; }
+    .avatar-chip {
+      width: 34px; height: 34px; border-radius: 50%;
+      border: 2px solid transparent; cursor: pointer;
+      background: radial-gradient(circle at 35% 30%, var(--c), #0a1020 75%);
+      box-shadow: 0 0 8px color-mix(in srgb, var(--c) 50%, transparent);
+      transition: transform .15s, border-color .15s;
+      position: relative;
+    }
+    .avatar-chip:hover { transform: scale(1.12); }
+    .avatar-chip.active { border-color: var(--c); transform: scale(1.15); }
+    .avatar-chip.active::after {
+      content: '✓'; position:absolute; inset:0;
+      display:flex; align-items:center; justify-content:center;
+      font-size:13px; color:#fff; text-shadow:0 1px 2px rgba(0,0,0,.6);
+    }
+
+    /* ── Voice engine ──────────────────────────────────────────────────────── */
+    .ve-canvas-wrap { padding: 8px 12px 4px; }
+    .ve-footer { display:flex; justify-content:space-between; padding: 4px 12px 8px; font-size:9px; }
+    .ve-ring {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: #334155; transition: background .3s, box-shadow .3s; flex-shrink:0;
+    }
+    .ve-ring.match    { background:#22c55e; box-shadow:0 0 5px #22c55e; }
+    .ve-ring.no-match { background:#8b5cf6; box-shadow:0 0 4px #8b5cf6; }
+    .ve-ring.speaking { background:#f59e0b; box-shadow:0 0 5px #f59e0b; }
+
+    /* ── Transcript ────────────────────────────────────────────────────────── */
+    .transcript {
+      padding: 8px 12px; min-height: 34px;
+      font-size: 11px; color: var(--muted); word-break:break-word;
+      line-height: 1.4;
+    }
+    .transcript .final { color: var(--text); }
+
+    /* ── Balances ──────────────────────────────────────────────────────────── */
+    #accountBalances { display:flex; flex-direction:column; gap:5px; }
+    .bal-row {
+      display:flex; align-items:center; gap:8px;
+      padding: 5px 12px; font-size:11px;
+      border-bottom: 1px solid rgba(255,255,255,.03);
+    }
+    .bal-row:last-child { border-bottom: none; }
+    .bal-icon { font-size: 13px; flex-shrink: 0; }
+    .bal-name { flex:1; color:var(--subtle); font-size:10px; }
+    .bal-value { font-weight: 700; color:var(--text); }
+    .bal-fpnl { font-size:10px; font-weight:600; padding:1px 6px; border-radius:8px; }
+    .bal-fpnl.pos { background:rgba(34,197,94,.12); color:#86efac; }
+    .bal-fpnl.neg { background:rgba(239,68,68,.12); color:#fca5a5; }
+
+    /* ── Position tabs ─────────────────────────────────────────────────────── */
+    .pos-tabs { display:flex; gap:3px; padding: 8px 12px 0; }
+    .pos-tab {
+      flex:1; padding:5px 6px; border:1px solid var(--border);
+      border-radius:8px; font-size:10px; font-weight:600;
+      cursor:pointer; background:transparent; color:var(--muted);
+      transition:all .15s;
+    }
+    .pos-tab.active {
+      background:rgba(139,92,246,.15);
+      border-color:rgba(139,92,246,.4);
+      color:#c4b5fd;
+    }
+    .pos-tab:hover:not(.active) {
+      background:rgba(255,255,255,.04);
+      color:var(--subtle);
+    }
+    .count-chip {
+      display:inline-block; background:rgba(139,92,246,.25);
+      color:#c4b5fd; border-radius:8px; padding:0 5px;
+      font-size:9px; margin-left:3px;
+    }
+
+    /* ── Positions list ────────────────────────────────────────────────────── */
+    .positions-list {
+      max-height:160px; overflow-y:auto;
+      display:flex; flex-direction:column; gap:4px;
+      padding: 8px 12px;
+    }
+    .positions-list::-webkit-scrollbar { width:3px; }
+    .positions-list::-webkit-scrollbar-track { background:transparent; }
+    .positions-list::-webkit-scrollbar-thumb { background:#334155; border-radius:2px; }
+
+    .pos-card {
+      background:rgba(255,255,255,.03);
+      border:1px solid var(--border);
+      border-left-width: 3px;
+      border-left-color: #334155;
+      border-radius: 8px; padding:7px 9px;
+    }
+    .pos-card.profit { border-left-color:var(--green); }
+    .pos-card.loss   { border-left-color:var(--red); }
+    .pos-row { display:flex; align-items:center; justify-content:space-between; }
+    .pos-symbol { font-size:12px; font-weight:700; }
+    .pos-side {
+      font-size:9px; font-weight:700; padding:1px 5px;
+      border-radius:4px; text-transform:uppercase;
+    }
+    .pos-side.long  { background:rgba(34,197,94,.15); color:#86efac; }
+    .pos-side.short { background:rgba(239,68,68,.15); color:#fca5a5; }
+    .pos-meta { font-size:9px; color:var(--muted); margin-top:2px; }
+    .pos-pnl  { font-size:11px; font-weight:600; margin-top:2px; }
+    .pos-pnl.pos { color:var(--green); }
+    .pos-pnl.neg { color:var(--red); }
+    .pos-ex { font-size:9px; color:#475569; margin-top:1px; }
+    .pos-empty { text-align:center; padding:18px 12px; color:var(--muted); font-size:11px; }
+
+    /* ── Analysis panel ────────────────────────────────────────────────────── */
+    .analysis-list {
+      max-height:180px; overflow-y:auto;
+      display:flex; flex-direction:column; gap:5px;
+      padding: 8px 12px;
+    }
+    .analysis-card {
+      background:rgba(139,92,246,.05);
+      border:1px solid rgba(139,92,246,.15);
+      border-radius:8px; padding:7px 9px;
+    }
+    .analysis-text { font-size:9px; color:var(--subtle); margin-top:3px; line-height:1.5; }
+    .analysis-levels { font-size:9px; color:var(--cyan); margin-top:3px; font-weight:700; }
+    .analysis-verdict { font-size:9px; color:#c4b5fd; margin-top:2px; }
+    .analysis-badge {
+      font-size:8px; font-weight:700; padding:1px 6px; border-radius:6px;
+    }
+    .analysis-badge.suggest { background:rgba(34,197,94,.12); color:#86efac; }
+
+    /* ── Buttons ───────────────────────────────────────────────────────────── */
+    .btn-row { display:flex; gap:6px; padding:0 12px 10px; }
+    .btn {
+      flex:1; padding:7px 8px; border:1px solid var(--border);
+      border-radius:9px; font-size:11px; font-weight:500;
+      cursor:pointer; background:rgba(255,255,255,.04);
+      color:var(--text); transition:all .15s;
+    }
+    .btn:hover { background:rgba(255,255,255,.08); }
+    .btn:disabled { opacity:.45; cursor:not-allowed; }
+    .btn.cyan {
+      background:rgba(6,182,212,.12);
+      border-color:rgba(6,182,212,.3);
+      color:var(--cyan);
+    }
+    .btn.cyan:hover { background:rgba(6,182,212,.2); }
+    .btn.purple {
+      background:rgba(139,92,246,.12);
+      border-color:rgba(139,92,246,.3);
+      color:#c4b5fd;
+    }
+    .btn.purple:hover { background:rgba(139,92,246,.2); }
+
+    /* ── Refresh btn ───────────────────────────────────────────────────────── */
+    .icon-btn {
+      background:none; border:none; cursor:pointer;
+      color:var(--muted); font-size:14px; padding:2px 4px;
+      border-radius:5px; transition:all .15s; line-height:1;
+    }
+    .icon-btn:hover { color:var(--subtle); background:rgba(255,255,255,.06); }
+
+    /* ── Headroom bar ──────────────────────────────────────────────────────── */
+    .headroom-bar {
+      display:flex; align-items:center; gap:6px;
+      padding: 6px 14px;
+      border-top:1px solid var(--border);
+      font-size:10px; color:var(--muted);
+    }
+    .hd-dot { width:6px; height:6px; border-radius:50%; background:var(--green); flex-shrink:0; }
+    .hd-dot.off { background:#334155; }
+    .hd-label { flex:1; }
+    .hd-link { color:var(--cyan); text-decoration:none; font-size:9px; }
+    .hd-link:hover { text-decoration:underline; }
+
+    /* ── Footer buttons ────────────────────────────────────────────────────── */
+    .footer { padding:8px 14px 12px; display:flex; gap:6px; }
+    .footer .btn { padding:6px; font-size:10px; }
+
+    /* ── Hint ──────────────────────────────────────────────────────────────── */
+    .hint {
+      font-size:9px; color:#475569; line-height:1.6;
+      padding:8px 14px 12px;
+      border-top:1px solid var(--border);
+    }
+    kbd {
+      background:rgba(255,255,255,.06); border-radius:3px;
+      padding:0px 4px; font-size:9px; color:#94a3b8;
+      border:1px solid rgba(255,255,255,.1);
+    }
+
+    /* ── Animations ────────────────────────────────────────────────────────── */
+    @keyframes spin { to { transform:rotate(360deg); } }
+    .spinning { animation:spin .8s linear infinite; display:inline-block; }
+
+    /* ── Separators ────────────────────────────────────────────────────────── */
+    .sep { height:1px; background:var(--border); margin:0; }
+  </style>
+</head>
+<body>
+
+  <!-- ── Header ──────────────────────────────────────────────────────────── -->
+  <div class="header">
+    <div class="header-top">
+      <div class="logo-ring">🤖</div>
+      <div class="header-info">
+        <div class="header-title">JARVIS</div>
+        <div class="header-sub">Crypto + MT5 Unified Monitor</div>
+      </div>
+      <button class="version-badge" id="versionBadge" title="Extension version — click to check for updates">
+        <span class="update-dot"></span>
+        <span id="versionText">v3.2.0</span>
+      </button>
+    </div>
+    <div class="status-row">
+      <div class="status-pill" id="statusPill">
+        <div class="pulse-dot" id="dot"></div>
+        <span id="statusText">Checking…</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="content">
+
+    <!-- ── Controls card ─────────────────────────────────────────────────── -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">🎛 Controls</span>
+      </div>
+      <div class="toggle-grid">
+        <div class="toggle-row">
+          <span class="toggle-label"><span class="emoji">🎙</span>Voice listening</span>
+          <button class="switch" id="enableSwitch" aria-label="Toggle listening"></button>
+        </div>
+        <div class="toggle-row">
+          <span class="toggle-label"><span class="emoji">👋</span>Require "Hey" greeting</span>
+          <button class="switch" id="greetingSwitch" aria-label="Toggle greeting"></button>
+        </div>
+        <div class="toggle-row">
+          <span class="toggle-label"><span class="emoji">🔔</span>Desktop notifications</span>
+          <button class="switch" id="notifSwitch" aria-label="Toggle notifications"></button>
+        </div>
+        <div class="toggle-row">
+          <span class="toggle-label"><span class="emoji">📊</span>Unified monitor <small style="color:#8b5cf6">(crypto+MT5)</small></span>
+          <button class="switch purple" id="monitorSwitch" aria-label="Toggle monitor"></button>
+        </div>
+        <div class="toggle-row">
+          <span class="toggle-label"><span class="emoji">🔊</span>Read aloud on change</span>
+          <button class="switch green" id="ttsSwitch" aria-label="Toggle TTS"></button>
+        </div>
+        <div class="toggle-row">
+          <span class="toggle-label"><span class="emoji">🤖</span>Robot mode <small style="color:#8b5cf6">(walks &amp; talks)</small></span>
+          <button class="switch purple" id="robotModeSwitch" aria-label="Toggle robot mode"></button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Avatar picker card ─────────────────────────────────────────────── -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">🤖 Robot Avatar</span>
+        <span style="font-size:9px;color:var(--muted)" id="avatarName">Cyan</span>
+      </div>
+      <div class="avatar-grid" id="avatarGrid">
+        <button class="avatar-chip active" data-style="cyan"    title="Cyan"    style="--c:#22d3ee"></button>
+        <button class="avatar-chip"        data-style="purple"  title="Purple"  style="--c:#a78bfa"></button>
+        <button class="avatar-chip"        data-style="gold"    title="Gold"    style="--c:#fbbf24"></button>
+        <button class="avatar-chip"        data-style="crimson" title="Crimson" style="--c:#fb7185"></button>
+        <button class="avatar-chip"        data-style="emerald" title="Emerald" style="--c:#34d399"></button>
+      </div>
+      <div style="font-size:9px;color:var(--muted);padding:0 12px 8px">
+        The cyborg walks all over the page, stops to talk/think, and vanishes into a hole after 90s — say "Jarvis" to call it back.
+      </div>
+    </div>
+
+    <!-- ── Voice engine card ──────────────────────────────────────────────── -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">
+          <div class="ve-ring" id="veRing"></div>
+          Voice Binary Engine
+        </span>
+        <span style="font-size:9px;color:var(--muted)" id="veStatus">IDLE</span>
+      </div>
+      <div class="ve-canvas-wrap">
+        <canvas id="veCanvas" width="372" height="44" style="border-radius:6px;display:block"></canvas>
+      </div>
+      <div class="ve-footer">
+        <span style="color:var(--muted)" id="veWords">0 words learned</span>
+      </div>
+    </div>
+
+    <!-- ── Transcript card ────────────────────────────────────────────────── -->
+    <div class="card">
+      <div class="transcript" id="transcript">
+        Say <b>"Jarvis"</b> then a command — e.g. <i>"analyze my positions"</i>
+      </div>
+    </div>
+
+    <!-- ── Account balances card ─────────────────────────────────────────── -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">💰 Account Balances</span>
+        <button class="icon-btn" id="refreshBtn" title="Refresh">⟳</button>
+      </div>
+      <div id="accountBalances">
+        <div class="pos-empty" style="padding:10px">Loading accounts…</div>
+      </div>
+    </div>
+
+    <!-- ── Open positions card ────────────────────────────────────────────── -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">📍 Open Positions <span class="count-chip" id="posCount">0</span></span>
+      </div>
+      <div class="pos-tabs">
+        <button class="pos-tab active" data-tab="crypto">🪙 Crypto</button>
+        <button class="pos-tab" data-tab="mt5">📈 MT5</button>
+      </div>
+      <div class="positions-list" id="positionsList">
+        <div class="pos-empty">No open positions</div>
+      </div>
+    </div>
+
+    <!-- ── Analysis card ─────────────────────────────────────────────────── -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">🔍 Position Analysis</span>
+        <span style="font-size:9px;color:var(--muted)" id="analysisLastTime">not yet run</span>
+      </div>
+      <div class="analysis-list" id="analysisList">
+        <div class="pos-empty">Runs every 15 min. Click Analyze Now for instant results.</div>
+      </div>
+      <div class="btn-row" style="padding-top:6px">
+        <button class="btn purple" id="analyzeNowBtn">🔍 Analyze Now</button>
+      </div>
+    </div>
+
+  </div><!-- /content -->
+
+  <!-- ── Headroom proxy bar ─────────────────────────────────────────────── -->
+  <div class="headroom-bar">
+    <div class="hd-dot" id="headroomDot"></div>
+    <span class="hd-label" id="headroomLabel">headroom proxy · checking…</span>
+    <a href="http://127.0.0.1:8787/dashboard" target="_blank" class="hd-link">dashboard →</a>
+  </div>
+
+  <!-- ── Footer buttons ─────────────────────────────────────────────────── -->
+  <div class="footer">
+    <button class="btn" id="testNotify">🔔 Test</button>
+    <button class="btn cyan" id="openApp">Open TradeBot →</button>
+  </div>
+
+  <!-- ── Hint ────────────────────────────────────────────────────────────── -->
+  <div class="hint">
+    <b>Commands:</b>&nbsp;
+    <kbd>analyze positions</kbd>&nbsp;
+    <kbd>take 500% profit on ETHUSDT</kbd>&nbsp;
+    <kbd>close BTCUSDT</kbd>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -59,6 +59,26 @@ def _prune_cooldown_cache():
         del _last_signal_time[k]
 
 
+def _ohlcv_rows_to_candles(rows: list) -> list[dict[str, Any]]:
+    candles: list[dict[str, Any]] = []
+    for row in rows or []:
+        if isinstance(row, dict):
+            candles.append(row)
+            continue
+        try:
+            candles.append({
+                "timestamp": row[0],
+                "open": float(row[1]),
+                "high": float(row[2]),
+                "low": float(row[3]),
+                "close": float(row[4]),
+                "volume": float(row[5]) if len(row) > 5 else 0.0,
+            })
+        except Exception:
+            continue
+    return candles
+
+
 def _parse_iso_datetime(value: Any) -> Optional[datetime]:
     if not value or not isinstance(value, str):
         return None
@@ -939,6 +959,32 @@ async def run_signal_pipeline(
                         })
                 except Exception as e:
                     logger.warning(f"Pine Script '{ps.name}' eval failed for {symbol}: {e}")
+
+            # 2.7. Evaluate JARVIS-generated Python strategies learned from
+            # Sentiment, Telegram Signals, SMC, Insights, and the Brain Map.
+            try:
+                from plugins.AiMarketAnalyst.backend.services.jarvis_intelligence import evaluate_generated_strategies
+                connector = exchange_manager.get_exchange(EXCHANGE)
+                if connector:
+                    jarvis_ohlcv = await connector.get_ohlcv(symbol=symbol, timeframe=effective_tf, limit=200)
+                    jarvis_candles = _ohlcv_rows_to_candles(jarvis_ohlcv)
+                    if len(jarvis_candles) >= 30:
+                        jarvis_scores = await evaluate_generated_strategies(
+                            db,
+                            candles=jarvis_candles,
+                            symbol=symbol,
+                        )
+                        for js in jarvis_scores:
+                            strategy_scores.append({
+                                "name": f"[JARVIS] {js.get('name', 'generated')}",
+                                "score": float(js.get("score") or 0.0),
+                                "confidence": float(js.get("confidence") or 0.0),
+                                "reasoning": js.get("reasoning"),
+                            })
+                        if jarvis_scores:
+                            logger.info(f"🧠 {len(jarvis_scores)} JARVIS generated strategies scored {symbol}")
+            except Exception as e:
+                logger.warning(f"JARVIS generated strategy eval failed for {symbol}: {e}")
 
             # 3. Combine TA + sentiment + strategies (baseline decision)
             decision = compute_final_signal(

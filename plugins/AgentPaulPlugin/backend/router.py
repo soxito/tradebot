@@ -3,10 +3,12 @@ Agent Paul Plugin — API Router
 
 All routes prefixed at /plugins/agent-paul by the plugin loader.
 """
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
+from pydantic import BaseModel
 
 from app.core.database import AsyncSessionLocal
 from plugins.AgentPaulPlugin.backend.models import PaulDecision
@@ -200,3 +202,380 @@ async def unify_decision(
     except PaulNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     return _decision_to_dict(decision)
+
+
+# ── MT5 account helper (used by agent-paul.tsx decide console) ─────────────
+
+
+@router.get("/mt5-accounts")
+async def list_mt5_accounts():
+    """List configured MT5 accounts for the decision console."""
+    try:
+        from plugins.MT5TradingPlugin.backend.services.mt5_client import mt5_client  # type: ignore
+        if mt5_client is None:
+            return []
+        return await mt5_client.get_accounts()
+    except ImportError:
+        return []
+    except Exception:
+        return []
+
+
+# ── JARVIS Chat (SSE streaming) ────────────────────────────────────────────
+
+
+class JarvisChatRequest(BaseModel):
+    messages: List[Dict[str, Any]]
+    pathname: Optional[str] = "/"
+    session_key: Optional[str] = None
+
+
+@router.post("/chat")
+async def jarvis_chat(payload: JarvisChatRequest, db: AsyncSession = Depends(get_db)):
+    """Stream a JARVIS response as Server-Sent Events.
+
+    Each event is: ``data: {"delta": "..."}\n\n``
+    Terminated by: ``data: {"done": true}\n\n``
+    """
+    from plugins.AgentPaulPlugin.backend.services.paul_chat import stream_jarvis_chat  # noqa
+
+    session_key = payload.session_key or "default"
+
+    async def event_generator():
+        async for chunk in stream_jarvis_chat(
+            db, payload.messages, payload.pathname or "/", session_key
+        ):
+            yield chunk
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ── MT5 Position Monitor ───────────────────────────────────────────────────
+
+
+@router.get("/mt5-monitor/status")
+async def mt5_monitor_status():
+    from plugins.AgentPaulPlugin.backend.services.mt5_monitor import get_monitor_status  # noqa
+    return get_monitor_status()
+
+
+@router.post("/mt5-monitor/start")
+async def mt5_monitor_start():
+    from plugins.AgentPaulPlugin.backend.services.mt5_monitor import start_monitor  # noqa
+    started = start_monitor()
+    return {"started": started}
+
+
+@router.post("/mt5-monitor/stop")
+async def mt5_monitor_stop():
+    from plugins.AgentPaulPlugin.backend.services.mt5_monitor import stop_monitor  # noqa
+    stopped = stop_monitor()
+    return {"stopped": stopped}
+
+
+# ── JARVIS Alerts ──────────────────────────────────────────────────────────
+
+
+@router.get("/alerts")
+async def get_alerts(unread_only: bool = Query(False)):
+    from plugins.AgentPaulPlugin.backend.services.mt5_monitor import get_alerts as _get  # noqa
+    return {"alerts": _get(unread_only=unread_only)}
+
+
+@router.patch("/alerts/{alert_id}/read")
+async def read_alert(alert_id: str):
+    from plugins.AgentPaulPlugin.backend.services.mt5_monitor import mark_alert_read  # noqa
+    found = mark_alert_read(alert_id)
+    if not found:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    return {"ok": True}
+
+
+@router.delete("/alerts")
+async def clear_alerts():
+    from plugins.AgentPaulPlugin.backend.services.mt5_monitor import clear_all_alerts  # noqa
+    n = clear_all_alerts()
+    return {"cleared": n}
+
+
+# ── JARVIS memory, news, research & prediction ─────────────────────────────
+
+
+@router.get("/chat/history")
+async def chat_history(
+    session_key: str = Query("default"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the persisted message history for the active conversation.
+
+    Returns the most recent messages (kept intact until the user starts a new
+    chat). The cap is generous so reloading never appears to drop the
+    conversation.
+    """
+    from plugins.AgentPaulPlugin.backend.services import knowledge_base  # noqa
+    history = await knowledge_base.get_history(db, session_key, limit=500)
+    return {"session_key": session_key, "messages": history}
+
+
+@router.post("/chat/new")
+async def chat_new(
+    session_key: str = Query("default"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Archive the active conversation and start a fresh one."""
+    from plugins.AgentPaulPlugin.backend.services import knowledge_base  # noqa
+    conv = await knowledge_base.start_new_conversation(db, session_key)
+    return {"ok": True, "conversation_id": conv.id if conv else None}
+
+
+@router.get("/news")
+async def get_news(
+    topic: Optional[str] = Query(None, description="crypto|stocks|macro"),
+    symbol: Optional[str] = Query(None),
+):
+    """Aggregated live RSS news (cached 5 min)."""
+    from plugins.AgentPaulPlugin.backend.services import news_research  # noqa
+    if symbol:
+        items = await news_research.news_for_symbol(symbol, limit=20)
+    else:
+        items = await news_research.fetch_news(topic=topic)
+    return {"count": len(items), "items": items[:30]}
+
+
+@router.post("/news/ingest")
+async def ingest_news(db: AsyncSession = Depends(get_db)):
+    """Pull fresh RSS news into JARVIS long-term knowledge."""
+    from plugins.AgentPaulPlugin.backend.services.market_predictor import ingest_news_to_knowledge  # noqa
+    stored = await ingest_news_to_knowledge(db)
+    return {"ok": True, "stored": stored}
+
+
+@router.get("/predict")
+async def predict(
+    pair: str = Query(..., description="e.g. BTCUSDT, XAUUSD, EURUSD, AAPL"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Forecast direction for any stock or crypto pair."""
+    from plugins.AgentPaulPlugin.backend.services.market_predictor import predict_pair  # noqa
+    return await predict_pair(db, pair)
+
+
+@router.get("/knowledge/search")
+async def knowledge_search(
+    q: str = Query(""),
+    symbol: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Search JARVIS long-term learned knowledge."""
+    from plugins.AgentPaulPlugin.backend.services import knowledge_base  # noqa
+    items = await knowledge_base.search_knowledge(db, q, limit=20, symbol=symbol)
+    return {"count": len(items), "items": items}
+
+
+@router.get("/knowledge/stats")
+async def knowledge_stats(db: AsyncSession = Depends(get_db)):
+    """Knowledge counts for the brain-map intelligence panel."""
+    from plugins.AgentPaulPlugin.backend.services import knowledge_base  # noqa
+    return await knowledge_base.knowledge_stats(db)
+
+
+@router.post("/research")
+async def research(
+    url: str = Query(..., description="Public http(s) URL to research"),
+):
+    """Fetch a public URL and return cleaned text for online research."""
+    from plugins.AgentPaulPlugin.backend.services import news_research  # noqa
+    return await news_research.research_url(url)
+
+
+# ── JARVIS Skills ───────────────────────────────────────────────────────────
+
+
+@router.get("/skills")
+async def list_skills(db: AsyncSession = Depends(get_db)):
+    from plugins.AgentPaulPlugin.backend.services.skills_hooks import list_skills as _list, seed_defaults  # noqa
+    await seed_defaults(db)
+    return {"skills": await _list(db)}
+
+
+@router.post("/skills")
+async def create_skill(payload: Dict[str, Any] = Body(...), db: AsyncSession = Depends(get_db)):
+    from plugins.AgentPaulPlugin.backend.services.skills_hooks import create_skill as _create  # noqa
+    return await _create(db, payload)
+
+
+@router.put("/skills/{skill_id}")
+async def update_skill(skill_id: int, payload: Dict[str, Any] = Body(...), db: AsyncSession = Depends(get_db)):
+    from plugins.AgentPaulPlugin.backend.services.skills_hooks import update_skill as _update  # noqa
+    try:
+        return await _update(db, skill_id, payload)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.delete("/skills/{skill_id}")
+async def delete_skill(skill_id: int, db: AsyncSession = Depends(get_db)):
+    from plugins.AgentPaulPlugin.backend.services.skills_hooks import delete_skill as _del  # noqa
+    await _del(db, skill_id)
+    return {"ok": True}
+
+
+# ── JARVIS Hooks ────────────────────────────────────────────────────────────
+
+
+@router.get("/hooks")
+async def list_hooks(db: AsyncSession = Depends(get_db)):
+    from plugins.AgentPaulPlugin.backend.services.skills_hooks import list_hooks as _list, seed_defaults  # noqa
+    await seed_defaults(db)
+    return {"hooks": await _list(db)}
+
+
+@router.post("/hooks")
+async def create_hook(payload: Dict[str, Any] = Body(...), db: AsyncSession = Depends(get_db)):
+    from plugins.AgentPaulPlugin.backend.services.skills_hooks import create_hook as _create  # noqa
+    return await _create(db, payload)
+
+
+@router.put("/hooks/{hook_id}")
+async def update_hook(hook_id: int, payload: Dict[str, Any] = Body(...), db: AsyncSession = Depends(get_db)):
+    from plugins.AgentPaulPlugin.backend.services.skills_hooks import update_hook as _update  # noqa
+    try:
+        return await _update(db, hook_id, payload)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.delete("/hooks/{hook_id}")
+async def delete_hook(hook_id: int, db: AsyncSession = Depends(get_db)):
+    from plugins.AgentPaulPlugin.backend.services.skills_hooks import delete_hook as _del  # noqa
+    await _del(db, hook_id)
+    return {"ok": True}
+
+
+# ── JARVIS Voice Trade Execution ─────────────────────────────────────────────
+
+
+class VoiceTradeRequest(BaseModel):
+    command: str
+
+
+@router.post("/voice-trade")
+async def voice_trade(payload: VoiceTradeRequest, db: AsyncSession = Depends(get_db)):
+    """Parse a natural-language trade command and execute the best matching signal."""
+    from plugins.AgentPaulPlugin.backend.services.voice_trade import execute_voice_trade_command  # noqa
+    result = await execute_voice_trade_command(db, payload.command)
+    return {"ok": True, "response": result}
+
+
+# ── JARVIS Natural-Language Intent Parser (hands-free AI fallback) ────────────
+
+
+class IntentRequest(BaseModel):
+    text: str
+    pathname: Optional[str] = "/"
+
+
+@router.post("/intent")
+async def parse_intent_route(payload: IntentRequest, db: AsyncSession = Depends(get_db)):
+    """Map a natural-language command to a structured hands-free action."""
+    from plugins.AgentPaulPlugin.backend.services.intent_parser import parse_intent  # noqa
+    try:
+        return await parse_intent(db, payload.text, payload.pathname or "/")
+    except Exception:
+        return {"type": "none"}
+
+
+# ── JARVIS Self-Improvement ────────────────────────────────────────────────────
+
+class JarvisImproveRequest(BaseModel):
+    """Request body for Jarvis to store a self-improvement."""
+    type: str = "knowledge"       # knowledge | agent_update | rule | pattern
+    content: str                  # the learning / insight / rule to store
+    symbol: Optional[str] = None  # trading symbol if relevant
+    agent_role: Optional[str] = None  # which agent to update (for agent_update type)
+    importance: float = 0.7       # 0-1 importance weight
+    topic: Optional[str] = "general"
+
+
+@router.post("/jarvis-improve", summary="Jarvis stores a self-improvement")
+async def jarvis_improve(payload: JarvisImproveRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Called by JARVIS to permanently store a learning, pattern, or rule.
+
+    Writes to:
+    1. The Paul knowledge base (immediately queryable by future conversations)
+    2. The Obsidian vault (persistent across restarts, visible in brain map)
+
+    This is the core self-improvement loop — every time Jarvis learns something
+    valuable, it calls this endpoint so it never forgets.
+    """
+    from plugins.AgentPaulPlugin.backend.services import knowledge_base as _kb
+
+    stored_kb = False
+    stored_vault = False
+
+    # 1. Store in Paul knowledge base
+    try:
+        content = payload.content.strip()
+        if payload.symbol:
+            content = f"[{payload.symbol}] {content}"
+        if payload.agent_role:
+            content = f"[agent:{payload.agent_role}] {content}"
+
+        await _kb.record_knowledge(
+            db,
+            kind="insight" if payload.type == "knowledge" else payload.type,
+            content=content,
+            source="jarvis_self_improvement",
+            topic=payload.topic or "general",
+            importance=min(1.0, max(0.0, payload.importance)),
+        )
+        stored_kb = True
+    except Exception as _kbe:
+        pass
+
+    # 2. Store in Obsidian vault (persistent memory)
+    try:
+        from plugins.ObsidianKnowledgePlugin.backend.services.vault_capture import vault_capture
+        vault_capture(
+            action_type="jarvis-improvement",
+            symbol=payload.symbol or "",
+            summary=f"[{payload.type}] {payload.content[:150]}",
+            detail=payload.content,
+            tags=["self-improvement", payload.type, payload.topic or "general"],
+            agent_role=payload.agent_role or "",
+        )
+        stored_vault = True
+    except Exception:
+        pass
+
+    # 3. If agent_update, also update the agent's configuration in the DB
+    if payload.type == "agent_update" and payload.agent_role:
+        try:
+            from app.models.database import Agent
+            from sqlalchemy import select as _sel
+            _agent = (await db.execute(
+                _sel(Agent).where(Agent.role == payload.agent_role)
+            )).scalars().first()
+            if _agent:
+                # Append the improvement to the agent's notes/memory field
+                existing = _agent.notes or ""
+                _agent.notes = (existing + f"\n[JARVIS IMPROVEMENT] {payload.content}").strip()[-2000:]
+                await db.commit()
+        except Exception:
+            pass
+
+    return {
+        "stored_to_knowledge_base": stored_kb,
+        "stored_to_vault": stored_vault,
+        "type": payload.type,
+        "message": "Improvement stored. I will use this in future conversations.",
+    }
+

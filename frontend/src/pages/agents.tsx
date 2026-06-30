@@ -96,6 +96,7 @@ const ROLE_META: Record<string, { icon: any; color: string; label: string }> = {
 }
 
 const MODELS = [
+  'fable-5-high',
   'gpt-5.1', 'gpt-5', 'gpt-4.1', 'gpt-4.1-mini', 'gpt-4.1-nano',
   'o4-mini', 'o3', 'o3-mini', 'o1', 'o1-mini',
   'gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-3.5-turbo',
@@ -116,7 +117,7 @@ export default function AgentsPage() {
     role: 'market_analyst',
     description: '',
     system_prompt: '',
-    model: 'gpt-4o-mini',
+    model: 'fable-5-high',
     temperature: 0.3,
     max_tokens: 2000,
     is_active: true,
@@ -217,7 +218,7 @@ export default function AgentsPage() {
       role: 'market_analyst',
       description: '',
       system_prompt: '',
-      model: 'gpt-4o-mini',
+      model: 'fable-5-high',
       temperature: 0.3,
       max_tokens: 2000,
       is_active: true,

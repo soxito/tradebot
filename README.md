@@ -256,6 +256,56 @@ cd frontend
 npm test
 ```
 
+## 🎙️ JARVIS voice — cost-aware Deepgram fallback
+
+JARVIS keeps using the **free browser Web Speech API** as its primary speech
+recogniser. Deepgram is used **only as a fallback**, and only when JARVIS
+genuinely mis-hears a command — so the prepaid Deepgram credit lasts for months.
+
+**How it works**
+- A short rolling audio buffer (~8s) of the mic is kept on both the in-page
+  widget (`PaulChat.tsx`) and the browser extension (`jarvis-extension/`).
+- On a **miss** (low-confidence result, a wake word with no usable command, or
+  several misses in a row) the buffered clip is sent **once** to the backend
+  endpoint `POST /api/v1/voice/deepgram/stt`, which transcribes it with
+  Deepgram pre-recorded STT (Nova, ~$0.0043/min — ~15–20× cheaper than the
+  Voice Agent). The raw Deepgram key never leaves the backend.
+- A **budget guard** caps spend. When the cap is reached the endpoint returns
+  `used_deepgram=false` and JARVIS **silently stays on the free engine** — no
+  error is shown.
+- **Your voice only**: when you have calibrated a voice profile and enabled
+  voice match, the fallback is gated by the same speaker-ID fingerprint as the
+  free engine. A clip is sent to Deepgram **only** while the live analyser
+  confirms it is your calibrated voice — so a TV or another person nearby is
+  never transcribed (or charged). The extension reuses the page's live
+  `voice-match-update` signal for the same gate. With voice match off, the
+  fallback behaves exactly like the free engine (no speaker restriction).
+
+**Budget settings** (in `.env` / `backend/app/core/config.py`):
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `DEEPGRAM_FALLBACK_ENABLED` | `true` | Master on/off switch for the fallback |
+| `DEEPGRAM_MONTHLY_CAP_USD` | `60.0` | Hard monthly spend ceiling (~3 months on $200) |
+| `DEEPGRAM_DAILY_CAP_USD` | `5.0` | Daily sub-cap to smooth spend |
+| `DEEPGRAM_STT_RATE_PER_MIN` | `0.0043` | Nova pre-recorded $/min, used for cost math |
+| `DEEPGRAM_STT_MODEL` | `nova-3` | Pre-recorded model |
+| `DEEPGRAM_TOTAL_CREDIT_USD` | `200.0` | Total credit, used for the runway projection |
+
+Usage/runway is reported by `GET /api/v1/voice/deepgram/usage` and surfaced in
+the JARVIS settings panel (and on the Voice Agent tab as a cost warning).
+
+**Manual verification checklist**
+1. Speak a clear command → it runs via Web Speech; **no** `/voice/deepgram/stt`
+   call is made (check the Network tab / backend logs).
+2. Mumble or say a wake word with a garbled command → exactly **one**
+   `/voice/deepgram/stt` call fires and the recovered command runs.
+3. `curl http://localhost:1448/api/v1/voice/deepgram/usage` → `month_spend`,
+   `remaining`, and `projected_runway_days` update after a real escalation.
+4. Force the cap (set `DEEPGRAM_MONTHLY_CAP_USD=0` and reload the backend) →
+   escalation returns `used_deepgram=false` and JARVIS stays on the free engine
+   with no error UI; the settings badge shows **Paused (budget)**.
+
 ## 📈 Roadmap
 
 - [x] Phase 1: Infrastructure & scaffold

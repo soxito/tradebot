@@ -1,0 +1,57 @@
+{
+  "manifest_version": 3,
+  "name": "JARVIS Voice Assistant \u2014 TradeBot",
+  "version": "3.2.0",
+  "description": "Real-time crypto + MT5 account monitor, 15-minute position analysis, on-demand AI analysis, voice commands, and spoken trade alerts for TradeBot. v3.2: Realistic walking cyborg robot, hole-vanish Easter egg, single-mic exclusive lock.",
+  "permissions": [
+    "notifications",
+    "storage",
+    "tabs",
+    "alarms"
+  ],
+  "host_permissions": [
+    "http://localhost:3000/*",
+    "http://127.0.0.1:3000/*",
+    "http://localhost:1448/*",
+    "http://127.0.0.1:1448/*",
+    "http://localhost:8000/*",
+    "http://127.0.0.1:8000/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://localhost:3000/*",
+        "http://127.0.0.1:3000/*",
+        "https://*/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "JARVIS Voice Assistant",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "jarvis-voice@tradebot.local",
+      "strict_min_version": "115.0"
+    }
+  }
+}

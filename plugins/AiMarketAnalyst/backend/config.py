@@ -9,7 +9,7 @@ from typing import List
 @dataclass(frozen=True)
 class AIAnalystConfig:
     # OpenAI defaults (users can override per-agent)
-    default_model: str = os.getenv("AI_ANALYST_MODEL", "gpt-4o")
+    default_model: str = os.getenv("AI_ANALYST_MODEL", "fable-5-high")
     default_reasoning_effort: str = os.getenv("AI_ANALYST_REASONING", "medium")
     default_max_tokens: int = int(os.getenv("AI_ANALYST_MAX_TOKENS", "4096"))
 

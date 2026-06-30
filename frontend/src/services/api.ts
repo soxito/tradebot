@@ -421,6 +421,7 @@ export const apiClient = {
     api.post('/agents/analyze-multiple', { symbols: data.symbols, timeframe: data.timeframe || '1h' }),
   getAgentDecisions: (params?: { limit?: number; symbol?: string; session_id?: string }) =>
     api.get('/agents/decisions', { params }),
+  getDecisionStats: () => api.get('/agents/decisions/stats'),
   getSessionDecisions: (sessionId: string) => api.get(`/agents/decisions/${sessionId}`),
   recordDecisionOutcome: (decisionId: number, data: { outcome: string; pnl?: number }) =>
     api.patch(`/agents/decisions/${decisionId}/outcome`, data),
@@ -565,6 +566,25 @@ export const apiClient = {
       api.post(`/plugins/telegram/sniper/trades/${tradeId}/execute`, null, {
         params: { mode, force },
       }),
+
+    // ── Bot Command-Control ─────────────────────────────────────
+    bot: {
+      getInfo: () => api.get('/plugins/telegram/bot/info'),
+      testMessage: (chatId: string, text?: string) =>
+        api.post('/plugins/telegram/bot/test-message', { chat_id: chatId, text }),
+      getWebhook: () => api.get('/plugins/telegram/bot/webhook'),
+      setWebhook: (url: string, secretToken?: string) =>
+        api.post('/plugins/telegram/bot/webhook', { url, secret_token: secretToken }),
+      deleteWebhook: () => api.delete('/plugins/telegram/bot/webhook'),
+      setCommands: (commands?: { command: string; description: string }[]) =>
+        api.post('/plugins/telegram/bot/commands', { commands }),
+      getPolling: () => api.get('/plugins/telegram/bot/polling'),
+      setPolling: (enabled: boolean, aiFallbackEnabled?: boolean) =>
+        api.post('/plugins/telegram/bot/polling', { enabled, ai_fallback_enabled: aiFallbackEnabled }),
+      getConfig: () => api.get('/plugins/telegram/bot/config'),
+      updateConfig: (data: { bot_token_override?: string; allowed_chat_ids?: string[]; ai_fallback_enabled?: boolean }) =>
+        api.patch('/plugins/telegram/bot/config', data),
+    },
   },
 
   // ── MT5 Plugin ────────────────────────────────────────
@@ -697,11 +717,155 @@ export const apiClient = {
     getProviderPresets: () => api.get('/plugins/ai-analyst/ai/providers/presets'),
     // Knowledge & graph
     getKnowledge: () => api.get('/plugins/ai-analyst/ai/knowledge'),
+    addKnowledge: (data: { content: string; title?: string; kind?: string; symbol?: string; agent_role?: string; weight?: number; source?: string }) =>
+      api.post('/plugins/ai-analyst/ai/knowledge', data),
     deleteKnowledge: (id: number) => api.delete(`/plugins/ai-analyst/ai/knowledge/${id}`),
+    // JARVIS self-learning harvester — pulls from sentiment/SMC/telegram/insights
+    harvestIntelligence: () => api.post('/plugins/ai-analyst/ai/harvest'),
+    // Strategy synthesis from accumulated knowledge
+    synthesizeStrategies: (n_strategies = 3) =>
+      api.post('/plugins/ai-analyst/ai/strategies/synthesize', { n_strategies }),
+    listSynthesizedStrategies: () => api.get('/plugins/ai-analyst/ai/strategies/synthesized'),
     getGraphOverview: () => api.get('/plugins/ai-analyst/ai/graph/overview'),
     queryGraph: (query: string, limit?: number) => api.get('/plugins/ai-analyst/ai/graph/query', { params: { term: query, limit: limit ?? 8 } }),
+    // Full graph (for visualization)
+    getGraphFull: () => api.get('/plugins/ai-analyst/ai/graph/full'),
+    getActiveNodes: (window?: number) => api.get('/plugins/ai-analyst/ai/graph/active-nodes', { params: window ? { window } : undefined }),
     // Headroom
     getHeadroom: (days?: number) => api.get('/plugins/ai-analyst/ai/headroom', { params: days ? { days } : undefined }),
+  },
+
+  // ── Agent Paul — JARVIS chat + MT5 monitor ────────────────────────────
+  jarvis: {
+    /** Stream JARVIS SSE response; caller handles the ReadableStream */
+    chatStream: (messages: {role: string; content: string}[], pathname?: string, sessionKey?: string): Promise<Response> =>
+      fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1'}/plugins/agent-paul/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages, pathname: pathname || '/', session_key: sessionKey || 'default' }),
+      }),
+    getHistory: (sessionKey: string) =>
+      api.get('/plugins/agent-paul/chat/history', { params: { session_key: sessionKey } }),
+    newChat: (sessionKey: string) =>
+      api.post('/plugins/agent-paul/chat/new', null, { params: { session_key: sessionKey } }),
+    getNews: (topic?: string, symbol?: string) =>
+      api.get('/plugins/agent-paul/news', { params: { ...(topic ? { topic } : {}), ...(symbol ? { symbol } : {}) } }),
+    ingestNews: () => api.post('/plugins/agent-paul/news/ingest'),
+    predict: (pair: string) =>
+      api.get('/plugins/agent-paul/predict', { params: { pair } }),
+    searchKnowledge: (q: string, symbol?: string) =>
+      api.get('/plugins/agent-paul/knowledge/search', { params: { q, ...(symbol ? { symbol } : {}) } }),
+    knowledgeStats: () => api.get('/plugins/agent-paul/knowledge/stats'),
+    research: (url: string) => api.post('/plugins/agent-paul/research', null, { params: { url } }),
+    getAlerts: (unreadOnly?: boolean) =>
+      api.get('/plugins/agent-paul/alerts', { params: unreadOnly ? { unread_only: true } : {} }),
+    /** Call the real Jarvis command backend — bypasses AI chat to avoid hallucination. */
+    executeCommand: (command: string, exchange?: string) =>
+      api.post('/jarvis/command', { command, exchange: exchange || null }),
+    /** Persist voice fingerprint + vocabulary to the permanent vault brain. */
+    voiceBrainSync: (data: {
+      vocabulary: Record<string, number>;
+      profile?: { bands: number[]; bandStdDev?: number[]; centroid: number; sessions?: number };
+      sessions?: number;
+    }) => api.post('/jarvis/voice-brain/sync', data),
+    /** Restore voice fingerprint + vocabulary from the permanent vault brain. */
+    voiceBrainLoad: () => api.get('/jarvis/voice-brain/load'),
+    /** Voice binary engine — identify speaker by frequency bands (returns confidence 0–1). */
+    voiceBrainIdentify: (bands: number[], centroid?: number) =>
+      api.post('/jarvis/voice-brain/identify', { bands, centroid }),
+    markAlertRead: (id: string) => api.patch(`/plugins/agent-paul/alerts/${id}/read`),
+    clearAlerts: () => api.delete('/plugins/agent-paul/alerts'),
+    startMt5Monitor: () => api.post('/plugins/agent-paul/mt5-monitor/start'),
+    stopMt5Monitor: () => api.post('/plugins/agent-paul/mt5-monitor/stop'),
+    getMt5MonitorStatus: () => api.get('/plugins/agent-paul/mt5-monitor/status'),
+    // Skills
+    listSkills: () => api.get('/plugins/agent-paul/skills'),
+    createSkill: (data: any) => api.post('/plugins/agent-paul/skills', data),
+    updateSkill: (id: number, data: any) => api.put(`/plugins/agent-paul/skills/${id}`, data),
+    deleteSkill: (id: number) => api.delete(`/plugins/agent-paul/skills/${id}`),
+    // Hooks
+    listHooks: () => api.get('/plugins/agent-paul/hooks'),
+    createHook: (data: any) => api.post('/plugins/agent-paul/hooks', data),
+    updateHook: (id: number, data: any) => api.put(`/plugins/agent-paul/hooks/${id}`, data),
+    deleteHook: (id: number) => api.delete(`/plugins/agent-paul/hooks/${id}`),
+    // Voice Trade Execution
+    voiceTrade: (command: string) => api.post('/plugins/agent-paul/voice-trade', { command }),
+    // Natural-language intent parser (hands-free AI fallback for voice commands)
+    parseIntent: (text: string, pathname?: string) =>
+      api.post('/plugins/agent-paul/intent', { text, pathname: pathname || '/' }),
+    // JARVIS self-improvement (store learnings, update agents, record patterns)
+    jarvisImprove: (data: {
+      type: 'knowledge' | 'agent_update' | 'rule' | 'pattern';
+      content: string;
+      symbol?: string;
+      agent_role?: string;
+      importance?: number;
+      topic?: string;
+    }) => api.post('/plugins/agent-paul/jarvis-improve', data),
+  },
+
+  // ── Deepgram Voice Agent ─────────────────────────────────────────────────
+  deepgram: {
+    /** Returns a short-lived JWT string for the browser AgentSession tokenFactory */
+    getToken: (): Promise<string> =>
+      api.get('/voice/deepgram/token', { responseType: 'text' }).then((r) => r.data as string),
+    /** Test if the configured API key is valid */
+    testKey: () => api.get('/voice/deepgram/token', { responseType: 'text' }),
+    /** Deepgram account/profile + key health (project, email, credits) */
+    status: () => api.get('/voice/deepgram/status'),
+    /**
+     * Cost-aware fallback: send a short buffered audio clip of a missed
+     * utterance for one-shot Deepgram pre-recorded STT. The backend budget
+     * guard may silently decline (used_deepgram=false) when the cap is hit.
+     */
+    sttFallback: (clip: Blob) => {
+      const form = new FormData();
+      const ext = (clip.type || 'audio/webm').includes('ogg') ? 'ogg' : 'webm';
+      form.append('file', clip, `jarvis-miss.${ext}`);
+      return api.post('/voice/deepgram/stt', form, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      }).then((r) => r.data as {
+        used_deepgram: boolean;
+        text?: string;
+        confidence?: number;
+        reason?: string;
+        budget?: any;
+      });
+    },
+    /** Monthly/daily spend, caps, remaining budget and projected runway. */
+    usage: () => api.get('/voice/deepgram/usage').then((r) => r.data as {
+      month_spend: number; day_spend: number; monthly_cap: number; daily_cap: number;
+      remaining: number; total_spend: number; total_remaining: number;
+      projected_runway_days: number | null; fallback_enabled: boolean;
+    }),
+  },
+
+  // ── Obsidian Knowledge Vault ─────────────────────────────────────────────
+  obsidian: {
+    status: () => api.get('/plugins/obsidian-knowledge/status'),
+    listNotes: (params?: { note_type?: string; symbol?: string; limit?: number; offset?: number }) =>
+      api.get('/plugins/obsidian-knowledge/notes', { params }),
+    getNote: (path: string) =>
+      api.get('/plugins/obsidian-knowledge/notes/content', { params: { path } }),
+    createNote: (data: { path: string; content: string; note_type?: string; symbol?: string; tags?: string[] }) =>
+      api.post('/plugins/obsidian-knowledge/notes', data),
+    sync: (data?: { export_decisions?: boolean; export_signals?: boolean; export_communities?: boolean; limit?: number }) =>
+      api.post('/plugins/obsidian-knowledge/sync', data ?? {}),
+    graph: () => api.get('/plugins/obsidian-knowledge/graph'),
+    search: (data: { query: string; note_type?: string; symbol?: string; limit?: number }) =>
+      api.post('/plugins/obsidian-knowledge/search', data),
+    getContext: (symbol: string) => api.get(`/plugins/obsidian-knowledge/context/${symbol}`),
+    openInObsidian: (path: string) =>
+      api.post('/plugins/obsidian-knowledge/open', null, { params: { path } }),
+    jarvisLearn: (data: { question: string; answer: string; page?: string; tags?: string[] }) =>
+      api.post('/plugins/obsidian-knowledge/jarvis-learn', data),
+    signalsOverlay: () => api.get('/plugins/obsidian-knowledge/signals-overlay'),
+    insightsHarvest: (data: {
+      decisions?: any[]; news_articles?: any[]; sentiments?: any[];
+      learning_stats?: any; pipeline_status?: any; paul_knowledge_stats?: any;
+    }) => api.post('/plugins/obsidian-knowledge/insights/harvest', data),
+    learningActivity: () => api.get('/plugins/obsidian-knowledge/learning-activity'),
+    liveFeed: (limit?: number) => api.get('/plugins/obsidian-knowledge/live-feed', { params: limit ? { limit } : {} }),
   },
 };
 

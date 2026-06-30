@@ -49,7 +49,7 @@ interface AgentForm {
   indicators: string
 }
 
-const MODELS = ['gpt-4o', 'gpt-4o-mini', 'o3', 'o4-mini']
+const MODELS = ['fable-5-high', 'gpt-4o', 'gpt-4o-mini', 'o3', 'o4-mini']
 const EFFORTS = ['low', 'medium', 'high']
 
 export default function AIAgentsAdminPage() {
@@ -61,7 +61,7 @@ export default function AIAgentsAdminPage() {
   const [expanded, setExpanded] = useState<number | null>(null)
   const [form, setForm] = useState<AgentForm>({
     name: '', slug: '', description: '', role_type: 'custom',
-    model: 'gpt-4o', reasoning_effort: 'medium', system_prompt: '',
+    model: 'fable-5-high', reasoning_effort: 'medium', system_prompt: '',
     instruments: '', timeframes: 'M15,H1,H4,D1',
     indicators: 'RSI,EMA_20,EMA_50,ATR,VWAP',
   })
@@ -95,7 +95,7 @@ export default function AIAgentsAdminPage() {
         indicators_json: form.indicators ? form.indicators.split(',').map(s => s.trim()) : undefined,
       })
       setShowCreate(false)
-      setForm({ name: '', slug: '', description: '', role_type: 'custom', model: 'gpt-4o', reasoning_effort: 'medium', system_prompt: '', instruments: '', timeframes: 'M15,H1,H4,D1', indicators: 'RSI,EMA_20,EMA_50,ATR,VWAP' })
+      setForm({ name: '', slug: '', description: '', role_type: 'custom', model: 'fable-5-high', reasoning_effort: 'medium', system_prompt: '', instruments: '', timeframes: 'M15,H1,H4,D1', indicators: 'RSI,EMA_20,EMA_50,ATR,VWAP' })
       await fetchAgents()
     } catch (e: any) {
       setError(e.message)

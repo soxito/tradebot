@@ -1379,7 +1379,360 @@ export default function TelegramPage() {
             </div>
           </div>
         </div>
+
+        {/* ── Bot Control ─────────────────────────────────────────── */}
+        <BotControlPanel onMessage={setMessage} onError={setError} />
       </div>
     </>
+  )
+}
+
+// ── Bot Control Panel ─────────────────────────────────────────────────────────
+
+function BotControlPanel({
+  onMessage,
+  onError,
+}: {
+  onMessage: (msg: string) => void
+  onError: (err: string) => void
+}) {
+  const [botInfo, setBotInfo] = useState<{
+    ok: boolean; bot_id?: number; username?: string; first_name?: string; error?: string
+  } | null>(null)
+  const [botConfig, setBotConfig] = useState<{
+    token_set: boolean; webhook_url: string | null; polling_enabled: boolean;
+    allowed_chat_ids: string[]; ai_fallback_enabled: boolean; last_update_id: number | null
+  } | null>(null)
+  const [webhookInfo, setWebhookInfo] = useState<{
+    ok: boolean; url?: string | null; pending_update_count?: number;
+    last_error_message?: string | null; error?: string | null
+  } | null>(null)
+
+  const [loadingInfo, setLoadingInfo] = useState(false)
+  const [webhookUrl, setWebhookUrl] = useState('')
+  const [webhookSecret, setWebhookSecret] = useState('')
+  const [settingWebhook, setSettingWebhook] = useState(false)
+  const [deletingWebhook, setDeletingWebhook] = useState(false)
+  const [testChatId, setTestChatId] = useState('')
+  const [testText, setTestText] = useState('✅ Jarvis TradeBot test message — connection OK!')
+  const [sendingTest, setSendingTest] = useState(false)
+  const [pollingEnabled, setPollingEnabled] = useState(false)
+  const [togglingPolling, setTogglingPolling] = useState(false)
+  const [syncingCommands, setSyncingCommands] = useState(false)
+  const [allowedChatIdsInput, setAllowedChatIdsInput] = useState('')
+  const [savingConfig, setSavingConfig] = useState(false)
+
+  const loadBotInfo = useCallback(async () => {
+    setLoadingInfo(true)
+    try {
+      const [infoRes, configRes, webhookRes] = await Promise.all([
+        apiClient.telegram.bot.getInfo().catch(() => null),
+        apiClient.telegram.bot.getConfig().catch(() => null),
+        apiClient.telegram.bot.getWebhook().catch(() => null),
+      ])
+      if (infoRes?.data) setBotInfo(infoRes.data)
+      if (configRes?.data) {
+        setBotConfig(configRes.data)
+        setPollingEnabled(configRes.data.polling_enabled)
+        setAllowedChatIdsInput((configRes.data.allowed_chat_ids || []).join(', '))
+      }
+      if (webhookRes?.data) {
+        setWebhookInfo(webhookRes.data)
+        if (webhookRes.data.url) setWebhookUrl(webhookRes.data.url)
+      }
+    } catch (e) {
+      onError('Failed to load bot info')
+    } finally {
+      setLoadingInfo(false)
+    }
+  }, [onError])
+
+  useEffect(() => { loadBotInfo() }, [loadBotInfo])
+
+  const handleSetWebhook = async () => {
+    if (!webhookUrl.trim()) { onError('Webhook URL is required'); return }
+    setSettingWebhook(true)
+    try {
+      await apiClient.telegram.bot.setWebhook(webhookUrl.trim(), webhookSecret.trim() || undefined)
+      onMessage(`Webhook set: ${webhookUrl}`)
+      await loadBotInfo()
+    } catch (e: any) {
+      onError(e?.response?.data?.detail || 'Failed to set webhook')
+    } finally { setSettingWebhook(false) }
+  }
+
+  const handleDeleteWebhook = async () => {
+    setDeletingWebhook(true)
+    try {
+      await apiClient.telegram.bot.deleteWebhook()
+      onMessage('Webhook deleted.')
+      await loadBotInfo()
+    } catch (e: any) {
+      onError(e?.response?.data?.detail || 'Failed to delete webhook')
+    } finally { setDeletingWebhook(false) }
+  }
+
+  const handleTestMessage = async () => {
+    if (!testChatId.trim()) { onError('Chat ID is required'); return }
+    setSendingTest(true)
+    try {
+      await apiClient.telegram.bot.testMessage(testChatId.trim(), testText)
+      onMessage(`Test message sent to ${testChatId}`)
+    } catch (e: any) {
+      onError(e?.response?.data?.detail || 'Failed to send test message')
+    } finally { setSendingTest(false) }
+  }
+
+  const handleTogglePolling = async () => {
+    setTogglingPolling(true)
+    try {
+      const res = await apiClient.telegram.bot.setPolling(!pollingEnabled)
+      setPollingEnabled(res.data.polling_enabled)
+      onMessage(res.data.polling_enabled ? '🤖 Bot polling started.' : '⏹ Bot polling stopped.')
+      await loadBotInfo()
+    } catch (e: any) {
+      onError(e?.response?.data?.detail || 'Failed to toggle polling')
+    } finally { setTogglingPolling(false) }
+  }
+
+  const handleSyncCommands = async () => {
+    setSyncingCommands(true)
+    try {
+      const res = await apiClient.telegram.bot.setCommands()
+      onMessage(`✅ ${res.data.commands_set} commands synced to Telegram.`)
+    } catch (e: any) {
+      onError(e?.response?.data?.detail || 'Failed to sync commands')
+    } finally { setSyncingCommands(false) }
+  }
+
+  const handleSaveConfig = async () => {
+    setSavingConfig(true)
+    try {
+      const chatIds = allowedChatIdsInput.split(',').map(s => s.trim()).filter(Boolean)
+      await apiClient.telegram.bot.updateConfig({ allowed_chat_ids: chatIds })
+      onMessage('Bot config saved.')
+      await loadBotInfo()
+    } catch (e: any) {
+      onError(e?.response?.data?.detail || 'Failed to save config')
+    } finally { setSavingConfig(false) }
+  }
+
+  return (
+    <div className="bg-gray-800/30 border border-gray-700 rounded-lg p-5">
+      <div className="flex items-center justify-between mb-4">
+        <div>
+          <h2 className="font-semibold text-white flex items-center gap-2">
+            🤖 Bot Control
+          </h2>
+          <p className="text-xs text-gray-400 mt-0.5">
+            Create, test, and manage your Telegram bot. Execute Jarvis commands from any Telegram chat.
+          </p>
+        </div>
+        <button
+          onClick={loadBotInfo}
+          disabled={loadingInfo}
+          className="px-3 py-1.5 rounded bg-gray-700 hover:bg-gray-600 text-white text-xs"
+        >
+          <RefreshCw className={`w-3.5 h-3.5 ${loadingInfo ? 'animate-spin' : ''}`} />
+        </button>
+      </div>
+
+      {/* Bot Identity */}
+      <div className="rounded-lg border border-gray-700 bg-gray-900/40 p-4 mb-4">
+        <h3 className="text-sm font-medium text-gray-200 mb-2">Bot Identity</h3>
+        {botInfo ? (
+          botInfo.ok ? (
+            <div className="flex items-center gap-3">
+              <span className="text-2xl">🤖</span>
+              <div>
+                <div className="text-white font-medium">@{botInfo.username}</div>
+                <div className="text-xs text-gray-400">{botInfo.first_name} · ID: {botInfo.bot_id}</div>
+                <div className="text-xs text-emerald-400 mt-0.5">● Token valid</div>
+              </div>
+            </div>
+          ) : (
+            <div className="text-xs text-red-400">❌ {botInfo.error || 'Bot token invalid or not set'}</div>
+          )
+        ) : (
+          <div className="text-xs text-gray-400">
+            {loadingInfo ? 'Loading...' : 'Bot token not configured. Set it in the API Details section above.'}
+          </div>
+        )}
+      </div>
+
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+        {/* Webhook / Polling */}
+        <div className="space-y-4">
+          <div className="rounded-lg border border-gray-700 bg-gray-900/40 p-4">
+            <h3 className="text-sm font-medium text-gray-200 mb-3">Connection Mode</h3>
+
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <div className="text-sm text-white">Polling Mode</div>
+                <div className="text-xs text-gray-400">
+                  {pollingEnabled ? '🟢 Active (localhost-friendly)' : '⚫ Disabled'}
+                </div>
+              </div>
+              <button
+                onClick={handleTogglePolling}
+                disabled={togglingPolling}
+                className={`px-4 py-1.5 rounded text-sm text-white disabled:opacity-60 ${
+                  pollingEnabled ? 'bg-red-600 hover:bg-red-500' : 'bg-emerald-600 hover:bg-emerald-500'
+                }`}
+              >
+                {togglingPolling ? '...' : pollingEnabled ? 'Stop' : 'Start Polling'}
+              </button>
+            </div>
+
+            <div className="border-t border-gray-700 pt-3 space-y-2">
+              <div className="text-xs text-gray-300 font-medium">Webhook (requires public HTTPS URL)</div>
+
+              {webhookInfo?.url && (
+                <div className="rounded border border-cyan-500/30 bg-cyan-500/10 px-2.5 py-2 text-xs text-cyan-200 break-all">
+                  Active: {webhookInfo.url}
+                  {webhookInfo.pending_update_count !== undefined && (
+                    <span className="ml-2 text-cyan-300">({webhookInfo.pending_update_count} pending)</span>
+                  )}
+                  {webhookInfo.last_error_message && (
+                    <div className="text-red-300 mt-1">Last error: {webhookInfo.last_error_message}</div>
+                  )}
+                </div>
+              )}
+
+              <input
+                type="url"
+                placeholder="https://yourdomain.com/api/v1/plugins/telegram/bot/receive"
+                value={webhookUrl}
+                onChange={e => setWebhookUrl(e.target.value)}
+                className="w-full rounded bg-gray-900 border border-gray-600 px-3 py-2 text-xs text-white placeholder:text-gray-500"
+              />
+              <input
+                type="text"
+                placeholder="Secret token (optional, recommended)"
+                value={webhookSecret}
+                onChange={e => setWebhookSecret(e.target.value)}
+                className="w-full rounded bg-gray-900 border border-gray-600 px-3 py-2 text-xs text-white placeholder:text-gray-500"
+              />
+              <div className="flex gap-2">
+                <button
+                  onClick={handleSetWebhook}
+                  disabled={settingWebhook || !webhookUrl}
+                  className="flex-1 px-3 py-1.5 rounded bg-cyan-600 hover:bg-cyan-500 text-white text-xs disabled:opacity-60"
+                >
+                  {settingWebhook ? 'Setting...' : 'Set Webhook'}
+                </button>
+                {webhookInfo?.url && (
+                  <button
+                    onClick={handleDeleteWebhook}
+                    disabled={deletingWebhook}
+                    className="px-3 py-1.5 rounded bg-red-600/30 border border-red-500/40 text-red-300 text-xs disabled:opacity-60"
+                  >
+                    {deletingWebhook ? '...' : 'Delete'}
+                  </button>
+                )}
+              </div>
+              {!botConfig?.token_set && (
+                <div className="text-xs text-amber-300">
+                  ⚠️ No bot token set. Add one in API Details → Bot Token above.
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Security */}
+          <div className="rounded-lg border border-gray-700 bg-gray-900/40 p-4">
+            <h3 className="text-sm font-medium text-gray-200 mb-2">Security</h3>
+            <div className="space-y-2">
+              <div>
+                <label className="text-xs text-gray-400 block mb-1">
+                  Allowed Chat IDs <span className="text-gray-500">(comma-separated, empty = allow all)</span>
+                </label>
+                <input
+                  type="text"
+                  placeholder="e.g. 123456789, -100987654321"
+                  value={allowedChatIdsInput}
+                  onChange={e => setAllowedChatIdsInput(e.target.value)}
+                  className="w-full rounded bg-gray-900 border border-gray-600 px-3 py-2 text-xs text-white placeholder:text-gray-500"
+                />
+                <p className="text-[10px] text-gray-500 mt-1">
+                  Only messages from these chats will be processed. Leave empty to accept from anyone (dev only).
+                </p>
+              </div>
+              <button
+                onClick={handleSaveConfig}
+                disabled={savingConfig}
+                className="w-full px-3 py-1.5 rounded bg-gray-600 hover:bg-gray-500 text-white text-xs disabled:opacity-60"
+              >
+                {savingConfig ? 'Saving...' : 'Save Security Config'}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Test Console + Commands */}
+        <div className="space-y-4">
+          <div className="rounded-lg border border-gray-700 bg-gray-900/40 p-4">
+            <h3 className="text-sm font-medium text-gray-200 mb-3">Test Console</h3>
+            <p className="text-xs text-gray-400 mb-3">
+              Send a message through your bot to verify the full connection works.
+            </p>
+            <div className="space-y-2">
+              <input
+                type="text"
+                placeholder="Chat ID (e.g. 123456789)"
+                value={testChatId}
+                onChange={e => setTestChatId(e.target.value)}
+                className="w-full rounded bg-gray-900 border border-gray-600 px-3 py-2 text-xs text-white placeholder:text-gray-500"
+              />
+              <textarea
+                rows={3}
+                value={testText}
+                onChange={e => setTestText(e.target.value)}
+                className="w-full rounded bg-gray-900 border border-gray-600 px-3 py-2 text-xs text-white resize-none"
+              />
+              <button
+                onClick={handleTestMessage}
+                disabled={sendingTest || !testChatId}
+                className="w-full px-3 py-2 rounded bg-cyan-600 hover:bg-cyan-500 text-white text-sm disabled:opacity-60"
+              >
+                {sendingTest ? 'Sending...' : '📨 Send Test Message'}
+              </button>
+            </div>
+          </div>
+
+          <div className="rounded-lg border border-gray-700 bg-gray-900/40 p-4">
+            <h3 className="text-sm font-medium text-gray-200 mb-2">Registered Commands</h3>
+            <p className="text-xs text-gray-400 mb-3">
+              Push the Jarvis command list to Telegram so it appears in the / menu.
+            </p>
+            <div className="space-y-1 mb-3 text-xs text-gray-300 font-mono">
+              {[
+                '/start — Get started',
+                '/help — List all commands',
+                '/status — App & exchange health',
+                '/positions — Open futures positions',
+                '/portfolio — Total PnL & equity',
+                '/signals — Latest channel signals',
+                '/sniper — Sniper auto-trade status',
+                '/monitor start|stop — Signal monitor',
+                '/close BTCUSDT — Close a position',
+                '/tp 0.025 BTCUSDT — Set take-profit',
+                '/sl 0.020 BTCUSDT — Set stop-loss',
+                '/jarvis <command> — Free-form command',
+              ].map(cmd => (
+                <div key={cmd} className="text-gray-400">{cmd}</div>
+              ))}
+            </div>
+            <button
+              onClick={handleSyncCommands}
+              disabled={syncingCommands}
+              className="w-full px-3 py-2 rounded bg-indigo-600 hover:bg-indigo-500 text-white text-sm disabled:opacity-60"
+            >
+              {syncingCommands ? 'Syncing...' : '↑ Sync Commands to Telegram'}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
   )
 }

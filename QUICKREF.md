@@ -368,6 +368,25 @@ CREATE INDEX idx_trades_created_at ON trades(created_at DESC);
 
 ---
 
+## 🎙️ JARVIS Deepgram fallback (cost-aware)
+
+JARVIS uses the **free Web Speech API** first; Deepgram is only called when a
+command is **missed**, on a short buffered clip, with a backend spend cap.
+
+```bash
+# Current spend / remaining budget / projected runway
+curl http://localhost:1448/api/v1/voice/deepgram/usage
+
+# Transcribe a clip (multipart) — returns used_deepgram=false when capped
+curl -F file=@clip.webm http://localhost:1448/api/v1/voice/deepgram/stt
+```
+
+Caps live in `.env` (`DEEPGRAM_MONTHLY_CAP_USD=60`, `DEEPGRAM_DAILY_CAP_USD=5`,
+`DEEPGRAM_STT_RATE_PER_MIN=0.0043`). When the cap is hit JARVIS silently stays
+on the free engine. See **[README.md](README.md)** → *JARVIS voice* for details.
+
+---
+
 ## 📚 Documentation Links
 
 - **Full Documentation**: [README.md](README.md)

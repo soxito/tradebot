@@ -103,7 +103,7 @@ class BaseAgent:
         name: str,
         role: str,
         system_prompt: str,
-        model: str = "gpt-4o-mini",
+        model: str = "fable-5-high",
         temperature: float = 0.3,
         max_tokens: int = 2000,
     ):

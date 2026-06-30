@@ -416,7 +416,7 @@ class Agent(Base):
     role = Column(String, nullable=False)  # AgentRole value
     description = Column(Text, nullable=True)
     system_prompt = Column(Text, nullable=False)
-    model = Column(String, default="gpt-4o-mini", nullable=False)
+    model = Column(String, default="fable-5-high", nullable=False)
     temperature = Column(Float, default=0.3, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
     pairs = Column(Text, nullable=True)  # comma-separated, null = all

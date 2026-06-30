@@ -435,3 +435,78 @@ class TelegramSniperTradeResponse(BaseModel):
     live_order_id: str | None = None
     created_at: datetime
     updated_at: datetime
+
+
+# ── Telegram Bot command-control schemas ─────────────────────────────────────
+
+class TelegramBotInfoResponse(BaseModel):
+    """Returned by GET /plugins/telegram/bot/info (getMe)."""
+    ok: bool
+    bot_id: int | None = None
+    username: str | None = None
+    first_name: str | None = None
+    can_join_groups: bool | None = None
+    can_read_all_group_messages: bool | None = None
+    error: str | None = None
+
+
+class TelegramBotWebhookRequest(BaseModel):
+    """POST /plugins/telegram/bot/webhook — set webhook URL."""
+    url: str = Field(..., min_length=1)
+    secret_token: str | None = Field(default=None, max_length=256)
+
+
+class TelegramBotWebhookResponse(BaseModel):
+    ok: bool
+    url: str | None = None
+    has_custom_certificate: bool = False
+    pending_update_count: int = 0
+    last_error_date: int | None = None
+    last_error_message: str | None = None
+    max_connections: int | None = None
+    error: str | None = None
+
+
+class TelegramBotTestMessageRequest(BaseModel):
+    """POST /plugins/telegram/bot/test-message."""
+    chat_id: str
+    text: str = Field(default="✅ Jarvis TradeBot test message — connection OK!", max_length=4096)
+
+
+class TelegramBotCommandItem(BaseModel):
+    command: str = Field(..., min_length=1, max_length=32, pattern=r"^[a-z0-9_]+$")
+    description: str = Field(..., min_length=3, max_length=256)
+
+
+class TelegramBotCommandsRequest(BaseModel):
+    """POST /plugins/telegram/bot/commands — register command list with Telegram."""
+    commands: list[TelegramBotCommandItem] | None = None  # None → use default JARVIS_COMMANDS
+
+
+class TelegramBotPollingRequest(BaseModel):
+    """POST /plugins/telegram/bot/polling — enable/disable polling mode."""
+    enabled: bool
+    ai_fallback_enabled: bool | None = None
+
+
+class TelegramBotPollingResponse(BaseModel):
+    polling_enabled: bool
+    ai_fallback_enabled: bool
+    last_update_id: int | None = None
+
+
+class TelegramBotConfigUpdate(BaseModel):
+    """PATCH /plugins/telegram/bot/config — update bot configuration."""
+    bot_token_override: str | None = None
+    allowed_chat_ids: list[str] | None = None
+    ai_fallback_enabled: bool | None = None
+
+
+class TelegramBotConfigResponse(BaseModel):
+    """Current bot configuration (sensitive fields masked)."""
+    token_set: bool
+    webhook_url: str | None
+    polling_enabled: bool
+    allowed_chat_ids: list[str]
+    ai_fallback_enabled: bool
+    last_update_id: int | None

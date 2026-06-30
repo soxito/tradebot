@@ -14,10 +14,14 @@ from app.api.agents import router as agents_router
 from app.api.rug_pulls import router as rug_pulls_router
 from app.api.pump_monitor import router as pump_monitor_router
 from app.api.strategy_lab import router as strategy_lab_router
+from app.api.voice import router as voice_router
+from app.api.jarvis import router as jarvis_router
+from app.api.provider_relay import router as provider_relay_router
 
 api_router = APIRouter()
 
 # Include sub-routers
+api_router.include_router(jarvis_router)
 api_router.include_router(exchanges_router)
 api_router.include_router(signals_router)
 api_router.include_router(sentiment_router)
@@ -30,6 +34,8 @@ api_router.include_router(agents_router)
 api_router.include_router(rug_pulls_router)
 api_router.include_router(pump_monitor_router)
 api_router.include_router(strategy_lab_router)
+api_router.include_router(voice_router)
+api_router.include_router(provider_relay_router)
 
 
 @api_router.get("/status")

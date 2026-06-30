@@ -68,6 +68,17 @@ class Settings(BaseSettings):
     # TradingView Webhook
     TRADINGVIEW_WEBHOOK_SECRET: str = "change-me-to-secure-webhook-secret"
 
+    # Voice / Deepgram
+    DEEPGRAM_API_KEY: str = ""
+
+    # Deepgram cost-aware fallback (pre-recorded STT) budget guard
+    DEEPGRAM_FALLBACK_ENABLED: bool = True
+    DEEPGRAM_MONTHLY_CAP_USD: float = 60.0      # hard monthly spend ceiling
+    DEEPGRAM_DAILY_CAP_USD: float = 5.0         # daily sub-cap to smooth spend
+    DEEPGRAM_STT_RATE_PER_MIN: float = 0.0043   # Nova pre-recorded $/min
+    DEEPGRAM_STT_MODEL: str = "nova-3"          # pre-recorded model
+    DEEPGRAM_TOTAL_CREDIT_USD: float = 200.0    # total credit, for runway projection
+
     # Monitoring & Alerts
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
@@ -116,7 +127,19 @@ class Settings(BaseSettings):
     PLUGIN_AUTO_MOUNT: bool = True
     PLUGIN_STRICT_MODE: bool = False
     PLUGINS_DIR: str = "plugins"
-    
+
+    # Obsidian Knowledge Vault integration
+    OBSIDIAN_VAULT_PATH: str = "~/obsidian-vault/tradebot"
+    OBSIDIAN_REST_URL: str = ""           # e.g. https://localhost:27124
+    OBSIDIAN_REST_TOKEN: str = ""
+    OBSIDIAN_AUTO_SYNC_MINUTES: int = 15
+    OBSIDIAN_EXPORT_DECISIONS: bool = True
+    OBSIDIAN_EXPORT_SIGNALS: bool = True
+    OBSIDIAN_EXPORT_COMMUNITIES: bool = True
+    OBSIDIAN_INJECT_CONTEXT: bool = False
+    OBSIDIAN_CONTEXT_NOTES_LIMIT: int = 5
+    OBSIDIAN_CONTEXT_TOKEN_BUDGET: int = 800
+
     @property
     def cors_origins_list(self) -> List[str]:
         """Parse CORS origins from comma-separated string"""

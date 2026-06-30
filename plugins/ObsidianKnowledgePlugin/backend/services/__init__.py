@@ -1,0 +1,1 @@
+"""ObsidianKnowledgePlugin services package."""

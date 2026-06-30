@@ -27,6 +27,8 @@ import time
 import socket
 import shutil
 import json
+import platform
+import urllib.request
 from pathlib import Path
 from typing import Optional, Dict, Tuple, List
 
@@ -55,6 +57,19 @@ UVICORN_BIN = VENV / "bin" / "uvicorn"
 PY_BIN      = VENV / "bin" / "python"
 PG_BIN      = Path("/opt/homebrew/opt/postgresql@16/bin")
 MODE_FILE   = ROOT / ".db-mode"
+HOME        = Path.home()
+
+# ── Integration paths/config ──────────────────────────────────────────────────
+HEADROOM_PORT = int(os.environ.get("HEADROOM_PORT", "8787"))
+HEADROOM_URL = f"http://127.0.0.1:{HEADROOM_PORT}"
+HEADROOM_LOG = HOME / "Library" / "Logs" / "headroom.log"
+HEADROOM_PLIST = HOME / "Library" / "LaunchAgents" / "ai.headroomlabs.headroom.plist"
+HEADROOM_DATA_DIR = HOME / ".headroom"
+HEADROOM_PROXY_KEY = os.environ.get("HEADROOM_PROXY_KEY", "tradebot-local-headroom")
+
+OBSIDIAN_APP_PATH = Path("/Applications/Obsidian.app")
+OBSIDIAN_VAULT_DIR = (ROOT / "obsidian-vault").resolve()
+OBSIDIAN_SETUP_FILE = OBSIDIAN_VAULT_DIR / "SETUP.md"
 
 # ── Ports ─────────────────────────────────────────────────────────────────────
 BACKEND_PORT  = int(os.environ.get("BACKEND_PORT", "1448"))
@@ -117,11 +132,260 @@ def pkill(pattern: str) -> None:
 
 def http_ok(url: str, timeout: float = 5.0) -> bool:
     try:
-        import urllib.request
         urllib.request.urlopen(url, timeout=timeout)
         return True
     except Exception:
         return False
+
+
+def http_json(url: str, timeout: float = 5.0) -> Optional[dict]:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+
+
+def ensure_dir(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        return True
+    except Exception as ex:
+        fail(f"Could not create directory {path}: {ex}")
+        return False
+
+
+def _on_macos() -> bool:
+    return platform.system().lower() == "darwin"
+
+
+def _headroom_bin() -> Optional[str]:
+    candidates = [
+        shutil.which("headroom"),
+        str(HOME / ".local" / "bin" / "headroom"),
+        "/opt/homebrew/bin/headroom",
+        "/usr/local/bin/headroom",
+    ]
+    for c in candidates:
+        if c and Path(c).exists():
+            return c
+    return None
+
+
+def _obsidian_installed() -> bool:
+    if OBSIDIAN_APP_PATH.exists():
+        return True
+    r = subprocess.run(["open", "-Ra", "Obsidian"], capture_output=True)
+    return r.returncode == 0
+
+
+def ensure_obsidian() -> bool:
+    if _obsidian_installed():
+        ok("Obsidian is installed")
+        return True
+
+    warn("Obsidian not found — attempting auto-install …")
+    if not _on_macos():
+        fail("Auto-install for Obsidian is only implemented on macOS")
+        return False
+
+    brew = shutil.which("brew") or "/opt/homebrew/bin/brew"
+    if not Path(brew).exists():
+        fail("Homebrew not found; install Obsidian manually from https://obsidian.md")
+        return False
+
+    ok_inst, err = _spinner_run([brew, "install", "--cask", "obsidian"], "brew install --cask obsidian")
+    if not ok_inst:
+        fail(f"Failed to install Obsidian: {err[:200]}")
+        return False
+
+    if _obsidian_installed():
+        ok("Obsidian installed")
+        return True
+
+    fail("Obsidian install command completed but app not detected")
+    return False
+
+
+def start_obsidian() -> bool:
+    if not ensure_dir(OBSIDIAN_VAULT_DIR):
+        return False
+
+    # Never delete vault data. Only ensure setup scaffold exists.
+    if not OBSIDIAN_SETUP_FILE.exists():
+        OBSIDIAN_SETUP_FILE.write_text(
+            "# Obsidian Vault\n\n"
+            "This vault is managed by TradeBot start.py bootstrap.\n"
+            "Data is persistent and never deleted by startup automation.\n"
+        )
+
+    r = subprocess.run(
+        ["open", "-a", "Obsidian", str(OBSIDIAN_VAULT_DIR)],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        fail(f"Failed to start Obsidian: {r.stderr.strip()[:200]}")
+        return False
+
+    ok("Obsidian launched with TradeBot vault")
+    return True
+
+
+def ensure_headroom_installed() -> bool:
+    if _headroom_bin():
+        ok("Headroom is installed")
+        return True
+
+    warn("Headroom not found — attempting auto-install …")
+    uv_bin = shutil.which("uv")
+    if uv_bin:
+        ok_inst, err = _spinner_run(
+            [uv_bin, "tool", "install", "--python", "3.13", "headroom-ai[all]"],
+            "uv tool install headroom-ai[all]",
+            timeout=900,
+        )
+        if ok_inst and _headroom_bin():
+            ok("Headroom installed via uv")
+            return True
+        warn(f"uv install failed: {err[:180]}")
+
+    pipx_bin = shutil.which("pipx")
+    if pipx_bin:
+        ok_inst, err = _spinner_run(
+            [pipx_bin, "install", "headroom-ai[all]"],
+            "pipx install headroom-ai[all]",
+            timeout=900,
+        )
+        if ok_inst and _headroom_bin():
+            ok("Headroom installed via pipx")
+            return True
+        warn(f"pipx install failed: {err[:180]}")
+
+    fail("Could not auto-install Headroom. Install manually with uv or pipx.")
+    return False
+
+
+def _headroom_launch_command() -> str:
+    headroom_bin = _headroom_bin() or "headroom"
+    return (
+        'export PATH="/Users/sakhilematsimela/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"; '
+        "unset HEADROOM_DEPLOYMENT_PROFILE HEADROOM_DEPLOYMENT_NAME HEADROOM_DEPLOYMENT_ID HEADROOM_DEPLOYMENT_MODE; "
+        f'export OPENAI_TARGET_API_URL="http://127.0.0.1:{BACKEND_PORT}/api/v1/provider-relay"; '
+        "export HEADROOM_COMPRESS_SYSTEM_MESSAGES=1; "
+        "export HEADROOM_COMPRESS_USER_MESSAGES=1; "
+        "export HEADROOM_MIN_TOKENS=1; "
+        "export HEADROOM_TARGET_RATIO=0.4; "
+        "export HEADROOM_FORCE_KOMPRESS=1; "
+        "export HEADROOM_COMPRESSION_STABLE_AFTER_TURN=0; "
+        "export HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS=0; "
+        "export HEADROOM_PROTECT_RECENT=0; "
+        "export HEADROOM_PROTECT_ANALYSIS_CONTEXT=0; "
+        "export HEADROOM_INTERCEPT_TOOL_RESULTS=1; "
+        f'export HEADROOM_DATA_DIR="{HEADROOM_DATA_DIR}"; '
+        f'export ANTHROPIC_API_KEY="{HEADROOM_PROXY_KEY}"; '
+        f"exec {headroom_bin} proxy --port {HEADROOM_PORT}"
+    )
+
+
+def ensure_headroom_launchagent() -> bool:
+    if not _on_macos():
+        fail("Headroom LaunchAgent management is only implemented on macOS")
+        return False
+
+    if not ensure_dir(HEADROOM_PLIST.parent):
+        return False
+    if not ensure_dir(HEADROOM_LOG.parent):
+        return False
+    if not ensure_dir(HEADROOM_DATA_DIR):
+        return False
+
+    launch_cmd = _headroom_launch_command()
+    plist_content = f'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>ai.headroomlabs.headroom</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>-lc</string>
+    <string>{launch_cmd}</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>{HEADROOM_LOG}</string>
+  <key>StandardErrorPath</key><string>{HEADROOM_LOG}</string>
+</dict>
+</plist>
+'''
+
+    existing = HEADROOM_PLIST.read_text() if HEADROOM_PLIST.exists() else ""
+    if existing != plist_content:
+        HEADROOM_PLIST.write_text(plist_content)
+        ok("Headroom LaunchAgent configured")
+    else:
+        ok("Headroom LaunchAgent already configured")
+    return True
+
+
+def start_headroom() -> bool:
+    if port_open("127.0.0.1", HEADROOM_PORT, 0.6):
+        health = http_json(f"{HEADROOM_URL}/health?include_config=1", timeout=3)
+        if health:
+            ok(f"Headroom already running on :{HEADROOM_PORT}")
+            return True
+
+    if not ensure_headroom_launchagent():
+        return False
+
+    launch_id = f"gui/{os.getuid()}/ai.headroomlabs.headroom"
+    subprocess.run(["launchctl", "unload", str(HEADROOM_PLIST)], capture_output=True)
+    load_res = subprocess.run(["launchctl", "load", str(HEADROOM_PLIST)], capture_output=True, text=True)
+    if load_res.returncode != 0:
+        fail(f"Failed to load Headroom LaunchAgent: {load_res.stderr.strip()[:200]}")
+        return False
+
+    subprocess.run(["launchctl", "kickstart", "-k", launch_id], capture_output=True)
+
+    if not wait_for_port("127.0.0.1", HEADROOM_PORT, "Headroom proxy", max_wait=40):
+        return False
+
+    health = http_json(f"{HEADROOM_URL}/health?include_config=1", timeout=5)
+    if not health:
+        fail("Headroom is listening but health endpoint failed")
+        return False
+
+    config = health.get("config", {})
+    if not config.get("compress_user_messages"):
+        fail("Headroom started but compress_user_messages is disabled")
+        return False
+    if not config.get("compress_system_messages"):
+        fail("Headroom started but compress_system_messages is disabled")
+        return False
+
+    ok("Headroom healthy with compression enabled")
+    return True
+
+
+def setup_integrations() -> bool:
+    """Install/configure/start integrations needed by TradeBot startup.
+
+    Safety: This function never deletes Headroom or Obsidian data.
+    """
+    header("0/7  Integrations (Headroom + Obsidian)")
+
+    if not ensure_headroom_installed():
+        return False
+    if not start_headroom():
+        return False
+
+    if not ensure_obsidian():
+        return False
+    if not start_obsidian():
+        return False
+
+    return True
 
 
 # ── Auto-install helpers ─────────────────────────────────────────────────────
@@ -875,6 +1139,8 @@ def stop_all() -> None:
     if _docker_available() and _container_running(MT5_CONTAINER):
         subprocess.run(["docker", "stop", MT5_CONTAINER], capture_output=True, timeout=15)
         info(f"Stopped Docker container: {MT5_CONTAINER}")
+    # Intentionally do NOT stop Headroom/Obsidian here to preserve continuous context tooling.
+    # Their data and processes are managed independently and are never deleted by this script.
     ok("Done")
 
 
@@ -882,6 +1148,7 @@ def stop_all() -> None:
 def status() -> None:
     header("TradeBot Service Status")
     checks = [
+        ("Headroom proxy", "127.0.0.1", HEADROOM_PORT),
         ("PostgreSQL (brew)", "localhost", 5434),
         ("PostgreSQL (docker)", "localhost", 5433),
         ("Redis (brew)", "localhost", 6379),
@@ -895,6 +1162,10 @@ def status() -> None:
         symbol = f"{C.GREEN}●{C.RESET}" if running else f"{C.RED}○{C.RESET}"
         state = "running" if running else "stopped"
         print(f"  {symbol}  {label:<26}  :{port}  {state}")
+    obsidian_open = subprocess.run(["pgrep", "-f", "Obsidian"], capture_output=True).returncode == 0
+    obs_symbol = f"{C.GREEN}●{C.RESET}" if obsidian_open else f"{C.YELLOW}○{C.RESET}"
+    obs_state = "running" if obsidian_open else "not running"
+    print(f"  {obs_symbol}  {'Obsidian app':<26}  {'-':>5}  {obs_state}")
 
 
 # ── Summary table ─────────────────────────────────────────────────────────────
@@ -908,6 +1179,8 @@ def print_summary(results: Dict[str, bool], mode: str, pg_port: int, redis_port:
     sep()
     if all_ok:
         print(f"\n  {C.BOLD}{C.GREEN}All services started successfully!{C.RESET}\n")
+        print(f"  {C.CYAN}Headroom →{C.RESET}  {HEADROOM_URL}/dashboard")
+        print(f"  {C.CYAN}Obsidian →{C.RESET}  vault at {OBSIDIAN_VAULT_DIR}")
         print(f"  {C.CYAN}Frontend  →{C.RESET}  http://localhost:{FRONTEND_PORT}")
         print(f"  {C.CYAN}Backend   →{C.RESET}  http://localhost:{BACKEND_PORT}/api/v1")
         print(f"  {C.CYAN}API docs  →{C.RESET}  http://localhost:{BACKEND_PORT}/docs")
@@ -950,8 +1223,15 @@ def main() -> None:
     header(f"TradeBot Startup  [{mode.upper()} mode]")
     results: Dict[str, bool] = {}
 
+    # ── 0. Integrations ───────────────────────────────────────────────────────
+    integrations_ok = setup_integrations()
+    results["Headroom + Obsidian"] = integrations_ok
+    if not integrations_ok:
+        fail("Cannot continue without required integrations (Headroom/Obsidian).")
+        sys.exit(1)
+
     # ── 1. Database ───────────────────────────────────────────────────────────
-    header("1/5  Database")
+    header("1/6  Database")
     if mode == "brew":
         pg_ok, pg_port = start_postgres_brew()
     else:
@@ -962,7 +1242,7 @@ def main() -> None:
         sys.exit(1)
 
     # ── 2. Redis ──────────────────────────────────────────────────────────────
-    header("2/5  Redis")
+    header("2/6  Redis")
     if mode == "brew":
         redis_ok, redis_port = start_redis_brew()
     else:
@@ -972,7 +1252,7 @@ def main() -> None:
         warn("Redis not available — backend may still start in degraded mode")
 
     # ── 3. Python environment ─────────────────────────────────────────────────
-    header("3/5  Python environment")
+    header("3/6  Python environment")
     venv_ok = ensure_venv()
     if not venv_ok:
         fail("Cannot start backend without Python venv.")
@@ -984,12 +1264,12 @@ def main() -> None:
         sys.exit(1)
 
     # ── 4. Backend ────────────────────────────────────────────────────────────
-    header("4/5  FastAPI backend")
+    header("4/6  FastAPI backend")
     backend_ok = start_backend(pg_port, redis_port if redis_ok else 6379, mode)
     results["Backend"] = backend_ok
 
     # ── 5. Frontend ───────────────────────────────────────────────────────────
-    header("5/5  Next.js frontend")
+    header("5/6  Next.js frontend")
     npm_ok = ensure_npm_deps()
     results["npm deps"] = npm_ok
     frontend_ok = start_frontend() if npm_ok else False

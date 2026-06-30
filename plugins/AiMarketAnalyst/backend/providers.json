@@ -1,0 +1,98 @@
+{
+  "providers": [
+    {
+      "id": "openai",
+      "label": "OpenAI",
+      "type": "openai",
+      "api_key_env": "OPENAI_API_KEY",
+      "base_url": null,
+      "models": ["*"],
+      "rate_limits": {
+        "minute": 20
+      },
+      "weight": 1.0,
+      "enabled": true
+    },
+    {
+      "id": "groq",
+      "label": "Groq",
+      "type": "openai_compatible",
+      "api_key_env": "GROQ_API_KEY",
+      "base_url": "https://api.groq.com/openai/v1",
+      "models": [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-70b-versatile",
+        "mixtral-8x7b-32768"
+      ],
+      "rate_limits": {
+        "minute": 30,
+        "day": 14400
+      },
+      "weight": 1.0,
+      "enabled": true
+    },
+    {
+      "id": "google-gemini",
+      "label": "Google Gemini",
+      "type": "google",
+      "api_key_env": "GOOGLE_API_KEY",
+      "base_url": "https://generativelanguage.googleapis.com",
+      "models": [
+        "gemini-2.0-flash-exp",
+        "gemini-1.5-pro",
+        "gemini-1.5-flash"
+      ],
+      "rate_limits": {
+        "minute": 15
+      },
+      "weight": 1.0,
+      "enabled": true
+    },
+    {
+      "id": "mistral",
+      "label": "Mistral",
+      "type": "openai_compatible",
+      "api_key_env": "MISTRAL_API_KEY",
+      "base_url": "https://api.mistral.ai/v1",
+      "models": [
+        "mistral-large-latest",
+        "mistral-medium-latest",
+        "mistral-small-latest"
+      ],
+      "rate_limits": {
+        "minute": 10
+      },
+      "weight": 1.0,
+      "enabled": true
+    },
+    {
+      "id": "cerebras",
+      "label": "Cerebras",
+      "type": "openai_compatible",
+      "api_key_env": "CEREBRAS_API_KEY",
+      "base_url": "https://api.cerebras.ai/v1",
+      "models": [
+        "llama3.1-8b",
+        "llama3.1-70b"
+      ],
+      "rate_limits": {
+        "minute": 30
+      },
+      "weight": 1.0,
+      "enabled": true
+    },
+    {
+      "id": "openrouter",
+      "label": "OpenRouter",
+      "type": "openai_compatible",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "base_url": "https://openrouter.ai/api/v1",
+      "models": ["*"],
+      "rate_limits": {
+        "minute": 20
+      },
+      "weight": 1.0,
+      "enabled": true
+    }
+  ]
+}

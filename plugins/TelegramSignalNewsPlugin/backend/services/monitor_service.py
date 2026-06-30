@@ -628,12 +628,144 @@ class TelegramSignalMonitor:
         self._task = loop.create_task(self._loop())
         self._running = True
         logger.info("📡 Telegram signal monitor started (every {}s)", MONITOR_INTERVAL_SECONDS)
+        # Also start bot polling if it is configured
+        self._maybe_start_bot_polling(loop, session_factory)
 
     def stop(self) -> None:
         self._running = False
         if self._task is not None and not self._task.done():
             self._task.cancel()
         self._task = None
+        if self._bot_polling_task is not None and not self._bot_polling_task.done():
+            self._bot_polling_task.cancel()
+        self._bot_polling_task = None
+
+    def start_bot_polling(self, session_factory) -> bool:
+        """Start the Telegram bot polling loop if not already running.
+
+        Returns True if started (or already running), False if polling is
+        disabled in the database config.
+        """
+        self._session_factory = session_factory
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        if self._bot_polling_task is not None and not self._bot_polling_task.done():
+            return True
+        self._bot_polling_task = loop.create_task(self._bot_polling_loop(session_factory))
+        logger.info("🤖 Telegram bot polling loop started")
+        return True
+
+    def stop_bot_polling(self) -> None:
+        """Stop the bot polling loop."""
+        if self._bot_polling_task is not None and not self._bot_polling_task.done():
+            self._bot_polling_task.cancel()
+        self._bot_polling_task = None
+        logger.info("🤖 Telegram bot polling loop stopped")
+
+    def _maybe_start_bot_polling(self, loop: asyncio.AbstractEventLoop, session_factory) -> None:
+        """Start bot polling if configured — best-effort, never raises."""
+        try:
+            if self._bot_polling_task is not None and not self._bot_polling_task.done():
+                return
+            self._bot_polling_task = loop.create_task(
+                self._bot_polling_loop(session_factory)
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[BotPolling] Auto-start skipped: {}", exc)
+
+    async def _bot_polling_loop(self, session_factory) -> None:
+        """Long-poll Telegram Bot API for incoming updates.
+
+        Runs as a background task alongside the signal monitor.  Only active
+        when ``TelegramBotConfig.polling_enabled`` is True in the DB.
+        """
+        from plugins.TelegramSignalNewsPlugin.backend.models import TelegramBotConfig
+        from plugins.TelegramSignalNewsPlugin.backend.services.bot_service import (
+            get_updates,
+            send_message,
+        )
+        from plugins.TelegramSignalNewsPlugin.backend.services.command_service import (
+            parse_and_execute,
+        )
+        from sqlalchemy import select
+
+        await asyncio.sleep(3)  # let the main loop start first
+        logger.info("🤖 Bot polling loop running")
+
+        offset: int | None = None
+
+        while True:
+            try:
+                async with session_factory() as db:
+                    cfg_row = (await db.execute(select(TelegramBotConfig).limit(1))).scalars().first()
+                    if cfg_row is None or not cfg_row.polling_enabled:
+                        # Polling disabled — sleep and re-check
+                        await asyncio.sleep(10)
+                        continue
+
+                    token = cfg_row.bot_token_override or ""
+                    if not token:
+                        # Fall back to plugin settings token
+                        from plugins.TelegramSignalNewsPlugin.backend.models import TelegramPluginSettings
+                        ps = (await db.execute(select(TelegramPluginSettings).limit(1))).scalars().first()
+                        token = (ps.bot_token if ps else "") or ""
+
+                    if not token:
+                        await asyncio.sleep(10)
+                        continue
+
+                    allowed = list(cfg_row.allowed_chat_ids_json or [])
+                    if cfg_row.last_update_id is not None:
+                        offset = cfg_row.last_update_id + 1
+
+                resp = await get_updates(token, offset=offset, timeout=2)
+                if not resp.get("ok"):
+                    await asyncio.sleep(5)
+                    continue
+
+                updates = resp.get("result", [])
+                for update in updates:
+                    update_id = update.get("update_id")
+                    if update_id is not None:
+                        offset = update_id + 1
+
+                    try:
+                        chat_id = (
+                            (update.get("message") or update.get("edited_message") or {})
+                            .get("chat", {}).get("id")
+                        )
+                        async with session_factory() as db2:
+                            reply_text, parse_mode = await parse_and_execute(
+                                update, token, allowed, db2
+                            )
+                        if reply_text and chat_id:
+                            await send_message(token, chat_id, reply_text, parse_mode)
+                    except Exception as update_exc:  # noqa: BLE001
+                        logger.warning("[BotPolling] Update processing error: {}", update_exc)
+
+                # Persist last update_id
+                if updates and offset is not None:
+                    try:
+                        async with session_factory() as db3:
+                            cfg2 = (await db3.execute(
+                                select(TelegramBotConfig).limit(1)
+                            )).scalars().first()
+                            if cfg2 is not None:
+                                cfg2.last_update_id = offset - 1
+                                await db3.commit()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                await asyncio.sleep(1)
+
+            except asyncio.CancelledError:
+                logger.info("🤖 Bot polling loop cancelled")
+                break
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[BotPolling] Loop error: {}", exc)
+                await asyncio.sleep(5)
 
     async def _loop(self) -> None:
         # Small initial delay so startup requests finish first
@@ -671,6 +803,8 @@ class TelegramSignalMonitor:
                 break
 
         self._running = False
+        self._task = None
+        self._bot_polling_task: asyncio.Task | None = None
 
 
 # Module-level singleton

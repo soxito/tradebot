@@ -96,6 +96,9 @@ async def call_model(
         {"role": "user", "content": user_prompt},
     ]
 
+    # Compress through headroom before sending
+    messages = compress_messages(messages, caller="openai_client")
+
     try:
         kwargs: Dict[str, Any] = {
             "model": model,

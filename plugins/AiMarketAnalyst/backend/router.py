@@ -3,7 +3,7 @@ AI Market Analyst Plugin — API Router
 
 All routes prefixed at /plugins/ai-analyst by the plugin loader.
 """
-from typing import List, Optional
+from typing import Any, List, Optional
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select, desc, func
@@ -84,6 +84,21 @@ def _provider_to_response(p: AILLMProvider) -> AIProviderResponse:
     )
 
 
+def _normalize_optional_text(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _provider_models(preset: dict[str, Any] | None, default_model: Optional[str]) -> list[str] | None:
+    if preset and not preset.get("editable_endpoint"):
+        return list(preset["models"])
+    if default_model:
+        return [default_model]
+    return [] if preset and preset.get("editable_endpoint") else None
+
+
 @router.get("/ai/providers/presets", response_model=list[LLMProviderPreset])
 async def list_provider_presets():
     return [LLMProviderPreset(**p) for p in PROVIDER_PRESETS]
@@ -100,6 +115,8 @@ async def list_providers(db: AsyncSession = Depends(get_db)):
 @router.post("/ai/providers", response_model=AIProviderResponse)
 async def add_provider(payload: AIProviderCreate, db: AsyncSession = Depends(get_db)):
     preset = get_preset(payload.provider_key)
+    base_url = _normalize_optional_text(payload.base_url) or (preset["base_url"] if preset else None)
+    default_model = _normalize_optional_text(payload.default_model) or (preset["default_model"] if preset else None)
     # Determine next priority (append to end)
     max_pri = await db.scalar(select(func.max(AILLMProvider.priority)))
     next_pri = payload.priority if payload.priority is not None else (int(max_pri or 0) + 10)
@@ -109,9 +126,9 @@ async def add_provider(payload: AIProviderCreate, db: AsyncSession = Depends(get
         label=payload.label or (preset["label"] if preset else payload.provider_key),
         type=payload.type or (preset["type"] if preset else "openai_compatible"),
         api_key=payload.api_key.strip() or None,
-        base_url=payload.base_url or (preset["base_url"] if preset else None),
-        default_model=payload.default_model or (preset["default_model"] if preset else None),
-        models_json=(preset["models"] if preset else None),
+        base_url=base_url,
+        default_model=default_model,
+        models_json=_provider_models(preset, default_model),
         enabled=payload.enabled,
         priority=next_pri,
         free_tier=payload.free_tier if payload.free_tier is not None else (preset["free_tier"] if preset else True),
@@ -137,12 +154,18 @@ async def update_provider(provider_id: int, payload: AIProviderUpdate, db: Async
     provider = await db.get(AILLMProvider, provider_id)
     if provider is None:
         raise HTTPException(status_code=404, detail="Provider not found")
+    preset = get_preset(provider.provider_key)
     data = payload.model_dump(exclude_unset=True)
     if "api_key" in data and data["api_key"]:
         provider.api_key = data["api_key"].strip()
-    for attr in ("label", "base_url", "default_model", "enabled", "priority", "daily_limit", "monthly_limit"):
+    for attr in ("label", "enabled", "priority", "daily_limit", "monthly_limit"):
         if attr in data and data[attr] is not None:
             setattr(provider, attr, data[attr])
+    if "base_url" in data and data["base_url"] is not None:
+        provider.base_url = _normalize_optional_text(data["base_url"])
+    if "default_model" in data and data["default_model"] is not None:
+        provider.default_model = _normalize_optional_text(data["default_model"])
+        provider.models_json = _provider_models(preset, provider.default_model)
     await db.commit()
     await db.refresh(provider)
     return _provider_to_response(provider)
@@ -315,6 +338,53 @@ async def delete_knowledge_endpoint(knowledge_id: int, db: AsyncSession = Depend
     return {"deleted": True}
 
 
+# ── JARVIS Intelligence Harvester ──────────────────────────────────────────────
+
+@router.post("/ai/harvest")
+async def jarvis_harvest_endpoint(db: AsyncSession = Depends(get_db)):
+    """Pull live data from sentiment, SMC, Telegram signals, decisions, news
+    and store critical findings as knowledge nodes that expand the Brain Map."""
+    from plugins.AiMarketAnalyst.backend.services.jarvis_intelligence import harvest_intelligence
+    result = await harvest_intelligence(db)
+    return result
+
+
+# ── JARVIS Strategy Synthesis ─────────────────────────────────────────────────
+
+class StrategySynthesisRequest(BaseModel):
+    n_strategies: int = 3
+
+@router.post("/ai/strategies/synthesize")
+async def jarvis_synthesize_strategies(
+    payload: StrategySynthesisRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Read accumulated JARVIS knowledge nodes and synthesise executable Python
+    strategies that can be used by the market analysis engine."""
+    from plugins.AiMarketAnalyst.backend.services.jarvis_intelligence import synthesize_strategies
+    strategies = await synthesize_strategies(db, n_strategies=payload.n_strategies)
+    return {"strategies": strategies, "count": len(strategies)}
+
+@router.get("/ai/strategies/synthesized")
+async def list_synthesized_strategies(db: AsyncSession = Depends(get_db)):
+    """List all JARVIS-generated strategies stored in the knowledge base."""
+    from plugins.AiMarketAnalyst.backend.services.jarvis_intelligence import list_generated_strategy_artifacts
+    strategies = await list_generated_strategy_artifacts(db, limit=20)
+    return {"strategies": strategies}
+
+
+@router.post("/ai/strategies/evaluate")
+async def evaluate_jarvis_strategies(payload: dict, db: AsyncSession = Depends(get_db)):
+    """Evaluate generated JARVIS Python strategies against supplied candles."""
+    from plugins.AiMarketAnalyst.backend.services.jarvis_intelligence import evaluate_generated_strategies
+    symbol = str(payload.get("symbol") or "")
+    candles = payload.get("candles") or []
+    if not symbol or not isinstance(candles, list):
+        raise HTTPException(status_code=400, detail="symbol and candles are required")
+    scores = await evaluate_generated_strategies(db, candles=candles, symbol=symbol)
+    return {"scores": scores, "count": len(scores)}
+
+
 # ── Graphify (code/knowledge map) ──────────────────────────
 
 @router.get("/ai/graph/overview")
@@ -325,6 +395,97 @@ async def graph_overview_endpoint():
 @router.get("/ai/graph/query")
 async def graph_query_endpoint(term: str = Query(...), limit: int = 8):
     return graphify_service.query_map(term, limit=limit)
+
+
+@router.get("/ai/graph/full")
+async def graph_full_endpoint(db: AsyncSession = Depends(get_db)):
+    """Full node+link data for the 2D/3D force-graph visualization.
+
+    Enriches the graph with synthetic DB-entity nodes from recent trades,
+    signals, and sniper trades so the brain map shows live DB state.
+    """
+    from sqlalchemy import select, desc as sqldesc
+    from app.models.database import Signal, Trade
+    from plugins.AiMarketAnalyst.backend.models import AIAgentKnowledge
+
+    db_entities: list[dict] = []
+    try:
+        # Recent signals
+        sigs = (await db.execute(
+            select(Signal.id, Signal.symbol, Signal.action, Signal.status)
+            .order_by(sqldesc(Signal.created_at)).limit(20)
+        )).all()
+        for row in sigs:
+            db_entities.append({
+                "id": str(row.id),
+                "type": "signal",
+                "label": f"Signal: {row.symbol} {row.action}",
+                "symbol": row.symbol,
+            })
+        # Recent trades
+        trades = (await db.execute(
+            select(Trade.id, Trade.symbol, Trade.action, Trade.status)
+            .order_by(sqldesc(Trade.created_at)).limit(20)
+        )).all()
+        for row in trades:
+            db_entities.append({
+                "id": str(row.id),
+                "type": "trade",
+                "label": f"Trade: {row.symbol} {row.action}",
+                "symbol": row.symbol,
+            })
+    except Exception:
+        pass
+
+    # Sniper trades (optional — telegram plugin)
+    try:
+        from plugins.TelegramSignalNewsPlugin.backend.models import TelegramSniperTrade
+        sniper_rows = (await db.execute(
+            select(TelegramSniperTrade.id, TelegramSniperTrade.symbol, TelegramSniperTrade.direction, TelegramSniperTrade.status)
+            .order_by(sqldesc(TelegramSniperTrade.created_at)).limit(10)
+        )).all()
+        for row in sniper_rows:
+            db_entities.append({
+                "id": f"sniper_{row.id}",
+                "type": "sniper_trade",
+                "label": f"Sniper: {row.symbol} {row.direction}",
+                "symbol": row.symbol,
+            })
+    except Exception:
+        pass
+
+    try:
+        knowledge_rows = (await db.execute(
+            select(
+                AIAgentKnowledge.id,
+                AIAgentKnowledge.title,
+                AIAgentKnowledge.kind,
+                AIAgentKnowledge.symbol,
+                AIAgentKnowledge.source,
+            )
+            .where(AIAgentKnowledge.agent_role.in_(["jarvis_intelligence", "jarvis_strategy_engine"]))
+            .order_by(sqldesc(AIAgentKnowledge.updated_at))
+            .limit(80)
+        )).all()
+        for row in knowledge_rows:
+            label_prefix = "Strategy" if row.kind == "strategy" else "Knowledge"
+            db_entities.append({
+                "id": f"knowledge_{row.id}",
+                "type": "jarvis_knowledge",
+                "label": row.title or f"{label_prefix}: {row.kind}",
+                "symbol": row.symbol,
+                "source": row.source,
+            })
+    except Exception:
+        pass
+
+    return graphify_service.graph_full(db_entities=db_entities)
+
+
+@router.get("/ai/graph/active-nodes")
+async def graph_active_nodes_endpoint(window: float = 90.0):
+    """Node IDs that agents queried within the last *window* seconds."""
+    return {"active_nodes": graphify_service.get_active_nodes(window_seconds=window)}
 
 
 @router.post("/ai/chat")
@@ -377,6 +538,27 @@ async def list_llm_providers():
 async def get_llm_usage():
     providers = get_enabled_providers()
     return await get_usage_snapshot(providers)
+
+
+@router.post("/llm/reset-circuits")
+async def reset_circuit_breakers():
+    """Reset all circuit breakers and reload provider registry."""
+    from plugins.AiMarketAnalyst.backend.services import llm_gateway, llm_registry
+    
+    circuit_count = len(llm_gateway._circuits)
+    llm_gateway._circuits.clear()
+    
+    providers = llm_registry.get_providers(force_reload=True)
+    enabled = [p for p in providers if p.enabled]
+    disabled = [p for p in providers if not p.enabled]
+    
+    return {
+        "success": True,
+        "circuits_cleared": circuit_count,
+        "providers_reloaded": len(providers),
+        "enabled_providers": [{"id": p.id, "label": p.label} for p in enabled],
+        "disabled_providers": [{"id": p.id, "label": p.label, "api_key_env": p.api_key_env} for p in disabled],
+    }
 
 
 # ── Agent Admin ────────────────────────────────────────────

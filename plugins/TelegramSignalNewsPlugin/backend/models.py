@@ -354,3 +354,38 @@ class TelegramNewsSentiment(TelegramBase):
     label = Column(String(20), nullable=True)    # bullish/bearish/neutral
     pushed_symbols = Column(Integer, default=0)  # how many sentiment rows written
     created_at = Column(DateTime, default=now_utc_naive, index=True)
+
+
+class TelegramBotConfig(TelegramBase):
+    """Single-row configuration for the Telegram Bot command integration.
+
+    Stores bot token (if not using the shared plugin settings token), webhook
+    info, polling mode toggle, security allow-list, and the last processed
+    update_id for polling de-duplication.
+
+    Table prefix: ``telegram_`` (plugin convention).
+    """
+
+    __tablename__ = "telegram_bot_configs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    # Optionally override the token stored in TelegramPluginSettings
+    bot_token_override = Column(String(300), nullable=True, default=None)
+
+    # Webhook configuration
+    webhook_url = Column(String(500), nullable=True, default=None)
+    webhook_secret = Column(String(200), nullable=True, default=None)
+
+    # Polling mode — used when webhook is not set (e.g. localhost dev)
+    polling_enabled = Column(Boolean, nullable=False, default=False)
+    last_update_id = Column(Integer, nullable=True, default=None)
+
+    # Security: comma-separated chat IDs that may send commands.
+    # NULL or empty string = accept all (dev convenience only).
+    allowed_chat_ids_json = Column(JSON, nullable=True, default=None)
+
+    # AI fallback for unrecognised text messages
+    ai_fallback_enabled = Column(Boolean, nullable=False, default=False)
+
+    updated_at = Column(DateTime, default=now_utc_naive, onupdate=now_utc_naive)

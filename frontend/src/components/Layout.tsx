@@ -1,7 +1,13 @@
 import { useRouter } from 'next/router';
 import Link from 'next/link';
+import dynamic from 'next/dynamic';
 import { useTradeStore } from '@/store/useTradeStore';
 import ConnectionStatus from '@/components/ConnectionStatus';
+
+// PAUL JARVIS — lazy-loaded so it never blocks the main bundle, no SSR needed
+const PaulChat = dynamic(() => import('@/components/PaulChat'), { ssr: false })
+// Extension install prompt — detects the browser & offers the voice extension
+const ExtensionInstallPrompt = dynamic(() => import('@/components/ExtensionInstallPrompt'), { ssr: false })
 import {
   LayoutDashboard,
   LineChart,
@@ -30,6 +36,8 @@ import {
   MessageSquareText,
   Network,
   Workflow,
+  AudioWaveform,
+  Atom,
 } from 'lucide-react';
 
 const navItems = [
@@ -50,6 +58,7 @@ const navItems = [
   { href: '/custom-agents', label: 'Custom Agents', icon: Cpu },
   { href: '/agent-paul', label: 'Agent Paul', icon: Workflow },
   { href: '/intelligence', label: 'Intelligence', icon: Network },
+  { href: '/vault', label: 'Vault', icon: BookOpen },
   { href: '/insights', label: 'Insights', icon: BookOpen },
   { href: '/mt5-live', label: 'MT5 Live', icon: Monitor },
   { href: '/mt5-replay', label: 'MT5 Replay', icon: Rewind },
@@ -58,6 +67,8 @@ const navItems = [
   { href: '/telegram', label: 'Telegram', icon: MessageCircle },
   { href: '/ai-agents-admin', label: 'AI Profiles', icon: Bot },
   { href: '/history', label: 'Trade History', icon: History },
+  { href: '/binary-engine', label: 'Binary Engine', icon: AudioWaveform },
+  { href: '/jarvis-room', label: 'JARVIS Room', icon: Atom },
   { href: '/settings', label: 'Settings', icon: Settings },
 ];
 
@@ -151,6 +162,12 @@ export default function Layout({ children }: { children: React.ReactNode }) {
         {/* Page Content */}
         <main className="flex-1 p-4 md:p-6 overflow-auto">{children}</main>
       </div>
+
+      {/* PAUL JARVIS — global floating assistant (available on every page) */}
+      <PaulChat />
+
+      {/* Browser extension install prompt (auto-hides when extension connects) */}
+      <ExtensionInstallPrompt />
     </div>
   );
 }

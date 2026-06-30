@@ -56,6 +56,7 @@ export default function InsightsPage() {
   const { toZar } = useZarRate()
   const [tab, setTab] = useState<Tab>('overview')
   const [loading, setLoading] = useState(true)
+  const [brainCapture, setBrainCapture] = useState<'idle' | 'capturing' | 'done'>('idle')
 
   // Data state
   const [articles, setArticles] = useState<NewsArticle[]>([])
@@ -79,18 +80,43 @@ export default function InsightsPage() {
   const fetchOverview = useCallback(async () => {
     setLoading(true)
     try {
-      const [statsRes, sentRes, pipeRes, learnRes, decisionsRes] = await Promise.allSettled([
+      const [statsRes, sentRes, pipeRes, learnRes, decisionsRes, newsRes, paulKnRes] = await Promise.allSettled([
         apiClient.getNewsStats(),
         apiClient.getEnhancedSentiments(),
         apiClient.getPipelineStatus(),
         apiClient.getLearningStats(),
         apiClient.getAgentDecisions({ limit: 20 }),
+        apiClient.getNewsArticles({ limit: 10 }),
+        // @ts-ignore — paul knowledge stats
+        fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1'}/plugins/agent-paul/knowledge/stats`).then(r => r.json()),
       ])
       if (statsRes.status === 'fulfilled') setNewsStats(statsRes.value.data)
-      if (sentRes.status === 'fulfilled') setEnhancedSentiments(sentRes.value.data?.sentiments || [])
-      if (pipeRes.status === 'fulfilled') setPipelineStatus(pipeRes.value.data)
-      if (learnRes.status === 'fulfilled') setLearningStats(learnRes.value.data)
-      if (decisionsRes.status === 'fulfilled') setDecisions(decisionsRes.value.data?.decisions || decisionsRes.value.data || [])
+      const sentData = sentRes.status === 'fulfilled' ? (sentRes.value.data?.sentiments || []) : []
+      if (sentRes.status === 'fulfilled') setEnhancedSentiments(sentData)
+      const pipeData = pipeRes.status === 'fulfilled' ? pipeRes.value.data : {}
+      if (pipeRes.status === 'fulfilled') setPipelineStatus(pipeData)
+      const learnData = learnRes.status === 'fulfilled' ? learnRes.value.data : {}
+      if (learnRes.status === 'fulfilled') setLearningStats(learnData)
+      const decsData = decisionsRes.status === 'fulfilled' ? (decisionsRes.value.data?.decisions || decisionsRes.value.data || []) : []
+      if (decisionsRes.status === 'fulfilled') setDecisions(decsData)
+      const newsData = newsRes.status === 'fulfilled' ? (newsRes.value.data?.articles || []) : []
+      const paulKn = paulKnRes.status === 'fulfilled' ? paulKnRes.value : {}
+
+      // ── Self-learning: capture full brain snapshot to Obsidian vault ─────
+      // Fire-and-forget so it never blocks the overview render.
+      setBrainCapture('capturing')
+      apiClient.obsidian.insightsHarvest({
+        decisions: decsData,
+        news_articles: newsData,
+        sentiments: sentData,
+        learning_stats: learnData,
+        pipeline_status: pipeData,
+        paul_knowledge_stats: paulKn,
+      }).then(() => {
+        setBrainCapture('done')
+        setTimeout(() => setBrainCapture('idle'), 4000)
+      }).catch(() => setBrainCapture('idle'))
+
     } catch {} finally { setLoading(false) }
   }, [])
 
@@ -134,7 +160,20 @@ export default function InsightsPage() {
     setLoading(true)
     try {
       const res = await apiClient.getLearningStats({ role: decisionRole || undefined })
-      setLearningStats(res.data)
+      const data = res.data
+      setLearningStats(data)
+      // Capture learning stats to vault for self-improvement
+      if (data?.total_decisions > 0) {
+        const summary = `AI learning update: ${data.total_decisions} decisions, ` +
+          `${data.ai_calls} AI calls, ${data.local_pct?.toFixed(1)}% local, ` +
+          `win rate ${data.win_rate?.toFixed(1)}%. Knowledge base actively learning.`
+        apiClient.obsidian.jarvisLearn({
+          question: `TradeBot learning stats — ${new Date().toLocaleDateString()}`,
+          answer: summary,
+          page: '/insights',
+          tags: ['learning', 'stats', 'ai'],
+        }).catch(() => {})
+      }
     } catch {} finally { setLoading(false) }
   }, [decisionRole])
 
@@ -197,9 +236,29 @@ export default function InsightsPage() {
       <div className="space-y-4 max-w-7xl mx-auto">
         <div className="flex items-center justify-between">
           <div>
-            <h1 className="text-2xl font-bold text-white">Insights & Data</h1>
-            <p className="text-xs text-gray-500 mt-0.5">
+            <h1 className="text-2xl font-bold text-white flex items-center gap-3">
+              Insights & Data
+              {/* ── Brain capture status badge ────────────────────────────── */}
+              {brainCapture === 'capturing' && (
+                <span className="inline-flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full bg-violet-900/30 border border-violet-500/40 text-violet-300 animate-pulse">
+                  <span className="w-1.5 h-1.5 rounded-full bg-violet-400 animate-ping" />
+                  Capturing to brain…
+                </span>
+              )}
+              {brainCapture === 'done' && (
+                <span className="inline-flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full bg-emerald-900/30 border border-emerald-500/40 text-emerald-300">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                  ✓ Brain updated
+                </span>
+              )}
+            </h1>
+            <p className="text-xs text-gray-500 mt-0.5 flex items-center gap-2">
               AI decisions, news feeds, sentiment data, and learning analytics
+              {brainCapture !== 'idle' ? null : (
+                <a href="/intelligence" className="text-violet-400 hover:text-violet-300">
+                  → View in brain
+                </a>
+              )}
             </p>
           </div>
           <button

@@ -15,6 +15,7 @@ try:
 except ImportError:
     AsyncOpenAI = None  # type: ignore
 
+from app.utils.headroom_compress import compress_messages
 from plugins.AiMarketAnalyst.backend.config import ai_analyst_config
 from plugins.AiMarketAnalyst.backend.services.llm_registry import (
     LLMProvider,
@@ -138,7 +139,26 @@ async def _call_openai_compatible(
         raise RuntimeError("openai package not installed")
 
     api_key = _get_api_key(provider)
-    client = AsyncOpenAI(api_key=api_key, base_url=provider.base_url)
+
+    # Route through the headroom proxy ONLY for OpenAI (base_url is None).
+    # Other providers must use their explicit base URLs to avoid auth errors.
+    # The AsyncOpenAI client reads OPENAI_BASE_URL from environment even when
+    # we pass base_url explicitly, so we need to temporarily unset it for
+    # non-OpenAI providers.
+    if provider.base_url is None:
+        # OpenAI: let it use OPENAI_BASE_URL from environment (headroom proxy)
+        client = AsyncOpenAI(api_key=api_key)
+    else:
+        # Other providers: temporarily clear OPENAI_BASE_URL to prevent
+        # the client from using it, then restore it
+        original_base_url = os.environ.get("OPENAI_BASE_URL")
+        try:
+            if original_base_url:
+                del os.environ["OPENAI_BASE_URL"]
+            client = AsyncOpenAI(api_key=api_key, base_url=provider.base_url)
+        finally:
+            if original_base_url:
+                os.environ["OPENAI_BASE_URL"] = original_base_url
 
     is_reasoning = model.startswith(("o1", "o3", "o4"))
     max_tokens = max_tokens or ai_analyst_config.default_max_tokens
@@ -147,6 +167,9 @@ async def _call_openai_compatible(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
+
+    # Compress messages through the headroom proxy before sending to the LLM
+    messages = compress_messages(messages, caller=f"llm_gateway:{provider.id}")
 
     kwargs: Dict[str, Any] = {
         "model": model,
@@ -194,12 +217,16 @@ async def _call_anthropic(
     base_url = provider.base_url or "https://api.anthropic.com"
     url = f"{base_url.rstrip('/')}/v1/messages"
 
+    # Build messages and compress them
+    messages = [{"role": "user", "content": user_prompt}]
+    messages = compress_messages(messages, caller=f"llm_gateway:{provider.id}")
+    
     payload = {
         "model": model,
         "max_tokens": max_tokens or ai_analyst_config.default_max_tokens,
         "temperature": 0.2,
-        "system": system_prompt,
-        "messages": [{"role": "user", "content": user_prompt}],
+        "system": system_prompt,  # Anthropic uses system as a separate field
+        "messages": messages,
     }
 
     headers = {
@@ -245,9 +272,19 @@ async def _call_google(
     base_url = provider.base_url or "https://generativelanguage.googleapis.com"
     url = f"{base_url.rstrip('/')}/v1beta/models/{model}:generateContent"
 
+    # Compress the user prompt using headroom
+    messages = [{"role": "user", "content": user_prompt}]
+    compressed = compress_messages(messages, caller=f"llm_gateway:{provider.id}")
+    compressed_user_prompt = compressed[0]["content"] if compressed else user_prompt
+    
+    # Compress system instruction separately (Google uses systemInstruction field)
+    system_messages = [{"role": "system", "content": system_prompt}]
+    compressed_system = compress_messages(system_messages, caller=f"llm_gateway:{provider.id}")
+    compressed_system_prompt = compressed_system[0]["content"] if compressed_system else system_prompt
+
     payload = {
-        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": [{"text": compressed_user_prompt}]}],
+        "systemInstruction": {"parts": [{"text": compressed_system_prompt}]},
         "generationConfig": {
             "temperature": 0.2,
             "maxOutputTokens": max_tokens or ai_analyst_config.default_max_tokens,

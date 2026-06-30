@@ -153,3 +153,128 @@ class PaulDecision(PaulBase):
 
 
 Index("ix_paul_decisions_symbol_status", PaulDecision.symbol, PaulDecision.status)
+
+
+# ── JARVIS Chat persistence ────────────────────────────────
+
+
+class PaulConversation(PaulBase):
+    """A JARVIS chat session. One active (non-archived) row per session_key."""
+    __tablename__ = "paul_conversations"
+
+    id = Column(Integer, primary_key=True)
+    session_key = Column(String, index=True, nullable=False)  # browser/client id
+    title = Column(String, nullable=True)                     # auto from first message
+    archived = Column(Boolean, default=False, nullable=False, index=True)
+    message_count = Column(Integer, default=0, nullable=False)
+
+    created_at = Column(DateTime, default=_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=_now, onupdate=_now, nullable=False)
+
+
+class PaulChatMessage(PaulBase):
+    """A single message inside a JARVIS conversation."""
+    __tablename__ = "paul_chat_messages"
+
+    id = Column(Integer, primary_key=True)
+    conversation_id = Column(Integer, index=True, nullable=False)
+    role = Column(String, nullable=False)          # 'user' | 'assistant'
+    content = Column(Text, nullable=False)
+    pathname = Column(String, nullable=True)       # page the user was on
+    created_at = Column(DateTime, default=_now, nullable=False, index=True)
+
+
+Index("ix_paul_chat_messages_conv", PaulChatMessage.conversation_id, PaulChatMessage.created_at)
+
+
+# ── Learned knowledge (JARVIS long-term memory) ────────────
+
+
+class PaulKnowledge(PaulBase):
+    """Distilled facts / news / research JARVIS has learned over time.
+
+    Sources: chat distillation, RSS news ingestion, online research.
+    Used to ground future answers and market predictions.
+    """
+    __tablename__ = "paul_knowledge"
+
+    id = Column(Integer, primary_key=True)
+    kind = Column(String, default="insight", nullable=False, index=True)  # insight|news|research
+    source = Column(String, nullable=True)        # feed name / domain / 'chat'
+    title = Column(String, nullable=True)
+    url = Column(String, nullable=True)
+    symbol = Column(String, nullable=True, index=True)  # related pair if any
+    topic = Column(String, nullable=True, index=True)   # crypto|stocks|macro|general
+    content = Column(Text, nullable=False)
+    sentiment = Column(Float, nullable=True)      # -1..1 (news/research)
+    importance = Column(Float, default=0.5, nullable=False)
+    published_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=_now, nullable=False, index=True)
+
+
+Index("ix_paul_knowledge_kind_created", PaulKnowledge.kind, PaulKnowledge.created_at)
+
+
+# ── JARVIS Skills (capability modules JARVIS learns and reuses) ────────────
+
+
+class PaulSkill(PaulBase):
+    """A JARVIS skill — domain knowledge or behaviour JARVIS injects when relevant.
+
+    When the user's message matches any of the trigger_keywords, JARVIS
+    prepends the skill's system_prompt_addition to its context so it
+    answers in specialist mode. Skills can optionally be powered by a
+    specific AI provider.
+    """
+    __tablename__ = "paul_skills"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), nullable=False)
+    description = Column(Text, nullable=True)
+    trigger_keywords = Column(JSON, default=list, nullable=False)   # list[str]
+    system_prompt_addition = Column(Text, nullable=False)            # injected into system prompt
+    ai_provider_id = Column(Integer, nullable=True)                  # refs ai_llm_providers.id
+    enabled = Column(Boolean, default=True, nullable=False, index=True)
+    is_default = Column(Boolean, default=False, nullable=False)      # shipped with plugin
+    created_at = Column(DateTime, default=_now, nullable=False)
+    updated_at = Column(DateTime, default=_now, onupdate=_now, nullable=False)
+
+
+# ── JARVIS Hooks (trigger-based automated actions) ─────────────────────────
+
+
+class PaulHookTrigger(str, enum.Enum):
+    ON_SIGNAL   = "on_signal"          # fires when a new signal is created
+    ON_POSITION = "on_position_change" # fires when an MT5 position changes P&L
+    ON_PRICE    = "on_price_threshold" # fires when a pair crosses a price
+    ON_SCHEDULE = "on_schedule"        # fires on a cron-like schedule
+    ON_COMMAND  = "on_voice_command"   # fires when a voice pattern is detected
+
+
+_HOOK_TRIGGER = SQLEnum(PaulHookTrigger, name="paul_hook_trigger")
+
+
+class PaulHook(PaulBase):
+    """A JARVIS hook — an automated reaction to an event.
+
+    When the trigger condition fires, JARVIS runs action_template (a prompt
+    with {{variable}} substitution) against the linked AI provider and either
+    speaks the result, executes a trade, or sends an alert.
+    """
+    __tablename__ = "paul_hooks"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), nullable=False)
+    description = Column(Text, nullable=True)
+    trigger_type = Column(_HOOK_TRIGGER, nullable=False)
+    condition = Column(JSON, default=dict, nullable=False)        # type-specific conditions
+    action_template = Column(Text, nullable=False)                # prompt template
+    action_type = Column(String(40), default="speak", nullable=False)  # speak|trade|alert
+    ai_provider_id = Column(Integer, nullable=True)
+    enabled = Column(Boolean, default=True, nullable=False, index=True)
+    is_default = Column(Boolean, default=False, nullable=False)
+    last_fired_at = Column(DateTime, nullable=True)
+    fire_count = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime, default=_now, nullable=False)
+    updated_at = Column(DateTime, default=_now, onupdate=_now, nullable=False)
+

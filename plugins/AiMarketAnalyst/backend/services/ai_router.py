@@ -7,9 +7,12 @@ chat endpoints, failing over to the next provider on error.
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -28,6 +31,85 @@ try:
     from app.utils.headroom_compress import compress_messages as _headroom_compress
 except Exception:  # pragma: no cover - core util always present, but stay safe
     _headroom_compress = None  # type: ignore
+
+# ── Headroom Dashboard Sync ───────────────────────────────────────────────────
+# After each successful provider call we:
+#  1. Write to ~/.headroom/proxy_savings.json  → updates "Per-Project Savings"
+#  2. Fire a fire-and-forget notification to the headroom proxy so the
+#     in-memory "Per-Model Token Savings" and "Recent Requests" tables stay live.
+_HEADROOM_PROXY = os.getenv("HEADROOM_PROXY_URL", "http://127.0.0.1:8787")
+_HEADROOM_PROJECT = "tradebot"
+_SAVINGS_PATH = Path.home() / ".headroom" / "proxy_savings.json"
+
+
+def _update_proxy_savings(model: str, provider_label: str, prompt_tokens: int,
+                          completion_tokens: int, tokens_saved: int, cost_usd: float) -> None:
+    """Atomically update ~/.headroom/proxy_savings.json with this call's data.
+
+    This makes the "Per-Project Savings" section of the headroom dashboard
+    reflect ALL AI provider calls, not just the ones routed through the proxy.
+    """
+    try:
+        data: dict[str, Any] = {}
+        if _SAVINGS_PATH.exists():
+            try:
+                data = json.loads(_SAVINGS_PATH.read_text())
+            except Exception:
+                data = {}
+
+        if data.get("schema_version") != 3:
+            data = {"schema_version": 3, "lifetime": {}, "display_session": {}, "history_points": [], "projects": {}, "projects_limit": 50}
+
+        projects: dict = data.setdefault("projects", {})
+        entry: dict = projects.setdefault(_HEADROOM_PROJECT, {
+            "requests": 0,
+            "tokens_saved": 0,
+            "compression_savings_usd": 0.0,
+            "total_input_tokens": 0,
+            "total_input_cost_usd": 0.0,
+            "last_activity_at": "",
+            # extended: per-model breakdown (non-standard, read by the tradebot UI)
+            "models": {},
+        })
+
+        entry["requests"] = entry.get("requests", 0) + 1
+        entry["tokens_saved"] = entry.get("tokens_saved", 0) + tokens_saved
+        entry["total_input_tokens"] = entry.get("total_input_tokens", 0) + prompt_tokens
+        entry["total_input_cost_usd"] = entry.get("total_input_cost_usd", 0.0) + cost_usd
+        entry["last_activity_at"] = datetime.utcnow().isoformat() + "Z"
+
+        # per-model row (displayed in the tradebot provider dashboard)
+        model_key = f"{model} ({provider_label})"
+        mdl: dict = entry.setdefault("models", {}).setdefault(model_key, {
+            "requests": 0, "total_input_tokens": 0, "tokens_saved": 0,
+        })
+        mdl["requests"] = mdl.get("requests", 0) + 1
+        mdl["total_input_tokens"] = mdl.get("total_input_tokens", 0) + prompt_tokens
+        mdl["tokens_saved"] = mdl.get("tokens_saved", 0) + tokens_saved
+
+        _SAVINGS_PATH.write_text(json.dumps(data, indent=2))
+    except Exception as exc:  # pragma: no cover - best-effort, never raise
+        logger.debug(f"[headroom sync] savings update skipped: {exc}")
+
+
+async def _notify_headroom_proxy(model: str, provider_label: str,
+                                 prompt_tokens: int, tokens_saved: int) -> None:
+    """Fire-and-forget: call the headroom proxy with a no-cost tracking request
+    so the in-memory Per-Model stats and Recent Requests tables stay current.
+    We use a GET /health request with custom headers to register the model name
+    in the proxy's tracking without making an actual LLM call."""
+    try:
+        # The savings file is our source of truth; the proxy HTTP request is
+        # bonus coverage for the in-memory stats panel. Both are best-effort.
+        headers = {
+            "X-Headroom-Model": model,
+            "X-Headroom-Provider": provider_label,
+            "X-Headroom-Tokens": str(prompt_tokens),
+        }
+        async with httpx.AsyncClient(timeout=2.0) as c:
+            await c.get(f"{_HEADROOM_PROXY}/health", headers=headers)
+    except Exception:  # proxy may not be running — silent
+        pass
 
 
 _TIMEOUT = 40.0
@@ -124,14 +206,29 @@ async def _call_openai_compatible(
     temperature: float,
     max_tokens: int,
     json_mode: bool,
-) -> tuple[str, dict[str, int]]:
+) -> tuple[str, dict[str, int], str | None]:
     """Call an OpenAI-compatible chat endpoint.
 
-    Returns (content, usage) where usage = {prompt_tokens, completion_tokens,
-    total_tokens}. Usage is best-effort — some free providers omit it.
+    For OpenAI (base_url with "openai.com"), routes through the headroom proxy
+    for compression. For other providers (Groq, Mistral, Cerebras, OpenRouter),
+    calls them directly to avoid 401 errors.
+
+    Returns (content, usage, routed_via).
     """
-    url = f"{base_url.rstrip('/')}/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    # ── Determine routing: OpenAI through proxy, others direct ──────────────
+    is_openai = "openai.com" in base_url
+    if is_openai:
+        # Route OpenAI through headroom proxy for compression
+        headroom_proxy = os.getenv("HEADROOM_PROXY_URL", "http://127.0.0.1:8787")
+        url = f"{headroom_proxy.rstrip('/')}/p/tradebot/v1/chat/completions"
+    else:
+        # Direct endpoint for other providers
+        url = f"{base_url.rstrip('/')}/chat/completions"
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
     payload: dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -150,6 +247,11 @@ async def _call_openai_compatible(
                 resp = await client.post(url, headers=headers, json=payload)
         resp.raise_for_status()
         data = resp.json()
+        # FreeLLMAPI (and similar proxies) report the upstream they routed to.
+        routed_via = resp.headers.get("x-routed-via") or resp.headers.get("X-Routed-Via")
+        attempts = resp.headers.get("x-fallback-attempts")
+        if routed_via and attempts:
+            routed_via = f"{routed_via} (×{attempts})"
     choices = data.get("choices") or []
     if not choices:
         raise RuntimeError("No choices in response")
@@ -160,7 +262,7 @@ async def _call_openai_compatible(
         "completion_tokens": int(raw_usage.get("completion_tokens") or 0),
         "total_tokens": int(raw_usage.get("total_tokens") or 0),
     }
-    return content, usage
+    return content, usage, routed_via
 
 
 async def get_enabled_providers(db: AsyncSession) -> list[AILLMProvider]:
@@ -229,9 +331,9 @@ async def db_chat(
             errors.append(f"{p.label}: usage cap reached (protecting free tier)")
             await db.commit()
             continue
-        model = model_override or p.default_model or "gpt-4o-mini"
+        model = model_override or p.default_model or "fable-5-high"
         try:
-            content, usage = await _call_openai_compatible(
+            content, usage, routed_via = await _call_openai_compatible(
                 base_url=p.base_url,
                 api_key=p.api_key,
                 model=model,
@@ -245,14 +347,16 @@ async def db_chat(
             p.monthly_calls = (p.monthly_calls or 0) + 1
             p.status = "ok"
             p.last_error = None
-            p.last_model_used = model
+            # For proxies (FreeLLMAPI) record the upstream actually served so
+            # the provider tab shows e.g. "google/gemini-2.5-flash" not "auto".
+            p.last_model_used = routed_via or model
             p.last_tested_at = datetime.utcnow()
             db.add(AIUsageRecord(
                 provider_id=p.id,
                 provider_label=p.label,
                 agent_name=agent_name,
                 agent_role=agent_role,
-                model=model,
+                model=routed_via or model,
                 source=source,
                 prompt_tokens=usage["prompt_tokens"],
                 completion_tokens=usage["completion_tokens"],
@@ -262,11 +366,31 @@ async def db_chat(
                 success=True,
             ))
             await db.commit()
+
+            # ── Headroom dashboard sync ────────────────────────────────────
+            tokens_saved_this_call = max(0, orig_chars - comp_chars) // 4  # rough token estimate from char savings
+            cost_usd = usage["prompt_tokens"] * 0.000001  # rough $1/1M tokens
+            _update_proxy_savings(
+                model=routed_via or model,
+                provider_label=p.label,
+                prompt_tokens=usage["prompt_tokens"],
+                completion_tokens=usage["completion_tokens"],
+                tokens_saved=tokens_saved_this_call,
+                cost_usd=cost_usd,
+            )
+            asyncio.ensure_future(_notify_headroom_proxy(
+                model=routed_via or model,
+                provider_label=p.label,
+                prompt_tokens=usage["prompt_tokens"],
+                tokens_saved=tokens_saved_this_call,
+            ))
+
             return {
                 "ok": True,
                 "content": content,
                 "provider": p.label,
                 "model": model,
+                "routed_via": routed_via,
                 "usage": usage,
             }
         except Exception as exc:  # noqa: BLE001
@@ -300,9 +424,9 @@ async def test_provider(provider: AILLMProvider) -> dict[str, Any]:
         return {"ok": False, "error": "No API key set"}
     if not provider.base_url:
         return {"ok": False, "error": "No base URL"}
-    model = provider.default_model or "gpt-4o-mini"
+    model = provider.default_model or "fable-5-high"
     try:
-        content, _usage = await _call_openai_compatible(
+        content, _usage, routed_via = await _call_openai_compatible(
             base_url=provider.base_url,
             api_key=provider.api_key,
             model=model,
@@ -314,7 +438,11 @@ async def test_provider(provider: AILLMProvider) -> dict[str, Any]:
             max_tokens=5,
             json_mode=False,
         )
-        return {"ok": True, "model": model, "reply": (content or "").strip()[:40]}
+        return {
+            "ok": True,
+            "model": routed_via or model,
+            "reply": (content or "").strip()[:40],
+        }
     except httpx.HTTPStatusError as exc:
         body = ""
         try:

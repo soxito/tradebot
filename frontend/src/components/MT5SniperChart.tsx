@@ -26,10 +26,11 @@ import { ZoneBoxPrimitive, ZoneBox } from './MT5ZonePrimitive'
 import {
   Crosshair, RefreshCw, Target, TrendingUp, TrendingDown, Activity,
   Zap, FlaskConical, ChevronRight, AlertTriangle, Brain, CheckCircle, X,
-  Calculator, Maximize2, Minimize2, Settings, Wifi,
+  Calculator, Maximize2, Minimize2, Settings, Wifi, Volume2, VolumeX,
 } from 'lucide-react'
 import { formatTimeZA } from '@/utils/datetime'
 import { getPriceSource, setPriceSource as savePriceSource, PRICE_SOURCE_OPTIONS } from '@/utils/priceSource'
+import { useJarvisSpeak } from '@/hooks/useJarvisSpeak'
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -153,6 +154,10 @@ interface Props {
   onCancelOrder?: (ticket: number) => void | Promise<void>
   /** Open positions (from the page) so the active trade + live P&L is shown on the chart. */
   positions?: ActiveChartPosition[]
+  /** Fired whenever the user changes the chart symbol (e.g. XAUUSD → EURUSD). */
+  onSymbolChange?: (symbol: string) => void
+  /** Fired whenever the user changes the chart timeframe (e.g. H1 → H4). */
+  onTimeframeChange?: (timeframe: string) => void
 }
 
 interface ActiveChartPosition {
@@ -178,9 +183,11 @@ interface PendingChartOrder {
   tp?: number | null
 }
 
-const TIMEFRAMES = ['M5', 'M15', 'M30', 'H1', 'H4', 'D1'] as const
-const TF_MINUTES: Record<string, number> = { M5: 5, M15: 15, M30: 30, H1: 60, H4: 240, D1: 1440 }
-const MT5_TF_TO_EXCHANGE: Record<string, string> = { M5: '5m', M15: '15m', M30: '30m', H1: '1h', H4: '4h', D1: '1d' }
+const TIMEFRAMES = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1'] as const
+const TF_MINUTES: Record<string, number> = { M1: 1, M5: 5, M15: 15, M30: 30, H1: 60, H4: 240, D1: 1440, W1: 10080 }
+const MT5_TF_TO_EXCHANGE: Record<string, string> = { M1: '1m', M5: '5m', M15: '15m', M30: '30m', H1: '1h', H4: '4h', D1: '1d', W1: '1w' }
+/** Optimal candle count per timeframe — enough SMC structure without hitting backend 1000-bar limit. */
+const TF_CANDLE_COUNT: Record<string, number> = { M1: 1000, M5: 800, M15: 600, M30: 500, H1: 400, H4: 300, D1: 200, W1: 100 }
 const CRYPTO_EXCHANGES = new Set(['bitget', 'binance', 'bybit', 'okx', 'kucoin', 'coinbase', 'huobi', 'gate'])
 const FOREX_TO_CRYPTO: Record<string, string> = {
   XAUUSD: 'XAUUSDT', XAGUSD: 'XAGUSDT', BTCUSD: 'BTCUSDT',
@@ -210,6 +217,16 @@ const THEME = {
   eq: '#eab308', liq: '#8b5cf6',
 }
 
+/** Safely extract a readable error string — prevents rendering Pydantic/Zod objects as React children. */
+function sniperApiErr(e: any): string {
+  const detail = e?.response?.data?.detail
+  if (!detail) return e?.message ?? 'Unknown error'
+  if (typeof detail === 'string') return detail
+  if (Array.isArray(detail)) return detail.map((d: any) => d?.msg ?? JSON.stringify(d)).join('; ')
+  if (typeof detail === 'object') return (detail as any).msg ?? JSON.stringify(detail)
+  return String(detail)
+}
+
 /** Point size (smallest increment), pip size (10 points) and contract size per lot. */
 function instrumentSpec(symbol: string): { pointSize: number; pipSize: number; contractSize: number } {
   const s = (symbol || '').toUpperCase().replace('/', '')
@@ -230,9 +247,90 @@ function precisionFor(prices: number[]): number {
   return minP < 0.001 ? 6 : minP < 0.01 ? 5 : minP < 1 ? 4 : minP < 10 ? 3 : 2
 }
 
+// ── JARVIS SMC speech summary ─────────────────────────────────────────────────
+/**
+ * Build a concise spoken summary of SMC analysis results for JARVIS to read.
+ * Designed for natural speech rhythm — short sentences, no symbols/brackets.
+ */
+function buildJarvisSummary(analysis: Analysis, symbol: string, timeframe: string): string {
+  const bias = analysis.bias ?? 'neutral'
+  const signals = analysis.signals ?? []
+  const price = analysis.last_price
+  const ai = analysis.ai
+  const fb = (analysis as any).false_breakout
+
+  const parts: string[] = []
+
+  // Opening line
+  parts.push(`${symbol} ${timeframe} analysis complete.`)
+
+  // Bias
+  const biasStr = bias === 'bullish' ? 'bullish' : bias === 'bearish' ? 'bearish' : 'neutral'
+  const momentumStr = analysis.momentum === 'expanding' ? 'expanding momentum' : analysis.momentum === 'contracting' ? 'contracting momentum' : ''
+  parts.push(`Market bias is ${biasStr}${momentumStr ? `, with ${momentumStr}` : ''}.`)
+
+  // False breakout alert (highest priority — speak first)
+  if (fb?.false_break_score >= 60) {
+    if (fb.sweep_high) parts.push('Warning: a stop hunt above a key swing high was detected. Price swept liquidity and reversed — watch for a sell setup.')
+    else if (fb.sweep_low) parts.push('Warning: a stop hunt below a key swing low was detected. Price swept liquidity and reversed — watch for a buy setup.')
+    else parts.push(`Caution: false breakout signals detected with a score of ${Math.round(fb.false_break_score)} out of 100.`)
+  }
+
+  // Primary signal
+  if (signals.length === 0) {
+    parts.push('No sniper grade setups are available right now. Wait for price to build structure.')
+  } else {
+    const top = signals[0]
+    const side = top.side === 'buy' ? 'buy' : 'sell'
+    const rr = top.rr?.toFixed(1)
+    const confPct = Math.round((top.confidence ?? 0) * 100)
+    const entryRounded = price ? `near ${Math.round(top.entry)}` : `at ${Math.round(top.entry)}`
+    const isBelowRR = top.confluence?.includes('below_min_rr')
+
+    // Sweeps and false-break tags
+    const hasSweep = top.confluence?.includes('sweep_of_lows') || top.confluence?.includes('sweep_of_highs')
+    const hasFb = top.confluence?.includes('strong_false_breakout') || top.confluence?.includes('possible_false_breakout')
+    const hasWick = top.confluence?.includes('wicked_into_zone')
+
+    let signalLine = `Top setup: ${side} limit ${entryRounded}, with a ${rr} to 1 reward to risk ratio and ${confPct}% confidence.`
+    if (isBelowRR) signalLine += ` Note: this setup is below your selected minimum R R.`
+    parts.push(signalLine)
+
+    // Reason / confluence highlights
+    if (top.reason) {
+      const cleanReason = top.reason.replace(/;\s*RR.*$/, '').trim()
+      if (cleanReason) parts.push(`Setup basis: ${cleanReason}.`)
+    }
+
+    if (hasSweep) parts.push('Liquidity sweep detected — institutional stop hunt preceding this setup. Higher probability entry.')
+    if (hasFb) parts.push('False breakout context present — market faked a break before reversing into this zone.')
+    if (hasWick) parts.push('Zone was tested with a wick but no close inside — strong rejection and mitigation signal.')
+
+    // Additional setups
+    if (signals.length > 1) {
+      parts.push(`${signals.length - 1} additional setup${signals.length > 2 ? 's are' : ' is'} also available.`)
+    }
+  }
+
+  // AI review summary
+  if (ai?.available && ai.rated_signals && ai.rated_signals.length > 0) {
+    const topRated = ai.rated_signals.find(r => r.verdict === 'take')
+    const skip = ai.rated_signals.filter(r => r.verdict === 'skip').length
+    if (topRated) {
+      parts.push(`AI review recommends taking the setup at ${Math.round(topRated.entry)}.`)
+      if (topRated.note) parts.push(topRated.note.slice(0, 120))
+    } else if (skip === ai.rated_signals.length) {
+      parts.push('AI review recommends skipping all setups. Market conditions are not ideal.')
+    }
+    if (ai.risk_warning) parts.push(`Risk note: ${ai.risk_warning.slice(0, 100)}`)
+  }
+
+  return parts.join(' ')
+}
+
 // ── Component ────────────────────────────────────────────────────────────────
 
-export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', accountBalance = 0, accountCurrency = 'USD', fallbackExchange, onPlaced, orders = [], onCancelOrder, positions = [] }: Props) {
+export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', accountBalance = 0, accountCurrency = 'USD', fallbackExchange, onPlaced, orders = [], onCancelOrder, positions = [], onSymbolChange, onTimeframeChange }: Props) {
   const chartRef = useRef<HTMLDivElement>(null)
   const chart = useRef<IChartApi | null>(null)
   const candleSeries = useRef<ISeriesApi<'Candlestick'> | null>(null)
@@ -258,6 +356,7 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
   const [btTo, setBtTo] = useState('')
   const [isFullscreen, setIsFullscreen] = useState(false)  // maximize chart to monitor
   const [useAI, setUseAI] = useState(false)  // off by default so first auto-run is fast
+  const [voiceAnalysis, setVoiceAnalysis] = useState(true)  // JARVIS speaks analysis results
   const [lot, setLot] = useState('0.01')
 
   const [loading, setLoading] = useState(true)
@@ -281,6 +380,9 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
   // Position review apply (SL/TP modify)
   const [applying, setApplying] = useState<'sl' | 'tp' | 'both' | null>(null)
   const [applyMsg, setApplyMsg] = useState<{ ok: boolean; text: string } | null>(null)
+
+  // JARVIS speech — triggered after analysis completes to narrate the results
+  const speakAsJarvis = useJarvisSpeak()
 
   // Pending-order price lines drawn on the chart (separate from analysis overlays)
   const orderPriceLines = useRef<any[]>([])
@@ -530,7 +632,7 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
     if (!accountId) return
     setError(null)
     try {
-      const { candles: loaded, source } = await loadSourceCandles(timeframe, 400)
+      const { candles: loaded, source } = await loadSourceCandles(timeframe, TF_CANDLE_COUNT[timeframe] ?? 400)
       // Sanitise: sort ascending by time + drop duplicate/zero timestamps so
       // lightweight-charts never throws "data must be asc ordered by time".
       const seen = new Set<number>()
@@ -558,7 +660,7 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
         setError('No candle data for this symbol/timeframe (MT5 history + fallback empty).')
       }
     } catch (e: any) {
-      setError(e?.response?.data?.detail ?? e?.message ?? 'Failed to load candles')
+      setError(sniperApiErr(e))
     } finally {
       setLoading(false)
     }
@@ -576,7 +678,7 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
         symbol, timeframe,
         // Reward-first defaults: min_rr is the floor (reward must beat risk) and
         // max_rr lets TP run to real liquidity above the floor, so reward > risk.
-        min_rr: minRR, max_rr: Math.max(minRR + 1, 3), sl_buffer_atr: 1.0, min_confidence: 0.6,
+        min_rr: minRR, max_rr: 10, sl_buffer_atr: 1.0, min_confidence: 0.6,
         // Balance-aware position sizing (lot/risk shown per setup).
         account_balance: accountBalance, risk_per_trade_pct: riskPct,
         max_total_loss: useCap ? maxLoss : 0, daily_profit_target_pct: dailyTargetPct,
@@ -587,13 +689,19 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
       const a: Analysis = res.data
       setAnalysis(a)
       setSelectedIdx(0)
-      if (a.error) setError(a.error)
+      if (a.error) {
+        setError(a.error)
+        if (voiceAnalysis) speakAsJarvis(`Analysis failed for ${symbol}. ${a.error}`)
+      } else {
+        // JARVIS narrates the analysis results
+        if (voiceAnalysis) speakAsJarvis(buildJarvisSummary(a, symbol, timeframe))
+      }
     } catch (e: any) {
-      setError(e?.response?.data?.detail ?? e?.message ?? 'Analysis failed')
+      setError(sniperApiErr(e))
     } finally {
       setAnalyzing(false)
     }
-  }, [accountId, symbol, timeframe, minRR, useAI, accountBalance, maxLoss, dailyTargetPct, usSession, riskPct, useCap])
+  }, [accountId, symbol, timeframe, minRR, useAI, accountBalance, maxLoss, dailyTargetPct, usSession, riskPct, useCap, speakAsJarvis, voiceAnalysis])
 
   useEffect(() => {
     setLoading(true)
@@ -610,6 +718,13 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fetchCandles])
+
+  // Re-run analysis whenever Min RR changes so the user immediately sees results
+  // at the new floor without needing to click Analyze again.
+  useEffect(() => {
+    if (analysis) runAnalysis()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [minRR])
 
   // ── Live price polling (forming bar + live line + realtime P&L) ─────────────
   // Source-aware: MT5-sourced symbols use the broker quote; exchange-sourced
@@ -714,7 +829,7 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
         setConnResult({ ok: false, text: err })
       }
     } catch (e: any) {
-      setConnResult({ ok: false, text: e?.response?.data?.detail ?? e?.message ?? 'Connection failed' })
+      setConnResult({ ok: false, text: sniperApiErr(e) })
     } finally {
       setTestingConn(false)
     }
@@ -747,7 +862,7 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
       setApplyMsg({ ok: true, text: `${label} updated on ${ticketList}` })
       onPlaced?.()  // refresh positions so the new SL/TP shows
     } catch (e: any) {
-      setApplyMsg({ ok: false, text: e?.response?.data?.detail ?? e?.message ?? 'Modify failed' })
+      setApplyMsg({ ok: false, text: sniperApiErr(e) })
     } finally {
       setApplying(null)
     }
@@ -928,7 +1043,7 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
       setPlaceMsg({ ok: true, text: `${sig.side.toUpperCase()} LIMIT @ ${sig.entry} placed (SL ${sig.stop_loss} / TP ${sig.take_profit})` })
       await onPlaced?.()
     } catch (e: any) {
-      setPlaceMsg({ ok: false, text: e?.response?.data?.detail ?? e?.message ?? 'Order failed' })
+      setPlaceMsg({ ok: false, text: sniperApiErr(e) })
     } finally {
       setPlacingIdx(null)
     }
@@ -970,7 +1085,7 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
       // Instrument-adaptive parameters: gold uses tighter SL buffer + lower confidence threshold
       const slBuf = isGold ? 0.5 : 1.0
       const minConf = isGold ? 0.5 : 0.6
-      const maxRR = isGold ? 4.0 : Math.max(minRR + 1, 3)
+      const maxRR = 10  // backend cap; allows all high-RR setups to surface
       // Equity simulation — always provide a non-zero starting balance so the
       // daily profit accumulation table can be computed. Fall back to $10,000
       // (a sensible demo balance) when the live account balance hasn't loaded.
@@ -991,7 +1106,7 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
       setBtAiAnalysis(res.data?.ai ?? null)
       if (res.data?.error) setBtError(res.data.error)
     } catch (e: any) {
-      setBtError(e?.response?.data?.detail ?? e?.message ?? 'Backtest failed')
+      setBtError(sniperApiErr(e))
     } finally {
       setBacktesting(false)
     }
@@ -1002,6 +1117,7 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
     if (!clean) return
     setSymbol(clean)
     setSymbolInput(clean)
+    onSymbolChange?.(clean)
   }
 
   const biasColor = analysis?.bias === 'bullish' ? 'text-green-400' : analysis?.bias === 'bearish' ? 'text-red-400' : 'text-gray-400'
@@ -1029,7 +1145,7 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
         </div>
         <div className="flex gap-0.5 bg-gray-800/70 rounded-lg p-0.5">
           {TIMEFRAMES.map(tf => (
-            <button key={tf} onClick={() => setTimeframe(tf)}
+            <button key={tf} onClick={() => { setTimeframe(tf); onTimeframeChange?.(tf) }}
               className={`px-2 py-1 rounded text-xs font-medium transition-colors ${timeframe === tf ? 'bg-tradebot-accent/30 text-tradebot-accent' : 'text-gray-400 hover:text-gray-200'}`}>
               {tf}
             </button>
@@ -1039,7 +1155,7 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
           <span>Min RR</span>
           <select value={minRR} onChange={e => setMinRR(Number(e.target.value))}
             className="bg-gray-800 border border-gray-600 rounded px-1.5 py-1 text-white">
-            {[1.5, 2, 2.5, 3].map(v => <option key={v} value={v}>{v}</option>)}
+            {[1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5, 5.5, 6, 6.5, 7, 7.5, 8, 8.5, 9, 9.5, 10].map(v => <option key={v} value={v}>{v}</option>)}
           </select>
         </div>
         <div className="flex items-center gap-1 text-xs text-gray-400">
@@ -1078,6 +1194,15 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
         <label className="flex items-center gap-1 text-xs text-gray-400 cursor-pointer">
           <input type="checkbox" checked={useAI} onChange={e => setUseAI(e.target.checked)} className="accent-tradebot-accent" />
           <Brain className="w-3.5 h-3.5" /> AI
+        </label>
+        <label
+          className="flex items-center gap-1 text-xs cursor-pointer"
+          title={voiceAnalysis ? 'JARVIS will speak analysis results — click to mute' : 'JARVIS voice narration is muted — click to enable'}
+        >
+          <input type="checkbox" checked={voiceAnalysis} onChange={e => setVoiceAnalysis(e.target.checked)} className="accent-tradebot-accent" />
+          {voiceAnalysis
+            ? <Volume2 className="w-3.5 h-3.5 text-tradebot-accent" />
+            : <VolumeX className="w-3.5 h-3.5 text-gray-500" />}
         </label>
         <button
           onClick={runAnalysis}
@@ -1389,9 +1514,31 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
                         {isBuy ? <TrendingUp className="w-3.5 h-3.5" /> : <TrendingDown className="w-3.5 h-3.5" />}
                         {isBuy ? 'BUY LIMIT' : 'SELL LIMIT'}
                       </span>
-                      <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-tradebot-accent/20 text-tradebot-accent font-semibold">
-                        {(s.confidence * 100).toFixed(0)}% · RR {s.rr}
-                      </span>
+                      <div className="flex items-center gap-1">
+                        {s.confluence?.includes('below_min_rr') && (
+                          <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-amber-500/20 text-amber-300 font-semibold">
+                            ⚠ below RR {minRR}
+                          </span>
+                        )}
+                        {s.confluence?.includes('sweep_of_lows') && (
+                          <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-purple-500/20 text-purple-300 font-semibold">
+                            🎯 sweep
+                          </span>
+                        )}
+                        {s.confluence?.includes('sweep_of_highs') && (
+                          <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-purple-500/20 text-purple-300 font-semibold">
+                            🎯 sweep
+                          </span>
+                        )}
+                        {(s.confluence?.includes('strong_false_breakout') || s.confluence?.includes('possible_false_breakout')) && (
+                          <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-red-500/20 text-red-300 font-semibold">
+                            ⚡ false break
+                          </span>
+                        )}
+                        <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-tradebot-accent/20 text-tradebot-accent font-semibold">
+                          {(s.confidence * 100).toFixed(0)}% · RR {s.rr}
+                        </span>
+                      </div>
                     </div>
                     <div className="grid grid-cols-3 gap-1 mt-1.5 text-[11px] font-mono">
                       <div><span className="text-gray-500">Entry</span><div className="text-gray-200">{s.entry}</div></div>
@@ -1443,9 +1590,20 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
                       </div>
                     )}
                     <div className="flex flex-wrap gap-1 mt-1.5">
-                      {s.confluence.slice(0, 4).map(c => (
-                        <span key={c} className="text-[9px] px-1.5 py-0.5 rounded bg-gray-700/60 text-gray-300">{c.replace(/_/g, ' ')}</span>
-                      ))}
+                      {s.confluence.slice(0, 6).map(c => {
+                        const isSweep = c === 'sweep_of_lows' || c === 'sweep_of_highs'
+                        const isFb = c === 'strong_false_breakout' || c === 'possible_false_breakout' || c === 'wicked_into_zone'
+                        const isBelowRr = c === 'below_min_rr'
+                        const isRej = c === 'rejection_wick'
+                        const cls = isBelowRr ? 'bg-amber-700/50 text-amber-200'
+                          : isSweep ? 'bg-purple-700/40 text-purple-200'
+                          : isFb ? 'bg-red-700/40 text-red-200'
+                          : isRej ? 'bg-pink-700/40 text-pink-200'
+                          : 'bg-gray-700/60 text-gray-300'
+                        return (
+                          <span key={c} className={`text-[9px] px-1.5 py-0.5 rounded ${cls}`}>{c.replace(/_/g, ' ')}</span>
+                        )
+                      })}
                     </div>
                     {aiRate && (
                       <div className={`mt-1.5 text-[10px] ${aiRate.verdict === 'take' ? 'text-green-400' : aiRate.verdict === 'skip' ? 'text-red-400' : 'text-amber-400'}`}>

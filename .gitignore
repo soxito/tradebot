@@ -86,3 +86,4 @@ docker-compose.override.yml
 credentials.json
 secrets/
 keys/
+.gstack/

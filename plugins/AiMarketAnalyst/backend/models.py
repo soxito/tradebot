@@ -82,7 +82,7 @@ class AIAgent(AIBase):
     is_enabled = Column(Boolean, default=True)
 
     # GPT Configuration
-    model = Column(String(50), default="gpt-4o")
+    model = Column(String(50), default="fable-5-high")
     reasoning_effort = Column(SQLEnum(ReasoningEffort), default=ReasoningEffort.MEDIUM)
     verbosity = Column(String(10), default="medium")  # low|medium|high
     max_output_tokens = Column(Integer, nullable=True)

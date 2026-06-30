@@ -429,6 +429,43 @@ class BitgetClient:
             params["newPresetStopSurplusPrice"] = new_preset_stop_surplus_price
         return await self.post("/api/v2/mix/order/modify-order", params)
 
+    async def place_futures_tpsl_order(
+        self,
+        symbol: str,
+        margin_coin: str,
+        plan_type: str,          # "profit_plan" (TP) | "loss_plan" (SL)
+        trigger_price: str,
+        size: str,
+        side: str,               # "buy" to close short, "sell" to close long
+        product_type: str = "USDT-FUTURES",
+        trigger_type: str = "fill_price",
+        hold_side: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        POST /api/v2/mix/order/place-tpsl-order
+        Place a take-profit or stop-loss conditional order on an existing position.
+
+        plan_type:
+          • "profit_plan" → take-profit (TP)
+          • "loss_plan"   → stop-loss   (SL)
+          • "pos_profit"  → position-level TP (one-way mode, no holdSide needed)
+          • "pos_loss"    → position-level SL (one-way mode, no holdSide needed)
+        trigger_type: "fill_price" | "mark_price"
+        """
+        params: Dict[str, str] = {
+            "symbol": symbol,
+            "marginCoin": margin_coin,
+            "productType": product_type,
+            "planType": plan_type,
+            "triggerPrice": trigger_price,
+            "size": size,
+            "side": side,
+            "triggerType": trigger_type,
+        }
+        if hold_side:
+            params["holdSide"] = hold_side
+        return await self.post("/api/v2/mix/order/place-tpsl-order", params)
+
     async def get_futures_open_orders(
         self,
         product_type: str = "USDT-FUTURES",

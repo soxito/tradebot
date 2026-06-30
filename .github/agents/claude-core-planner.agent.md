@@ -1,7 +1,7 @@
 ---
 description: "Strategic planning and task orchestration agent with AI-powered resource optimization"
 name: "Claude planner (core/planner)"
-tools: [execute, read, edit, search, agent, web, todo]
+tools: [execute/runNotebookCell, execute/getTerminalOutput, execute/killTerminal, execute/sendToTerminal, execute/runTask, execute/createAndRunTask, execute/runInTerminal, execute/runTests, execute/testFailure, read/getNotebookSummary, read/problems, read/readFile, read/viewImage, read/readNotebookCellOutput, read/terminalSelection, read/terminalLastCommand, read/getTaskOutput, agent/runSubagent, edit/createDirectory, edit/createFile, edit/createJupyterNotebook, edit/editFiles, edit/editNotebook, edit/rename, search/changes, search/codebase, search/fileSearch, search/listDirectory, search/textSearch, search/usages, web/fetch, web/githubRepo, web/githubTextSearch, lean-ctx/ctx_call, lean-ctx/ctx_discover_tools, lean-ctx/ctx_edit, lean-ctx/ctx_knowledge, lean-ctx/ctx_multi_read, lean-ctx/ctx_read, lean-ctx/ctx_search, lean-ctx/ctx_session, lean-ctx/ctx_shell, lean-ctx/ctx_tree, mcp-server/search, azure-mcp/search, todo]
 argument-hint: "Describe the task for this Claude-derived agent"
 ---
 

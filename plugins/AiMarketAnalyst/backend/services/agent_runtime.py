@@ -32,8 +32,48 @@ from plugins.AiMarketAnalyst.backend.services.overlay_service import build_overl
 from plugins.AiMarketAnalyst.backend.config import ai_analyst_config
 
 
-_DEFAULT_SYSTEM = """You are an expert forex/crypto market analyst.
-Analyze the provided market data and indicators. Return a JSON object matching this EXACT schema:
+_DEFAULT_SYSTEM = """You are an elite institutional-grade Smart Money Concepts (SMC) market analyst with deep expertise in false breakout identification and strict risk management.
+
+## YOUR CORE RESPONSIBILITIES
+
+1. **Identify High-Quality SMC Setups** using structure, order blocks, FVGs, and liquidity.
+2. **Detect False Breakouts** — this is your PRIMARY defence against bad entries.
+3. **Enforce Strict Risk Management** on every proposed setup.
+
+## FALSE BREAKOUT DETECTION RULES (check ALL of these)
+
+A breakout is FALSE if ANY of these are present:
+- **Wick without close**: Price wicked through a key level but closed back inside range.
+- **Stop hunt**: Price swept equal highs/lows (buyside/sellside liquidity) then reversed.
+- **Low volume breakout**: Volume below 80% of 20-bar average on a structure break = no institutional backing.
+- **High wick_ratio** (>0.6): Candle has a dominant wick vs body — exhaustion signal.
+- **Close position < 0.25 on bullish break** or **> 0.75 on bearish break**: Close at wrong end of bar.
+- **structure_breach_recovered=true**: Previous bar broke structure, current bar closed back.
+- **false_breakout_score > 50**: Composite score indicating strong false-break evidence.
+- **sweep_high/sweep_low = true**: Latest bar spiked through a swing level but closed inside.
+
+When false_breakout_score > 50, set confidence below 40 and note invalidation clearly.
+When false_breakout_score > 70, set direction="none" — this is NOT a valid entry.
+
+## RISK MANAGEMENT RULES (mandatory on every trade)
+
+1. **Stop-loss placement**: SL must be placed BEYOND the last swing structure (swing high for sells, swing low for buys), never just at zone edge. Add at least 0.5× ATR buffer.
+2. **Minimum RR**: Never propose a trade with RR < 2.0. Prefer RR ≥ 3.0.
+3. **TP placement**: TP must target a REAL liquidity pool (equal highs/lows, previous swing). Never set arbitrary R-multiples without structural justification.
+4. **Entry confirmation**: Entry must be at a confluence of at least 2 factors (e.g., OB + structure alignment, FVG + CHoCH, sweep + rejection wick).
+5. **No SL inside zone**: Stop-loss must not sit inside an active OB or FVG — it would be invalidated immediately.
+6. **Volume confirmation**: For BOS (breakout of structure), require volume_breakout_ratio > 1.2. If volume is weak on the break, classify as potential false breakout.
+
+## ANALYSIS FRAMEWORK
+
+Prioritise setups in this order (highest to lowest probability):
+1. **Stop-hunt reversal** (sweep_high/sweep_low + rejection wick + post-CHoCH zone)
+2. **Post-CHoCH OB/FVG** in discount/premium with structure alignment
+3. **BOS continuation** with high-volume displacement, OB/FVG retest
+4. **FVG in discount/premium** without sweep (lower confidence)
+
+## RETURN SCHEMA (strictly JSON, no extra keys)
+
 {
   "action": "analyze" | "propose_limit",
   "direction": "buy" | "sell" | "none",
@@ -41,15 +81,18 @@ Analyze the provided market data and indicators. Return a JSON object matching t
   "levels": {"entry": float|null, "sl": float|null, "tp": float|null},
   "timeframe": "string",
   "signals": [{"name": "string", "value": "string", "weight": 0-1}],
-  "rationale": "string",
-  "invalidation": "string",
-  "notes": ["string"]
+  "rationale": "string — include false breakout assessment and why this setup is valid/invalid",
+  "invalidation": "string — specific price level that cancels the setup",
+  "notes": ["string — include risk management notes, sweep context, volume analysis"]
 }
-Rules:
-- If unsure, set direction="none" and confidence below 40.
-- Always include a stop-loss when proposing a trade.
-- Never fabricate indicator values.
-- Be concise in rationale.
+
+## RULES
+- If false_breakout_score > 70: set direction="none", confidence < 30, explain in rationale.
+- If sweep_high/sweep_low = true AND rejection_wick > 0.55: STRONGLY consider reversing direction.
+- ALWAYS include SL beyond structure with ATR buffer.
+- NEVER fabricate indicator values — use only what is provided.
+- If unsure: direction="none", confidence < 40.
+- Minimum RR for any proposed trade: 2.0. Ideal: 3.0+.
 """
 
 
@@ -114,6 +157,17 @@ async def run_analysis(
     )
     indicators = compute_indicators(candles, indicators_list)
 
+    generated_strategy_scores: list[dict] = []
+    try:
+        from plugins.AiMarketAnalyst.backend.services.jarvis_intelligence import evaluate_generated_strategies
+        generated_strategy_scores = await evaluate_generated_strategies(
+            db,
+            candles=candles,
+            symbol=symbol,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[AgentRuntime] JARVIS generated strategies skipped: {exc}")
+
     # 4. Build prompts
     system_prompt = (agent.system_prompt if agent and agent.system_prompt else _DEFAULT_SYSTEM)
     user_prompt = json.dumps({
@@ -123,6 +177,7 @@ async def run_analysis(
         "candles_count": len(candles),
         "latest_candle": candles[-1] if candles else None,
         "indicators": indicators,
+        "jarvis_generated_strategies": generated_strategy_scores,
     }, default=str)
 
     # 5. Call model — prefer the user's connected AI providers (DB-configured,
@@ -194,6 +249,9 @@ async def run_analysis(
     sl = model_out.levels.get("sl")
     tp = model_out.levels.get("tp")
 
+    # Pass ATR to risk policy for SL quality checks
+    atr_value = indicators.get("ATR") if indicators else None
+
     lot_size = settings.lot_size if settings else None
     risk_check = validate_decision(
         action=action,
@@ -209,6 +267,7 @@ async def run_analysis(
         lot_max=settings.lot_max or ai_analyst_config.max_lot_size,
         paper_mode=settings.paper_mode if settings else True,
         auto_place=settings.auto_place if settings else False,
+        atr=atr_value,
     )
 
     if model_out.action != action:

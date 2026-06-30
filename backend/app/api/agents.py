@@ -31,7 +31,7 @@ class AgentCreate(BaseModel):
     role: str
     description: Optional[str] = None
     system_prompt: str
-    model: str = "gpt-4o-mini"
+    model: str = "fable-5-high"
     temperature: float = 0.3
     max_tokens: int = 2000
     is_active: bool = True
@@ -200,7 +200,7 @@ async def agent_status(db: AsyncSession = Depends(get_db)):
             "remaining_s": ai_status.get("circuit_breaker_remaining_s", 0),
         },
         "custom_agents": get_custom_agent_status(),
-        "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        "model": os.getenv("OPENAI_MODEL", "fable-5-high"),
         "total_agents": len(agents),
         "active_agents": len(active),
         "roles": list(set(a.role for a in active)),
@@ -374,6 +374,57 @@ async def list_decisions(
     }
 
 
+@router.get("/decisions/stats")
+async def get_decision_stats(db: AsyncSession = Depends(get_db)):
+    """
+    Aggregate decision statistics broken down by agent_role and action.
+    Returned as a summary for the Insights → AI Decisions tab.
+    """
+    from sqlalchemy import case, Float
+
+    result = await db.execute(select(AgentDecision))
+    decisions = result.scalars().all()
+
+    by_role: dict = {}
+    by_action: dict = {}
+    by_symbol: dict = {}
+
+    for d in decisions:
+        role = d.agent_role or "unknown"
+        action = (d.action or "hold").lower()
+        symbol = d.symbol or "unknown"
+
+        by_role.setdefault(role, {"count": 0, "ai_calls": 0, "local": 0, "wins": 0})
+        by_role[role]["count"] += 1
+        if d.ai_called:
+            by_role[role]["ai_calls"] += 1
+        else:
+            by_role[role]["local"] += 1
+        if d.outcome == "win":
+            by_role[role]["wins"] += 1
+
+        by_action[action] = by_action.get(action, 0) + 1
+
+        by_symbol.setdefault(symbol, {"count": 0, "buy": 0, "sell": 0, "hold": 0})
+        by_symbol[symbol]["count"] += 1
+        if action in ("buy", "long"):
+            by_symbol[symbol]["buy"] += 1
+        elif action in ("sell", "short"):
+            by_symbol[symbol]["sell"] += 1
+        else:
+            by_symbol[symbol]["hold"] += 1
+
+    # Top 10 symbols by decision count
+    top_symbols = sorted(by_symbol.items(), key=lambda x: -x[1]["count"])[:10]
+
+    return {
+        "total": len(decisions),
+        "by_role": by_role,
+        "by_action": by_action,
+        "top_symbols": [{"symbol": s, **v} for s, v in top_symbols],
+    }
+
+
 class RecordOutcomeRequest(BaseModel):
     outcome: str  # win, loss, break_even
     pnl: Optional[float] = None
@@ -398,6 +449,21 @@ async def record_decision_outcome(
     decision.outcome_pnl = data.pnl
     decision.outcome_recorded_at = now_sast()
     await db.commit()
+
+    # ── Live vault capture: record outcome ────────────────────────────────────
+    try:
+        from plugins.ObsidianKnowledgePlugin.backend.services.vault_capture import vault_capture
+        pnl_str = f" PnL={data.pnl:+.4f}" if data.pnl else ""
+        vault_capture(
+            action_type="decision-outcome",
+            symbol=getattr(decision, "symbol", "") or "",
+            summary=f"Outcome: {data.outcome.upper()}{pnl_str} | {getattr(decision,'agent_role','?')} → {getattr(decision,'action','?')}",
+            detail=f"Decision ID {decision_id} recorded as {data.outcome}",
+            tags=["outcome", data.outcome, getattr(decision, "symbol", "")],
+            agent_role=getattr(decision, "agent_role", ""),
+        )
+    except Exception:
+        pass
 
     return {
         "id": decision.id,

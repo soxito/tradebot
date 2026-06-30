@@ -6,6 +6,7 @@ to last a long time on free tiers.
 """
 from __future__ import annotations
 
+import os
 from typing import Any
 
 # Per-model capability catalog. Keyed by the exact model id used in API calls.
@@ -255,6 +256,9 @@ MODEL_CATALOG: dict[str, dict[str, Any]] = {
     },
 }
 
+_FREELLMAPI_BASE_URL = os.getenv("AI_ANALYST_FREELLMAPI_BASE_URL", "http://localhost:3002/v1").strip() or "http://localhost:3002/v1"
+_FREELLMAPI_DEFAULT_MODEL = os.getenv("AI_ANALYST_FREELLMAPI_DEFAULT_MODEL", "auto").strip() or "auto"
+
 
 def get_model_info(model: str) -> dict[str, Any] | None:
     return MODEL_CATALOG.get(model)
@@ -381,6 +385,40 @@ PROVIDER_PRESETS: list[dict[str, Any]] = [
         "monthly_limit": None,
         "signup_url": "https://platform.openai.com/api-keys",
         "notes": "Paid; highest quality. Use as a premium fallback.",
+    },
+    {
+        # FreeLLMAPI — a self-hosted OpenAI-compatible proxy that stacks the
+        # free tiers of 16+ providers behind one /v1 endpoint with model="auto"
+        # routing + automatic failover. Run it yourself (docker) and point this
+        # super-provider at it; it handles per-upstream rate limits internally.
+        "key": "freellmapi",
+        "label": "FreeLLMAPI (self-hosted proxy)",
+        "type": "openai_compatible",
+        "base_url": _FREELLMAPI_BASE_URL,
+        "default_model": _FREELLMAPI_DEFAULT_MODEL,
+        "models": [_FREELLMAPI_DEFAULT_MODEL],
+        "free_tier": True,
+        "daily_limit": None,   # the proxy enforces upstream free-tier caps itself
+        "monthly_limit": None,
+        "signup_url": "https://freellmapi.co/",
+        "notes": "Self-host FreeLLMAPI (docker) — one endpoint that aggregates 16+ free providers. In Tradebot, run it on PORT=3002 so it does not collide with the frontend on 3001, then use your unified freellmapi-… key with model 'auto'. Edit the Base URL if it runs elsewhere.",
+        "editable_endpoint": True,
+    },
+    {
+        # Generic custom OpenAI-compatible endpoint (LM Studio, Ollama, vLLM,
+        # llama.cpp, a remote gateway, etc.). User supplies base_url + model.
+        "key": "custom",
+        "label": "Custom OpenAI-compatible endpoint",
+        "type": "openai_compatible",
+        "base_url": "",
+        "default_model": "",
+        "models": [],
+        "free_tier": True,
+        "daily_limit": None,
+        "monthly_limit": None,
+        "signup_url": "https://platform.openai.com/docs/api-reference/chat",
+        "notes": "Point at any OpenAI-compatible /v1 endpoint — LM Studio, Ollama (http://localhost:11434/v1), vLLM, llama.cpp, or a remote gateway. Enter the Base URL and model id.",
+        "editable_endpoint": True,
     },
 ]
 

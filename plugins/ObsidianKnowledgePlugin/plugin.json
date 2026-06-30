@@ -1,0 +1,33 @@
+{
+  "name": "Obsidian Knowledge Vault",
+  "slug": "obsidian-knowledge",
+  "version": "1.0.0",
+  "description": "Bi-directional sync between the TradeBot Brain and an Obsidian markdown vault. Exports agent decisions, signals, and graphify communities as wikilinked notes. Optionally injects vault context into agent prompts.",
+  "author": "TradeBot",
+  "requires": { "python": ">=3.12", "tradebot": ">=0.1.0" },
+  "service_provider": "backend.router",
+  "provides": {
+    "routes": ["backend/router.py"],
+    "models": ["backend/models.py"],
+    "pages": ["frontend/pages/"],
+    "overlays": false,
+    "scheduled_jobs": ["sync_vault_periodic"]
+  },
+  "permissions": [
+    "obsidian.vault.read",
+    "obsidian.vault.write",
+    "obsidian.decisions.export",
+    "obsidian.signals.export",
+    "obsidian.agents.context"
+  ],
+  "settings_keys": [
+    "obsidian.vault_path",
+    "obsidian.rest_url",
+    "obsidian.rest_token",
+    "obsidian.auto_sync_minutes",
+    "obsidian.export_decisions",
+    "obsidian.export_signals",
+    "obsidian.export_communities",
+    "obsidian.inject_context"
+  ]
+}

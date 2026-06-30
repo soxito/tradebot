@@ -1115,3 +1115,340 @@ async def apply_channel_preset(
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# ── Telegram Bot command-control endpoints ────────────────────────────────────
+# All routes under /plugins/telegram/bot/
+# These allow the frontend to create, configure, test, and control a Telegram bot.
+
+from plugins.TelegramSignalNewsPlugin.backend.schemas import (
+    TelegramBotInfoResponse,
+    TelegramBotWebhookRequest,
+    TelegramBotWebhookResponse,
+    TelegramBotTestMessageRequest,
+    TelegramBotCommandsRequest,
+    TelegramBotPollingRequest,
+    TelegramBotPollingResponse,
+    TelegramBotConfigUpdate,
+    TelegramBotConfigResponse,
+)
+from plugins.TelegramSignalNewsPlugin.backend.models import TelegramBotConfig
+from plugins.TelegramSignalNewsPlugin.backend.services.bot_service import (
+    get_me,
+    send_message as bot_send_message,
+    get_webhook_info,
+    set_webhook as bot_set_webhook,
+    delete_webhook as bot_delete_webhook,
+    set_my_commands,
+    JARVIS_COMMANDS,
+)
+
+
+async def _resolve_bot_token(db: AsyncSession) -> str:
+    """Resolve the active bot token: config override → plugin settings → env."""
+    from sqlalchemy import select
+
+    cfg_row = (await db.execute(select(TelegramBotConfig).limit(1))).scalars().first()
+    if cfg_row and cfg_row.bot_token_override:
+        return cfg_row.bot_token_override
+
+    ps = (await db.execute(select(TelegramPluginSettings).limit(1))).scalars().first()
+    if ps and ps.bot_token:
+        return ps.bot_token
+
+    from plugins.TelegramSignalNewsPlugin.backend.config import telegram_plugin_config
+    return telegram_plugin_config.bot_token or ""
+
+
+async def _get_or_create_bot_config(db: AsyncSession) -> TelegramBotConfig:
+    """Return the single TelegramBotConfig row, creating it if absent."""
+    from sqlalchemy import select
+
+    row = (await db.execute(select(TelegramBotConfig).limit(1))).scalars().first()
+    if row is None:
+        row = TelegramBotConfig()
+        db.add(row)
+        await db.commit()
+        await db.refresh(row)
+    return row
+
+
+@router.get("/bot/info", response_model=TelegramBotInfoResponse)
+async def bot_get_info(db: AsyncSession = Depends(get_db)):
+    """Call getMe to validate the bot token and return bot identity."""
+    token = await _resolve_bot_token(db)
+    if not token:
+        raise HTTPException(status_code=400, detail="No bot token configured. Set it in Settings → Bot Token.")
+
+    result = await get_me(token)
+    if not result.get("ok"):
+        return TelegramBotInfoResponse(
+            ok=False,
+            error=result.get("description", "getMe failed"),
+        )
+    bot = result.get("result", {})
+    return TelegramBotInfoResponse(
+        ok=True,
+        bot_id=bot.get("id"),
+        username=bot.get("username"),
+        first_name=bot.get("first_name"),
+        can_join_groups=bot.get("can_join_groups"),
+        can_read_all_group_messages=bot.get("can_read_all_group_messages"),
+    )
+
+
+@router.post("/bot/test-message")
+async def bot_test_message(
+    payload: TelegramBotTestMessageRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Send a test message through the bot to verify the connection end-to-end."""
+    token = await _resolve_bot_token(db)
+    if not token:
+        raise HTTPException(status_code=400, detail="No bot token configured.")
+
+    result = await bot_send_message(token, payload.chat_id, payload.text)
+    if not result.get("ok"):
+        raise HTTPException(
+            status_code=400,
+            detail=result.get("description", "Failed to send message"),
+        )
+    return {"ok": True, "message_id": result.get("result", {}).get("message_id")}
+
+
+@router.get("/bot/webhook", response_model=TelegramBotWebhookResponse)
+async def bot_webhook_info(db: AsyncSession = Depends(get_db)):
+    """Return current webhook configuration from Telegram."""
+    token = await _resolve_bot_token(db)
+    if not token:
+        raise HTTPException(status_code=400, detail="No bot token configured.")
+
+    result = await get_webhook_info(token)
+    if not result.get("ok"):
+        return TelegramBotWebhookResponse(
+            ok=False,
+            error=result.get("description", "getWebhookInfo failed"),
+        )
+    info = result.get("result", {})
+    return TelegramBotWebhookResponse(
+        ok=True,
+        url=info.get("url") or None,
+        has_custom_certificate=info.get("has_custom_certificate", False),
+        pending_update_count=info.get("pending_update_count", 0),
+        last_error_date=info.get("last_error_date"),
+        last_error_message=info.get("last_error_message"),
+        max_connections=info.get("max_connections"),
+    )
+
+
+@router.post("/bot/webhook", response_model=TelegramBotWebhookResponse)
+async def bot_set_webhook_endpoint(
+    payload: TelegramBotWebhookRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Register a webhook URL with Telegram and persist it to the bot config."""
+    token = await _resolve_bot_token(db)
+    if not token:
+        raise HTTPException(status_code=400, detail="No bot token configured.")
+    if not payload.url.startswith("https://"):
+        raise HTTPException(
+            status_code=400,
+            detail="Telegram requires HTTPS webhook URLs. For local dev, use ngrok.",
+        )
+
+    result = await bot_set_webhook(token, payload.url, payload.secret_token)
+    if not result.get("ok"):
+        raise HTTPException(
+            status_code=400,
+            detail=result.get("description", "setWebhook failed"),
+        )
+
+    cfg = await _get_or_create_bot_config(db)
+    cfg.webhook_url = payload.url
+    if payload.secret_token:
+        cfg.webhook_secret = payload.secret_token
+    cfg.polling_enabled = False  # webhook and polling are mutually exclusive
+    await db.commit()
+
+    return TelegramBotWebhookResponse(ok=True, url=payload.url)
+
+
+@router.delete("/bot/webhook")
+async def bot_delete_webhook_endpoint(db: AsyncSession = Depends(get_db)):
+    """Remove the webhook from Telegram (switches to polling mode)."""
+    token = await _resolve_bot_token(db)
+    if not token:
+        raise HTTPException(status_code=400, detail="No bot token configured.")
+
+    result = await bot_delete_webhook(token)
+    if not result.get("ok"):
+        raise HTTPException(
+            status_code=400,
+            detail=result.get("description", "deleteWebhook failed"),
+        )
+
+    cfg = await _get_or_create_bot_config(db)
+    cfg.webhook_url = None
+    await db.commit()
+
+    return {"ok": True, "message": "Webhook deleted. Switch to polling mode if needed."}
+
+
+@router.post("/bot/receive")
+async def bot_receive_update(
+    request: dict,
+    x_telegram_bot_api_secret_token: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Telegram webhook receiver — processes incoming bot updates.
+
+    Verifies the optional secret token header then routes the update through
+    the command service.  Always returns 200 to avoid Telegram retry storms.
+    """
+    from sqlalchemy import select
+    from plugins.TelegramSignalNewsPlugin.backend.services.command_service import parse_and_execute
+
+    try:
+        cfg = (await db.execute(select(TelegramBotConfig).limit(1))).scalars().first()
+        token = await _resolve_bot_token(db)
+
+        # Verify secret if configured
+        if cfg and cfg.webhook_secret:
+            if x_telegram_bot_api_secret_token != cfg.webhook_secret:
+                logger.warning("[BotWebhook] Invalid secret token — rejecting update")
+                return {"ok": False, "error": "invalid_secret"}
+
+        allowed = list((cfg.allowed_chat_ids_json if cfg else None) or [])
+        reply_text, parse_mode = await parse_and_execute(request, token, allowed, db)
+
+        if reply_text:
+            msg = (request.get("message") or request.get("edited_message") or {})
+            chat_id = msg.get("chat", {}).get("id")
+            if chat_id:
+                await bot_send_message(token, chat_id, reply_text, parse_mode)
+
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[BotWebhook] Update processing error: {}", exc)
+
+    return {"ok": True}
+
+
+@router.post("/bot/commands")
+async def bot_set_commands(
+    payload: TelegramBotCommandsRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Register the Jarvis command list with Telegram (shown in the / menu)."""
+    token = await _resolve_bot_token(db)
+    if not token:
+        raise HTTPException(status_code=400, detail="No bot token configured.")
+
+    commands = (
+        [{"command": c.command, "description": c.description} for c in payload.commands]
+        if payload.commands
+        else JARVIS_COMMANDS
+    )
+    result = await set_my_commands(token, commands)
+    if not result.get("ok"):
+        raise HTTPException(
+            status_code=400,
+            detail=result.get("description", "setMyCommands failed"),
+        )
+    return {"ok": True, "commands_set": len(commands)}
+
+
+@router.get("/bot/polling", response_model=TelegramBotPollingResponse)
+async def bot_polling_status(db: AsyncSession = Depends(get_db)):
+    """Return current polling mode state."""
+    cfg = await _get_or_create_bot_config(db)
+    return TelegramBotPollingResponse(
+        polling_enabled=cfg.polling_enabled,
+        ai_fallback_enabled=cfg.ai_fallback_enabled,
+        last_update_id=cfg.last_update_id,
+    )
+
+
+@router.post("/bot/polling", response_model=TelegramBotPollingResponse)
+async def bot_set_polling(
+    payload: TelegramBotPollingRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Enable or disable bot polling mode.
+
+    Polling is the correct mode for localhost development (no public HTTPS URL
+    needed).  Enabling polling automatically disables the webhook setting.
+    """
+    cfg = await _get_or_create_bot_config(db)
+
+    if payload.enabled:
+        # Verify token works before enabling
+        token = await _resolve_bot_token(db)
+        if not token:
+            raise HTTPException(status_code=400, detail="No bot token configured.")
+        me = await get_me(token)
+        if not me.get("ok"):
+            raise HTTPException(
+                status_code=400,
+                detail=me.get("description", "Token invalid — getMe failed"),
+            )
+
+    cfg.polling_enabled = payload.enabled
+    if payload.enabled:
+        cfg.webhook_url = None  # can't use both at once
+    if payload.ai_fallback_enabled is not None:
+        cfg.ai_fallback_enabled = payload.ai_fallback_enabled
+
+    await db.commit()
+
+    if payload.enabled:
+        signal_monitor.start_bot_polling(AsyncSessionLocal)
+    else:
+        signal_monitor.stop_bot_polling()
+
+    return TelegramBotPollingResponse(
+        polling_enabled=cfg.polling_enabled,
+        ai_fallback_enabled=cfg.ai_fallback_enabled,
+        last_update_id=cfg.last_update_id,
+    )
+
+
+@router.get("/bot/config", response_model=TelegramBotConfigResponse)
+async def bot_get_config(db: AsyncSession = Depends(get_db)):
+    """Return current bot configuration (token masked)."""
+    token = await _resolve_bot_token(db)
+    cfg = await _get_or_create_bot_config(db)
+    return TelegramBotConfigResponse(
+        token_set=bool(token),
+        webhook_url=cfg.webhook_url,
+        polling_enabled=cfg.polling_enabled,
+        allowed_chat_ids=list(cfg.allowed_chat_ids_json or []),
+        ai_fallback_enabled=cfg.ai_fallback_enabled,
+        last_update_id=cfg.last_update_id,
+    )
+
+
+@router.patch("/bot/config", response_model=TelegramBotConfigResponse)
+async def bot_update_config(
+    payload: TelegramBotConfigUpdate,
+    db: AsyncSession = Depends(get_db),
+):
+    """Update bot-specific settings (token override, allowed_chat_ids, AI fallback)."""
+    cfg = await _get_or_create_bot_config(db)
+
+    if payload.bot_token_override is not None:
+        cfg.bot_token_override = payload.bot_token_override or None
+    if payload.allowed_chat_ids is not None:
+        cfg.allowed_chat_ids_json = payload.allowed_chat_ids or None
+    if payload.ai_fallback_enabled is not None:
+        cfg.ai_fallback_enabled = payload.ai_fallback_enabled
+
+    await db.commit()
+    token = await _resolve_bot_token(db)
+    return TelegramBotConfigResponse(
+        token_set=bool(token),
+        webhook_url=cfg.webhook_url,
+        polling_enabled=cfg.polling_enabled,
+        allowed_chat_ids=list(cfg.allowed_chat_ids_json or []),
+        ai_fallback_enabled=cfg.ai_fallback_enabled,
+        last_update_id=cfg.last_update_id,
+    )

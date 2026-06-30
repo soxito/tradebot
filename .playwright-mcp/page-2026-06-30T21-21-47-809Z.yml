@@ -1,0 +1,40 @@
+- generic [active]:
+  - generic:
+    - generic:
+      - generic:
+        - generic: UNIT-A12 // ADVANCED COGNITION
+        - generic: NEURAL NET RPT // DATA STREAM ACTIVE // ALGO PROCESS
+      - generic:
+        - generic: AI PROCESSING UNIT_07
+        - generic: CORE TEMP NOMINAL // THROUGHPUT 99.4%
+    - generic: "PROJECT: COGNIZANCE"
+    - generic:
+      - generic: UNIT-B07 · ASSIST
+    - generic "Click or say 'Jarvis' to summon"
+    - generic "Click to open chat" [ref=f3e3] [cursor=pointer]:
+      - generic [ref=f3e4]: UNIT-A12 · JARVIS
+    - generic:
+      - generic:
+        - generic: BTC/USD
+        - generic: $67,658.13
+        - generic: ▼ 0.96%
+      - generic:
+        - generic: ETH/USD
+        - generic: $3,547.74
+        - generic: ▼ 2.37%
+      - generic:
+        - generic: GOLD
+        - generic: $2,374.61
+        - generic: ▼ 1.60%
+      - generic:
+        - generic: SOL/USD
+        - generic: $174.06
+        - generic: ▲ 0.64%
+    - generic:
+      - generic:
+        - generic: JARVIS CONTROL ROOM
+        - generic:
+          - generic: SYSTEMS ONLINE
+        - generic: Listening for wake word…
+      - button "▶ SUMMON JARVIS" [ref=f3e7] [cursor=pointer]
+  - alert [ref=f3e8]

@@ -343,7 +343,130 @@ def _liquidity_pools(swings: List[Swing], atr: float) -> Dict[str, List[float]]:
     return {"buyside": cluster(highs), "sellside": cluster(lows)}
 
 
-# ── Range / premium-discount ───────────────────────────────────────────────────
+# ── False breakout / stop-hunt detection ──────────────────────────────────────
+
+def _detect_liquidity_sweeps(
+    candles: List[Candle],
+    swings: List[Swing],
+    atr: float,
+    lookback: int = 5,
+) -> Dict[str, Any]:
+    """
+    Detect liquidity sweeps (stop hunts) and false breakouts in recent bars.
+
+    A liquidity sweep occurs when price briefly violates a swing high/low (hunting
+    stops placed beyond those levels) but then closes back inside — a classic
+    institutional manipulation pattern that often precedes a sharp reversal.
+
+    Returns a dict with:
+      swept_highs     — list of swing-high prices that were swept recently
+      swept_lows      — list of swing-low prices that were swept recently
+      is_sweep_bar    — True if the LAST bar swept a swing level
+      sweep_direction — "up" (swept above swing high) | "down" | None
+      rejection_wick  — 0–1 ratio of the dominant wick on the sweep bar
+      volume_on_sweep — volume ratio vs 20-bar average (< 0.8 = low-volume sweep)
+      false_break_score — 0–100: how likely the last move was a false breakout
+    """
+    result: Dict[str, Any] = {
+        "swept_highs": [], "swept_lows": [], "is_sweep_bar": False,
+        "sweep_direction": None, "rejection_wick": 0.0,
+        "volume_on_sweep": 1.0, "false_break_score": 0.0,
+    }
+    if len(candles) < 10 or not swings or atr <= 0:
+        return result
+
+    swing_highs = sorted([s.price for s in swings if s.kind == "high"])
+    swing_lows  = sorted([s.price for s in swings if s.kind == "low"])
+
+    # Volume baseline
+    vols = [c.volume for c in candles[-(20 + 1):-1] if c.volume and c.volume > 0]
+    avg_vol = sum(vols) / len(vols) if vols else 0.0
+
+    # Scan the most recent bars for sweep patterns
+    recent = candles[-lookback:]
+    tol = atr * 0.3   # within 30% of ATR = "touching" the level
+
+    swept_h: List[float] = []
+    swept_l: List[float] = []
+    score = 0.0
+
+    for bar in recent:
+        bar_range = bar.high - bar.low
+        if bar_range <= 0:
+            continue
+        upper_wick = bar.high - max(bar.open, bar.close)
+        lower_wick = min(bar.open, bar.close) - bar.low
+
+        # Sweep above a swing high (close back below it)
+        for sh in swing_highs:
+            if bar.high > sh + tol and bar.close < sh:
+                swept_h.append(round(sh, 6))
+                score += 30.0
+
+        # Sweep below a swing low (close back above it)
+        for sl_lvl in swing_lows:
+            if bar.low < sl_lvl - tol and bar.close > sl_lvl:
+                swept_l.append(round(sl_lvl, 6))
+                score += 30.0
+
+    result["swept_highs"] = list(dict.fromkeys(swept_h))   # dedup
+    result["swept_lows"]  = list(dict.fromkeys(swept_l))
+
+    # Analyse the very last bar specifically
+    last = candles[-1]
+    last_range = last.high - last.low
+    if last_range > 0:
+        upper = last.high - max(last.open, last.close)
+        lower = min(last.open, last.close) - last.low
+        dom_wick = max(upper, lower)
+        result["rejection_wick"] = round(dom_wick / last_range, 3)
+
+        # Volume ratio on last bar
+        if avg_vol > 0:
+            result["volume_on_sweep"] = round((last.volume or 0.0) / avg_vol, 2)
+
+        # Last bar is the sweep bar?
+        is_up_sweep   = any(last.high > sh + tol and last.close < sh for sh in swing_highs)
+        is_down_sweep = any(last.low  < sl - tol  and last.close > sl for sl in swing_lows)
+        result["is_sweep_bar"] = is_up_sweep or is_down_sweep
+        if is_up_sweep:
+            result["sweep_direction"] = "up"
+            score += 20.0
+        elif is_down_sweep:
+            result["sweep_direction"] = "down"
+            score += 20.0
+
+        # Rejection wick adds evidence
+        if result["rejection_wick"] > 0.55:
+            score += 15.0
+        # Low volume on the sweep amplifies false-break probability
+        if result["volume_on_sweep"] < 0.8:
+            score += 10.0
+
+    result["false_break_score"] = round(min(score, 100.0), 1)
+    return result
+
+
+def _wicked_into_zone(zone: "Zone", candles: List[Candle], atr: float) -> bool:
+    """
+    Return True when recent bars tested `zone` with a wick but NOT with a close.
+
+    This is a high-probability mitigation signal: institutions pushed into the
+    zone to fill orders but did not close inside it — price rejection is likely.
+    """
+    if not candles or atr <= 0:
+        return False
+    recent = candles[-8:]
+    for bar in recent:
+        # Wick enters the zone but close stays outside
+        wick_entered = bar.low <= zone.top and bar.high >= zone.bottom
+        close_inside = zone.bottom <= bar.close <= zone.top
+        if wick_entered and not close_inside:
+            return True
+    return False
+
+
+
 
 def _dealing_range(swings: List[Swing]) -> Optional[Tuple[float, float]]:
     """Most recent (low, high) swing pair forming the active dealing range."""
@@ -593,9 +716,6 @@ class SMCStrategyEngine:
         rng = _dealing_range(swings)
 
         # ── CHoCH context ─────────────────────────────────────────────────────
-        # Extract the most recent bullish / bearish CHoCH event so _build_signal
-        # can reference the institutional 'protected low/high' and tag zones that
-        # formed AFTER the character-change (post-CHoCH zones are highest quality).
         recent_bull_choch = next(
             (e for e in reversed(events)
              if e.get("type") == "CHoCH" and e.get("direction") == "bullish"),
@@ -607,6 +727,9 @@ class SMCStrategyEngine:
             None,
         )
 
+        # ── False breakout / stop-hunt context ────────────────────────────────
+        sweeps = _detect_liquidity_sweeps(candles, swings, atr)
+
         return {
             "atr": atr, "swings": swings, "bias": bias, "events": events,
             "order_blocks": obs, "fvgs": fvgs, "liquidity": liquidity,
@@ -617,6 +740,10 @@ class SMCStrategyEngine:
             # Bearish CHoCH context (used for sell signals)
             "choch_bear_index":         recent_bear_choch["index"]           if recent_bear_choch else -1,
             "choch_bear_protected_high": recent_bear_choch.get("protected_high") if recent_bear_choch else None,
+            # False breakout / sweep context
+            "sweeps": sweeps,
+            # candles reference (needed for wicked_into_zone check)
+            "_candles": candles,
         }
 
     # -- signal construction ----------------------------------------------------
@@ -630,7 +757,17 @@ class SMCStrategyEngine:
         prim: Dict[str, Any],
     ) -> Optional[Signal]:
         rng = prim["range"]
-        if not rng or atr <= 0:
+        # When no swing-based dealing range exists yet (e.g. insufficient fractal
+        # pivots on very short history), synthesise one from the recent price
+        # extremes so the fallback guarantee can still produce at least one signal.
+        if not rng:
+            candles_ref = prim.get("_candles", [])
+            if len(candles_ref) >= 20 and atr > 0:
+                win = candles_ref[-60:]
+                rng = (min(c.low for c in win), max(c.high for c in win))
+            else:
+                return None
+        if atr <= 0:
             return None
         lo, hi = rng
         equilibrium = (lo + hi) / 2.0
@@ -766,39 +903,25 @@ class SMCStrategyEngine:
             confluence.append("structure_aligned")
 
         # ── CHoCH-specific tags ───────────────────────────────────────────────
-        # choch_reversal: the current bias was established by a character change
-        # (not merely a BOS continuation).  This means the market has signalled
-        # a shift in sentiment — the highest-quality context for a limit entry.
         if choch_index >= 0:
             confluence.append("choch_reversal")
-            # post_choch_zone: this specific zone formed AFTER the CHoCH bar,
-            # meaning it was created by the new institutional order flow that
-            # drove the reversal.  These are the most reliable mitigation targets.
             if zone.index > choch_index:
                 confluence.append("post_choch_zone")
 
-        # choch_protected_low/high: the SL was anchored to the CHoCH inflection
-        # point rather than just the zone boundary — a tighter, more meaningful stop.
         if _used_choch_sl:
             confluence.append("choch_protected_low" if side == "buy" else "choch_protected_high")
 
         # ── FVG / OB zone-combination tags ───────────────────────────────────
-        # FVG in discount/premium
         if "fair_value_gap" in confluence and "discount" in confluence and side == "buy":
             confluence.append("fvg_in_discount")
         if "fair_value_gap" in confluence and "premium" in confluence and side == "sell":
             confluence.append("fvg_in_premium")
-        # OB in discount/premium (mirror of fvg_in_discount for order blocks)
         if "order_block" in confluence and "discount" in confluence and side == "buy":
             confluence.append("ob_in_discount")
         if "order_block" in confluence and "premium" in confluence and side == "sell":
             confluence.append("ob_in_premium")
-        # OB + structure alignment (origin of the BOS leg)
         if "order_block" in confluence and "structure_aligned" in confluence:
             confluence.append("ob_structure_confluence")
-        # multi_zone_discount: BOTH FVG and OB types are present in the discount area.
-        # This is the exact scenario described in the example narrative — FVGs and an
-        # OB clustered in the same demand region compound the probability of a fill.
         if prim.get("multi_zone_discount") and side == "buy":
             confluence.append("multi_zone_discount")
         if prim.get("multi_zone_premium") and side == "sell":
@@ -812,6 +935,33 @@ class SMCStrategyEngine:
             confluence.append("rsi_premium")
         if prim["vol_z"] > 1.0:
             confluence.append("volume_displacement")
+
+        # ── False breakout / stop-hunt confluence tags ────────────────────────
+        sweeps = prim.get("sweeps", {})
+        candles_ref = prim.get("_candles", [])
+
+        # Liquidity sweep (stop hunt) into the zone direction
+        if side == "buy" and sweeps.get("swept_lows"):
+            # A sweep of recent lows just before a buy = stop hunt, now reversal
+            confluence.append("sweep_of_lows")
+        if side == "sell" and sweeps.get("swept_highs"):
+            confluence.append("sweep_of_highs")
+
+        # Zone was wicked into (tested by wick, no close inside) — highest quality
+        if _wicked_into_zone(zone, candles_ref, atr):
+            confluence.append("wicked_into_zone")
+
+        # High false-break score on the recent sweep bar amplifies confidence
+        fb_score = sweeps.get("false_break_score", 0.0)
+        if fb_score >= 60:
+            confluence.append("strong_false_breakout")
+        elif fb_score >= 35:
+            confluence.append("possible_false_breakout")
+
+        # Rejection wick at the zone top/bottom (pin bar / hammer)
+        rej_wick = sweeps.get("rejection_wick", 0.0)
+        if rej_wick >= 0.55:
+            confluence.append("rejection_wick")
 
         # ── Confidence formula ────────────────────────────────────────────────
         base_count = min(len(confluence) / 10.0, 1.0) * 0.40
@@ -836,18 +986,39 @@ class SMCStrategyEngine:
         extreme_bonus    = 0.08 if ("at_weak_low"            in confluence or
                                      "at_strong_high"        in confluence) else 0.0
         bos_bonus        = 0.06 if "bos_continuation"         in confluence else 0.0
+        # False-breakout / sweep bonuses — these are the highest-quality setups
+        sweep_bonus      = 0.10 if ("sweep_of_lows"          in confluence or
+                                     "sweep_of_highs"         in confluence) else 0.0
+        wick_zone_bonus  = 0.08 if "wicked_into_zone"         in confluence else 0.0
+        fb_bonus         = 0.10 if "strong_false_breakout"    in confluence else (
+                           0.05 if "possible_false_breakout"  in confluence else 0.0)
+        rej_bonus        = 0.06 if "rejection_wick"           in confluence else 0.0
 
         confidence = round(min(
             base_count + rr_bonus + fvg_bonus + fvg_zone_bonus + ob_zone_bonus +
             struct_bonus + deep_bonus + choch_bonus + post_choch_bonus +
             multi_zone_bonus + choch_sl_bonus + ob_struct_bonus +
-            extreme_bonus + bos_bonus + 0.10,
+            extreme_bonus + bos_bonus + sweep_bonus + wick_zone_bonus +
+            fb_bonus + rej_bonus + 0.10,
             0.98
         ), 2)
 
         # ── Human-readable reason ─────────────────────────────────────────────
         factors: List[str] = []
-        # Lead with the CHoCH context when present — this is the narrative
+        # Lead with false-breakout context (highest priority narrative)
+        if "sweep_of_lows" in confluence:
+            factors.append("stop-hunt sweep of lows")
+        elif "sweep_of_highs" in confluence:
+            factors.append("stop-hunt sweep of highs")
+        if "strong_false_breakout" in confluence:
+            factors.append("strong false breakout")
+        elif "possible_false_breakout" in confluence:
+            factors.append("false breakout signal")
+        if "wicked_into_zone" in confluence:
+            factors.append("wick-tested zone")
+        if "rejection_wick" in confluence:
+            factors.append("rejection wick")
+        # CHoCH context
         if "post_choch_zone" in confluence:
             factors.append("post-CHoCH")
         elif "choch_reversal" in confluence:
@@ -1046,13 +1217,18 @@ class SMCStrategyEngine:
                     break
 
             # ── Minimum-signal guarantee ──────────────────────────────────────
-            # If the strict filters produced nothing (common on quiet higher
-            # timeframes like H1/H4 where price sits far from a qualifying zone),
-            # relax progressively so there is ALWAYS at least one actionable setup:
+            # If the strict filters produced nothing, relax progressively so the
+            # user ALWAYS sees at least one actionable setup:
             #   pass 1 — ignore the confidence floor (keep bias + discount rules)
             #   pass 2 — also allow counter-trend zones (best available regardless)
+            #   pass 3 — drop the RR floor entirely (show best available setup
+            #             even if RR < min_rr, tagged "below_min_rr" so the UI
+            #             can warn the user. This guarantees Analyze always returns
+            #             something useful regardless of the chosen Min RR.)
             if not out:
                 relaxed: List[Signal] = []
+
+                # Pass 1 & 2: keep user's min_rr but relax structure/bias
                 for allow_counter in (False, True):
                     for z in sorted(zone_set, key=lambda x: x.index, reverse=True):
                         side = "buy" if z.kind.startswith("bullish") else "sell"
@@ -1068,6 +1244,31 @@ class SMCStrategyEngine:
                         relaxed.append(sig)
                     if relaxed:
                         break
+
+                # Pass 3: drop RR floor — show BEST available setup even if below
+                # the user's requested Min RR.  This ensures Analyze always returns
+                # at least one result so the AI review and chart overlay can fire.
+                if not relaxed and self.min_rr > 1.0:
+                    saved_min_rr = self.min_rr
+                    self.min_rr = 1.0  # temporarily lower floor
+                    for allow_counter in (False, True):
+                        for z in sorted(zone_set, key=lambda x: x.index, reverse=True):
+                            side = "buy" if z.kind.startswith("bullish") else "sell"
+                            if not allow_counter:
+                                if bias == "bullish" and side == "sell":
+                                    continue
+                                if bias == "bearish" and side == "buy":
+                                    continue
+                            sig = self._build_signal(z, side, last_price, atr, prim)
+                            if not sig:
+                                continue
+                            sig.confluence.append("relaxed_fallback")
+                            sig.confluence.append("below_min_rr")
+                            relaxed.append(sig)
+                        if relaxed:
+                            break
+                    self.min_rr = saved_min_rr  # restore
+
                 relaxed.sort(key=lambda s: s.confidence, reverse=True)
                 out = relaxed[: max(1, self.max_signals)]
             return out
@@ -1114,6 +1315,11 @@ class SMCStrategyEngine:
                 "open_time": us_open.time if us_open else None,
                 "open_price": round(us_open.open, 6) if us_open else None,
                 "live_in_session": self._in_us_session(candles[-1].time),
+            },
+            # ── False breakout / sweep context for the frontend ───────────────
+            "false_breakout": {
+                k: v for k, v in prim.get("sweeps", {}).items()
+                if k != "_candles"  # never serialise the candle list
             },
         }
 

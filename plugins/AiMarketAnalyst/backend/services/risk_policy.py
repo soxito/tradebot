@@ -29,6 +29,10 @@ def validate_decision(
     max_risk_pct: float = ai_analyst_config.max_risk_per_trade_pct,
     paper_mode: bool = True,
     auto_place: bool = False,
+    # ── Risk management quality checks ────────────────────────────────────────
+    min_rr: float = 2.0,          # minimum reward:risk ratio (warn below this)
+    require_min_rr: bool = False,  # if True, block trades below min_rr
+    atr: Optional[float] = None,  # used for minimum SL distance quality check
 ) -> Dict:
     """
     Validate a proposed trade against risk policy.
@@ -119,12 +123,47 @@ def validate_decision(
         elif direction == "sell" and sl <= entry:
             reasons.append("Sell SL must be above entry")
 
+        # ── ATR-based SL quality check ────────────────────────────────────────
+        # SL must be at least 0.5 × ATR from entry to be meaningful
+        if atr and atr > 0:
+            sl_dist = abs(entry - sl)
+            if sl_dist < atr * 0.5:
+                warnings.append(
+                    f"SL is very tight ({sl_dist:.4f} < 0.5×ATR={atr*0.5:.4f}); "
+                    "risk of premature stop-out. SL should be beyond swing structure."
+                )
+
     # Take-profit direction check
     if tp is not None and entry is not None:
         if direction == "buy" and tp <= entry:
             reasons.append("Buy TP must be above entry")
         elif direction == "sell" and tp >= entry:
             reasons.append("Sell TP must be below entry")
+
+    # ── Reward:Risk ratio quality checks ──────────────────────────────────────
+    if entry is not None and sl is not None and tp is not None and entry > 0:
+        risk = abs(entry - sl)
+        reward = abs(tp - entry)
+        if risk > 0:
+            actual_rr = reward / risk
+            if actual_rr < 1.0:
+                # Hard block: reward must exceed risk (RR < 1 is always wrong)
+                reasons.append(
+                    f"RR {actual_rr:.2f} < 1.0 — reward must exceed risk. "
+                    "Move TP to a real liquidity target."
+                )
+            elif actual_rr < min_rr:
+                msg = (
+                    f"RR {actual_rr:.2f} is below recommended minimum of {min_rr:.1f}. "
+                    "Consider extending TP to the next liquidity pool."
+                )
+                if require_min_rr:
+                    reasons.append(msg)
+                else:
+                    warnings.append(msg)
+            else:
+                # Good RR — log it
+                logger.debug(f"[RiskPolicy] RR={actual_rr:.2f} ✓ (min={min_rr:.1f})")
 
     # Lot size bounds
     if requires_trade and lot_size is None:

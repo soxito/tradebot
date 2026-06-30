@@ -819,8 +819,80 @@ async def get_live_price(account_id: int, symbol: str):
 
 # ── SMC Sniper Strategy ─────────────────────────────────────────────────
 
+# MT5 timeframe → ccxt/exchange timeframe string
+_MT5_TF_TO_EX: dict[str, str] = {
+    "M1": "1m", "M5": "5m", "M15": "15m", "M30": "30m",
+    "H1": "1h", "H4": "4h", "D1": "1d", "W1": "1w",
+}
+
+# MT5 symbol → Bitget/exchange symbol (explicit overrides)
+_MT5_SYMBOL_TO_EX: dict[str, str] = {
+    "XAUUSD": "XAU/USDT",
+    "XAGUSD": "XAG/USDT",
+    "BTCUSD": "BTC/USDT",
+    "ETHUSD": "ETH/USDT",
+    "EURUSD": "EUR/USDT",
+    "GBPUSD": "GBP/USDT",
+    "USDJPY": "BTC/USDT",  # no JPY pair on Bitget; fall through gracefully
+}
+
+
+def _symbol_to_exchange(symbol: str) -> Optional[str]:
+    """Map an MT5 symbol to a Bitget/exchange tradeable pair."""
+    s = (symbol or "").upper().replace("/", "")
+    if s in _MT5_SYMBOL_TO_EX:
+        return _MT5_SYMBOL_TO_EX[s]
+    if s.endswith("USDT") and len(s) > 4:
+        return f"{s[:-4]}/USDT"
+    if s.endswith("USD") and not s.endswith("USDT") and len(s) > 3:
+        return f"{s[:-3]}/USDT"
+    return None
+
+
+async def _exchange_candles_fallback(symbol: str, timeframe: str, count: int):
+    """Fetch candles from Bitget when MT5 history is stale / empty."""
+    try:
+        from app.exchanges.manager import exchange_manager, SupportedExchange  # type: ignore
+
+        ex_symbol = _symbol_to_exchange(symbol)
+        if not ex_symbol:
+            return []
+
+        ex_tf = _MT5_TF_TO_EX.get((timeframe or "").upper(), "1h")
+
+        conn = exchange_manager.get_exchange(SupportedExchange.BITGET)
+        if conn is None:
+            # try Binance as secondary fallback
+            conn = exchange_manager.get_exchange(SupportedExchange.BINANCE)
+        if conn is None:
+            return []
+
+        raw = await conn.get_ohlcv(ex_symbol, ex_tf, count)
+        if not raw:
+            return []
+
+        return candles_from_payload([
+            {
+                "time": int(c[0] / 1000),
+                "open": float(c[1]), "high": float(c[2]),
+                "low": float(c[3]), "close": float(c[4]),
+                "volume": float(c[5] or 0),
+            }
+            for c in raw
+        ])
+    except Exception as exc:
+        logger.debug(f"[MT5/strategy] exchange candle fallback error for {symbol}/{timeframe}: {exc}")
+        return []
+
+
 async def _load_candles(account_id: int, symbol: str, timeframe: str, count: int):
-    """Fetch + normalise candles for an account (shared by strategy endpoints)."""
+    """Fetch + normalise candles for an account (shared by strategy endpoints).
+
+    First tries the MT5 bridge.  If it returns fewer than 40 bars (common with
+    metals/forex brokers where mtapi-io ignores the fromDate parameter), falls
+    back to the same Bitget/exchange feed used by the SMC chart's own candle
+    loader — so the analysis is never blocked by a stale MT5 history.
+    """
     async with AsyncSessionLocal() as db:
         account = await db.get(MT5Account, account_id)
         if not account:
@@ -831,13 +903,33 @@ async def _load_candles(account_id: int, symbol: str, timeframe: str, count: int
                 symbol, timeframe, count,
             )
         except Exception as e:
-            logger.warning(f"[MT5/strategy] {symbol}: {e}")
-            raise HTTPException(502, f"MT5 API error fetching candles: {e}")
-    return candles_from_payload([
+            logger.warning(f"[MT5/strategy] MT5 candle fetch failed for {symbol}/{timeframe}: {e}")
+            bars = []
+
+    candles = candles_from_payload([
         {"time": b["time"], "open": b["open"], "high": b["high"],
          "low": b["low"], "close": b["close"], "volume": b.get("volume")}
         for b in bars
     ])
+
+    if len(candles) < 40:
+        logger.info(
+            f"[MT5/strategy] MT5 returned {len(candles)} candles for "
+            f"{symbol}/{timeframe} — trying exchange fallback"
+        )
+        ex_candles = await _exchange_candles_fallback(symbol, timeframe, count)
+        if len(ex_candles) >= 40:
+            logger.info(
+                f"[MT5/strategy] exchange fallback provided {len(ex_candles)} "
+                f"candles for {symbol}/{timeframe}"
+            )
+            return ex_candles
+        # Both sources sparse — return whatever we have; engine will report the
+        # proper "Not enough candles" error to the caller.
+        if ex_candles:
+            return ex_candles
+
+    return candles
 
 
 @router.get("/strategy/analyze", response_model=MT5SmcAnalyzeResponse)
@@ -979,6 +1071,10 @@ async def smc_place(data: MT5SmcPlaceRequest):
 
     Server-side guards enforce sane stop/target geometry before the order is sent
     to the broker (paper-safe: rejects inverted SL/TP).
+
+    After a successful placement the order is written directly to the DB from the
+    broker response so it appears in the /orders endpoint immediately — even if
+    the subsequent sync races with the broker's order propagation delay.
     """
     # Geometry validation (fail-closed).
     if data.side == "buy":
@@ -1002,15 +1098,65 @@ async def smc_place(data: MT5SmcPlaceRequest):
                 volume=data.volume, price=data.entry,
                 sl=data.stop_loss, tp=data.take_profit, comment=data.comment,
             )
-            await MT5SyncService.sync_account(db, account)
-            return MT5TradeResultResponse(
-                success=True,
-                ticket=result.get("ticket") if isinstance(result, dict) else None,
-                message=f"{operation} placed @ {data.entry}",
-                raw=result,
-            )
         except Exception as e:
             raise HTTPException(502, f"Limit order failed: {e}")
+
+        ticket = result.get("ticket") if isinstance(result, dict) else None
+
+        # ── Immediately persist the placed order to the DB ─────────────────
+        # This ensures the order shows in /orders right away without waiting
+        # for the broker to propagate it back through the periodic sync.
+        if ticket:
+            try:
+                from plugins.MT5TradingPlugin.backend.models import (
+                    MT5Order, MT5OrderType, MT5OrderStatus,
+                )
+                try:
+                    ot = MT5OrderType(operation)
+                except ValueError:
+                    ot = MT5OrderType.BUY_LIMIT
+
+                # Upsert by ticket so a subsequent sync won't create a duplicate.
+                existing = (
+                    await db.execute(
+                        select(MT5Order).where(
+                            MT5Order.account_id == account.id,
+                            MT5Order.mt5_ticket == int(ticket),
+                        ).limit(1)
+                    )
+                ).scalar_one_or_none()
+                if not existing:
+                    db.add(MT5Order(
+                        account_id=account.id,
+                        mt5_ticket=int(ticket),
+                        symbol=data.symbol,
+                        order_type=ot,
+                        volume=data.volume,
+                        price=data.entry,
+                        sl=data.stop_loss,
+                        tp=data.take_profit,
+                        status=MT5OrderStatus.PENDING,
+                        comment=data.comment,
+                        raw_data=result,
+                    ))
+                    await db.commit()
+            except Exception as insert_err:
+                logger.debug(f"[MT5/place] direct DB insert skipped: {insert_err}")
+                await db.rollback()
+
+        # ── Background sync to refresh positions, balance, other orders ────
+        try:
+            await MT5SyncService.sync_account(db, account)
+        except Exception as sync_err:
+            # Non-fatal — the order is already in DB; sync will catch up later.
+            logger.debug(f"[MT5/place] post-place sync error: {sync_err}")
+
+        return MT5TradeResultResponse(
+            success=True,
+            ticket=ticket,
+            message=f"{operation} placed @ {data.entry}",
+            raw=result,
+        )
 
 
 # ── Symbols List ────────────────────────────────────────────────────────

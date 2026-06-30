@@ -55,7 +55,7 @@ class TelegramPluginConfig:
 
     # Extraction strategy
     enable_llm_fallback: bool = _as_bool("TELEGRAM_PLUGIN_ENABLE_LLM_FALLBACK", False)
-    llm_model: str = os.getenv("TELEGRAM_PLUGIN_LLM_MODEL", "gpt-4o-mini")
+    llm_model: str = os.getenv("TELEGRAM_PLUGIN_LLM_MODEL", "fable-5-high")
     llm_timeout_seconds: int = _as_int("TELEGRAM_PLUGIN_LLM_TIMEOUT_SECONDS", 20)
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
 

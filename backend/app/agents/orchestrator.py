@@ -24,6 +24,7 @@ from app.agents.specialists import agent_from_db
 from app.agents.memory import get_past_decisions, build_memory_prompt, try_local_decision
 from app.signals.technical import analyze as technical_analyze
 from app.exchanges.manager import exchange_manager, SupportedExchange
+from app.exchanges.forex_provider import is_forex_symbol, fetch_ohlcv as forex_fetch_ohlcv
 
 
 def _is_quota_error_decision(decision: Dict[str, Any]) -> bool:
@@ -249,12 +250,55 @@ class AgentOrchestrator:
         timeframe: str = "1h",
         exchange: SupportedExchange = SupportedExchange.BITGET,
     ) -> Dict[str, Any]:
-        """Build market context dict for agents."""
+        """Build market context dict for agents.
+
+        For forex/metals symbols (XAUUSD, XAGUSD, EURUSD, etc.) that are not
+        available on Bitget, data is fetched from Yahoo Finance via the
+        ForexProvider module — giving live, real-time prices.
+        """
+        context: Dict[str, Any] = {"symbol": symbol, "timeframe": timeframe}
+
+        # ── Branch: Forex / metals symbols (e.g. XAUUSD, XAGUSD) ─────────────
+        if is_forex_symbol(symbol):
+            try:
+                ohlcv, forex_ticker = await forex_fetch_ohlcv(
+                    symbol, timeframe=timeframe, limit=200
+                )
+                if ohlcv:
+                    ta = technical_analyze(ohlcv, timeframe)
+                    context["technical"] = ta
+                    context["recent_candles"] = [
+                        {"time": c[0], "open": c[1], "high": c[2], "low": c[3],
+                         "close": c[4], "volume": c[5]}
+                        for c in ohlcv[-5:]
+                    ]
+                    context["current_price"] = ohlcv[-1][4]
+                    context["ticker"] = forex_ticker  # includes buy_volume, sell_volume
+                    context["price_source"] = forex_ticker.get("source", "forex_provider")
+                    logger.info(
+                        f"[Orchestrator] Forex/metal {symbol} — live price "
+                        f"${context['current_price']:.2f} (CoinGecko/ForexProvider)"
+                    )
+            except Exception as e:
+                logger.warning(f"[Orchestrator] Forex OHLCV failed for {symbol}: {e}")
+                context["technical"] = {"error": str(e)}
+
+            # Sentiment stub (no exchange needed)
+            try:
+                base_coin = symbol.replace("USD", "").replace("/", "")
+                context["sentiment"] = {
+                    "symbol": base_coin,
+                    "note": "Forex/metals — use pipeline_signal.sentiment for detail",
+                }
+            except Exception:
+                pass
+
+            return context
+
+        # ── Branch: Crypto symbols via Bitget ─────────────────────────────────
         connector = exchange_manager.get_exchange(exchange)
         if not connector:
             return {"error": f"Exchange {exchange.value} not initialized", "symbol": symbol}
-
-        context: Dict[str, Any] = {"symbol": symbol, "timeframe": timeframe}
 
         # OHLCV + TA
         try:
@@ -358,6 +402,25 @@ class AgentOrchestrator:
         except Exception as e:
             logger.debug(f"[Orchestrator] store_decision_knowledge skipped: {e}")
 
+        # ── Live vault capture (fire-and-forget) ──────────────────────────────
+        # Write every significant agent decision to the Obsidian vault so the
+        # Intelligence brain map and Vault page learn from it in real time.
+        try:
+            from plugins.ObsidianKnowledgePlugin.backend.services.vault_capture import vault_capture
+            conf_val = float(confidence or 0)
+            if conf_val >= 0.4:  # only capture meaningful decisions
+                vault_capture(
+                    action_type="agent-decision",
+                    symbol=symbol,
+                    summary=f"{action.upper()} @ {timeframe} | conf={conf_val:.0%}",
+                    detail=reasoning.strip()[:400],
+                    tags=["agent-decision", symbol, action.lower(), timeframe],
+                    agent_role="signal_generator",
+                    confidence=conf_val,
+                )
+        except Exception:
+            pass
+
     @staticmethod
     async def _run_agent_with_memory(
         db: AsyncSession,
@@ -378,6 +441,24 @@ class AgentOrchestrator:
 
         # Inject stored knowledge + Graphify code map (plugin-optional)
         memory_prompt += await AgentOrchestrator._build_knowledge_graph_prompt(db, agent.role, symbol)
+
+        # ── Obsidian vault context (plugin-optional) ───────────────────────────
+        # When OBSIDIAN_INJECT_CONTEXT=true, recent vault notes for this symbol
+        # are appended to the memory prompt — enriching agent reasoning with
+        # human-curated strategy notes and historical signal journals.
+        if settings.OBSIDIAN_INJECT_CONTEXT:
+            try:
+                from plugins.ObsidianKnowledgePlugin.backend.services.vault_reader import VaultReader
+                vault_reader = VaultReader()
+                vault_context = vault_reader.get_context_for_symbol(symbol)
+                if vault_context:
+                    memory_prompt += (
+                        "\n\n## Obsidian Vault Knowledge\n"
+                        "_(Recent notes from the linked knowledge vault)_\n\n"
+                        + vault_context
+                    )
+            except Exception as _vault_exc:
+                logger.debug(f"[Orchestrator] Vault context skipped: {_vault_exc}")
 
         # Try local decision first (no LLM call)
         local = try_local_decision(past, agent.role)

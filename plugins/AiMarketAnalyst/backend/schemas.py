@@ -35,6 +35,9 @@ class LLMProviderPreset(BaseModel):
     monthly_limit: Optional[int] = None
     signup_url: str
     notes: str = ""
+    # When True, the UI shows an editable Base URL + free-text Model field
+    # (FreeLLMAPI proxy / generic custom OpenAI-compatible endpoints).
+    editable_endpoint: bool = False
 
 
 class AIProviderCreate(BaseModel):
@@ -126,7 +129,7 @@ class AIAgentCreate(BaseModel):
     slug: str = Field(..., max_length=50, pattern=r"^[a-z0-9-]+$")
     description: Optional[str] = None
     role_type: str = "custom"
-    model: str = "gpt-4o"
+    model: str = "fable-5-high"
     reasoning_effort: str = "medium"
     verbosity: str = "medium"
     max_output_tokens: Optional[int] = None

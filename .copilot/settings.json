@@ -1,0 +1,20 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "/Users/sakhilematsimela/.local/bin/headroom init hook ensure --profile init-tradebot-f58c4a32 --marker headroom-init-copilot",
+        "cwd": ".",
+        "timeout": 15
+      }
+    ],
+    "PreToolUse": [
+      {
+        "type": "command",
+        "command": "/Users/sakhilematsimela/.local/bin/headroom init hook ensure --profile init-tradebot-f58c4a32 --marker headroom-init-copilot",
+        "cwd": ".",
+        "timeout": 15
+      }
+    ]
+  }
+}

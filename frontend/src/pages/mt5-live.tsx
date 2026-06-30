@@ -481,6 +481,17 @@ function pnlColor(n: number) {
   return n >= 0 ? 'text-green-400' : 'text-red-400'
 }
 
+/** Safely extract a human-readable error string from an axios error.
+ *  FastAPI validation errors return detail as an array of {type,loc,msg,...} objects — we join them. */
+function apiErr(e: any): string {
+  const detail = e?.response?.data?.detail
+  if (!detail) return e?.message ?? 'Unknown error'
+  if (typeof detail === 'string') return detail
+  if (Array.isArray(detail)) return detail.map((d: any) => d?.msg ?? JSON.stringify(d)).join('; ')
+  if (typeof detail === 'object') return detail.msg ?? JSON.stringify(detail)
+  return String(detail)
+}
+
 // ── Component ──────────────────────────────────────────────────────────────────
 
 export default function MT5LivePage() {
@@ -494,6 +505,7 @@ export default function MT5LivePage() {
   const [syncing, setSyncing]           = useState(false)
   const [error, setError]               = useState<string | null>(null)
   const [chartSymbol, setChartSymbol]   = useState('XAUUSD')
+  const [chartTimeframe, setChartTimeframe] = useState('H1')
   const [chartMode, setChartMode]       = useState<'advanced' | 'classic' | 'sniper'>('sniper')
   const [showAdd, setShowAdd]           = useState(false)
   const [editingId, setEditingId]       = useState<number | null>(null)
@@ -556,7 +568,7 @@ export default function MT5LivePage() {
         setSelectedId(list[0].id)
       }
     } catch (e: any) {
-      setError(e?.response?.data?.detail ?? e.message)
+      setError(apiErr(e))
     } finally {
       setLoading(false)
     }
@@ -583,7 +595,7 @@ export default function MT5LivePage() {
       setDeals(dealRes.data)
     } catch (e: any) {
       // non-fatal — show in error banner without clobbering account data
-      setError(e?.response?.data?.detail ?? e.message)
+      setError(apiErr(e))
     }
   }, [selectedId])
 
@@ -648,7 +660,7 @@ export default function MT5LivePage() {
           : `Analysis complete — no new suggestions (already optimal or side mismatch)`,
       })
     } catch (e: any) {
-      setAutoManageMsg({ ok: false, text: e?.response?.data?.detail ?? 'Analysis failed' })
+      setAutoManageMsg({ ok: false, text: apiErr(e) })
     } finally {
       setAnalyzingPositions(false)
     }
@@ -676,7 +688,7 @@ export default function MT5LivePage() {
       setPositionSuggestions({})
       await fetchAccountData()
     } catch (e: any) {
-      setAutoManageMsg({ ok: false, text: e?.response?.data?.detail ?? 'Apply failed' })
+      setAutoManageMsg({ ok: false, text: apiErr(e) })
     } finally {
       setApplyingAll(false)
     }
@@ -709,7 +721,7 @@ export default function MT5LivePage() {
         setAutoManageMsg({ ok: true, text: 'Auto-manage loop started (60s interval)' })
       }
     } catch (e: any) {
-      setAutoManageMsg({ ok: false, text: e?.response?.data?.detail ?? 'Failed to toggle auto-manage loop' })
+      setAutoManageMsg({ ok: false, text: apiErr(e) })
     } finally {
       setAutoManageLoading(false)
     }
@@ -806,7 +818,7 @@ export default function MT5LivePage() {
       await fetchAccounts()
       await fetchAccountData()
     } catch (e: any) {
-      setError(e?.response?.data?.detail ?? e.message)
+      setError(apiErr(e))
     } finally {
       setSyncing(false)
     }
@@ -821,7 +833,7 @@ export default function MT5LivePage() {
       // Refresh account list to pick up updated reachable status
       await fetchAccounts()
     } catch (e: any) {
-      setRetestResult({ reachable: false, error: e?.response?.data?.detail ?? e.message })
+      setRetestResult({ reachable: false, error: apiErr(e) })
     } finally {
       setRetestId(null)
     }
@@ -845,7 +857,7 @@ export default function MT5LivePage() {
       })
       setTestResult(res.data)
     } catch (e: any) {
-      setTestResult({ reachable: false, error: e?.response?.data?.detail ?? e.message })
+      setTestResult({ reachable: false, error: apiErr(e) })
     } finally {
       setTestLoading(false)
     }
@@ -894,7 +906,7 @@ export default function MT5LivePage() {
       setTestResult(null)
       await fetchAccounts()
     } catch (e: any) {
-      setAddError(e?.response?.data?.detail ?? e.message)
+      setAddError(apiErr(e))
     } finally {
       setAddLoading(false)
     }
@@ -907,7 +919,7 @@ export default function MT5LivePage() {
       if (selectedId === id) setSelectedId(null)
       await fetchAccounts()
     } catch (e: any) {
-      setError(e?.response?.data?.detail ?? e.message)
+      setError(apiErr(e))
     }
   }
 
@@ -927,7 +939,7 @@ export default function MT5LivePage() {
       setTradeMsg({ ok: true, text: `${tradeForm.operation.toUpperCase()} ${tradeForm.volume} ${tradeForm.symbol} sent` })
       await fetchAccountData()
     } catch (e: any) {
-      setTradeMsg({ ok: false, text: e?.response?.data?.detail ?? e.message })
+      setTradeMsg({ ok: false, text: apiErr(e) })
     } finally {
       setTradeLoading(false)
     }
@@ -946,7 +958,7 @@ export default function MT5LivePage() {
       setTradeMsg({ ok: true, text: `${operation.toUpperCase()} ${volume} ${symbol} sent` })
       await fetchAccountData()
     } catch (e: any) {
-      setTradeMsg({ ok: false, text: e?.response?.data?.detail ?? e.message })
+      setTradeMsg({ ok: false, text: apiErr(e) })
     }
   }
 
@@ -956,7 +968,7 @@ export default function MT5LivePage() {
       await apiClient.mt5.closeTrade({ account_id: selectedId, ticket })
       await fetchAccountData()
     } catch (e: any) {
-      setError(e?.response?.data?.detail ?? e.message)
+      setError(apiErr(e))
     }
   }
 
@@ -968,7 +980,7 @@ export default function MT5LivePage() {
       await apiClient.mt5.cancelPendingOrder(selectedId, ticket)
       await fetchAccountData()
     } catch (e: any) {
-      setError(e?.response?.data?.detail ?? e.message)
+      setError(apiErr(e))
     } finally {
       setCancelingTicket(null)
     }
@@ -999,22 +1011,62 @@ export default function MT5LivePage() {
   const brokerFloating = positions.reduce((s, p) => s + p.profit, 0)
   const hasPositions = positions.length > 0
 
-  const totalFloating = exchBalance ? exchBalance.unrealizedPnl : brokerFloating
+  // Resolved display values.
+  // Rule: use exchBalance ONLY when it carries meaningful data (non-zero balance)
+  // OR when the MT5 DB has no balance stored yet.
+  // This prevents Bitget API returning 0 (no API keys / empty account) from
+  // overriding real MT5 broker data that IS stored in the DB.
+  const mt5HasBalance = (selected?.balance ?? 0) > 0 || (selected?.equity ?? 0) > 0
+  const useExchBal = exchBalance != null && (!mt5HasBalance || (exchBalance.balance ?? 0) > 0)
 
-  // Resolved display values (exchange fallback overrides MT5 zeros)
-  const displayBalance     = exchBalance ? exchBalance.balance     : selected?.balance     ?? 0
+  const totalFloating = useExchBal ? exchBalance!.unrealizedPnl : brokerFloating
+
+  const displayBalance     = useExchBal ? exchBalance!.balance     : selected?.balance     ?? 0
   // Equity = balance + floating P&L (matches the broker's equity at each sync).
-  const displayEquity      = exchBalance
-    ? exchBalance.equity
+  const displayEquity      = useExchBal
+    ? exchBalance!.equity
     : (selected?.balance ?? 0) + totalFloating
-  const displayFreeMargin  = exchBalance ? exchBalance.available   : selected?.free_margin ?? 0
-  const displayCurrency    = exchBalance ? exchBalance.currency    : selected?.currency    ?? 'USD'
+  const displayFreeMargin  = useExchBal ? exchBalance!.available   : selected?.free_margin ?? 0
+  const displayCurrency    = useExchBal ? exchBalance!.currency    : selected?.currency    ?? 'USD'
   // Margin level = equity / used-margin × 100, recomputed from equity.
   const usedMargin         = selected?.margin ?? 0
-  const displayMarginLevel = !exchBalance && usedMargin > 0
+  const displayMarginLevel = !useExchBal && usedMargin > 0
     ? (displayEquity / usedMargin) * 100
     : selected?.margin_level ?? null
   const brokerName         = selected ? getBrokerFromServer(selected.server) : ''
+
+  // ── JARVIS context bridge ───────────────────────────────────────────────────────
+  // Publish the currently selected MT5 account + chart symbol to the global JARVIS
+  // assistant (PaulChat) so it can analyse / place sniper setups for the right
+  // account without the user having to specify the symbol. Uses the existing
+  // `__jarvisPage` postMessage convention.
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    if (selectedId == null) return
+    window.postMessage({
+      __jarvisPage: true,
+      type: 'mt5-context',
+      accountId: selectedId,
+      symbol: chartSymbol,
+      timeframe: chartTimeframe,
+      balance: displayBalance,
+      currency: displayCurrency,
+    }, '*')
+  }, [selectedId, chartSymbol, chartTimeframe, displayBalance, displayCurrency])
+
+  // Allow JARVIS to request a positions/orders refresh after it places an order
+  // from the chat (so the page reflects the new pending order immediately).
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const onMsg = (e: MessageEvent) => {
+      const d = e.data
+      if (d && d.__jarvisPage && d.type === 'mt5-refresh') {
+        fetchAccountData()
+      }
+    }
+    window.addEventListener('message', onMsg)
+    return () => window.removeEventListener('message', onMsg)
+  }, [fetchAccountData])
 
   // ── Render ────────────────────────────────────────────────────────────────────
 
@@ -1510,6 +1562,8 @@ export default function MT5LivePage() {
                       onCancelOrder={handleCancelOrder}
                       onPlaced={fetchAccountData}
                       positions={positions}
+                      onSymbolChange={s => { setChartSymbol(s); setTradeForm(p => ({ ...p, symbol: s })) }}
+                      onTimeframeChange={tf => setChartTimeframe(tf)}
                     />
                   </ChartErrorBoundary>
                 ) : chartMode === 'advanced' ? (
