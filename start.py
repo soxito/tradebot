@@ -802,15 +802,26 @@ def preflight_check(mode: str) -> bool:
             info(f"Missing pip packages: {', '.join(missing_pkgs)} — installing …")
             pip = VENV / "bin" / "pip"
             reqs_file = BACKEND_DIR / "requirements.txt"
-            # Upgrade pip itself first — old pip versions fail on binary wheels
-            # (asyncpg, cryptography, etc.) and produce cryptic errors.
+            lock_file = BACKEND_DIR / "requirements-lock.txt"
+            # Upgrade pip itself first — old pip versions fail on binary wheels.
             _spinner_run([str(pip), "install", "--quiet", "--upgrade", "pip"],
                          "Upgrading pip", timeout=60)
-            ok_p, err_p = _spinner_run(
-                [str(pip), "install", "--prefer-binary", "--upgrade", "-r", str(reqs_file)],
-                "pip install -r requirements.txt",
-                cwd=BACKEND_DIR, timeout=360
-            )
+            # Prefer the fully-pinned lockfile: --no-deps skips resolution entirely,
+            # avoiding the "dependency graph too complex" error from ccxt/openai trees.
+            if lock_file.exists():
+                ok_p, err_p = _spinner_run(
+                    [str(pip), "install", "--prefer-binary", "--no-deps",
+                     "-r", str(lock_file)],
+                    "pip install -r requirements-lock.txt",
+                    cwd=BACKEND_DIR, timeout=360
+                )
+            else:
+                ok_p, err_p = _spinner_run(
+                    [str(pip), "install", "--prefer-binary", "--upgrade",
+                     "-r", str(reqs_file)],
+                    "pip install -r requirements.txt",
+                    cwd=BACKEND_DIR, timeout=360
+                )
             if ok_p:
                 # Re-check every package individually
                 still_missing = [
@@ -1113,7 +1124,16 @@ def ensure_pip_deps() -> bool:
     # Upgrade pip first — stale pip misses binary wheels for asyncpg, etc.
     run([str(pip), "install", "--quiet", "--upgrade", "pip"], cwd=BACKEND_DIR)
 
-    r = run([str(pip), "install", "--prefer-binary", "--upgrade", "-r", str(reqs)], cwd=BACKEND_DIR)
+    # Use the fully-pinned lockfile when available — it lets pip skip dependency
+    # resolution entirely (--no-deps) which avoids the "graph too complex" error
+    # caused by ccxt + openai + headroom-ai having very deep transitive trees.
+    lock = BACKEND_DIR / "requirements-lock.txt"
+    if lock.exists():
+        r = run([str(pip), "install", "--prefer-binary", "--no-deps",
+                 "-r", str(lock)], cwd=BACKEND_DIR)
+    else:
+        r = run([str(pip), "install", "--prefer-binary", "--upgrade",
+                 "-r", str(reqs)], cwd=BACKEND_DIR)
     if r.returncode != 0:
         fail(f"pip install failed:\n{r.stderr[:600]}")
         return False
