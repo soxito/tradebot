@@ -807,7 +807,7 @@ def preflight_check(mode: str) -> bool:
             _spinner_run([str(pip), "install", "--quiet", "--upgrade", "pip"],
                          "Upgrading pip", timeout=60)
             ok_p, err_p = _spinner_run(
-                [str(pip), "install", "--upgrade", "-r", str(reqs_file)],
+                [str(pip), "install", "--prefer-binary", "--upgrade", "-r", str(reqs_file)],
                 "pip install -r requirements.txt",
                 cwd=BACKEND_DIR, timeout=360
             )
@@ -1113,7 +1113,7 @@ def ensure_pip_deps() -> bool:
     # Upgrade pip first — stale pip misses binary wheels for asyncpg, etc.
     run([str(pip), "install", "--quiet", "--upgrade", "pip"], cwd=BACKEND_DIR)
 
-    r = run([str(pip), "install", "--upgrade", "-r", str(reqs)], cwd=BACKEND_DIR)
+    r = run([str(pip), "install", "--prefer-binary", "--upgrade", "-r", str(reqs)], cwd=BACKEND_DIR)
     if r.returncode != 0:
         fail(f"pip install failed:\n{r.stderr[:600]}")
         return False
