@@ -22,6 +22,7 @@ import { apiClient } from '@/services/api'
 const PaulChat = dynamic(() => import('@/components/PaulChat'), { ssr: false })
 const TradingViewWidget = dynamic(() => import('@/components/TradingViewWidget'), { ssr: false })
 const ExtensionInstallPrompt = dynamic(() => import('@/components/ExtensionInstallPrompt'), { ssr: false })
+const FaceVisionPanel = dynamic(() => import('@/components/FaceVisionPanel'), { ssr: false })
 
 function soxSpeak(text: string) {
   if (typeof window === 'undefined' || !text) return
@@ -1004,6 +1005,14 @@ export default function SoxRoom() {
             </div>
           )
         })}
+      </DraggablePanel>
+
+      {/* ═══ DRAGGABLE — FACE VISION ═══ */}
+      <DraggablePanel
+        id="sox-facevision" title="FACE VISION" defaultX={16} defaultY={430} width={300}
+        color="rgba(6,182,212,0.34)"
+      >
+        <FaceVisionPanel />
       </DraggablePanel>
 
       {/* ═══ DRAGGABLE — ACCOUNTS · LIVE ═══ */}

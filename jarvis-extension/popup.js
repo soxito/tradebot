@@ -642,137 +642,123 @@ setInterval(() => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Face Vision Integration
+//
+//  The camera runs in a full extension TAB (camera.html) or in the JARVIS Room
+//  page — both are stable origins where the browser reliably prompts for camera
+//  permission. MV3 popups cannot prompt, so the popup only OPENS those surfaces
+//  and shows the live face status relayed through background.js.
 // ─────────────────────────────────────────────────────────────────────────────
 ;(function initFaceVision () {
-  const fvSwitch     = document.getElementById('faceVisionSwitch')
-  const fvBody       = document.getElementById('fvBody')
-  const fvWrap       = document.getElementById('fvWrap')
-  const fvNoCamera   = document.getElementById('fvNoCamera')
-  const fvVideo      = document.getElementById('fvVideo')
-  const fvCanvas     = document.getElementById('fvCanvas')
-  const fvEnrollBtn  = document.getElementById('fvEnrollBtn')
-  const fvClearBtn   = document.getElementById('fvClearBtn')
-  const fvMarBar     = document.getElementById('fvMarBar')
-  const fvMarVal     = document.getElementById('fvMarVal')
-  const fvSpeakVal   = document.getElementById('fvSpeakVal')
-  const fvIdentityVal= document.getElementById('fvIdentityVal')
-  const fvBackendVal = document.getElementById('fvBackendVal')
-  const fvWsDot      = document.getElementById('fvWsDot')
-  const fvTalking    = document.getElementById('fvTalkingBadge')
+  const fvSwitch      = document.getElementById('faceVisionSwitch')
+  const fvBody        = document.getElementById('fvBody')
+  const fvOpenCamera  = document.getElementById('fvOpenCameraBtn')
+  const fvOpenRoom    = document.getElementById('fvOpenRoomBtn')
+  const fvMarBar      = document.getElementById('fvMarBar')
+  const fvMarVal      = document.getElementById('fvMarVal')
+  const fvSpeakVal    = document.getElementById('fvSpeakVal')
+  const fvIdentityVal = document.getElementById('fvIdentityVal')
+  const fvBackendVal  = document.getElementById('fvBackendVal')
+  const fvWsDot       = document.getElementById('fvWsDot')
+  const fvTalking     = document.getElementById('fvTalkingBadge')
 
-  if (!fvSwitch || !JarvisFaceVision) return
+  if (!fvSwitch) return
 
   let fvEnabled = false
+  let statusTimer = null
 
   // ── Persist on/off across popup opens ──────────────────────────────────
   api.storage.local.get(['faceVisionEnabled'], (r) => {
     fvEnabled = !!r.faceVisionEnabled
-    applyFaceVisionState(fvEnabled, false)
+    applyState(fvEnabled)
   })
 
   applySwitch(fvSwitch, fvEnabled)
 
-  fvSwitch.addEventListener('click', async () => {
+  fvSwitch.addEventListener('click', () => {
     fvEnabled = !fvEnabled
     applySwitch(fvSwitch, fvEnabled)
     api.storage.local.set({ faceVisionEnabled: fvEnabled })
-    applyFaceVisionState(fvEnabled, true)
+    applyState(fvEnabled)
   })
 
-  async function applyFaceVisionState (on, doStart) {
+  function applyState (on) {
     fvBody.style.display = on ? 'block' : 'none'
-    if (!on) {
-      JarvisFaceVision.stopCamera()
-      fvWrap.style.display    = 'none'
-      fvNoCamera.style.display = 'flex'
+    clearInterval(statusTimer)
+    statusTimer = null
+    if (on) {
+      pollStatus()
+      statusTimer = setInterval(pollStatus, 400)  // live relayed status
+    } else {
       fvTalking.classList.remove('visible')
-      return
     }
-    if (!doStart) return
-    await JarvisFaceVision.init(fvVideo, fvCanvas)
-    await JarvisFaceVision.startCamera()
-    fvWrap.style.display    = 'block'
-    fvNoCamera.style.display = 'none'
   }
 
-  // ── Events from face-vision.js ──────────────────────────────────────────
-  JarvisFaceVision.on('camera', ({ active }) => {
-    if (active) {
-      fvWrap.style.display     = 'block'
-      fvNoCamera.style.display = 'none'
-    } else {
-      fvWrap.style.display     = 'none'
-      fvNoCamera.style.display = 'flex'
+  // ── Open the camera surfaces ───────────────────────────────────────────
+  fvOpenCamera.addEventListener('click', () => {
+    try { api.tabs.create({ url: api.runtime.getURL('camera.html') }) } catch (e) {
+      console.warn('open camera tab failed', e)
     }
   })
-
-  JarvisFaceVision.on('ws', ({ connected }) => {
-    fvWsDot.classList.toggle('on', connected)
-    fvBackendVal.textContent = connected ? 'connected' : 'offline'
-    fvBackendVal.className   = 'fv-stat-value ' + (connected ? 'ok' : 'warn')
+  fvOpenRoom.addEventListener('click', () => {
+    api.tabs.query({ url: ['http://localhost:3000/*', 'http://127.0.0.1:3000/*'] }, (tabs) => {
+      const roomUrl = 'http://localhost:3000/jarvis-room'
+      if (tabs && tabs[0]) {
+        api.tabs.update(tabs[0].id, { active: true, url: roomUrl })
+        if (tabs[0].windowId != null) api.windows.update(tabs[0].windowId, { focused: true })
+      } else {
+        api.tabs.create({ url: roomUrl })
+      }
+    })
   })
 
-  JarvisFaceVision.on('frame', ({ facePresent, mar, isTalking, identityMatch }) => {
-    // MAR bar
-    const pct = Math.min(mar / 0.65, 1) * 100
-    fvMarBar.style.width      = pct + '%'
-    fvMarBar.style.background = isTalking ? '#22c55e' : '#06b6d4'
-    fvMarVal.textContent      = mar.toFixed(3)
-    fvMarVal.className        = 'fv-stat-value ' + (isTalking ? 'ok' : 'cyan')
+  // ── Poll live face status from background (relayed from camera tab/room) ─
+  function pollStatus () {
+    api.runtime.sendMessage({ type: 'get-face-state' }, (s) => {
+      if (api.runtime.lastError || !s) { renderOffline(); return }
+      const fresh = s.lastUpdateMs && (Date.now() - s.lastUpdateMs) < 2000
+      if (!fresh) { renderOffline(); return }
 
-    // Talking
-    fvSpeakVal.textContent = isTalking ? 'TALKING' : 'silent'
-    fvSpeakVal.className   = 'fv-stat-value ' + (isTalking ? 'ok' : 'dim')
-    fvTalking.classList.toggle('visible', isTalking)
+      // WS / camera dot
+      fvWsDot.classList.add('on')
+      fvBackendVal.textContent = 'live'
+      fvBackendVal.className   = 'fv-stat-value ok'
 
-    // Identity
-    const enrolled = JarvisFaceVision.isEnrolled()
-    if (!facePresent) {
-      fvIdentityVal.textContent = 'no face'
-      fvIdentityVal.className   = 'fv-stat-value dim'
-    } else if (!enrolled) {
-      fvIdentityVal.textContent = 'not enrolled'
-      fvIdentityVal.className   = 'fv-stat-value warn'
-    } else {
-      fvIdentityVal.textContent = identityMatch ? '✓ YOU' : '? unknown'
-      fvIdentityVal.className   = 'fv-stat-value ' + (identityMatch ? 'ok' : 'warn')
-    }
-  })
+      // MAR bar
+      const mar = s.mar || 0
+      const pct = Math.min(mar / 0.65, 1) * 100
+      fvMarBar.style.width      = pct + '%'
+      fvMarBar.style.background = s.isTalking ? '#22c55e' : '#06b6d4'
+      fvMarVal.textContent      = mar.toFixed(3)
+      fvMarVal.className        = 'fv-stat-value ' + (s.isTalking ? 'ok' : 'cyan')
 
-  JarvisFaceVision.on('enrolling', ({ stage }) => {
-    fvEnrollBtn.textContent  = stage === 'start' ? '⟳ Enrolling…' : '⟳ Sampling…'
-    fvEnrollBtn.disabled     = true
-  })
+      // Talking
+      fvSpeakVal.textContent = s.isTalking ? 'TALKING' : 'silent'
+      fvSpeakVal.className   = 'fv-stat-value ' + (s.isTalking ? 'ok' : 'dim')
+      fvTalking.classList.toggle('visible', !!s.isTalking)
 
-  JarvisFaceVision.on('enrolled', ({ success, cleared }) => {
-    fvEnrollBtn.textContent = '⊕ Enroll Face'
-    fvEnrollBtn.disabled    = false
-    if (success) {
-      fvEnrollBtn.textContent = '✓ Enrolled!'
-      setTimeout(() => { fvEnrollBtn.textContent = '⊕ Re-Enroll' }, 2500)
-    } else if (cleared) {
-      fvIdentityVal.textContent = 'cleared'
-    }
-  })
-
-  JarvisFaceVision.on('error', ({ msg }) => {
-    fvEnrollBtn.textContent = '⊕ Enroll Face'
-    fvEnrollBtn.disabled    = false
-    console.warn('[FaceVision]', msg)
-  })
-
-  // ── Enroll / Clear buttons ─────────────────────────────────────────────
-  fvEnrollBtn.addEventListener('click', () => JarvisFaceVision.enrollFace())
-  fvClearBtn.addEventListener('click',  () => {
-    if (confirm('Clear enrolled face?')) JarvisFaceVision.clearEnrollment()
-  })
-
-  // ── If face vision was previously on, auto-start ───────────────────────
-  if (fvEnabled) {
-    JarvisFaceVision.init(fvVideo, fvCanvas).then(() => {
-      JarvisFaceVision.startCamera()
-      fvWrap.style.display     = 'block'
-      fvNoCamera.style.display = 'none'
+      // Identity
+      if (!s.facePresent) {
+        fvIdentityVal.textContent = 'no face'; fvIdentityVal.className = 'fv-stat-value dim'
+      } else if (s.identityMatch) {
+        fvIdentityVal.textContent = '✓ YOU';   fvIdentityVal.className = 'fv-stat-value ok'
+      } else {
+        fvIdentityVal.textContent = '? unknown'; fvIdentityVal.className = 'fv-stat-value warn'
+      }
     })
   }
+
+  function renderOffline () {
+    fvWsDot.classList.remove('on')
+    fvBackendVal.textContent = 'off'
+    fvBackendVal.className   = 'fv-stat-value dim'
+    fvSpeakVal.textContent   = 'silent'
+    fvSpeakVal.className      = 'fv-stat-value dim'
+    fvTalking.classList.remove('visible')
+    fvMarBar.style.width = '0%'
+    fvMarVal.textContent = '0.00'
+    fvMarVal.className    = 'fv-stat-value dim'
+    fvIdentityVal.textContent = '—'
+    fvIdentityVal.className    = 'fv-stat-value dim'
+  }
 })()
+

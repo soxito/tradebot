@@ -1127,6 +1127,28 @@
           // speaker is the calibrated user. We use this to update the panel ring.
           pageVoiceMatch = !!d.isMatch
           break
+
+        case 'jarvis-face-state':
+          // The JARVIS Room's FaceVisionPanel broadcasts face/lip state here.
+          // Store it locally (keeps speech↔face sync working when the Room is
+          // the active camera) AND relay to background so the popup mirrors it.
+          faceState = {
+            present: !!d.facePresent,
+            talking: !!d.isTalking,
+            match:   !!d.identityMatch,
+            mar:     d.mar || 0,
+            ts:      Date.now(),
+          }
+          try {
+            api.runtime.sendMessage({
+              type: 'face-vision-update',
+              facePresent: faceState.present,
+              isTalking: faceState.talking,
+              mar: faceState.mar,
+              identityMatch: faceState.match,
+            }).catch?.(() => {})
+          } catch { /* noop */ }
+          break
       }
     } catch { /* noop */ }
   })

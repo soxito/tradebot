@@ -554,39 +554,38 @@
 
       <!-- Camera + stats row (hidden until enabled) -->
       <div id="fvBody" style="display:none;padding:0 12px 10px">
-        <div class="fv-camera-row">
-          <!-- Video preview -->
-          <div id="fvWrap" class="fv-wrap" style="display:none">
-            <video id="fvVideo" class="fv-video" autoplay muted playsinline></video>
-            <canvas id="fvCanvas" class="fv-canvas"></canvas>
-          </div>
-          <div id="fvNoCamera" class="fv-no-camera">
-            <div class="fv-icon">📷</div>
-            <div>Camera off</div>
-          </div>
+        <!-- Camera preview surfaces (extension tab + JARVIS Room) -->
+        <div class="fv-btn-row">
+          <button class="fv-btn cyan" id="fvOpenCameraBtn">📷 Open Camera Preview</button>
+          <button class="fv-btn" id="fvOpenRoomBtn">🛰 JARVIS Room</button>
+        </div>
+        <div style="font-size:9px;color:var(--muted);margin:6px 0 8px;line-height:1.5">
+          The camera opens in a tab so the browser can ask permission reliably
+          (extension popups can't prompt). Allow the camera there, then enroll
+          your face. Live status shows here.
+        </div>
 
-          <!-- Stats column -->
-          <div class="fv-status-grid">
-            <div class="fv-stat">
-              <span class="fv-stat-icon">👤</span>
-              <span class="fv-stat-label">Identity</span>
-              <span class="fv-stat-value dim" id="fvIdentityVal">—</span>
-            </div>
-            <div class="fv-stat">
-              <span class="fv-stat-icon">👄</span>
-              <span class="fv-stat-label">Mouth</span>
-              <span class="fv-stat-value cyan" id="fvMarVal">0.00</span>
-            </div>
-            <div class="fv-stat">
-              <span class="fv-stat-icon">🗣</span>
-              <span class="fv-stat-label">Speaking</span>
-              <span class="fv-stat-value dim" id="fvSpeakVal">silent</span>
-            </div>
-            <div class="fv-stat">
-              <span class="fv-stat-icon">📡</span>
-              <span class="fv-stat-label">Backend</span>
-              <span class="fv-stat-value dim" id="fvBackendVal">offline</span>
-            </div>
+        <!-- Stats grid -->
+        <div class="fv-status-grid" style="gap:6px">
+          <div class="fv-stat">
+            <span class="fv-stat-icon">👤</span>
+            <span class="fv-stat-label">Identity</span>
+            <span class="fv-stat-value dim" id="fvIdentityVal">—</span>
+          </div>
+          <div class="fv-stat">
+            <span class="fv-stat-icon">👄</span>
+            <span class="fv-stat-label">Mouth</span>
+            <span class="fv-stat-value cyan" id="fvMarVal">0.00</span>
+          </div>
+          <div class="fv-stat">
+            <span class="fv-stat-icon">🗣</span>
+            <span class="fv-stat-label">Speaking</span>
+            <span class="fv-stat-value dim" id="fvSpeakVal">silent</span>
+          </div>
+          <div class="fv-stat">
+            <span class="fv-stat-icon">📡</span>
+            <span class="fv-stat-label">Camera</span>
+            <span class="fv-stat-value dim" id="fvBackendVal">off</span>
           </div>
         </div>
 
@@ -595,13 +594,8 @@
           <div class="fv-mar-bar" id="fvMarBar"></div>
         </div>
 
-        <!-- Action buttons -->
-        <div class="fv-btn-row" style="margin-top:8px">
-          <button class="fv-btn green" id="fvEnrollBtn">⊕ Enroll Face</button>
-          <button class="fv-btn red"   id="fvClearBtn">✕ Clear</button>
-        </div>
-        <div style="font-size:9px;color:var(--muted);margin-top:5px;line-height:1.5">
-          GPU via MediaPipe FaceMesh (478 pts) · face_recognition identity · lip MAR tracking
+        <div style="font-size:9px;color:var(--muted);margin-top:6px;line-height:1.5">
+          GPU MediaPipe FaceLandmarker (478 pts) · face_recognition identity · lip MAR + jawOpen tracking · speech↔face sync
         </div>
       </div>
     </div>
@@ -675,7 +669,6 @@
     <kbd>close BTCUSDT</kbd>
   </div>
 
-  <script src="face-vision.js"></script>
-<script src="popup.js"></script>
+  <script src="popup.js"></script>
 </body>
 </html>

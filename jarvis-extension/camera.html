@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>JARVIS — Face Vision Camera</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --cyan: #06b6d4; --purple: #8b5cf6; --green: #22c55e;
+      --red: #ef4444; --amber: #f59e0b;
+      --bg: #060b16; --card: #101a2e; --border: rgba(255,255,255,.08);
+      --text: #e2e8f0; --muted: #64748b;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: radial-gradient(circle at 50% 0%, #0c1830 0%, #060b16 60%);
+      color: var(--text); min-height: 100vh;
+      display: flex; flex-direction: column; align-items: center;
+      padding: 24px 16px 40px;
+    }
+    .header { text-align: center; margin-bottom: 18px; }
+    .logo { font-size: 34px; margin-bottom: 6px; }
+    h1 { font-size: 20px; font-weight: 700; letter-spacing: .04em; }
+    .sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
+
+    .stage {
+      position: relative; width: min(720px, 92vw);
+      aspect-ratio: 4 / 3; background: #000;
+      border-radius: 16px; overflow: hidden;
+      border: 1px solid var(--border);
+      box-shadow: 0 12px 48px rgba(6,182,212,.15);
+    }
+    #video { width: 100%; height: 100%; object-fit: cover; display: block; transform: scaleX(-1); }
+    #overlay { position: absolute; inset: 0; width: 100%; height: 100%; transform: scaleX(-1); pointer-events: none; }
+    .no-cam {
+      position: absolute; inset: 0; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 12px;
+      color: var(--muted); text-align: center; padding: 24px;
+    }
+    .no-cam .ic { font-size: 52px; }
+    .no-cam .msg { font-size: 14px; max-width: 460px; line-height: 1.6; }
+
+    .talking-badge {
+      position: absolute; top: 14px; right: 14px;
+      display: none; align-items: center; gap: 6px;
+      background: rgba(34,197,94,.2); border: 1px solid rgba(34,197,94,.5);
+      color: #86efac; border-radius: 22px; padding: 5px 12px;
+      font-size: 12px; font-weight: 600; transform: scaleX(-1);
+      animation: pulse 1.2s infinite;
+    }
+    .talking-badge.on { display: inline-flex; }
+    @keyframes pulse { 0%,100%{box-shadow:0 0 0 0 rgba(34,197,94,0)} 50%{box-shadow:0 0 0 6px rgba(34,197,94,.2)} }
+
+    .stats {
+      display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px;
+      width: min(720px, 92vw); margin-top: 16px;
+    }
+    .stat {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 12px; padding: 12px 14px;
+    }
+    .stat .k { font-size: 10px; color: var(--muted); letter-spacing: .06em; text-transform: uppercase; }
+    .stat .v { font-size: 17px; font-weight: 700; margin-top: 4px; }
+    .v.ok { color: var(--green); } .v.cyan { color: var(--cyan); }
+    .v.warn { color: var(--amber); } .v.dim { color: var(--muted); }
+
+    .mar-wrap { width: min(720px, 92vw); margin-top: 12px; height: 8px; border-radius: 4px; background: rgba(255,255,255,.06); overflow: hidden; }
+    .mar-bar { height: 100%; width: 0%; border-radius: 4px; background: var(--cyan); transition: width .1s, background .15s; }
+
+    .controls { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; width: min(720px, 92vw); margin-top: 18px; }
+    button {
+      font-family: inherit; font-size: 13px; font-weight: 600;
+      border-radius: 10px; padding: 11px 20px; cursor: pointer;
+      border: 1px solid var(--border); background: var(--card); color: var(--text);
+      transition: all .15s;
+    }
+    button:hover { filter: brightness(1.2); }
+    button:disabled { opacity: .5; cursor: default; }
+    button.cyan  { border-color: rgba(6,182,212,.5);  color: var(--cyan); background: rgba(6,182,212,.1); }
+    button.green { border-color: rgba(34,197,94,.5);  color: var(--green); background: rgba(34,197,94,.1); }
+    button.red   { border-color: rgba(239,68,68,.5);  color: var(--red);  background: rgba(239,68,68,.1); }
+
+    .footer { margin-top: 22px; font-size: 11px; color: var(--muted); text-align: center; line-height: 1.7; max-width: 520px; }
+    .ws-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #334155; margin-right: 6px; }
+    .ws-dot.on { background: var(--green); }
+    .err { color: var(--amber); margin-top: 10px; font-size: 12px; min-height: 16px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="logo">👁</div>
+    <h1>JARVIS Face Vision</h1>
+    <div class="sub">GPU face detection · identity recognition · lip / mouth tracking</div>
+  </div>
+
+  <div class="stage">
+    <video id="video" autoplay muted playsinline></video>
+    <canvas id="overlay"></canvas>
+    <div class="talking-badge" id="talkingBadge">🗣 TALKING</div>
+    <div class="no-cam" id="noCam">
+      <div class="ic">📷</div>
+      <div class="msg">
+        Click <b>Start Camera</b> below. Your browser will ask for camera
+        permission — click <b>Allow</b>. Nothing is uploaded; frames go only to
+        your local JARVIS backend for face &amp; lip analysis.
+      </div>
+    </div>
+  </div>
+
+  <div class="mar-wrap"><div class="mar-bar" id="marBar"></div></div>
+
+  <div class="stats">
+    <div class="stat"><div class="k">Identity</div><div class="v dim" id="idVal">—</div></div>
+    <div class="stat"><div class="k">Mouth (MAR)</div><div class="v cyan" id="marVal">0.00</div></div>
+    <div class="stat"><div class="k">Speaking</div><div class="v dim" id="speakVal">silent</div></div>
+    <div class="stat"><div class="k">Backend</div><div class="v dim" id="backendVal"><span class="ws-dot" id="wsDot"></span>offline</div></div>
+  </div>
+
+  <div class="controls">
+    <button class="cyan"  id="startBtn">📷 Start Camera</button>
+    <button class="green" id="enrollBtn" disabled>⊕ Enroll My Face</button>
+    <button class="red"   id="clearBtn">✕ Clear Enrollment</button>
+    <button id="stopBtn" disabled>⏹ Stop</button>
+  </div>
+
+  <div class="err" id="errMsg"></div>
+
+  <div class="footer">
+    This preview runs inside the JARVIS extension. Once you allow the camera here,
+    the extension popup can show live face status too. Close this tab to stop the
+    camera. &nbsp;|&nbsp; Backend: <code>ws://127.0.0.1:1448</code>
+  </div>
+
+  <script src="face-vision.js"></script>
+  <script src="camera.js"></script>
+</body>
+</html>
