@@ -669,6 +669,7 @@ setInterval(() => {
   // ── Persist on/off across popup opens ──────────────────────────────────
   api.storage.local.get(['faceVisionEnabled'], (r) => {
     fvEnabled = !!r.faceVisionEnabled
+    applySwitch(fvSwitch, fvEnabled)   // reflect the saved state on the switch
     applyState(fvEnabled)
   })
 
@@ -679,6 +680,10 @@ setInterval(() => {
     applySwitch(fvSwitch, fvEnabled)
     api.storage.local.set({ faceVisionEnabled: fvEnabled })
     applyState(fvEnabled)
+    // Turning the feature OFF stops any running camera (extension tab / room).
+    if (!fvEnabled) {
+      try { api.runtime.sendMessage({ type: 'face-camera-stop' }).catch?.(() => {}) } catch { /* noop */ }
+    }
   })
 
   function applyState (on) {
@@ -690,6 +695,7 @@ setInterval(() => {
       statusTimer = setInterval(pollStatus, 400)  // live relayed status
     } else {
       fvTalking.classList.remove('visible')
+      renderOffline()
     }
   }
 

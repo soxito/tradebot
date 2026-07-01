@@ -104,6 +104,16 @@
   // Auto-init the engine so enrollment state loads from the backend
   FV.init(video, overlay).catch(() => {})
 
+  // Popup toggled Face Vision OFF → stop the camera in this tab.
+  try {
+    const rt = (typeof browser !== 'undefined' && browser.runtime) ? browser : chrome
+    rt.runtime.onMessage.addListener((msg) => {
+      if (msg && msg.type === 'face-camera-stop') {
+        try { FV.stopCamera() } catch { /* noop */ }
+      }
+    })
+  } catch { /* noop */ }
+
   // Stop the camera cleanly when the tab is closed/hidden
   window.addEventListener('beforeunload', () => { try { FV.stopCamera() } catch {} })
 })()

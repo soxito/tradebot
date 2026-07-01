@@ -483,9 +483,10 @@ def _safe_float(val, default: float = 0.0) -> float:
 # Fallback version only — the real version is ALWAYS read live from
 # jarvis-extension/manifest.json (see _ext_version()). Keep this in sync so a
 # missing manifest never advertises a stale version.
-_EXT_VERSION = "3.5.0"
+_EXT_VERSION = "3.5.1"
 _EXT_RELEASED = "2026-07-02"
 _EXT_CHANGELOG = [
+    "Face Vision toggle now reliably turns the camera on/off and remembers its state",
     "Face Vision camera now opens in a tab so the browser reliably asks for permission",
     "Live camera preview with lip/face overlay in the extension tab and JARVIS Room",
     "Enroll your face from the camera tab or the Room; popup mirrors live status",
