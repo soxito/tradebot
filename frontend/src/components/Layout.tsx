@@ -38,6 +38,7 @@ import {
   Workflow,
   AudioWaveform,
   Atom,
+  Puzzle,
 } from 'lucide-react';
 
 const navItems = [
@@ -119,6 +120,18 @@ export default function Layout({ children }: { children: React.ReactNode }) {
               </Link>
             );
           })}
+
+          {/* Extension — opens the JARVIS voice-extension install guide on demand
+              (works even after the auto-prompt was dismissed). */}
+          <button
+            type="button"
+            onClick={() => window.dispatchEvent(new CustomEvent('jarvis-open-extension-install'))}
+            className="w-[calc(100%-1rem)] flex items-center gap-3 mx-2 px-3 py-2.5 rounded-lg text-sm transition-colors text-gray-400 hover:text-white hover:bg-gray-800/60"
+            title={sidebarOpen ? undefined : 'Voice Extension'}
+          >
+            <Puzzle className="w-5 h-5 shrink-0" />
+            {sidebarOpen && <span className="whitespace-nowrap">Voice Extension</span>}
+          </button>
         </nav>
 
         {/* Collapse Button */}

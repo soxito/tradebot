@@ -855,3 +855,123 @@ def get_pump_monitor_status() -> dict:
         "started_at": _pump_monitor_started_at,
         "last_run": _pump_monitor_last_run,
     }
+
+
+# ── Crypto Pair Catalog Sync Loop ──────────────────────────
+
+_pair_catalog_task: asyncio.Task | None = None
+_pair_catalog_running = False
+_pair_catalog_last_run: dict | None = None
+_pair_catalog_started_at: str | None = None
+
+
+async def _pair_catalog_sync_loop():
+    """
+    Keep the crypto-pair catalog fresh.
+
+    Runs a fast market-cap/volume refresh every ``refresh_minutes`` and a slower
+    full enrich (names + lightweight profiles) every ``full_hours``. On the very
+    first tick it does a full sync if the catalog is empty so JARVIS has names +
+    live metadata as soon as possible. Fully self-healing and non-blocking.
+    """
+    global _pair_catalog_running, _pair_catalog_last_run
+    from app.services import pair_catalog
+
+    refresh_minutes = max(5, int(getattr(settings, "PAIR_CATALOG_REFRESH_MINUTES", 15)))
+    full_hours = max(1, int(getattr(settings, "PAIR_CATALOG_FULL_SYNC_HOURS", 6)))
+    refresh_seconds = refresh_minutes * 60
+    full_seconds = full_hours * 3600
+
+    _pair_catalog_running = True
+    logger.info(
+        f"🪙 [PAIR CATALOG] Started — refresh every {refresh_minutes}m, "
+        f"full enrich every {full_hours}h"
+    )
+
+    # Small startup delay so it never competes with critical boot work.
+    try:
+        await asyncio.sleep(15)
+    except asyncio.CancelledError:
+        _pair_catalog_running = False
+        return
+
+    last_full = 0.0
+    import time as _time
+
+    # First tick: full sync when empty, otherwise a quick refresh.
+    try:
+        empty = await pair_catalog.catalog_is_empty()
+        result = await pair_catalog.sync_catalog(full=empty)
+        last_full = _time.time() if empty else 0.0
+        _pair_catalog_last_run = {"at": now_sast().isoformat(), "status": "ok", **result}
+    except asyncio.CancelledError:
+        _pair_catalog_running = False
+        return
+    except Exception as e:
+        logger.error(f"🪙 [PAIR CATALOG] Initial sync error: {e}")
+        _pair_catalog_last_run = {"at": now_sast().isoformat(), "status": "error", "error": str(e)}
+
+    while _pair_catalog_running:
+        try:
+            await asyncio.sleep(refresh_seconds)
+        except asyncio.CancelledError:
+            break
+
+        if not _pair_catalog_running:
+            break
+
+        do_full = (_time.time() - last_full) >= full_seconds
+        try:
+            result = await pair_catalog.sync_catalog(full=do_full)
+            if do_full:
+                last_full = _time.time()
+            _pair_catalog_last_run = {"at": now_sast().isoformat(), "status": "ok", **result}
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            err_safe = str(e).replace("{", "{{").replace("}", "}}")
+            logger.error(f"🪙 [PAIR CATALOG] Cycle error: {err_safe}")
+            _pair_catalog_last_run = {"at": now_sast().isoformat(), "status": "error", "error": str(e)}
+
+    _pair_catalog_running = False
+    logger.info("🪙 [PAIR CATALOG] Stopped")
+
+
+def start_pair_catalog_sync_loop():
+    """Start the crypto-pair catalog sync loop (idempotent)."""
+    global _pair_catalog_task, _pair_catalog_running, _pair_catalog_started_at
+
+    if _pair_catalog_task is not None and not _pair_catalog_task.done():
+        logger.warning("Pair catalog sync loop already running")
+        return False
+
+    _pair_catalog_running = True
+    _pair_catalog_started_at = now_sast().isoformat()
+    _pair_catalog_task = asyncio.create_task(_pair_catalog_sync_loop())
+    logger.info("🪙 Pair catalog sync loop started")
+    return True
+
+
+def stop_pair_catalog_sync_loop():
+    """Stop the crypto-pair catalog sync loop."""
+    global _pair_catalog_running, _pair_catalog_task, _pair_catalog_started_at
+
+    if not _pair_catalog_running and (_pair_catalog_task is None or _pair_catalog_task.done()):
+        return False
+
+    _pair_catalog_running = False
+    if _pair_catalog_task:
+        _pair_catalog_task.cancel()
+        _pair_catalog_task = None
+    _pair_catalog_started_at = None
+    logger.info("🪙 Pair catalog sync loop stopped")
+    return True
+
+
+def get_pair_catalog_status() -> dict:
+    """Return the current state of the pair catalog sync loop."""
+    return {
+        "running": _pair_catalog_running,
+        "started_at": _pair_catalog_started_at,
+        "last_run": _pair_catalog_last_run,
+    }

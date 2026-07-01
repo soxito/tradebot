@@ -3,7 +3,7 @@ Database Models for TradeBot
 """
 from datetime import datetime, timezone, timedelta
 from typing import Optional
-from sqlalchemy import Column, String, Float, Boolean, DateTime, Text, Enum as SQLEnum, Integer, event
+from sqlalchemy import Column, String, Float, Boolean, DateTime, Text, Enum as SQLEnum, Integer, JSON, event
 from sqlalchemy.orm import DeclarativeBase, validates
 import enum
 
@@ -673,3 +673,48 @@ class StrategyLabPromotion(Base):
     reason = Column(Text, nullable=True)
     metadata_json = Column(Text, default="{}", nullable=False)  # JSON object
     created_at = Column(DateTime, default=_utcnow, nullable=False)
+
+
+# ─── Crypto Pair Catalog ───────────────────────────────────
+# Single source of truth mapping every Bitget-tradeable pair to its real coin
+# name + live market metadata (market cap / 24h volume) and a lightweight
+# CoinGecko profile. Seeded from Bitget ccxt markets and enriched from CoinGecko
+# by app/services/pair_catalog.py. Lets JARVIS talk about coins by NAME
+# ("Bitcoin" instead of "BTCUSDT") and resolve spoken names/tickers to a
+# tradeable pair. Auto-created via init_db()'s Base.metadata.create_all.
+
+
+class CryptoPair(Base):
+    """A Bitget-tradeable crypto pair enriched with CoinGecko metadata."""
+
+    __tablename__ = "crypto_pairs"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # Identity
+    symbol = Column(String, unique=True, index=True, nullable=False)  # "BTC/USDT"
+    base = Column(String, index=True, nullable=False)                 # "BTC"
+    quote = Column(String, nullable=False)                            # "USDT"
+
+    # CoinGecko linkage + profile
+    coingecko_id = Column(String, nullable=True, index=True)          # "bitcoin"
+    name = Column(String, index=True, nullable=True)                  # "Bitcoin"
+    description = Column(Text, nullable=True)                          # lightweight summary
+    categories = Column(JSON, nullable=True)                          # ["Layer 1", ...]
+    links = Column(JSON, nullable=True)                               # {homepage, whitepaper, explorer}
+    aliases = Column(JSON, nullable=True)                             # learned user aliases (lowercased)
+
+    # Live market metadata
+    market_cap = Column(Float, nullable=True)
+    market_cap_rank = Column(Integer, nullable=True)
+    volume_24h = Column(Float, nullable=True)
+    price = Column(Float, nullable=True)
+    price_change_24h = Column(Float, nullable=True)
+
+    # Status
+    tradeable = Column(Boolean, default=True, index=True)
+
+    # Timestamps
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+    enriched_at = Column(DateTime, nullable=True)  # last CoinGecko profile enrich

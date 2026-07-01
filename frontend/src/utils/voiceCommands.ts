@@ -50,7 +50,7 @@ export interface VoiceAction {
 
 // ── App routes with natural-language aliases ─────────────────────────────────
 export const NAV_ROUTES: { label: string; path: string; aliases: string[] }[] = [
-  { label: 'Dashboard', path: '/', aliases: ['dashboard', 'home', 'main', 'overview', 'start'] },
+  { label: 'Dashboard', path: '/', aliases: ['dashboard', 'home', 'main', 'overview'] },
   { label: 'Trading', path: '/trading', aliases: ['trading', 'trade', 'orders', 'spot'] },
   { label: 'Futures', path: '/futures', aliases: ['futures', 'perpetuals', 'perps'] },
   { label: 'Signals', path: '/signals', aliases: ['signals', 'signal feed', 'tradingview signals'] },
@@ -84,31 +84,60 @@ function normalize(s: string): string {
   return s.toLowerCase().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim()
 }
 
-function bestRoute(phrase: string): { label: string; path: string } | null {
+// Match a spoken phrase to a route.
+//  • Default (lenient) mode is for when the user clearly issued a navigation
+//    verb ("open X", "go to X").
+//  • strict mode is for bare page names with NO verb — here the command must be
+//    essentially JUST the page name, so a long sentence that merely mentions a
+//    route word never triggers an unwanted navigation (the old `.includes()`
+//    substring match caused JARVIS to wrongly "open the dashboard").
+function bestRoute(phrase: string, opts?: { strict?: boolean }): { label: string; path: string } | null {
+  const strict = !!opts?.strict
   const p = normalize(phrase)
   if (!p) return null
-  let best: { label: string; path: string; score: number } | null = null
+  const pTokens = p.split(' ').filter(Boolean)
+  const pSet = new Set(pTokens)
+  let best: { label: string; path: string; score: number; aliasTokens: number } | null = null
   for (const r of NAV_ROUTES) {
     const candidates = [r.label.toLowerCase(), ...r.aliases]
     for (const c of candidates) {
       const cn = normalize(c)
+      if (!cn) continue
+      const ct = cn.split(' ').filter(Boolean)
+      // Generic short single-word aliases (e.g. "home", "main") are dangerous —
+      // they appear inside many unrelated commands. They may ONLY match when
+      // they ARE the whole phrase, never as one word inside a longer command.
+      const genericShort = ct.length === 1 && cn.length <= 5
       let score = 0
-      if (p === cn) score = 100
-      else if (p.includes(cn)) score = 80 + cn.length
-      else if (cn.includes(p) && p.length >= 3) score = 60 + p.length
-      else {
-        // token overlap
-        const pt = new Set(p.split(' '))
-        const ct = cn.split(' ')
-        const hit = ct.filter(t => pt.has(t)).length
-        if (hit > 0 && hit === ct.length) score = 50 + hit
+      if (p === cn) {
+        score = 100
+      } else if (!genericShort) {
+        // Whole-word / whole-phrase containment (never a substring inside a word).
+        const esc = cn.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+        const boundary = new RegExp(`(^|\\s)${esc}(\\s|$)`)
+        if (boundary.test(p)) {
+          score = 70 + cn.length
+        } else {
+          // Full token-set match: every alias token present as a whole word.
+          const hit = ct.filter(tk => pSet.has(tk)).length
+          if (hit > 0 && hit === ct.length) score = 50 + hit * 2
+        }
       }
       if (score > 0 && (!best || score > best.score)) {
-        best = { label: r.label, path: r.path, score }
+        best = { label: r.label, path: r.path, score, aliasTokens: ct.length }
       }
     }
   }
-  return best && best.score >= 50 ? { label: best.label, path: best.path } : null
+  if (!best) return null
+  if (strict) {
+    // Bare-name navigation: reject when the phrase is much longer than the
+    // matched page name (i.e. it's a sentence, not a page name).
+    if (best.score < 100 && pTokens.length > best.aliasTokens + 1) return null
+    if (best.score < 60) return null
+  } else if (best.score < 50) {
+    return null
+  }
+  return { label: best.label, path: best.path }
 }
 
 /**
@@ -240,7 +269,9 @@ export function interpretVoiceCommand(raw: string): VoiceAction | null {
   // NOT navigate — it should be answered by the AI).
   const analyticalIntent = /\b(analys[ei]|tell me|explain|describe|compare|recommend(ation)?|give me|forecast|predict|review|summari[sz]e|report|calculate|evaluate|assess|what (are|is|can)|how (do|can|does)|why|thoughts|opinion|insight|based on|sniper setup|setup|recommendation|advice|signal|signals|trade idea|ideas)\b/.test(t)
   if (!analyticalIntent) {
-    const bare = bestRoute(t)
+    // strict: the command must be essentially the page name itself, so an
+    // unrelated sentence that merely mentions a route word never navigates.
+    const bare = bestRoute(t, { strict: true })
     if (bare) return { type: 'navigate', path: bare.path, say: `Opening ${bare.label}.` }
   }
 

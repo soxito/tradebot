@@ -727,7 +727,7 @@ function hasWakeWord(transcript: string, requireGreeting = false): boolean {
   return phoneticWakeMatch(transcript, requireGreeting)
 }
 
-const PaulChat = memo(function PaulChat() {
+const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boolean } = {}) {
   const router = useRouter()
   const [open, setOpen] = useState(false)
   const [messages, setMessages] = useState<Message[]>([
@@ -830,6 +830,13 @@ const PaulChat = memo(function PaulChat() {
 
   const dictationRef = useRef<SpeechRecognitionLike>(null)
   const wakeRef = useRef<SpeechRecognitionLike>(null)
+  // Transient runtime pause for the wake recognizer (e.g. the browser briefly
+  // denies/blocks the mic). This is NOT the user's preference — it is cleared on
+  // the next user gesture so a one-off glitch can never leave JARVIS permanently
+  // deaf (which used to happen by persisting the wake word OFF to localStorage).
+  const wakeErrorPausedRef = useRef(false)
+  // Re-arms the wake recognizer on the next user gesture (set up below).
+  const rearmWakeOnGestureRef = useRef<() => void>(() => {})
   // Active Whisper capture (so it can be aborted the instant JARVIS starts to
   // speak — prevents the assistant from recording its own voice).
   const whisperRecorderRef = useRef<MediaRecorder | null>(null)
@@ -1069,6 +1076,19 @@ const PaulChat = memo(function PaulChat() {
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // Broadcast JARVIS activity (listening / thinking) so other surfaces — e.g.
+  // the JARVIS Room's animated energy core — can react to the voice pipeline
+  // exactly like the chat does. Talking is already broadcast via `speak-status`.
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    try {
+      window.postMessage(
+        { __jarvisPage: true, type: 'jarvis-activity', listening, thinking: streaming },
+        window.location.origin,
+      )
+    } catch { /* noop */ }
+  }, [listening, streaming])
 
   // ── Send message ──────────────────────────────────────────────────────────
   const send = useCallback(async (overrideText?: string) => {
@@ -3206,6 +3226,7 @@ const PaulChat = memo(function PaulChat() {
     const SR = getSpeechRecognition()
     if (!SR || !wakeEnabledRef.current) return
     if (extVoiceReadyRef.current) return  // extension owns the mic — no in-page recognizer
+    if (wakeErrorPausedRef.current) return  // paused after a mic error — re-armed on next gesture
     // Don't start recognition if we're still in the post-speech echo-tail blackout
     if (micGatedRef.current) return
     try { wakeRef.current?.stop() } catch { /* noop */ }
@@ -3268,9 +3289,14 @@ const PaulChat = memo(function PaulChat() {
       }
     }
     rec.onerror = (e: any) => {
+      // A denied/blocked mic must NOT permanently disable the wake word — doing so
+      // (by persisting OFF) was leaving JARVIS deaf across reloads after a single
+      // transient glitch. Instead, pause this session and re-arm on the next user
+      // gesture; the user's wake-word preference stays ON.
       if (e?.error === 'not-allowed' || e?.error === 'service-not-allowed') {
-        wakeEnabledRef.current = false
-        setWakeEnabled(false)
+        wakeErrorPausedRef.current = true
+        try { rec.stop() } catch { /* noop */ }
+        rearmWakeOnGestureRef.current()
       }
     }
     rec.onend = () => {
@@ -3279,10 +3305,10 @@ const PaulChat = memo(function PaulChat() {
       // the wake recognizer alive during speech so the user can interrupt — the
       // stored-voice gate above rejects JARVIS's own voice.
       const speakingBlocks = isSpeakingRef.current && !canBargeIn()
-      if (wakeEnabledRef.current && !listeningRef.current && !speakingBlocks) {
+      if (wakeEnabledRef.current && !listeningRef.current && !speakingBlocks && !wakeErrorPausedRef.current) {
         setTimeout(() => {
           const stillBlocked = isSpeakingRef.current && !canBargeIn()
-          if (wakeEnabledRef.current && !listeningRef.current && !stillBlocked) startWake()
+          if (wakeEnabledRef.current && !listeningRef.current && !stillBlocked && !wakeErrorPausedRef.current) startWake()
         }, 400)
       }
     }
@@ -3310,12 +3336,23 @@ const PaulChat = memo(function PaulChat() {
   useEffect(() => {
     if (!speechSupported) return
     const arm = () => {
+      // A fresh user gesture clears any transient mic-error pause and lets the
+      // browser re-prompt for the mic, so JARVIS self-heals instead of staying
+      // deaf after a one-off denial.
+      wakeErrorPausedRef.current = false
       if (wakeEnabledRef.current && !listeningRef.current) {
         try { startWake() } catch { /* noop */ }
       }
     }
-    window.addEventListener('pointerdown', arm, { once: true })
-    window.addEventListener('keydown', arm, { once: true })
+    // Re-arm on the next gesture (used on first load AND after a mic error). The
+    // listeners are one-shot; `rearmWakeOnGestureRef` lets the error handler add
+    // a new pair so recovery always needs exactly one fresh user interaction.
+    const rearm = () => {
+      window.addEventListener('pointerdown', arm, { once: true })
+      window.addEventListener('keydown', arm, { once: true })
+    }
+    rearmWakeOnGestureRef.current = rearm
+    rearm()
     return () => {
       window.removeEventListener('pointerdown', arm)
       window.removeEventListener('keydown', arm)
@@ -3411,14 +3448,18 @@ const PaulChat = memo(function PaulChat() {
 
   return (
     <>
-      {/* ── 3D JARVIS robot avatar — floats on every page, click to open chat ── */}
-      <JarvisRobotAvatar
-        state={robotState}
-        energy={robotEnergy}
-        avatarStyle={avatarStyle}
-        extRobotActive={robotLocked}
-        onClick={() => !robotLocked && setOpen(o => !o)}
-      />
+      {/* ── 3D JARVIS robot avatar — floats on every page, click to open chat ──
+           Suppressed where the host page renders its own JARVIS visual (e.g. the
+           JARVIS Room's energy core), so the robot doesn't float over it. */}
+      {!hideRobot && (
+        <JarvisRobotAvatar
+          state={robotState}
+          energy={robotEnergy}
+          avatarStyle={avatarStyle}
+          extRobotActive={robotLocked}
+          onClick={() => !robotLocked && setOpen(o => !o)}
+        />
+      )}
 
       {/* ── Floating button — hidden when robot has exclusive mic/speaker ─── */}
       <button

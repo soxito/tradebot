@@ -1,0 +1,150 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080" preserveAspectRatio="xMidYMid slice">
+  <defs>
+    <!-- Deep space background -->
+    <radialGradient id="sox-bg" cx="50%" cy="44%" r="82%">
+      <stop offset="0%" stop-color="#0d1a2e"/>
+      <stop offset="35%" stop-color="#070e1d"/>
+      <stop offset="70%" stop-color="#030810"/>
+      <stop offset="100%" stop-color="#010104"/>
+    </radialGradient>
+    <!-- Square grid -->
+    <pattern id="sq-grid" x="0" y="0" width="44" height="44" patternUnits="userSpaceOnUse">
+      <path d="M44 0 L0 0 0 44" fill="none" stroke="rgba(45,226,197,0.055)" stroke-width="0.4"/>
+    </pattern>
+    <!-- Diamond overlay -->
+    <pattern id="diamond" x="0" y="0" width="88" height="88" patternUnits="userSpaceOnUse">
+      <path d="M44 2 L86 44 L44 86 L2 44 Z" fill="none" stroke="rgba(45,226,197,0.038)" stroke-width="0.35"/>
+    </pattern>
+    <!-- Scan lines -->
+    <pattern id="sl" x="0" y="0" width="1920" height="6" patternUnits="userSpaceOnUse">
+      <line x1="0" y1="0" x2="1920" y2="0" stroke="rgba(45,226,197,0.022)" stroke-width="1"/>
+    </pattern>
+    <!-- Data stream gradients (origin: bottom-left) -->
+    <linearGradient id="ds1" x1="0" y1="1080" x2="360" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="rgba(45,226,197,0.16)"/>
+      <stop offset="100%" stop-color="rgba(45,226,197,0)"/>
+    </linearGradient>
+    <linearGradient id="ds2" x1="0" y1="1080" x2="540" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="rgba(45,226,197,0.10)"/>
+      <stop offset="100%" stop-color="rgba(45,226,197,0)"/>
+    </linearGradient>
+    <linearGradient id="ds3" x1="0" y1="1080" x2="760" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="rgba(96,165,250,0.08)"/>
+      <stop offset="100%" stop-color="rgba(96,165,250,0)"/>
+    </linearGradient>
+    <!-- Data stream gradients (origin: bottom-right) -->
+    <linearGradient id="ds4" x1="1920" y1="1080" x2="1560" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="rgba(45,226,197,0.16)"/>
+      <stop offset="100%" stop-color="rgba(45,226,197,0)"/>
+    </linearGradient>
+    <linearGradient id="ds5" x1="1920" y1="1080" x2="1380" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="rgba(96,165,250,0.10)"/>
+      <stop offset="100%" stop-color="rgba(96,165,250,0)"/>
+    </linearGradient>
+    <!-- Central ambient glow -->
+    <radialGradient id="center-glow" cx="50%" cy="44%" r="22%">
+      <stop offset="0%" stop-color="rgba(45,226,197,0.055)"/>
+      <stop offset="100%" stop-color="rgba(0,0,0,0)"/>
+    </radialGradient>
+    <!-- Edge vignette -->
+    <radialGradient id="vig" cx="50%" cy="50%" r="62%">
+      <stop offset="0%" stop-color="rgba(0,0,0,0)"/>
+      <stop offset="72%" stop-color="rgba(1,2,8,0.32)"/>
+      <stop offset="100%" stop-color="rgba(1,2,8,0.95)"/>
+    </radialGradient>
+  </defs>
+
+  <!-- ── Background ── -->
+  <rect width="1920" height="1080" fill="url(#sox-bg)"/>
+
+  <!-- ── Grid layers ── -->
+  <rect width="1920" height="1080" fill="url(#sq-grid)"/>
+  <rect width="1920" height="1080" fill="url(#diamond)"/>
+
+  <!-- ── Scan lines ── -->
+  <rect width="1920" height="1080" fill="url(#sl)"/>
+
+  <!-- ── Arc-reactor rings (center: 960, 474) ── -->
+  <!-- Inner — teal dashed -->
+  <circle cx="960" cy="474" r="142" fill="none" stroke="rgba(45,226,197,0.15)" stroke-width="1.4" stroke-dasharray="3 9"/>
+  <!-- Medium — gold dashed -->
+  <circle cx="960" cy="474" r="318" fill="none" stroke="rgba(245,158,11,0.09)" stroke-width="1" stroke-dasharray="2 18"/>
+  <!-- Outer — blue dashed -->
+  <circle cx="960" cy="474" r="502" fill="none" stroke="rgba(96,165,250,0.06)" stroke-width="0.8" stroke-dasharray="4 34"/>
+  <!-- Halo — very faint teal -->
+  <circle cx="960" cy="474" r="694" fill="none" stroke="rgba(45,226,197,0.035)" stroke-width="0.5" stroke-dasharray="1 28"/>
+
+  <!-- ── Cardinal tick marks on inner ring (r=142, center=960,474) ── -->
+  <!-- East (0°) -->
+  <line x1="1094" y1="474" x2="1116" y2="474" stroke="rgba(45,226,197,0.45)" stroke-width="1.5"/>
+  <!-- South (90°) -->
+  <line x1="960" y1="606" x2="960" y2="628" stroke="rgba(45,226,197,0.45)" stroke-width="1.5"/>
+  <!-- West (180°) -->
+  <line x1="826" y1="474" x2="804" y2="474" stroke="rgba(45,226,197,0.45)" stroke-width="1.5"/>
+  <!-- North (270°) -->
+  <line x1="960" y1="342" x2="960" y2="320" stroke="rgba(45,226,197,0.45)" stroke-width="1.5"/>
+  <!-- NE (330°) -->
+  <line x1="1079" y1="403" x2="1091" y2="393" stroke="rgba(45,226,197,0.22)" stroke-width="1"/>
+  <!-- SE (30°) -->
+  <line x1="1079" y1="545" x2="1091" y2="555" stroke="rgba(45,226,197,0.22)" stroke-width="1"/>
+  <!-- SW (150°) -->
+  <line x1="841" y1="545" x2="829" y2="555" stroke="rgba(45,226,197,0.22)" stroke-width="1"/>
+  <!-- NW (210°) -->
+  <line x1="841" y1="403" x2="829" y2="393" stroke="rgba(45,226,197,0.22)" stroke-width="1"/>
+
+  <!-- ── Cross-hairs (split — gap in centre for the orb) ── -->
+  <!-- Horizontal west -->
+  <line x1="0" y1="474" x2="700" y2="474" stroke="rgba(45,226,197,0.055)" stroke-width="0.5"/>
+  <!-- Horizontal east -->
+  <line x1="1220" y1="474" x2="1920" y2="474" stroke="rgba(45,226,197,0.055)" stroke-width="0.5"/>
+  <!-- Vertical north -->
+  <line x1="960" y1="0" x2="960" y2="278" stroke="rgba(45,226,197,0.055)" stroke-width="0.5"/>
+  <!-- Vertical south -->
+  <line x1="960" y1="670" x2="960" y2="1080" stroke="rgba(45,226,197,0.055)" stroke-width="0.5"/>
+
+  <!-- ── Offset dashed guide lines ── -->
+  <line x1="0" y1="370" x2="1920" y2="370" stroke="rgba(45,226,197,0.022)" stroke-width="0.4" stroke-dasharray="4 22"/>
+  <line x1="0" y1="578" x2="1920" y2="578" stroke="rgba(45,226,197,0.022)" stroke-width="0.4" stroke-dasharray="4 22"/>
+  <line x1="810" y1="0" x2="810" y2="1080" stroke="rgba(45,226,197,0.022)" stroke-width="0.4" stroke-dasharray="4 22"/>
+  <line x1="1110" y1="0" x2="1110" y2="1080" stroke="rgba(45,226,197,0.022)" stroke-width="0.4" stroke-dasharray="4 22"/>
+
+  <!-- ── Data streams (bottom-left) ── -->
+  <line x1="0" y1="1080" x2="360" y2="0" stroke="url(#ds1)" stroke-width="1"/>
+  <line x1="40" y1="1080" x2="400" y2="0" stroke="url(#ds1)" stroke-width="0.6" opacity="0.6"/>
+  <line x1="100" y1="1080" x2="540" y2="0" stroke="url(#ds2)" stroke-width="0.7"/>
+  <line x1="160" y1="1080" x2="760" y2="0" stroke="url(#ds3)" stroke-width="0.5"/>
+  <!-- Data streams (bottom-right) -->
+  <line x1="1920" y1="1080" x2="1560" y2="0" stroke="url(#ds4)" stroke-width="1"/>
+  <line x1="1880" y1="1080" x2="1520" y2="0" stroke="url(#ds4)" stroke-width="0.6" opacity="0.6"/>
+  <line x1="1820" y1="1080" x2="1380" y2="0" stroke="url(#ds5)" stroke-width="0.5"/>
+
+  <!-- ── Corner HUD brackets ── -->
+  <!-- Top-left -->
+  <path d="M8 70 L8 8 L70 8" fill="none" stroke="rgba(45,226,197,0.6)" stroke-width="2"/>
+  <rect x="34" y="34" width="7" height="7" fill="rgba(45,226,197,0.45)"/>
+  <line x1="78" y1="8" x2="118" y2="8" stroke="rgba(45,226,197,0.22)" stroke-width="1"/>
+  <line x1="8" y1="78" x2="8" y2="118" stroke="rgba(45,226,197,0.22)" stroke-width="1"/>
+  <!-- Top-right -->
+  <path d="M1912 70 L1912 8 L1850 8" fill="none" stroke="rgba(45,226,197,0.6)" stroke-width="2"/>
+  <rect x="1879" y="34" width="7" height="7" fill="rgba(45,226,197,0.45)"/>
+  <line x1="1802" y1="8" x2="1842" y2="8" stroke="rgba(45,226,197,0.22)" stroke-width="1"/>
+  <line x1="1912" y1="78" x2="1912" y2="118" stroke="rgba(45,226,197,0.22)" stroke-width="1"/>
+  <!-- Bottom-left -->
+  <path d="M8 1010 L8 1072 L70 1072" fill="none" stroke="rgba(45,226,197,0.6)" stroke-width="2"/>
+  <rect x="34" y="1039" width="7" height="7" fill="rgba(45,226,197,0.45)"/>
+  <!-- Bottom-right -->
+  <path d="M1912 1010 L1912 1072 L1850 1072" fill="none" stroke="rgba(45,226,197,0.6)" stroke-width="2"/>
+  <rect x="1879" y="1039" width="7" height="7" fill="rgba(45,226,197,0.45)"/>
+
+  <!-- ── Mid-side bracket accents ── -->
+  <line x1="8" y1="530" x2="8" y2="550" stroke="rgba(45,226,197,0.3)" stroke-width="1.5"/>
+  <line x1="8" y1="400" x2="8" y2="420" stroke="rgba(45,226,197,0.18)" stroke-width="1"/>
+  <line x1="1912" y1="530" x2="1912" y2="550" stroke="rgba(45,226,197,0.3)" stroke-width="1.5"/>
+  <line x1="1912" y1="400" x2="1912" y2="420" stroke="rgba(45,226,197,0.18)" stroke-width="1"/>
+
+  <!-- ── Central ambient glow ── -->
+  <rect width="1920" height="1080" fill="url(#center-glow)"/>
+
+  <!-- ── Edge vignette ── -->
+  <rect width="1920" height="1080" fill="url(#vig)"/>
+</svg>

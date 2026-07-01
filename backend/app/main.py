@@ -54,7 +54,18 @@ async def lifespan(app: FastAPI):
 
     started_workers = start_background_workers(allow_in_api=False)
     logger.info(f"Background worker startup result: {started_workers}")
-    
+
+    # Always keep the crypto-pair catalog fresh, even in API-only mode, so JARVIS
+    # has real coin names + live market cap/volume and can resolve token names to
+    # tradeable Bitget pairs. The loop is idempotent (won't double-start) and does
+    # a one-time full sync when the catalog is empty.
+    if settings.AUTO_START_PAIR_CATALOG_SYNC_LOOP and not started_workers.get("pair_catalog_sync_loop"):
+        try:
+            from app.core.scheduler import start_pair_catalog_sync_loop
+            start_pair_catalog_sync_loop()
+        except Exception as e:
+            logger.warning(f"Pair catalog sync loop failed to start: {e}")
+
     yield
     
     # Shutdown logic here

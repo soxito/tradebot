@@ -25,6 +25,12 @@
   // Normalise chrome/browser namespace so this works in both Chrome and Firefox.
   const api = (typeof browser !== 'undefined' && browser.runtime) ? browser : chrome
 
+  // Installed extension version (from manifest). Reported to the page so it can
+  // detect when a NEWER version is available on the backend and prompt to update.
+  const EXT_VERSION = (() => {
+    try { return (api.runtime.getManifest && api.runtime.getManifest().version) || '' } catch { return '' }
+  })()
+
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition
 
   // Firefox has no Web Speech API. When MediaRecorder + getUserMedia exist we
@@ -179,6 +185,8 @@
     try {
       document.documentElement.setAttribute('data-jarvis-ext', '1')
       document.documentElement.setAttribute('data-jarvis-ext-voice', VOICE_SUPPORTED ? '1' : '0')
+      // Expose the installed version so the page can detect available updates.
+      if (EXT_VERSION) document.documentElement.setAttribute('data-jarvis-ext-version', EXT_VERSION)
     } catch { /* noop */ }
   }
   function status(extra = {}) {
@@ -195,6 +203,7 @@
     markPresence()
     toPage({
       type: 'connected',
+      version: EXT_VERSION,
       enabled: !!settings.enabled,
       speechSupported: VOICE_SUPPORTED,
       voiceReady: VOICE_SUPPORTED && !!settings.enabled,

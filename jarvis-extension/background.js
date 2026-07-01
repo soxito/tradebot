@@ -35,6 +35,8 @@ let ttsEnabled         = true
 let pollTimer          = null
 let lastAnalysisResult = null  // cached from most recent 15-min or on-demand run
 let defaultMt5Account  = null  // first configured MT5 account ID
+let coinNames          = {}    // { "BTCUSDT": "Bitcoin", "BTC/USDT": "Bitcoin", ... }
+let coinNamesFetchedAt = 0     // epoch ms of last name-map fetch
 
 // Restore settings on startup
 api.storage.local.get(
@@ -98,6 +100,40 @@ async function legacyApiFetch(path, opts = {}) {
   return apiFetch(path, opts, BACKEND_OLD)
 }
 
+// ── Coin name map ─────────────────────────────────────────────────────────────
+// Fetch the compact { symbol: name } map so notifications/TTS say real coin
+// names ("Bitcoin") instead of raw symbols ("BTCUSDT"). Keyed by BOTH BTC/USDT
+// and BTCUSDT server-side, so monitor payloads (glued form) map directly.
+async function refreshCoinNames(force = false) {
+  const STALE_MS = 6 * 60 * 60 * 1000  // 6h
+  if (!force && coinNamesFetchedAt && (Date.now() - coinNamesFetchedAt) < STALE_MS) return
+  // Try the unified backend first, then the legacy crypto backend.
+  for (const backend of [BACKEND, BACKEND_OLD]) {
+    try {
+      const data = await apiFetch('/jarvis/pairs/names', {}, backend)
+      if (data && data.names && Object.keys(data.names).length) {
+        coinNames = data.names
+        coinNamesFetchedAt = Date.now()
+        return
+      }
+    } catch { /* try next backend */ }
+  }
+}
+
+// Resolve a position symbol to its real coin name, gracefully falling back to
+// the symbol when unknown. Handles glued (BTCUSDT), slashed (BTC/USDT) and
+// ccxt swap (BTC/USDT:USDT) forms.
+function coinName(symbol) {
+  if (!symbol) return symbol
+  const s = String(symbol)
+  if (coinNames[s]) return coinNames[s]
+  const noSwap = s.split(':')[0]
+  if (coinNames[noSwap]) return coinNames[noSwap]
+  const glued = noSwap.replace(/\//g, '')
+  if (coinNames[glued]) return coinNames[glued]
+  return s
+}
+
 // ── Cost-aware Deepgram fallback relay ────────────────────────────────────────
 // Forwards a short buffered audio clip (base64 from the content script) to the
 // backend's budget-guarded pre-recorded STT endpoint. The raw Deepgram key never
@@ -128,6 +164,8 @@ function scheduleNextPoll() {
 
 async function doPoll() {
   if (!monitorEnabled) return
+  // Keep the coin-name map fresh (no-op unless stale). Non-blocking on failure.
+  refreshCoinNames().catch(() => {})
   try {
     const data = await apiFetch('/jarvis/unified-monitor')
     handleUnifiedUpdate(data)
@@ -175,29 +213,44 @@ function handleUnifiedUpdate(data) {
 
   for (const [key, p] of Object.entries(newCryptoSnap)) {
     if (!positionSnapshot[key]) {
-      showNotification(`📈 New Crypto: ${p.symbol}`,
+      // First sight of this position — announce the current value, NO bogus delta.
+      const nm = coinName(p.symbol)
+      showNotification(`📈 New Crypto: ${nm}`,
         `${p.side.toUpperCase()} @ ${p.entry_price} | ${p.exchange.toUpperCase()}`)
-      speakText(`New ${p.side} position opened on ${p.symbol} at ${p.entry_price}.`)
+      speakText(`New ${p.side} position opened on ${nm} at ${p.entry_price}.`)
     }
   }
   for (const [key, prev] of Object.entries(positionSnapshot)) {
     if (!newCryptoSnap[key]) {
+      const nm = coinName(prev.symbol)
       const sign = (prev.pnl || 0) >= 0 ? 'PROFIT' : 'LOSS'
-      showNotification(`🚪 Closed: ${prev.symbol}`,
+      showNotification(`🚪 Closed: ${nm}`,
         `${sign}: ${(prev.pnl || 0) >= 0 ? '+' : ''}${(prev.pnl || 0).toFixed(2)} USDT`, true)
-      speakText(`${prev.symbol} closed. ${(prev.pnl || 0) >= 0 ? 'Profit' : 'Loss'} ${Math.abs(prev.pnl || 0).toFixed(2)}.`)
+      speakText(`${nm} closed. ${(prev.pnl || 0) >= 0 ? 'Profit' : 'Loss'} ${Math.abs(prev.pnl || 0).toFixed(2)}.`)
     }
   }
   for (const [key, p] of Object.entries(newCryptoSnap)) {
     const prev = positionSnapshot[key]
-    if (!prev) continue
-    const pctDelta = Math.abs((p.pnl_pct || 0) - (prev.pnl_pct || 0))
+    if (!prev) continue  // first-sight handled above — never announce a delta here
+    const curPct = p.pnl_pct || 0
+    const prevPct = prev.pnl_pct || 0
+    const delta = curPct - prevPct                 // change since the last reading
+    const pctDelta = Math.abs(delta)
     const usdDelta = Math.abs((p.pnl || 0) - (prev.pnl || 0))
     if (pctDelta >= PNL_THRESHOLD_PCT || usdDelta >= PNL_THRESHOLD_USD) {
-      const dir = (p.pnl || 0) >= 0 ? '▲' : '▼'
-      showNotification(`${dir} ${p.symbol}: ${(p.pnl_pct || 0).toFixed(2)}%`,
-        `PnL ${(p.pnl || 0) >= 0 ? '+' : ''}${(p.pnl || 0).toFixed(2)} USDT`)
-      speakText(`${p.symbol} is ${(p.pnl_pct || 0) >= 0 ? 'up' : 'down'} ${Math.abs(p.pnl_pct || 0).toFixed(1)} percent.`)
+      const nm = coinName(p.symbol)
+      // Current direction = sign of the position's own PnL; change direction =
+      // sign of the delta (new − previous). This fixes the old bug where a
+      // position dropping from +600% to +500% was announced as simply "up".
+      const curDir = curPct >= 0 ? 'up' : 'down'
+      const chgDir = delta >= 0 ? 'up' : 'down'
+      const arrow = delta >= 0 ? '▲' : '▼'
+      showNotification(`${arrow} ${nm}: ${curPct.toFixed(2)}%`,
+        `${chgDir === 'up' ? '+' : '-'}${pctDelta.toFixed(2)}% since last | PnL ${(p.pnl || 0) >= 0 ? '+' : ''}${(p.pnl || 0).toFixed(2)} USDT`)
+      speakText(
+        `${nm} is ${curDir} ${Math.abs(curPct).toFixed(1)} percent, ` +
+        `a change of ${pctDelta.toFixed(1)} percent ${chgDir} from the last reading.`
+      )
     }
   }
   positionSnapshot = newCryptoSnap

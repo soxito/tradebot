@@ -115,6 +115,74 @@ def wait_for_port(host: str, port: int, label: str, max_wait: int = 60) -> bool:
     return False
 
 
+def _augment_path() -> None:
+    """
+    Make sure common tool locations are on PATH for THIS process.
+
+    `python3 start.py` is frequently launched from an IDE / GUI / launchd
+    context whose PATH is minimal, so tools that are actually installed
+    (Homebrew in /opt/homebrew, Node via nvm, Postgres@16, etc.) are invisible
+    to `shutil.which()` and `subprocess` — which made pre-flight report them as
+    "not found" and bail out with a wall of unresolved issues.
+
+    This prepends every standard tool directory that exists (including the most
+    recent nvm Node install and `brew shellenv`) so detection + auto-install
+    work regardless of how the script was started. It only adds paths; it never
+    removes anything.
+    """
+    candidates: List[str] = [
+        "/opt/homebrew/bin", "/opt/homebrew/sbin",
+        "/usr/local/bin", "/usr/local/sbin",
+        "/opt/local/bin", "/opt/local/sbin",
+        str(PG_BIN),
+        str(HOME / ".local" / "bin"),
+        "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+    ]
+
+    # Discover the newest nvm-managed Node install (node/npm/npx live here).
+    nvm_versions = HOME / ".nvm" / "versions" / "node"
+    if nvm_versions.is_dir():
+        try:
+            newest = sorted(
+                (d for d in nvm_versions.iterdir() if (d / "bin").is_dir()),
+                key=lambda d: d.name, reverse=True,
+            )
+            if newest:
+                candidates.insert(0, str(newest[0] / "bin"))
+        except Exception:
+            pass
+
+    # Pull in Homebrew's own shellenv (covers non-standard prefixes too).
+    brew = shutil.which("brew")
+    if not brew:
+        for bp in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew"):
+            if Path(bp).exists():
+                brew = bp
+                break
+    if brew and Path(brew).exists():
+        try:
+            r = subprocess.run([brew, "shellenv"], capture_output=True, text=True, timeout=10)
+            for ln in r.stdout.splitlines():
+                # Lines look like: export PATH="/opt/homebrew/bin:...";
+                if ln.startswith("export PATH="):
+                    val = ln.split("=", 1)[1].strip().strip('";')
+                    for part in val.split(":"):
+                        if part and "$PATH" not in part:
+                            candidates.append(part)
+        except Exception:
+            pass
+
+    existing = os.environ.get("PATH", "").split(os.pathsep)
+    seen = set(existing)
+    prepend: List[str] = []
+    for c in candidates:
+        if c and c not in seen and Path(c).is_dir():
+            prepend.append(c)
+            seen.add(c)
+    if prepend:
+        os.environ["PATH"] = os.pathsep.join(prepend + existing)
+
+
 def run(cmd: List[str], cwd=None, env=None) -> subprocess.CompletedProcess:
     merged = {**os.environ, **(env or {})}
     return subprocess.run(cmd, cwd=cwd, env=merged,
@@ -426,44 +494,60 @@ def _spinner_run(cmd: List[str], label: str, cwd=None,
         return False, f"{cmd[0]!r} not found"
 
 
+def _brew_path() -> Optional[str]:
+    """Return the brew binary path if Homebrew is present, else None."""
+    brew = shutil.which("brew")
+    if brew and Path(brew).exists():
+        return brew
+    for bp in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew"):
+        if Path(bp).exists():
+            return bp
+    return None
+
+
 def _install_homebrew() -> bool:
-    """Install Homebrew via the official install script."""
+    """
+    Install Homebrew via the official, fully non-interactive install script.
+
+    The previous implementation ran `/bin/bash -s` without ever feeding it the
+    fetched script (a no-op) and didn't set NONINTERACTIVE, so it stalled or
+    silently did nothing. This pipes the official installer straight into bash
+    with NONINTERACTIVE=1 (no TTY prompts) and then puts brew on PATH.
+    """
+    # Already installed but just off PATH? Adopt it and succeed.
+    existing = _brew_path()
+    if existing:
+        os.environ["PATH"] = str(Path(existing).parent) + os.pathsep + os.environ["PATH"]
+        ok(f"Homebrew already installed ({existing})")
+        return True
+
     info("Installing Homebrew (requires internet) …")
-    curl = shutil.which("curl") or "/usr/bin/curl"
     script_url = "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
-    r = subprocess.run([curl, "-fsSL", script_url], capture_output=True, timeout=30)
-    if r.returncode != 0:
-        fail("Could not fetch Homebrew install script — check internet connection")
-        return False
-    script = r.stdout
-    ok_inst, err = _spinner_run(
-        ["/bin/bash", "-s"], "Installing Homebrew",
-        timeout=600
-    )
-    # pipe script via stdin
-    if not ok_inst:
-        # Try direct pipe approach
-        proc = subprocess.run(
-            ["/bin/bash", "-c",
-             f'{curl} -fsSL {script_url} | NONINTERACTIVE=1 /bin/bash'],
-            timeout=600, capture_output=True
-        )
-        ok_inst = proc.returncode == 0
-    if ok_inst:
-        # Ensure brew is on PATH
-        for bp in ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]:
-            if Path(bp).exists():
-                os.environ["PATH"] = str(Path(bp).parent) + ":" + os.environ["PATH"]
-                break
-        ok("Homebrew installed")
-    else:
-        fail("Homebrew install failed — install manually then re-run")
-    return ok_inst
+    # NONINTERACTIVE=1 makes the installer skip the "press RETURN" prompt; it
+    # still uses sudo for /opt/homebrew creation, which works when the invoking
+    # user has admin rights (the common case on a personal Mac).
+    cmd = ["/bin/bash", "-c",
+           f'/usr/bin/curl -fsSL {script_url} | NONINTERACTIVE=1 /bin/bash']
+    ok_inst, err = _spinner_run(cmd, "Installing Homebrew", timeout=900)
+
+    if ok_inst or _brew_path():
+        brew = _brew_path()
+        if brew:
+            os.environ["PATH"] = str(Path(brew).parent) + os.pathsep + os.environ["PATH"]
+            ok("Homebrew installed")
+            return True
+
+    fail("Homebrew install failed — run this once manually, then re-run start.py:")
+    fail('  /bin/bash -c "$(curl -fsSL '
+         'https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"')
+    if err:
+        warn(f"  installer said: {err[:200]}")
+    return False
 
 
 def _brew(formula: str, label: str = "") -> bool:
     """brew install formula, return True on success."""
-    brew = shutil.which("brew") or "/opt/homebrew/bin/brew"
+    brew = _brew_path() or "/opt/homebrew/bin/brew"
     tag = label or formula
     ok_inst, err = _spinner_run([brew, "install", formula], f"brew install {tag}")
     if not ok_inst:
@@ -513,6 +597,9 @@ def preflight_check(mode: str) -> bool:
     """
     header("Pre-flight checks  (auto-install enabled)")
     sep()
+    # Surface tools that are installed but hidden by a minimal launch PATH
+    # BEFORE any detection runs, so we don't try to (re)install what's there.
+    _augment_path()
     unfixable: List[str] = []   # critical, can't auto-fix
     fixed_items: List[str] = []  # were missing, successfully installed
 

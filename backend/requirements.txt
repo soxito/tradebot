@@ -52,6 +52,7 @@ httpx==0.28.1
 
 # Utilities
 python-multipart==0.0.20
+psutil>=5.9.0  # live system CPU/RAM stats for the JARVIS Room HUD
 
 # AI / LLM
 openai==1.82.0

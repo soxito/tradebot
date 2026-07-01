@@ -19,11 +19,32 @@ import { Download, X, Mic, Bell, Zap, ShieldCheck, CheckCircle2 } from 'lucide-r
 type Browser = 'chrome' | 'edge' | 'brave' | 'firefox' | 'safari' | 'other'
 
 const DISMISS_KEY = 'jarvis.extPrompt.dismissed'
+// Per-version snooze for the "update available" prompt, so a NEW release always
+// re-prompts even if the user dismissed the previous update notice.
+const UPDATE_DISMISS_PREFIX = 'jarvis.extPrompt.updateDismissed.'
+
+// Compare two dotted version strings (e.g. "3.2.0" vs "3.10.1").
+// Returns <0 if a<b, 0 if equal, >0 if a>b.
+function cmpVersions(a: string, b: string): number {
+  const pa = String(a).split('.').map(n => parseInt(n, 10) || 0)
+  const pb = String(b).split('.').map(n => parseInt(n, 10) || 0)
+  const len = Math.max(pa.length, pb.length)
+  for (let i = 0; i < len; i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0)
+    if (d !== 0) return d
+  }
+  return 0
+}
+// Resolve the backend base from the configured API URL (e.g. the backend runs
+// on :1448, not :8000) so the version check and download always hit the live
+// server instead of a hardcoded, possibly-dead address.
+const API_BASE = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:1448/api/v1').replace(/\/$/, '')
 // Dynamic backend endpoint — always serves the latest extension files with the
 // version baked into the filename (e.g. jarvis-extension-v3.0.0.zip).
 // Falls back to the static file if the backend is not running.
-const ZIP_URL = 'http://localhost:8000/api/v1/jarvis/extension-download'
+const ZIP_URL = `${API_BASE}/jarvis/extension-download`
 const ZIP_URL_FALLBACK = '/jarvis-extension.zip'
+const VERSION_URL = `${API_BASE}/jarvis/extension-version`
 
 function detectBrowser(): Browser {
   if (typeof navigator === 'undefined') return 'other'
@@ -91,22 +112,28 @@ export default function ExtensionInstallPrompt() {
   const [modalOpen, setModalOpen] = useState(false)
   const [downloaded, setDownloaded] = useState(false)
   const [latestVersion, setLatestVersion] = useState<string | null>(null)
+  const [installedVersion, setInstalledVersion] = useState<string | null>(null)
   const [downloading, setDownloading] = useState(false)
+
+  // The installed extension is OUT OF DATE when we know both versions and the
+  // installed one is lower than the latest the backend serves.
+  const outdated = !!(extConnected && installedVersion && latestVersion &&
+    cmpVersions(installedVersion, latestVersion) < 0)
 
   // Fetch the latest version from the backend so the download button always shows
   // the correct version and uses the versioned filename.
   // Use a short 1.5s timeout so the version resolves well before the 3s banner.
   useEffect(() => {
-    fetch('http://localhost:8000/api/v1/jarvis/extension-version', {
+    fetch(VERSION_URL, {
       signal: AbortSignal.timeout(1500),
     })
       .then(r => r.ok ? r.json() : null)
       .then(d => {
         // Use the version from the manifest (served by backend) — never hardcode it.
         if (d?.version) setLatestVersion(d.version)
-        else setLatestVersion('3.2.0')   // offline fallback — matches manifest
+        else setLatestVersion('3.3.0')   // offline fallback — matches manifest
       })
-      .catch(() => setLatestVersion('3.2.0'))   // backend offline fallback
+      .catch(() => setLatestVersion('3.3.0'))   // backend offline fallback
   }, [])
 
   // Detect browser + listen for the extension handshake
@@ -115,17 +142,20 @@ export default function ExtensionInstallPrompt() {
     if (typeof window === 'undefined') return
 
     let connected = false
-    const markConnected = () => {
+    const markConnected = (version?: string) => {
       connected = true
       setExtConnected(true)
-      setShow(false)
-      setModalOpen(false)
+      // Record the installed version (from the handshake or the DOM attribute) so
+      // we can detect when a newer release is available. We do NOT force-hide the
+      // prompt here — the render guard decides based on `outdated`.
+      const v = version || document.documentElement.getAttribute('data-jarvis-ext-version') || ''
+      if (v) setInstalledVersion(v)
     }
 
     // 1. Synchronous check: the content script sets a DOM attribute on load.
     //    This detects the extension instantly with no race condition.
     if (document.documentElement.getAttribute('data-jarvis-ext') === '1') {
-      markConnected()
+      markConnected(document.documentElement.getAttribute('data-jarvis-ext-version') || undefined)
       return
     }
 
@@ -133,7 +163,7 @@ export default function ExtensionInstallPrompt() {
     const onMsg = (e: MessageEvent) => {
       if (e.source !== window) return
       if (e.data && e.data.__jarvisExt === true && e.data.type === 'connected') {
-        markConnected()
+        markConnected(typeof e.data.version === 'string' ? e.data.version : undefined)
       }
     }
     window.addEventListener('message', onMsg)
@@ -161,10 +191,26 @@ export default function ExtensionInstallPrompt() {
     }
   }, [])
 
+  // When the installed extension is OUT OF DATE, surface the update banner —
+  // unless the user already snoozed THIS specific new version.
+  useEffect(() => {
+    if (!outdated || !latestVersion) return
+    let snoozed = false
+    try { snoozed = localStorage.getItem(UPDATE_DISMISS_PREFIX + latestVersion) === '1' } catch { /* ignore */ }
+    if (!snoozed) setShow(true)
+  }, [outdated, latestVersion])
+
   const dismiss = useCallback(() => {
     setShow(false); setModalOpen(false)
-    try { localStorage.setItem(DISMISS_KEY, '1') } catch { /* ignore */ }
-  }, [])
+    try {
+      if (outdated && latestVersion) {
+        // Snooze only this version's update notice; a future release re-prompts.
+        localStorage.setItem(UPDATE_DISMISS_PREFIX + latestVersion, '1')
+      } else {
+        localStorage.setItem(DISMISS_KEY, '1')
+      }
+    } catch { /* ignore */ }
+  }, [outdated, latestVersion])
 
   const download = useCallback(async () => {
     setDownloading(true)
@@ -202,7 +248,25 @@ export default function ExtensionInstallPrompt() {
     window.location.reload()
   }, [])
 
-  if (extConnected) return null
+  // Allow any part of the app (e.g. the sidebar "Extension" entry) to open this
+  // install dialog on demand — even after the user dismissed the auto-banner.
+  // We clear the dismiss flag and force the modal open regardless of state.
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const openNow = () => {
+      try { localStorage.removeItem(DISMISS_KEY) } catch { /* ignore */ }
+      setExtConnected(false)
+      setShow(true)
+      setModalOpen(true)
+    }
+    window.addEventListener('jarvis-open-extension-install', openNow as EventListener)
+    return () => window.removeEventListener('jarvis-open-extension-install', openNow as EventListener)
+  }, [])
+
+  // When opened on demand we still render the modal even if a stale "connected"
+  // flag was set, so the menu entry is always actionable. We also keep rendering
+  // when the installed extension is outdated, so the update prompt can show.
+  if (extConnected && !outdated && !modalOpen) return null
 
   const info = installSteps(browser)
 
@@ -219,10 +283,13 @@ export default function ExtensionInstallPrompt() {
               <Mic className="w-5 h-5 text-white" />
             </div>
             <div className="flex-1 min-w-0">
-              <div className="text-sm font-semibold text-white">Enable JARVIS Voice</div>
+              <div className="text-sm font-semibold text-white">
+                {outdated ? 'Update JARVIS Voice' : 'Enable JARVIS Voice'}
+              </div>
               <p className="text-[11px] text-gray-400 mt-0.5 leading-relaxed">
-                Install the {BROWSER_LABEL[browser]} extension for reliable voice recognition
-                and desktop notifications.
+                {outdated
+                  ? `A new version (v${latestVersion}) is available — you have v${installedVersion}. Update for the latest features and fixes.`
+                  : `Install the ${BROWSER_LABEL[browser]} extension for reliable voice recognition and desktop notifications.`}
               </p>
             </div>
             <button onClick={dismiss} className="p-1 hover:bg-gray-800 rounded shrink-0" aria-label="Dismiss">
@@ -235,7 +302,7 @@ export default function ExtensionInstallPrompt() {
               disabled={downloading}
               className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg bg-cyan-600 hover:bg-cyan-500 disabled:opacity-60 text-white text-xs font-medium transition"
             >
-              <Download className="w-3.5 h-3.5" /> Install v{latestVersion}
+              <Download className="w-3.5 h-3.5" /> {outdated ? `Update to v${latestVersion}` : `Install v${latestVersion}`}
             </button>
             <button
               onClick={dismiss}

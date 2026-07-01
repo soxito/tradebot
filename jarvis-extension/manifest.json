@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "JARVIS Voice Assistant \u2014 TradeBot",
-  "version": "3.2.0",
-  "description": "Real-time crypto + MT5 account monitor, 15-minute position analysis, on-demand AI analysis, voice commands, and spoken trade alerts for TradeBot. v3.2: Realistic walking cyborg robot, hole-vanish Easter egg, single-mic exclusive lock.",
+  "version": "3.3.0",
+  "description": "Real-time crypto + MT5 account monitor, 15-minute position analysis, on-demand AI analysis, voice commands, and spoken trade alerts for TradeBot. v3.3: Read-aloud on change now uses real coin names and reports the change from the previous reading (correct up/down direction).",
   "permissions": [
     "notifications",
     "storage",

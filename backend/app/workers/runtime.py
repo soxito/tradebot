@@ -7,12 +7,14 @@ from app.core.config import settings
 from app.core.scheduler import (
     start_auto_trade_loop,
     start_live_auto_trade_loop,
+    start_pair_catalog_sync_loop,
     start_position_monitor,
     start_pump_monitor_loop,
     start_scheduler,
     start_sniper_loop,
     stop_auto_trade_loop,
     stop_live_auto_trade_loop,
+    stop_pair_catalog_sync_loop,
     stop_position_monitor,
     stop_pump_monitor_loop,
     stop_scheduler,
@@ -81,6 +83,11 @@ def start_background_workers(allow_in_api: bool = False) -> dict[str, bool]:
     else:
         started["pump_monitor_loop"] = False
 
+    if settings.AUTO_START_PAIR_CATALOG_SYNC_LOOP:
+        started["pair_catalog_sync_loop"] = start_pair_catalog_sync_loop()
+    else:
+        started["pair_catalog_sync_loop"] = False
+
     return started
 
 
@@ -92,3 +99,4 @@ def stop_background_workers() -> None:
     stop_position_monitor()
     stop_sniper_loop()
     stop_pump_monitor_loop()
+    stop_pair_catalog_sync_loop()

@@ -762,6 +762,23 @@ export const apiClient = {
     /** Call the real Jarvis command backend — bypasses AI chat to avoid hallucination. */
     executeCommand: (command: string, exchange?: string) =>
       api.post('/jarvis/command', { command, exchange: exchange || null }),
+    /** Unified real-time monitor — all crypto positions + MT5 accounts/balances + grand totals.
+     *  sync=true pulls live MT5 balance/positions from the bridge (slower); default is the fast cached read. */
+    unifiedMonitor: (sync?: boolean) =>
+      api.get('/jarvis/unified-monitor', { params: sync ? { sync: true } : {} }),
+    /** AI/SMC analysis of an MT5 account's open positions (SL/TP suggestions). */
+    analyzePositions: (accountId: number) =>
+      api.get('/jarvis/analyze-positions', { params: { account_id: accountId } }),
+    /** Live host CPU / RAM / load stats for the JARVIS Room system HUD. */
+    systemStats: () => api.get('/jarvis/system-stats'),
+    /** Searchable crypto-pair catalog (symbol, name, market cap, 24h volume). */
+    pairs: (q?: string, limit = 50) =>
+      api.get('/jarvis/pairs', { params: { q, limit } }),
+    /** Compact { symbol: name } map (keyed by BTC/USDT AND BTCUSDT). */
+    pairNames: () => api.get('/jarvis/pairs/names'),
+    /** Resolve a token name/ticker/symbol to a tradeable Bitget pair + live metadata. */
+    resolvePair: (q: string) =>
+      api.get('/jarvis/pairs/resolve', { params: { q } }),
     /** Persist voice fingerprint + vocabulary to the permanent vault brain. */
     voiceBrainSync: (data: {
       vocabulary: Record<string, number>;

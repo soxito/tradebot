@@ -114,6 +114,11 @@ class Settings(BaseSettings):
     AUTO_START_POSITION_MONITOR_LOOP: bool = False
     AUTO_START_SNIPER_LOOP: bool = False
     AUTO_START_PUMP_MONITOR_LOOP: bool = False
+    # Crypto-pair catalog (names + market cap/volume) sync loop. Enabled by
+    # default and also started at API boot so JARVIS always has coin names.
+    AUTO_START_PAIR_CATALOG_SYNC_LOOP: bool = True
+    PAIR_CATALOG_REFRESH_MINUTES: int = 15   # fast market cap/volume refresh
+    PAIR_CATALOG_FULL_SYNC_HOURS: int = 6    # slow full enrich (names + profiles)
 
     # Loop intervals (seconds)
     SIM_AUTO_TRADE_LOOP_INTERVAL_SECONDS: int = 60

@@ -480,23 +480,55 @@ def _safe_float(val, default: float = 0.0) -> float:
 
 # ── Extension version / update check ─────────────────────────────────────────
 
-# Current extension version — kept in sync with manifest.json
-_EXT_VERSION = "3.1.0"
-_EXT_RELEASED = "2026-06-30"
+# Fallback version only — the real version is ALWAYS read live from
+# jarvis-extension/manifest.json (see _ext_version()). Keep this in sync so a
+# missing manifest never advertises a stale version.
+_EXT_VERSION = "3.3.0"
+_EXT_RELEASED = "2026-07-01"
 _EXT_CHANGELOG = [
+    "Read-aloud on change now uses real coin names (BTCUSDT → Bitcoin)",
+    "Correct up/down direction + change from the previous reading",
     "3D JARVIS robot avatar on every page",
     "Universal voice — extension speaks with your chosen chat voice",
     "Avatar style picker (cyan/purple/gold/crimson/emerald)",
     "Robot reacts to voice: listening, thinking, talking animations",
-    "Fixed MT5 account display in unified monitor",
-    "Per-account error isolation",
     "Unified monitor: crypto + MT5 accounts in real time",
     "15-minute automatic position analysis with AI/SMC",
     "On-demand analysis from popup with JARVIS speech",
-    "Account balances + equity shown in popup",
-    "False breakout detection in all sniper setups",
     "Auto-update detection when TradeBot opens",
 ]
+
+
+def _ext_dir() -> Optional[Path]:
+    """
+    Locate the ``jarvis-extension`` directory robustly.
+
+    Walks up from this file until it finds a folder containing a
+    ``jarvis-extension`` directory (project root), so the lookup never breaks if
+    the module is moved. Returns ``None`` if it cannot be found.
+    """
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidate = parent / "jarvis-extension"
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def _ext_version() -> str:
+    """Return the live extension version from manifest.json (fallback constant)."""
+    import json as _json
+    ext_dir = _ext_dir()
+    if ext_dir is not None:
+        manifest_path = ext_dir / "manifest.json"
+        try:
+            if manifest_path.exists():
+                v = _json.loads(manifest_path.read_text()).get("version")
+                if v:
+                    return str(v)
+        except Exception:
+            pass
+    return _EXT_VERSION
 
 
 @router.get("/extension-version")
@@ -508,14 +540,7 @@ async def get_extension_version():
     If the installed version differs from `version`, a banner is shown.
     """
     # Read version directly from manifest so backend and ZIP always agree
-    manifest_version = _EXT_VERSION
-    try:
-        import json as _json
-        _manifest_path = Path(__file__).parents[5] / "jarvis-extension" / "manifest.json"
-        if _manifest_path.exists():
-            manifest_version = _json.loads(_manifest_path.read_text())["version"]
-    except Exception:
-        pass
+    manifest_version = _ext_version()
 
     return {
         "version": manifest_version,
@@ -540,23 +565,16 @@ async def download_extension(v: Optional[str] = None):
     Filename format: jarvis-extension-v{version}.zip
     """
     import io as _io
-    import json as _json
     import zipfile as _zipfile
     from fastapi.responses import StreamingResponse
 
-    ext_dir = Path(__file__).parents[5] / "jarvis-extension"
-    if not ext_dir.exists():
+    ext_dir = _ext_dir()
+    if ext_dir is None or not ext_dir.exists():
         from fastapi import HTTPException
         raise HTTPException(404, "Extension directory not found")
 
-    # Read version from manifest for the filename
-    version = _EXT_VERSION
-    try:
-        manifest_path = ext_dir / "manifest.json"
-        if manifest_path.exists():
-            version = _json.loads(manifest_path.read_text()).get("version", _EXT_VERSION)
-    except Exception:
-        pass
+    # Read version from manifest for the filename (always the live value)
+    version = _ext_version()
 
     # Build the ZIP in memory from current files
     buf = _io.BytesIO()
@@ -580,6 +598,160 @@ async def download_extension(v: Optional[str] = None):
             "Cache-Control": "no-store, no-cache, must-revalidate",
         },
     )
+
+
+# ── System resource stats (CPU / RAM) ─────────────────────────────────────────
+
+@router.get("/system-stats")
+async def get_system_stats():
+    """
+    Live host resource usage for the JARVIS Room HUD.
+
+    Returns CPU %, per-core load, memory (used/total/percent), swap and the
+    process footprint. Used by the room to show the operator how much of the
+    machine the app is consuming so resources can be shared fairly.
+    Degrades gracefully (``available: False``) when psutil is missing.
+    """
+    try:
+        import psutil  # noqa
+    except Exception:
+        return {
+            "available": False,
+            "reason": "psutil not installed",
+            "cpu_percent": 0.0,
+            "cpu_count": 0,
+            "mem_percent": 0.0,
+            "mem_used": 0,
+            "mem_total": 0,
+        }
+
+    try:
+        # interval=None → non-blocking, returns usage since the previous call.
+        cpu_percent = psutil.cpu_percent(interval=None)
+        cpu_count = psutil.cpu_count(logical=True) or 0
+        try:
+            per_core = psutil.cpu_percent(interval=None, percpu=True)
+        except Exception:
+            per_core = []
+
+        vm = psutil.virtual_memory()
+        try:
+            sw = psutil.swap_memory()
+            swap_percent = float(sw.percent)
+            swap_used = int(sw.used)
+            swap_total = int(sw.total)
+        except Exception:
+            swap_percent, swap_used, swap_total = 0.0, 0, 0
+
+        # This backend process's own footprint.
+        proc_cpu = 0.0
+        proc_mem = 0
+        try:
+            p = psutil.Process()
+            proc_cpu = float(p.cpu_percent(interval=None))
+            proc_mem = int(p.memory_info().rss)
+        except Exception:
+            pass
+
+        # 1-minute load average (per-core normalised), where supported.
+        load_pct = None
+        try:
+            import os as _os
+            la1 = _os.getloadavg()[0]
+            if cpu_count:
+                load_pct = round(min(100.0, (la1 / cpu_count) * 100.0), 1)
+        except Exception:
+            load_pct = None
+
+        return {
+            "available": True,
+            "cpu_percent": round(float(cpu_percent), 1),
+            "cpu_count": cpu_count,
+            "per_core": [round(float(c), 1) for c in per_core],
+            "load_percent": load_pct,
+            "mem_percent": round(float(vm.percent), 1),
+            "mem_used": int(vm.used),
+            "mem_total": int(vm.total),
+            "mem_available": int(vm.available),
+            "swap_percent": swap_percent,
+            "swap_used": swap_used,
+            "swap_total": swap_total,
+            "proc_cpu_percent": round(proc_cpu, 1),
+            "proc_mem": proc_mem,
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:  # pragma: no cover - best effort
+        logger.debug(f"[JARVIS] system-stats error: {e}")
+        return {"available": False, "reason": str(e), "cpu_percent": 0.0, "mem_percent": 0.0}
+
+
+# ── Crypto pair catalog endpoints ──────────────────────────────────────────────
+# Backed by app/services/pair_catalog.py (the `crypto_pairs` table). These let
+# JARVIS, the extension and the frontend use REAL coin names and resolve spoken
+# token names/tickers to a tradeable Bitget pair.
+
+@router.get("/pairs")
+async def list_pairs(
+    q: Annotated[Optional[str], Query(description="Search by symbol / ticker / name")] = None,
+    limit: Annotated[int, Query(description="Max rows to return")] = 50,
+):
+    """Searchable catalog list (symbol, name, market cap, 24h volume, rank)."""
+    try:
+        from app.services import pair_catalog
+        rows = await pair_catalog.search_pairs(q or "", limit=limit)
+        return {"ok": True, "count": len(rows), "pairs": rows}
+    except Exception as e:
+        logger.warning(f"[JARVIS] /pairs error: {e}")
+        return {"ok": False, "count": 0, "pairs": [], "error": str(e)}
+
+
+@router.get("/pairs/names")
+async def pair_names():
+    """
+    Compact ``{symbol: name}`` map for the extension + frontend.
+
+    Keyed by BOTH ``BTC/USDT`` and ``BTCUSDT`` so monitor payloads (which use the
+    glued form) map straight to a coin name.
+    """
+    try:
+        from app.services import pair_catalog
+        names = await pair_catalog.get_name_map()
+        return {"ok": True, "count": len(names), "names": names}
+    except Exception as e:
+        logger.warning(f"[JARVIS] /pairs/names error: {e}")
+        return {"ok": False, "count": 0, "names": {}, "error": str(e)}
+
+
+@router.get("/pairs/resolve")
+async def resolve_pair(
+    q: Annotated[str, Query(description="Token name, ticker or symbol to resolve")],
+):
+    """
+    Resolve a token/name/symbol to a tradeable Bitget pair with live metadata,
+    or return ``ok:false`` with the closest suggestion when it isn't found.
+    """
+    try:
+        from app.services import pair_catalog
+        pair, suggestion = await pair_catalog.resolve_with_suggestion(q)
+        if pair is None:
+            return {"ok": False, "query": q, "suggestion": suggestion}
+
+        result = pair_catalog.pair_to_dict(pair, full=True)
+        # Overlay a fresh (cached ≤60s) live market snapshot.
+        try:
+            snap = await pair_catalog.get_market_snapshot(pair.symbol)
+            if snap:
+                for k in ("market_cap", "market_cap_rank", "volume_24h", "price", "price_change_24h", "name"):
+                    if snap.get(k) is not None:
+                        result[k] = snap[k]
+        except Exception:
+            pass
+        result["ok"] = True
+        result["query"] = q
+        return result
+    except Exception as e:
+        logger.warning(f"[JARVIS] /pairs/resolve error: {e}")
+        return {"ok": False, "query": q, "error": str(e)}
 
 
 # ── Positions endpoint ─────────────────────────────────────────────────────────
@@ -1635,6 +1807,33 @@ async def _analyze_symbol(symbol: str, original_cmd: str, ex_name: Optional[str]
         )
 
     # ── Route: Crypto symbols via Bitget ─────────────────────────────────────
+    # Resolve the token → canonical Bitget pair + REAL coin name so JARVIS can
+    # talk about "Bitcoin" (not "BTCUSDT") and never surfaces a raw ccxt
+    # "does not have market" error for a token that simply needs resolving.
+    coin_name: Optional[str] = None
+    _input_token = symbol  # the raw token before canonicalisation
+    try:
+        from app.services import pair_catalog
+        resolved_pair, suggestion = await pair_catalog.resolve_with_suggestion(symbol)
+        if resolved_pair is None:
+            token = symbol.replace("USDT", "").replace("USDC", "") or symbol
+            if suggestion:
+                msg = f"I couldn't find a Bitget pair for {token}. Did you mean {suggestion}?"
+            else:
+                msg = f"I couldn't find a Bitget-tradeable pair for {token}, Sir."
+            return CommandResult(ok=False, action="analyze", detail=msg, speech=msg)
+        coin_name = resolved_pair.name or resolved_pair.base
+        # Canonical glued form for downstream ccxt normalisation (e.g. BTCUSDT).
+        symbol = f"{resolved_pair.base}{resolved_pair.quote}"
+        # Learn the user's bare token as an alias so it resolves instantly next
+        # time (learn_alias no-ops when it equals the symbol/base/name).
+        try:
+            await pair_catalog.learn_alias(pair_catalog._strip_quote(_input_token), resolved_pair.symbol)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.debug(f"[JARVIS] pair resolution skipped: {e}")
+
     ex_list: List[SupportedExchange] = exchange_manager.get_all_exchanges()
     if ex_name:
         try:
@@ -1650,6 +1849,8 @@ async def _analyze_symbol(symbol: str, original_cmd: str, ex_name: Optional[str]
     # Normalise: SOLUSDT → SOL/USDT  (ccxt format)
     base   = symbol.replace("USDT", "").replace("USDC", "")
     ccxt_sym = f"{base}/USDT"
+    # Spoken/display label: the real coin name when known, else the symbol.
+    display_name = coin_name or symbol
 
     # ── Fetch 4H OHLCV (200 candles) ─────────────────────────────────────────
     try:
@@ -1741,7 +1942,7 @@ async def _analyze_symbol(symbol: str, original_cmd: str, ex_name: Optional[str]
     )
 
     detail = (
-        f"{symbol} | {trend.upper()} | RSI {rsi:.0f} ({rsi_label})\n"
+        f"{display_name} ({symbol}) | {trend.upper()} | RSI {rsi:.0f} ({rsi_label})\n"
         f"EMA50={ema50:.4g}  EMA200={ema200:.4g}  Current={current:.4g}\n"
         f"Swing Hi={swing_high:.4g}  Swing Lo={swing_low:.4g}\n"
         f"\nPROPOSED {side_label} SETUP (REAL DATA — NOT EXECUTED)\n"
@@ -1750,7 +1951,7 @@ async def _analyze_symbol(symbol: str, original_cmd: str, ex_name: Optional[str]
     )
 
     speech = (
-        f"{symbol} analysis: {trend}, RSI {rsi:.0f}, {rsi_label}. "
+        f"{display_name} analysis: {trend}, RSI {rsi:.0f}, {rsi_label}. "
         f"Proposed {side_label.lower()} entry at {entry}, SL {sl}, "
         f"TP1 {tp1}. "
         f"This is a proposal — say the execute command to confirm, Sir."
@@ -2188,17 +2389,57 @@ async def _list_positions() -> CommandResult:
 
 
 async def _position_status(symbol: str, ex_name: Optional[str]) -> CommandResult:
+    # Resolve the token → real coin name (so JARVIS says "Bitcoin", not "BTC").
+    coin_name = symbol
+    try:
+        from app.services import pair_catalog
+        rp = await pair_catalog.resolve(symbol)
+        if rp is not None:
+            coin_name = rp.name or rp.base
+    except Exception:
+        pass
+
     try:
         connector, pos = await _find_position(symbol, ex_name)
     except BaseException as e:
         friendly = "Exchange connection failed — please check your network."
         return CommandResult(ok=True, action="position_status", detail=friendly, speech=friendly)
+
     if pos is None:
+        # No open position — give a live market update instead of a dead-end,
+        # using the catalog's cached market cap / volume / price snapshot.
+        try:
+            from app.services import pair_catalog
+            snap = await pair_catalog.get_market_snapshot(symbol)
+        except Exception:
+            snap = None
+        if snap and snap.get("price") is not None:
+            chg = snap.get("price_change_24h")
+            cap = snap.get("market_cap")
+            vol = snap.get("volume_24h")
+            dir_txt = ""
+            if chg is not None:
+                dir_txt = f" {'up' if chg >= 0 else 'down'} {abs(chg):.2f} percent over 24 hours"
+            speech = (
+                f"{coin_name} is trading at {snap['price']:.6g}{dir_txt}. "
+                + (f"Market cap {_fmt_usd_short(cap)}. " if cap else "")
+                + (f"24 hour volume {_fmt_usd_short(vol)}. " if vol else "")
+                + "You have no open position on it, Sir."
+            )
+            detail = (
+                f"{coin_name} ({snap.get('symbol', symbol)}) | price {snap['price']:.6g}"
+                + (f" | 24h {chg:+.2f}%" if chg is not None else "")
+                + (f" | mcap {_fmt_usd_short(cap)}" if cap else "")
+                + (f" | vol {_fmt_usd_short(vol)}" if vol else "")
+                + " | no open position"
+            )
+            return CommandResult(ok=True, action="position_status", detail=detail, speech=speech)
         return CommandResult(
             ok=True, action="position_status",
-            detail=f"No open position found for {symbol}",
-            speech=f"No open position found for {symbol}, Sir.",
+            detail=f"No open position found for {coin_name}",
+            speech=f"You have no open position on {coin_name}, Sir.",
         )
+
     entry   = _safe_float(pos.get("entryPrice"))
     mark    = _safe_float(pos.get("markPrice")) or entry
     pnl     = _safe_float(pos.get("unrealizedPnl"))
@@ -2206,12 +2447,25 @@ async def _position_status(symbol: str, ex_name: Optional[str]) -> CommandResult
     side    = str(pos.get("side") or "long")
     direction = "up" if pnl >= 0 else "down"
     speech = (
-        f"{symbol} {side} position is {direction} {abs(pnl_pct):.2f} percent. "
+        f"{coin_name} {side} position is {direction} {abs(pnl_pct):.2f} percent. "
         f"PnL {'plus' if pnl>=0 else 'minus'} {abs(pnl):.2f} USDT. "
         f"Entry {entry:.6g}, current {mark:.6g}."
     )
     return CommandResult(
         ok=True, action="position_status",
-        detail=f"{symbol} {side} | entry {entry} | mark {mark} | PnL {pnl:+.2f} USDT ({pnl_pct:+.2f}%)",
+        detail=f"{coin_name} ({symbol}) {side} | entry {entry} | mark {mark} | PnL {pnl:+.2f} USDT ({pnl_pct:+.2f}%)",
         speech=speech,
     )
+
+
+def _fmt_usd_short(v: Optional[float]) -> str:
+    """Human-readable short USD, e.g. 1.17T, 42.7B, 903M, 12.3K."""
+    try:
+        n = float(v or 0)
+    except Exception:
+        return "$0"
+    a = abs(n)
+    for div, suf in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if a >= div:
+            return f"${n / div:.2f}{suf}"
+    return f"${n:.0f}"
