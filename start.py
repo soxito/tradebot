@@ -1119,11 +1119,58 @@ def _ensure_pg_port(pg_port: int) -> None:
         pass
 
 
+def _ensure_pg_role_and_db(pg_port: int) -> None:
+    """
+    Create the tradebot role + database if they don't exist.
+
+    A fresh Homebrew PostgreSQL install only has a superuser role named after the
+    current macOS user — it has no `tradebot` role and no `tradebot` database. The
+    backend's DATABASE_URL authenticates as tradebot/tradebot_password against a
+    `tradebot` DB, so without this the backend can never connect and start.py
+    times out waiting for the API port to bind.
+
+    We connect to the default `postgres` database as the OS superuser (peer/trust
+    auth on a local Homebrew install) and idempotently create the role + DB.
+    """
+    psql = PG_BIN / "psql"
+    if not psql.exists():
+        alt = shutil.which("psql")
+        if not alt:
+            return
+        psql = Path(alt)
+
+    def _psql(sql: str, db: str = "postgres") -> subprocess.CompletedProcess:
+        return run([str(psql), "-h", "localhost", "-p", str(pg_port),
+                    "-d", db, "-tAc", sql])
+
+    # 1) Role
+    r = _psql("SELECT 1 FROM pg_roles WHERE rolname='tradebot'")
+    if r.returncode == 0 and "1" not in r.stdout:
+        cr = _psql("CREATE ROLE tradebot LOGIN PASSWORD 'tradebot_password' CREATEDB")
+        if cr.returncode == 0:
+            ok("Created PostgreSQL role 'tradebot'")
+        else:
+            warn(f"Could not create role 'tradebot': {cr.stderr.strip()[:160]}")
+
+    # 2) Database (owned by tradebot)
+    r = _psql("SELECT 1 FROM pg_database WHERE datname='tradebot'")
+    if r.returncode == 0 and "1" not in r.stdout:
+        cd = _psql("CREATE DATABASE tradebot OWNER tradebot")
+        if cd.returncode == 0:
+            ok("Created PostgreSQL database 'tradebot'")
+        else:
+            warn(f"Could not create database 'tradebot': {cd.stderr.strip()[:160]}")
+
+    # 3) Make sure the password is set (in case the role predates this logic)
+    _psql("ALTER ROLE tradebot LOGIN PASSWORD 'tradebot_password'")
+
+
 def start_postgres_brew() -> Tuple[bool, int]:
     pg_port = 5434
     info("Starting PostgreSQL (Homebrew) …")
     if port_open("localhost", pg_port, 0.5):
         ok(f"PostgreSQL already running on :{pg_port}")
+        _ensure_pg_role_and_db(pg_port)
         return True, pg_port
 
     # Clean-install robustness: install if missing, fix port, clear stale lock.
@@ -1134,6 +1181,7 @@ def start_postgres_brew() -> Tuple[bool, int]:
 
     run(["brew", "services", "start", "postgresql@16"])
     if wait_for_port("localhost", pg_port, "PostgreSQL", max_wait=30):
+        _ensure_pg_role_and_db(pg_port)
         return True, pg_port
 
     # First attempt failed — likely a stale lock or errored service. Clear the
@@ -1143,7 +1191,10 @@ def start_postgres_brew() -> Tuple[bool, int]:
     time.sleep(2)
     _clear_stale_pg_pid()
     run(["brew", "services", "start", "postgresql@16"])
-    return wait_for_port("localhost", pg_port, "PostgreSQL", max_wait=45), pg_port
+    if wait_for_port("localhost", pg_port, "PostgreSQL", max_wait=45):
+        _ensure_pg_role_and_db(pg_port)
+        return True, pg_port
+    return False, pg_port
 
 
 def start_postgres_docker() -> Tuple[bool, int]:
