@@ -1210,7 +1210,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     try {
       abortRef.current = new AbortController()
       const resp = await fetch(
-        `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1'}/plugins/agent-paul/chat`,
+        `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:1448/api/v1'}/plugins/agent-paul/chat`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },

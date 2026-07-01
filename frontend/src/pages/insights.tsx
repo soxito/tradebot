@@ -88,7 +88,7 @@ export default function InsightsPage() {
         apiClient.getAgentDecisions({ limit: 20 }),
         apiClient.getNewsArticles({ limit: 10 }),
         // @ts-ignore — paul knowledge stats
-        fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1'}/plugins/agent-paul/knowledge/stats`).then(r => r.json()),
+        fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:1448/api/v1'}/plugins/agent-paul/knowledge/stats`).then(r => r.json()),
       ])
       if (statsRes.status === 'fulfilled') setNewsStats(statsRes.value.data)
       const sentData = sentRes.status === 'fulfilled' ? (sentRes.value.data?.sentiments || []) : []

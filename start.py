@@ -1328,7 +1328,27 @@ def ensure_pip_deps() -> bool:
 
 
 # ── npm deps ─────────────────────────────────────────────────────────────────
+def ensure_frontend_env() -> None:
+    """
+    Create frontend/.env.local if it doesn't exist.
+
+    This file is gitignored so fresh clones won't have it. Without it,
+    NEXT_PUBLIC_API_URL is undefined and every API call falls back to
+    the wrong port (the code had localhost:8000 as a stale hardcoded
+    default; the real backend runs on :1448) — causing HTTP 500 / ECONNREFUSED
+    on every page load.
+    """
+    env_local = FRONTEND_DIR / ".env.local"
+    if env_local.exists():
+        return
+    env_local.write_text(
+        f"NEXT_PUBLIC_API_URL=http://localhost:{BACKEND_PORT}/api/v1\n"
+    )
+    ok(f"Created frontend/.env.local (NEXT_PUBLIC_API_URL=http://localhost:{BACKEND_PORT}/api/v1)")
+
+
 def ensure_npm_deps() -> bool:
+    ensure_frontend_env()
     nm = FRONTEND_DIR / "node_modules"
     if nm.exists() and (nm / ".package-lock.json").exists():
         ok("npm dependencies already installed")

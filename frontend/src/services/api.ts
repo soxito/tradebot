@@ -1,7 +1,7 @@
 import axios from 'axios';
 import type { AxiosRequestConfig } from 'axios';
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1';
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:1448/api/v1';
 
 export const api = axios.create({
   baseURL: API_BASE_URL,
@@ -739,7 +739,7 @@ export const apiClient = {
   jarvis: {
     /** Stream JARVIS SSE response; caller handles the ReadableStream */
     chatStream: (messages: {role: string; content: string}[], pathname?: string, sessionKey?: string): Promise<Response> =>
-      fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1'}/plugins/agent-paul/chat`, {
+      fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:1448/api/v1'}/plugins/agent-paul/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messages, pathname: pathname || '/', session_key: sessionKey || 'default' }),
