@@ -3,8 +3,11 @@ JARVIS Vision API  –  GPU-accelerated face analysis
 ====================================================
 
 Powered by:
-  • MediaPipe Python FaceMesh  – 478-point face landmarks, GPU via CUDA / Metal
+  • MediaPipe Tasks FaceLandmarker  – 478-point face landmarks + 52 blendshapes
     github.com/google-ai-edge/mediapipe  (36k ⭐)
+    Uses the modern Tasks API (mediapipe.tasks.python.vision) which is the only
+    API shipped in mediapipe 0.10.x wheels on Python 3.13 / Apple Silicon.
+    The `jawOpen` blendshape gives a robust talking signal on top of MAR.
   • face_recognition (dlib)  – face identity embeddings
     github.com/ageitgey/face_recognition  (53k ⭐)
   • OpenCV  – frame decoding + preprocessing
@@ -12,7 +15,7 @@ Powered by:
 WebSocket endpoint  (primary, real-time):
   WS  /vision/face-stream
       Client → { "frame": "<base64 JPEG>", "ts": 1234567890 }
-      Server → { "face": bool, "mar": float, "talking": bool,
+      Server → { "face": bool, "mar": float, "jaw_open": float, "talking": bool,
                  "identity_match": bool, "box": {x,y,w,h},
                  "landmarks": [{x,y,z}, ...], "ts": ... }
 
@@ -23,14 +26,19 @@ REST endpoints:
   POST /vision/lip-data      { "samples": [...], "mar_avg": float }
 
 GPU notes:
-  • macOS  : MediaPipe uses Metal/CoreML automatically
-  • Linux/Windows with CUDA: set env MEDIAPIPE_USE_GPU=1 before starting
+  • The desktop Python Tasks wheel runs the model on CPU via the XNNPACK SIMD
+    delegate (very fast for single-face 320×240). The GPU delegate is attempted
+    first and falls back to CPU automatically if unavailable.
+  • macOS: XNNPACK uses Accelerate/SIMD; Linux/Windows CUDA builds use GPU.
 """
 
 from __future__ import annotations
 
 import base64
+import os
 import time
+import urllib.request
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -39,6 +47,29 @@ from loguru import logger
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/vision", tags=["vision"])
+
+# ── Model bundle (auto-downloaded on first use) ──────────────────────────────
+_MODEL_DIR  = Path(__file__).parent / "models"
+_MODEL_PATH = _MODEL_DIR / "face_landmarker.task"
+_MODEL_URL  = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/1/face_landmarker.task"
+)
+
+
+def _ensure_model() -> bool:
+    """Download the FaceLandmarker task bundle if not present. Returns True if ready."""
+    try:
+        if _MODEL_PATH.exists() and _MODEL_PATH.stat().st_size > 100_000:
+            return True
+        _MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Downloading MediaPipe FaceLandmarker model → {_MODEL_PATH}")
+        urllib.request.urlretrieve(_MODEL_URL, _MODEL_PATH)
+        return _MODEL_PATH.exists() and _MODEL_PATH.stat().st_size > 100_000
+    except Exception as e:
+        logger.error(f"Failed to download FaceLandmarker model: {e}")
+        return False
+
 
 # ── Optional imports (graceful fallback) ─────────────────────────────────────
 
@@ -51,12 +82,13 @@ except ImportError:
 
 try:
     import mediapipe as mp
+    from mediapipe.tasks import python as _mp_python
+    from mediapipe.tasks.python import vision as _mp_vision
     _MP = True
-    _mp_face_mesh_mod = mp.solutions.face_mesh
-    logger.info("mediapipe available — GPU face mesh enabled")
+    logger.info("mediapipe Tasks API available — FaceLandmarker enabled")
 except ImportError:
     _MP = False
-    logger.warning("mediapipe not installed  →  pip install mediapipe")
+    logger.warning("mediapipe not installed  →  bash scripts/setup-face-vision.sh")
 
 try:
     import face_recognition as fr
@@ -65,6 +97,49 @@ try:
 except ImportError:
     _FR = False
     logger.warning("face_recognition not installed  →  pip install face_recognition  (needs cmake)")
+
+
+def _make_landmarker():
+    """
+    Build a per-connection FaceLandmarker in VIDEO mode.
+
+    Delegate selection:
+      • Default = CPU (XNNPACK) — SIMD-accelerated, stable on all platforms.
+        On Apple Silicon this is the correct fast path; the macOS Metal GPU
+        delegate hard-aborts on desktop `mp.Image` inference (MediaPipe bug),
+        so it is NOT used unless explicitly forced.
+      • GPU (CUDA) — opt-in via env  JARVIS_VISION_GPU=1  for Linux/Windows
+        builds where the GPU delegate is stable.
+    """
+    if not _MP or not _ensure_model():
+        return None
+
+    use_gpu = os.getenv("JARVIS_VISION_GPU", "0") == "1"
+    delegate = (_mp_python.BaseOptions.Delegate.GPU if use_gpu
+                else _mp_python.BaseOptions.Delegate.CPU)
+
+    try:
+        base = _mp_python.BaseOptions(
+            model_asset_path=str(_MODEL_PATH),
+            delegate=delegate,
+        )
+        opts = _mp_vision.FaceLandmarkerOptions(
+            base_options=base,
+            running_mode=_mp_vision.RunningMode.VIDEO,
+            num_faces=1,
+            output_face_blendshapes=True,   # gives jawOpen / mouth signals
+            output_facial_transformation_matrixes=False,
+            min_face_detection_confidence=0.4,
+            min_face_presence_confidence=0.4,
+            min_tracking_confidence=0.4,
+        )
+        lm = _mp_vision.FaceLandmarker.create_from_options(opts)
+        logger.info(f"FaceLandmarker ready (delegate={'GPU' if use_gpu else 'CPU/XNNPACK'})")
+        return lm
+    except Exception as e:
+        logger.error(f"FaceLandmarker init failed: {e}")
+        return None
+
 
 # ── MediaPipe FaceMesh lip landmark indices (478-point model) ────────────────
 # Upper inner lip: 13   Lower inner lip: 14
@@ -121,10 +196,11 @@ def _b64_to_bgr(b64: str) -> Optional[np.ndarray]:
         return None
 
 
-def _compute_mar(landmarks: list, h: int, w: int) -> float:
+def _compute_mar(landmarks: list) -> float:
     """
     Mouth Aspect Ratio from MediaPipe 478-point normalised landmarks.
-    Uses:  top inner (13), bottom inner (14), left corner (61), right corner (291)
+    Uses:  top inner (13), bottom inner (14), left corner (61), right corner (291).
+    Landmarks are normalised (0–1) so the ratio is resolution-independent.
     """
     if len(landmarks) < 292:
         return 0.0
@@ -161,22 +237,17 @@ async def face_stream_ws(websocket: WebSocket) -> None:
     Real-time WebSocket face analysis.
 
     Expects JSON frames from the JARVIS extension's face-vision.js.
-    Processes each frame with MediaPipe FaceMesh (GPU) and face_recognition (dlib).
-    Returns landmarks, MAR, talking state, bounding box, and identity match.
+    Processes each frame with MediaPipe FaceLandmarker (Tasks API) and
+    face_recognition (dlib). Returns landmarks, MAR, jawOpen, talking state,
+    bounding box, and identity match.
     """
     await websocket.accept()
     client = websocket.client
     logger.info(f"Face-stream WS connected from {client}")
 
-    face_mesh = None
-    if _MP:
-        face_mesh = _mp_face_mesh_mod.FaceMesh(
-            static_image_mode=False,   # tracking mode (faster)
-            max_num_faces=1,
-            refine_landmarks=True,     # enables 478 landmarks (lips + iris)
-            min_detection_confidence=0.45,
-            min_tracking_confidence=0.45,
-        )
+    landmarker = _make_landmarker() if _MP else None
+    # VIDEO mode requires strictly-increasing millisecond timestamps.
+    frame_ts_ms = 0
 
     try:
         while True:
@@ -194,30 +265,33 @@ async def face_stream_ws(websocket: WebSocket) -> None:
             # Decode frame
             bgr = _b64_to_bgr(b64) if _CV2 else None
             if bgr is None:
-                await websocket.send_json({"face": False, "mar": 0, "talking": False,
-                                            "identity_match": False, "ts": ts,
-                                            "landmarks": [], "box": None})
+                await websocket.send_json({"face": False, "mar": 0, "jaw_open": 0,
+                                            "talking": False, "identity_match": False,
+                                            "ts": ts, "landmarks": [], "box": None})
                 continue
 
             h, w = bgr.shape[:2]
             result: Dict[str, Any] = {
-                "face": False, "mar": 0.0, "talking": False,
+                "face": False, "mar": 0.0, "jaw_open": 0.0, "talking": False,
                 "identity_match": False, "ts": ts,
                 "landmarks": [], "box": None,
             }
 
-            # ── MediaPipe face mesh ──────────────────────────────────────
-            if face_mesh is not None:
+            # ── MediaPipe FaceLandmarker (Tasks API) ─────────────────────
+            if landmarker is not None:
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                rgb.flags.writeable = False
-                mp_result = face_mesh.process(rgb)
-                rgb.flags.writeable = True
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                frame_ts_ms += 33  # monotonic (~30fps virtual clock)
+                try:
+                    det = landmarker.detect_for_video(mp_image, frame_ts_ms)
+                except Exception as e:
+                    logger.debug(f"FaceLandmarker error: {e}")
+                    det = None
 
-                if mp_result.multi_face_landmarks:
-                    face_lm = mp_result.multi_face_landmarks[0]
-                    lm_list = face_lm.landmark
+                if det and det.face_landmarks:
+                    lm_list = det.face_landmarks[0]   # 478 NormalizedLandmark
 
-                    # Bounding box (from face landmarks extent)
+                    # Bounding box (from landmark extent)
                     xs = [lm.x * w for lm in lm_list]
                     ys = [lm.y * h for lm in lm_list]
                     bx, by = int(min(xs)), int(min(ys))
@@ -225,13 +299,24 @@ async def face_stream_ws(websocket: WebSocket) -> None:
                     bh = int(max(ys) - min(ys))
                     result["box"] = {"x": bx, "y": by, "w": bw, "h": bh}
 
-                    # MAR
-                    mar = _compute_mar(lm_list, h, w)
-                    result["mar"]     = round(mar, 4)
-                    result["talking"] = mar > 0.30
-                    result["face"]    = True
+                    # MAR (geometric mouth-open ratio)
+                    mar = _compute_mar(lm_list)
+                    result["mar"]  = round(mar, 4)
+                    result["face"] = True
 
-                    # Lip landmarks (priority order) + sample of face mesh
+                    # jawOpen blendshape (robust talking signal)
+                    jaw_open = 0.0
+                    if det.face_blendshapes:
+                        for cat in det.face_blendshapes[0]:
+                            if cat.category_name == "jawOpen":
+                                jaw_open = float(cat.score)
+                                break
+                    result["jaw_open"] = round(jaw_open, 4)
+
+                    # Talking = mouth geometrically open OR jaw blendshape active
+                    result["talking"] = bool(mar > 0.30 or jaw_open > 0.25)
+
+                    # Lip landmarks (priority) + sampled face mesh for overlay
                     lip_pts = []
                     for idx in _LIPS_ALL_IDX:
                         if idx < len(lm_list):
@@ -241,7 +326,6 @@ async def face_stream_ws(websocket: WebSocket) -> None:
                                 "y": round(lm.y * h, 2),
                                 "z": round(lm.z, 4),
                             })
-                    # Add some general face points for overlay density
                     face_pts = []
                     for idx in range(0, min(150, len(lm_list)), 3):
                         lm = lm_list[idx]
@@ -270,8 +354,11 @@ async def face_stream_ws(websocket: WebSocket) -> None:
     except Exception as e:
         logger.error(f"Face-stream WS error: {e}")
     finally:
-        if face_mesh is not None:
-            face_mesh.close()
+        if landmarker is not None:
+            try:
+                landmarker.close()
+            except Exception:
+                pass
 
 
 @router.post("/enroll-face")
@@ -315,6 +402,7 @@ async def get_profile() -> Dict[str, Any]:
         "mediapipe_available":    _MP,
         "face_recognition_available": _FR,
         "opencv_available":       _CV2,
+        "model_ready":            _MODEL_PATH.exists(),
     }
 
 

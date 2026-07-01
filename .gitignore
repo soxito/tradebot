@@ -87,3 +87,6 @@ credentials.json
 secrets/
 keys/
 .gstack/
+
+# MediaPipe face vision model (auto-downloaded by scripts/setup-face-vision.sh)
+backend/app/api/models/*.task

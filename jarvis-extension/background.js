@@ -537,7 +537,9 @@ api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
     // ── Face Vision updates from popup face-vision.js ─────────────────────
     // Face state is tracked so background can gate speech recognition on
-    // whether the user's face is actually present and talking.
+    // whether the user's face is actually present and talking. It is also
+    // relayed to content.js so the page-level speech recogniser can use the
+    // visual "talking" signal to stay in sync with the microphone.
     case 'face-vision-update': {
       const { facePresent, isTalking, mar, identityMatch } = msg
       faceVisionState.facePresent    = !!facePresent
@@ -546,8 +548,21 @@ api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       faceVisionState.identityMatch  = !!identityMatch
       faceVisionState.lastUpdateMs   = Date.now()
 
-      // Optional: if face is gone for >5s, reduce polling aggression
-      // (already handled by content.js requireVoiceMatch gate)
+      // Relay to the TradeBot content tabs so speech + face stay in sync.
+      try {
+        api.tabs.query(
+          { url: ['http://localhost:3000/*', 'http://127.0.0.1:3000/*'] },
+          (tabs) => {
+            (tabs || []).forEach((t) => {
+              api.tabs.sendMessage(t.id, {
+                type: 'face-vision-state',
+                facePresent, isTalking, mar, identityMatch,
+                ts: faceVisionState.lastUpdateMs,
+              }).catch?.(() => {})
+            })
+          }
+        )
+      } catch { /* no tabs */ }
       break
     }
 

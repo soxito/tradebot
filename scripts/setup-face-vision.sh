@@ -72,7 +72,28 @@ else
   ok "face_recognition installed"
 fi
 
-# ── 3. Verify GPU / backend ─────────────────────────────────────────────────
+# ── 3. FaceLandmarker model bundle ──────────────────────────────────────────
+MODEL_DIR="backend/app/api/models"
+MODEL_PATH="$MODEL_DIR/face_landmarker.task"
+MODEL_URL="https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+mkdir -p "$MODEL_DIR"
+if [[ -f "$MODEL_PATH" ]] && [[ $(wc -c < "$MODEL_PATH") -gt 100000 ]]; then
+  ok "FaceLandmarker model already present"
+else
+  info "Downloading MediaPipe FaceLandmarker model (~3.6 MB)…"
+  if command -v curl &>/dev/null; then
+    curl -sL -o "$MODEL_PATH" "$MODEL_URL"
+  else
+    "$PYTHON" -c "import urllib.request; urllib.request.urlretrieve('$MODEL_URL','$MODEL_PATH')"
+  fi
+  if [[ -f "$MODEL_PATH" ]] && [[ $(wc -c < "$MODEL_PATH") -gt 100000 ]]; then
+    ok "FaceLandmarker model downloaded"
+  else
+    err "Model download failed — the backend will retry automatically on first use"
+  fi
+fi
+
+# ── 4. Verify GPU / backend ─────────────────────────────────────────────────
 echo ""
 info "Verifying installation…"
 $PYTHON - <<'PYEOF'
@@ -89,9 +110,9 @@ except ImportError:
 try:
     import mediapipe as mp
     print(f"  mediapipe:        {mp.__version__}  ✓")
-    # Quick GPU check
     from mediapipe.tasks import python as mp_python
-    print("  mediapipe tasks:  available  ✓")
+    from mediapipe.tasks.python import vision as mp_vision
+    print("  mediapipe Tasks:  FaceLandmarker available  ✓")
 except ImportError:
     print("  mediapipe:        NOT INSTALLED  ✗")
 
@@ -101,19 +122,19 @@ try:
 except ImportError:
     print("  face_recognition: NOT INSTALLED  (identity check disabled)")
 
-# Check if CUDA is available (optional)
-try:
-    import torch
-    cuda_ok = torch.cuda.is_available()
-    print(f"  torch CUDA:       {'available  ✓' if cuda_ok else 'not found (CPU/Metal will be used)'}")
-except ImportError:
-    print("  torch:            not installed (not required)")
+import os
+_model = "backend/app/api/models/face_landmarker.task"
+if os.path.exists(_model) and os.path.getsize(_model) > 100000:
+    print("  FaceLandmarker model: present  ✓")
+else:
+    print("  FaceLandmarker model: missing (auto-downloads on first use)")
 
 print("")
-print("  Backend GPU notes:")
-print("  • macOS:          Metal/CoreML used automatically by mediapipe")
-print("  • Linux (CUDA):   ensure CUDA 11.x+ and cuDNN are installed")
-print("  • Windows (CUDA): ensure CUDA toolkit and cuDNN match")
+print("  Inference delegate:")
+print("  • Default:        CPU / XNNPACK (SIMD-accelerated, stable everywhere)")
+print("  • Apple Silicon:  XNNPACK uses Accelerate/SIMD — fast for single face")
+print("  • Linux/Win CUDA: set JARVIS_VISION_GPU=1 to use the GPU delegate")
+print("  • Note: the macOS Metal GPU delegate is disabled (upstream desktop bug)")
 PYEOF
 
 echo ""

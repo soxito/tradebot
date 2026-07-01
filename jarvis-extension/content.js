@@ -60,6 +60,26 @@
   let pageSpeaking = false
   let pageVoiceMatch = true  // updated by page's voiceMatch loop; gates dispatch when false
   let learnedVocab = {}     // cached from chrome.storage, boosts pickBest() scoring
+
+  // ── Face Vision sync state ──────────────────────────────────────────────────
+  // Relayed from the popup (face-vision.js → background → here). Only "fresh"
+  // while the popup camera is active. When fresh, the user's matched face acts
+  // as a positive reinforcement for the voice gate (speech + face in sync) and
+  // an unknown face tightens it. When stale (popup closed) speech is voice-only.
+  let faceState = { present: false, talking: false, match: false, mar: 0, ts: 0 }
+  const FACE_FRESH_MS = 2500
+  function faceFresh() { return faceState.ts > 0 && (Date.now() - faceState.ts) < FACE_FRESH_MS }
+
+  // Combined identity gate — single source of truth for "should we transcribe".
+  // Blends the audio voice-ID (pageVoiceMatch) with the visual face signal.
+  function passesIdentityGate() {
+    const voiceOK = !settings.requireVoiceMatch || pageVoiceMatch
+    if (!faceFresh()) return voiceOK                     // face vision off → voice-only (unchanged)
+    if (faceState.present && faceState.match) return true // your matched face → trust it
+    if (settings.requireVoiceMatch && faceState.present && !faceState.match) return false // stranger → block
+    return voiceOK
+  }
+
   // ── Conversation continuity ────────────────────────────────────────────────
   // While inConversation is true, follow-up speech is treated as a command
   // without needing the wake word again. The window auto-closes after
@@ -621,7 +641,7 @@
   }
   async function fxSend(clip, type) {
     if (fxInFlight || dgPaused) return
-    const voiceOK = !settings.requireVoiceMatch || pageVoiceMatch
+    const voiceOK = passesIdentityGate()
     if (!voiceOK) return  // not the calibrated user → no spend, no transcript
     fxInFlight = true
     try {
@@ -824,7 +844,7 @@
   //   • Conversation guard: inside the open window, follow-ups skip the wake.
   function handleTranscript(transcript, isFinal) {
     if (!transcript) return
-    const voiceOK = !settings.requireVoiceMatch || pageVoiceMatch
+    const voiceOK = passesIdentityGate()
 
     // ── Barge-in while JARVIS is speaking ──────────────────────────────────
     if (pageSpeaking) {
@@ -968,7 +988,7 @@
 
           // Echo + voice gate for the popup transcript mirror: never show
           // JARVIS's own TTS, and (when voice-ID is on) never show other people.
-          const voiceOK = !settings.requireVoiceMatch || pageVoiceMatch
+          const voiceOK = passesIdentityGate()
           if (!pageSpeaking && voiceOK) mirrorTranscript(transcript, isFinal)
 
           // Single shared wake / conversation / command pipeline.
@@ -1148,6 +1168,20 @@
             // Popup toggle: show/hide the in-page binary engine overlay
             updateEnginePanel(!!msg.visible)
             sendResponse({ ok: true, visible: enginePanelVisible }); break
+          case 'face-vision-state':
+            // Relayed from popup face-vision.js (via background). Keeps the
+            // speech recogniser in sync with the visual talking/identity signal.
+            faceState = {
+              present: !!msg.facePresent,
+              talking: !!msg.isTalking,
+              match:   !!msg.identityMatch,
+              mar:     msg.mar || 0,
+              ts:      msg.ts || Date.now(),
+            }
+            // Mirror the visual "talking" onto the page robot so it reacts in
+            // sync with the mouth (nice-to-have; page may ignore it).
+            try { toPage({ type: 'face-talking', talking: faceState.talking, match: faceState.match }) } catch { /* noop */ }
+            sendResponse({ ok: true }); break
           default: sendResponse({}); break
         }
       } catch (e) { sendResponse({ error: String(e) }) }
