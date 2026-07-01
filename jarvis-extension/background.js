@@ -18,8 +18,8 @@
 
 const api = typeof browser !== 'undefined' ? browser : chrome
 
-const BACKEND_OLD         = 'http://localhost:1448/api/v1'    // legacy crypto API
-const BACKEND             = 'http://localhost:8000/api/v1'    // MT5 + unified
+const BACKEND_OLD         = 'http://localhost:1448/api/v1'    // legacy crypto API (kept for fallback)
+const BACKEND             = 'http://localhost:1448/api/v1'    // unified backend (crypto + MT5 + jarvis)
 const POLL_MS             = 10_000   // realtime monitor poll interval (10 s)
 const ANALYSIS_ALARM      = 'jarvis-position-analysis'        // alarm name
 const ANALYSIS_PERIOD_MIN = 15                                // every 15 minutes

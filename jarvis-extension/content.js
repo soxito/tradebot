@@ -1460,7 +1460,7 @@
     } catch { /* noop */ }
 
     try {
-      const res = await fetch('http://localhost:8000/api/v1/jarvis/extension-version', {
+      const res = await fetch('http://localhost:1448/api/v1/jarvis/extension-version', {
         signal: AbortSignal.timeout(5000)
       })
       if (!res.ok) return

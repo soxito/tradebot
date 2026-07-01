@@ -1,9 +1,10 @@
 /*
- * JARVIS Voice Assistant — Popup UI  v3.2.0
+ * JARVIS Voice Assistant — Popup UI
  *
  * Unified monitor: crypto + MT5 accounts, real-time balances, 15-min analysis,
- * on-demand analysis, voice engine visualizer in popup (not on page), auto-update detection.
- * v3.2: Robot mode sends jarvis-robot-lock to claim sole mic/speaker on page.
+ * on-demand analysis, voice engine visualizer in popup (not on page), face
+ * vision with lip tracking, auto-update detection.
+ * The displayed version is always read from manifest.json — never hardcoded.
  */
 
 'use strict'
@@ -41,6 +42,10 @@ const els = {
   versionBadge:      document.getElementById('versionBadge'),
   versionText:       document.getElementById('versionText'),
 }
+
+// Single source of truth: always display the manifest version immediately on
+// load — NEVER hardcode a version string in the HTML (it drifts on every bump).
+if (els.versionText) els.versionText.textContent = 'v' + INSTALLED_VERSION
 
 const DEFAULTS = {
   enabled:        true,
@@ -199,7 +204,7 @@ function semverNewer(a, b) {
 async function checkVersionInPopup() {
   if (els.versionText) els.versionText.textContent = 'v' + INSTALLED_VERSION
   try {
-    const res = await fetch('http://localhost:8000/api/v1/jarvis/extension-version', {
+    const res = await fetch('http://localhost:1448/api/v1/jarvis/extension-version', {
       signal: AbortSignal.timeout(3000),
     })
     if (!res.ok) return
@@ -216,7 +221,7 @@ async function checkVersionInPopup() {
 if (els.versionBadge) {
   els.versionBadge.addEventListener('click', async () => {
     try {
-      const res = await fetch('http://localhost:8000/api/v1/jarvis/extension-version', {
+      const res = await fetch('http://localhost:1448/api/v1/jarvis/extension-version', {
         signal: AbortSignal.timeout(3000),
       })
       const data = res.ok ? await res.json() : {}

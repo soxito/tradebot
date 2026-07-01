@@ -483,8 +483,8 @@ def _safe_float(val, default: float = 0.0) -> float:
 # Fallback version only — the real version is ALWAYS read live from
 # jarvis-extension/manifest.json (see _ext_version()). Keep this in sync so a
 # missing manifest never advertises a stale version.
-_EXT_VERSION = "3.3.0"
-_EXT_RELEASED = "2026-07-01"
+_EXT_VERSION = "3.4.0"
+_EXT_RELEASED = "2026-07-02"
 _EXT_CHANGELOG = [
     "Read-aloud on change now uses real coin names (BTCUSDT → Bitcoin)",
     "Correct up/down direction + change from the previous reading",
