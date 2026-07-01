@@ -802,13 +802,17 @@ def preflight_check(mode: str) -> bool:
             info(f"Missing pip packages: {', '.join(missing_pkgs)} — installing …")
             pip = VENV / "bin" / "pip"
             reqs_file = BACKEND_DIR / "requirements.txt"
+            # Upgrade pip itself first — old pip versions fail on binary wheels
+            # (asyncpg, cryptography, etc.) and produce cryptic errors.
+            _spinner_run([str(pip), "install", "--quiet", "--upgrade", "pip"],
+                         "Upgrading pip", timeout=60)
             ok_p, err_p = _spinner_run(
-                [str(pip), "install", "-q", "-r", str(reqs_file)],
+                [str(pip), "install", "--upgrade", "-r", str(reqs_file)],
                 "pip install -r requirements.txt",
-                cwd=BACKEND_DIR, timeout=300
+                cwd=BACKEND_DIR, timeout=360
             )
             if ok_p:
-                # Re-check
+                # Re-check every package individually
                 still_missing = [
                     name for imp, name in core_pkgs
                     if subprocess.run([str(PY_BIN), "-c", f"import {imp}"],
@@ -822,7 +826,9 @@ def preflight_check(mode: str) -> bool:
                            "installed by auto-setup")
                     fixed_items.append("pip packages")
             else:
-                _check("Python packages", False, "", f"pip install failed: {err_p[:100]}")
+                _check("Python packages", False, "",
+                       f"pip install failed: {err_p[:200]}")
+                fail(f"pip stderr:\n{err_p[:400]}")
                 unfixable.append("pip install failed")
         else:
             _check("Python packages (fastapi, uvicorn, sqlalchemy …)", True,
@@ -1078,17 +1084,42 @@ def ensure_pip_deps() -> bool:
     if not reqs.exists():
         fail("backend/requirements.txt not found")
         return False
-    # Quick check: if uvicorn is importable in the venv, skip reinstall
-    r = run([str(PY_BIN), "-c", "import uvicorn"], cwd=BACKEND_DIR)
-    if r.returncode == 0:
+
+    # Check ALL core packages — not just uvicorn — so a partial/broken venv is
+    # caught here and reinstalled rather than causing a cryptic backend crash.
+    core_imports = [
+        "fastapi", "uvicorn", "sqlalchemy", "asyncpg",
+        "redis", "pydantic", "httpx", "loguru",
+    ]
+    missing = [
+        pkg for pkg in core_imports
+        if run([str(PY_BIN), "-c", f"import {pkg}"], cwd=BACKEND_DIR).returncode != 0
+    ]
+
+    if not missing:
         ok("Python dependencies already installed")
         return True
-    info("Installing Python dependencies (this may take a minute) …")
+
+    info(f"Installing Python dependencies: {', '.join(missing)} …")
     pip = VENV / "bin" / "pip"
-    r = run([str(pip), "install", "-q", "-r", str(reqs)], cwd=BACKEND_DIR)
+
+    # Upgrade pip first — stale pip misses binary wheels for asyncpg, etc.
+    run([str(pip), "install", "--quiet", "--upgrade", "pip"], cwd=BACKEND_DIR)
+
+    r = run([str(pip), "install", "--upgrade", "-r", str(reqs)], cwd=BACKEND_DIR)
     if r.returncode != 0:
-        fail(f"pip install failed:\n{r.stderr[:400]}")
+        fail(f"pip install failed:\n{r.stderr[:600]}")
         return False
+
+    # Verify every package is now importable
+    still_missing = [
+        pkg for pkg in core_imports
+        if run([str(PY_BIN), "-c", f"import {pkg}"], cwd=BACKEND_DIR).returncode != 0
+    ]
+    if still_missing:
+        fail(f"Packages still not importable after install: {', '.join(still_missing)}")
+        return False
+
     ok("Python dependencies installed")
     return True
 
