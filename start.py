@@ -774,7 +774,7 @@ def preflight_check(mode: str) -> bool:
     venv_exists = VENV.exists() and (VENV / "bin" / "python").exists()
     if not venv_exists:
         info("Python venv not found — creating now …")
-        py = shutil.which("python3") or "/opt/homebrew/bin/python3"
+        py = _best_python()
         ok_v, err_v = _spinner_run([py, "-m", "venv", str(VENV)],
                                    "Creating Python venv")
         if ok_v:
@@ -1084,11 +1084,33 @@ def start_redis_docker() -> Tuple[bool, int]:
 
 
 # ── Python venv ───────────────────────────────────────────────────────────────
+def _best_python() -> str:
+    """
+    Return the newest Python ≥3.11 available.
+
+    The dependency lockfile is frozen against modern CPython, and several core
+    packages (pydantic-core, etc.) only ship pre-built wheels for 3.11–3.13.
+    If the venv is created with an old interpreter (e.g. macOS system Python
+    3.9), pip falls back to building those wheels from Rust/C source and fails.
+    Prefer 3.13 → 3.12 → 3.11, then any python3 as a last resort.
+    """
+    for name in ("python3.13", "python3.12", "python3.11"):
+        p = shutil.which(name)
+        if p:
+            return p
+    for cand in ("/opt/homebrew/bin/python3.13",
+                 "/opt/homebrew/bin/python3.12",
+                 "/opt/homebrew/bin/python3.11"):
+        if Path(cand).exists():
+            return cand
+    return shutil.which("python3") or "/opt/homebrew/bin/python3"
+
+
 def ensure_venv() -> bool:
     if UVICORN_BIN.exists():
         return True
     info("Creating Python virtual environment …")
-    py = shutil.which("python3") or "/opt/homebrew/bin/python3"
+    py = _best_python()
     r = run([py, "-m", "venv", str(VENV)])
     if r.returncode != 0:
         fail(f"Failed to create venv: {r.stderr[:200]}")
