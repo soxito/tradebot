@@ -1042,14 +1042,108 @@ def save_mode(mode: str) -> None:
 
 
 # ── PostgreSQL ────────────────────────────────────────────────────────────────
+def _pg_data_dir() -> Path:
+    """Homebrew's data directory for postgresql@16."""
+    return Path("/opt/homebrew/var/postgresql@16")
+
+
+def _clear_stale_pg_pid() -> None:
+    """
+    Remove a stale postmaster.pid.
+
+    If PostgreSQL was killed uncleanly (crash, hard reboot, `kill -9`), the
+    lock file `postmaster.pid` is left behind pointing at a dead PID. brew's
+    launchd job then loops with 'lock file already exists' and never starts.
+    We detect that the referenced PID is not alive and remove the file.
+    """
+    pid_file = _pg_data_dir() / "postmaster.pid"
+    if not pid_file.exists():
+        return
+    try:
+        first_line = pid_file.read_text().splitlines()[0].strip()
+        pid = int(first_line)
+    except Exception:
+        # Unparseable → treat as stale
+        pid = None
+    alive = False
+    if pid:
+        try:
+            os.kill(pid, 0)   # signal 0 = existence check
+            alive = True
+        except OSError:
+            alive = False
+    if not alive:
+        try:
+            pid_file.unlink()
+            warn("Removed stale PostgreSQL lock file (postmaster.pid)")
+        except Exception:
+            pass
+
+
+def _ensure_postgres_installed() -> bool:
+    """Install postgresql@16 via Homebrew if it's not present."""
+    if (PG_BIN / "postgres").exists() or shutil.which("postgres"):
+        return True
+    brew = _brew_path()
+    if not brew:
+        fail("Homebrew not found; cannot auto-install PostgreSQL.")
+        return False
+    warn("postgresql@16 not found — installing via Homebrew …")
+    ok_i, err_i = _spinner_run([brew, "install", "postgresql@16"],
+                               "brew install postgresql@16", timeout=600)
+    if not ok_i:
+        fail(f"Failed to install postgresql@16: {err_i[:200]}")
+        return False
+    ok("postgresql@16 installed")
+    return True
+
+
+def _ensure_pg_port(pg_port: int) -> None:
+    """Make sure postgresql.conf listens on the expected port."""
+    conf = _pg_data_dir() / "postgresql.conf"
+    if not conf.exists():
+        return
+    try:
+        text = conf.read_text()
+        import re as _re
+        if _re.search(rf"^\s*port\s*=\s*{pg_port}\b", text, _re.MULTILINE):
+            return  # already correct
+        # Replace an existing (commented or active) port line, else append.
+        new, n = _re.subn(r"^\s*#?\s*port\s*=.*$", f"port = {pg_port}",
+                          text, count=1, flags=_re.MULTILINE)
+        if n == 0:
+            new = text.rstrip() + f"\nport = {pg_port}\n"
+        conf.write_text(new)
+        warn(f"Set PostgreSQL port to {pg_port} in postgresql.conf")
+    except Exception:
+        pass
+
+
 def start_postgres_brew() -> Tuple[bool, int]:
     pg_port = 5434
     info("Starting PostgreSQL (Homebrew) …")
     if port_open("localhost", pg_port, 0.5):
         ok(f"PostgreSQL already running on :{pg_port}")
         return True, pg_port
+
+    # Clean-install robustness: install if missing, fix port, clear stale lock.
+    if not _ensure_postgres_installed():
+        return False, pg_port
+    _ensure_pg_port(pg_port)
+    _clear_stale_pg_pid()
+
     run(["brew", "services", "start", "postgresql@16"])
-    return wait_for_port("localhost", pg_port, "PostgreSQL"), pg_port
+    if wait_for_port("localhost", pg_port, "PostgreSQL", max_wait=30):
+        return True, pg_port
+
+    # First attempt failed — likely a stale lock or errored service. Clear the
+    # lock, restart the service, and wait again before giving up.
+    warn("PostgreSQL slow to start — clearing lock and restarting …")
+    run(["brew", "services", "stop", "postgresql@16"])
+    time.sleep(2)
+    _clear_stale_pg_pid()
+    run(["brew", "services", "start", "postgresql@16"])
+    return wait_for_port("localhost", pg_port, "PostgreSQL", max_wait=45), pg_port
 
 
 def start_postgres_docker() -> Tuple[bool, int]:
