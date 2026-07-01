@@ -825,6 +825,13 @@ def preflight_check(mode: str) -> bool:
                     _check("Python packages (fastapi, uvicorn, sqlalchemy …)", True,
                            "installed by auto-setup")
                     fixed_items.append("pip packages")
+                    # tradingagents is optional; install without deps so its
+                    # broken chainlit/Python-3.12 requirements don't block us.
+                    _spinner_run(
+                        [str(pip), "install", "--quiet", "--no-deps",
+                         "--upgrade", "tradingagents==0.6.0"],
+                        "tradingagents (no-deps)", timeout=60
+                    )
             else:
                 _check("Python packages", False, "",
                        f"pip install failed: {err_p[:200]}")
@@ -1121,6 +1128,15 @@ def ensure_pip_deps() -> bool:
         return False
 
     ok("Python dependencies installed")
+
+    # tradingagents has an unpublished dep (chainlit>=2.11.1) and requires
+    # Python>=3.12, so it can't be in requirements.txt.  Install the wheel
+    # alone (--no-deps) — the conditional import in orchestrator.py works fine
+    # without chainlit/langgraph being present.
+    pip = VENV / "bin" / "pip"
+    run([str(pip), "install", "--quiet", "--no-deps", "--upgrade",
+         "tradingagents==0.6.0"], cwd=BACKEND_DIR)
+
     return True
 
 
