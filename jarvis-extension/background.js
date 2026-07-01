@@ -38,6 +38,16 @@ let defaultMt5Account  = null  // first configured MT5 account ID
 let coinNames          = {}    // { "BTCUSDT": "Bitcoin", "BTC/USDT": "Bitcoin", ... }
 let coinNamesFetchedAt = 0     // epoch ms of last name-map fetch
 
+// ── Face Vision state (updated by popup face-vision.js) ──────────────────────
+// Background keeps last-known state so other modules can query it.
+let faceVisionState = {
+  facePresent:   false,
+  isTalking:     false,
+  mar:           0,
+  identityMatch: false,
+  lastUpdateMs:  0,
+}
+
 // Restore settings on startup
 api.storage.local.get(
   ['monitorEnabled', 'ttsEnabled', 'lastAnalysisResult', 'defaultMt5Account'],
@@ -524,6 +534,27 @@ api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         .then(respond)
         .catch(() => respond({ used_deepgram: false, reason: 'error' }))
       return true   // async
+
+    // ── Face Vision updates from popup face-vision.js ─────────────────────
+    // Face state is tracked so background can gate speech recognition on
+    // whether the user's face is actually present and talking.
+    case 'face-vision-update': {
+      const { facePresent, isTalking, mar, identityMatch } = msg
+      faceVisionState.facePresent    = !!facePresent
+      faceVisionState.isTalking      = !!isTalking
+      faceVisionState.mar            = mar || 0
+      faceVisionState.identityMatch  = !!identityMatch
+      faceVisionState.lastUpdateMs   = Date.now()
+
+      // Optional: if face is gone for >5s, reduce polling aggression
+      // (already handled by content.js requireVoiceMatch gate)
+      break
+    }
+
+    // Popup requests current face state (e.g. to initialise UI on reopen)
+    case 'get-face-state':
+      respond({ ...faceVisionState })
+      break
 
     default:
       break

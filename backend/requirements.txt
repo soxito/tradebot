@@ -61,3 +61,14 @@ openai==1.82.0
 # published deps require chainlit>=2.11.1 (unreleased) and Python>=3.12.
 # The package itself works fine without those deps when imported conditionally.
 headroom-ai==0.27.0  # context compression — 60-95% token reduction
+
+# Face Vision (GPU-accelerated)
+# Install:  bash scripts/setup-face-vision.sh
+# • mediapipe — FaceMesh 478 landmarks, GPU via CUDA/Metal (macOS)
+#   github.com/google-ai-edge/mediapipe  (36k ⭐)
+# • face_recognition — dlib face identity embeddings
+#   github.com/ageitgey/face_recognition  (53k ⭐)
+# • opencv-python-headless — frame decoding, no GUI deps
+mediapipe>=0.10.9
+opencv-python-headless>=4.9.0
+face_recognition>=1.3.0

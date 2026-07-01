@@ -17,6 +17,7 @@ from app.api.strategy_lab import router as strategy_lab_router
 from app.api.voice import router as voice_router
 from app.api.jarvis import router as jarvis_router
 from app.api.provider_relay import router as provider_relay_router
+from app.api.vision import router as vision_router
 
 api_router = APIRouter()
 
@@ -36,6 +37,7 @@ api_router.include_router(pump_monitor_router)
 api_router.include_router(strategy_lab_router)
 api_router.include_router(voice_router)
 api_router.include_router(provider_relay_router)
+api_router.include_router(vision_router)
 
 
 @api_router.get("/status")

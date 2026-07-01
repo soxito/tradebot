@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "JARVIS Voice Assistant \u2014 TradeBot",
-  "version": "3.3.0",
-  "description": "Real-time crypto + MT5 account monitor, 15-minute position analysis, on-demand AI analysis, voice commands, and spoken trade alerts for TradeBot. v3.3: Read-aloud on change now uses real coin names and reports the change from the previous reading (correct up/down direction).",
+  "name": "JARVIS Voice Assistant — TradeBot",
+  "version": "3.4.0",
+  "description": "Real-time crypto + MT5 account monitor, 15-minute position analysis, on-demand AI analysis, voice commands, spoken trade alerts, and GPU-accelerated face vision with lip tracking for TradeBot. v3.4: Face detection, identity recognition, and lip/mouth motion tracking using MediaPipe GPU.",
   "permissions": [
     "notifications",
     "storage",
@@ -18,6 +18,9 @@
     "http://127.0.0.1:8000/*",
     "https://*/*"
   ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src 'self' http://127.0.0.1:1448 ws://127.0.0.1:1448"
+  },
   "background": {
     "service_worker": "background.js"
   },

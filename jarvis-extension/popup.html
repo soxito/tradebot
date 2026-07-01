@@ -364,6 +364,86 @@
 
     /* ── Separators ────────────────────────────────────────────────────────── */
     .sep { height:1px; background:var(--border); margin:0; }
+
+    /* ── Face Vision Panel ─────────────────────────────────────────────────── */
+    .fv-wrap {
+      position: relative; border-radius: 8px; overflow: hidden;
+      background: #000; flex-shrink: 0;
+    }
+    .fv-video {
+      width: 180px; height: 135px; object-fit: cover;
+      display: block; border-radius: 8px;
+    }
+    .fv-canvas {
+      position: absolute; top: 0; left: 0;
+      width: 100%; height: 100%;
+      border-radius: 8px; pointer-events: none;
+    }
+    .fv-no-camera {
+      width: 180px; height: 135px;
+      display: flex; flex-direction: column; align-items: center;
+      justify-content: center; gap: 6px;
+      background: #0a101c; border-radius: 8px;
+      color: var(--muted); font-size: 11px; text-align: center;
+      border: 1px dashed rgba(6,182,212,.3);
+    }
+    .fv-no-camera .fv-icon { font-size: 28px; }
+    .fv-status-grid {
+      flex: 1; display: flex; flex-direction: column; gap: 6px;
+      font-size: 11px;
+    }
+    .fv-stat {
+      display: flex; align-items: center; gap: 6px;
+      background: rgba(255,255,255,.03);
+      border: 1px solid var(--border);
+      border-radius: 6px; padding: 5px 8px;
+    }
+    .fv-stat-icon { font-size: 13px; flex-shrink: 0; }
+    .fv-stat-label { color: var(--muted); flex: 1; }
+    .fv-stat-value { font-weight: 600; }
+    .fv-stat-value.ok    { color: #22c55e; }
+    .fv-stat-value.warn  { color: #f59e0b; }
+    .fv-stat-value.dim   { color: var(--muted); }
+    .fv-stat-value.cyan  { color: #06b6d4; }
+    .fv-camera-row {
+      display: flex; gap: 10px; padding: 4px 0 2px;
+    }
+    .fv-mar-bar-wrap {
+      margin-top: 4px; height: 6px; border-radius: 3px;
+      background: rgba(255,255,255,.06); overflow: hidden;
+    }
+    .fv-mar-bar {
+      height: 100%; width: 0%; border-radius: 3px;
+      background: #06b6d4; transition: width .12s, background .15s;
+    }
+    .fv-btn-row { display: flex; gap: 6px; margin-top: 4px; }
+    .fv-btn {
+      flex: 1; padding: 5px 4px; font-size: 10px;
+      border-radius: 6px; border: 1px solid rgba(255,255,255,.12);
+      background: rgba(255,255,255,.05); color: var(--text);
+      cursor: pointer; transition: background .15s;
+    }
+    .fv-btn:hover   { background: rgba(255,255,255,.1); }
+    .fv-btn:active  { background: rgba(255,255,255,.15); }
+    .fv-btn.cyan  { border-color: rgba(6,182,212,.4); color: #06b6d4; }
+    .fv-btn.green { border-color: rgba(34,197,94,.4); color: #22c55e; }
+    .fv-btn.red   { border-color: rgba(239,68,68,.4);  color: #ef4444; }
+    .fv-ws-dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: #334155; display: inline-block; margin-left: 4px;
+    }
+    .fv-ws-dot.on { background: #22c55e; }
+    @keyframes fv-pulse {
+      0%,100% { box-shadow: 0 0 0 0 rgba(34,197,94,0) }
+      50%      { box-shadow: 0 0 0 4px rgba(34,197,94,.2) }
+    }
+    .fv-talking-badge {
+      display: none; align-items: center; gap: 4px;
+      background: rgba(34,197,94,.15); border: 1px solid rgba(34,197,94,.4);
+      color: #86efac; border-radius: 20px; padding: 2px 8px;
+      font-size: 10px; animation: fv-pulse 1.2s infinite;
+    }
+    .fv-talking-badge.visible { display: inline-flex; }
   </style>
 </head>
 <body>
@@ -459,6 +539,73 @@
       </div>
     </div>
 
+    <!-- ── Face Vision card ───────────────────────────────────────────────── -->
+    <div class="card" id="faceVisionCard">
+      <div class="card-header">
+        <span class="card-title">
+          👁 Face Vision &amp; Lip Tracking
+          <span class="fv-ws-dot" id="fvWsDot" title="Backend WebSocket"></span>
+        </span>
+        <span style="display:flex;align-items:center;gap:6px">
+          <span class="fv-talking-badge" id="fvTalkingBadge">🗣 TALKING</span>
+          <button class="switch cyan" id="faceVisionSwitch" aria-label="Toggle face vision"></button>
+        </span>
+      </div>
+
+      <!-- Camera + stats row (hidden until enabled) -->
+      <div id="fvBody" style="display:none;padding:0 12px 10px">
+        <div class="fv-camera-row">
+          <!-- Video preview -->
+          <div id="fvWrap" class="fv-wrap" style="display:none">
+            <video id="fvVideo" class="fv-video" autoplay muted playsinline></video>
+            <canvas id="fvCanvas" class="fv-canvas"></canvas>
+          </div>
+          <div id="fvNoCamera" class="fv-no-camera">
+            <div class="fv-icon">📷</div>
+            <div>Camera off</div>
+          </div>
+
+          <!-- Stats column -->
+          <div class="fv-status-grid">
+            <div class="fv-stat">
+              <span class="fv-stat-icon">👤</span>
+              <span class="fv-stat-label">Identity</span>
+              <span class="fv-stat-value dim" id="fvIdentityVal">—</span>
+            </div>
+            <div class="fv-stat">
+              <span class="fv-stat-icon">👄</span>
+              <span class="fv-stat-label">Mouth</span>
+              <span class="fv-stat-value cyan" id="fvMarVal">0.00</span>
+            </div>
+            <div class="fv-stat">
+              <span class="fv-stat-icon">🗣</span>
+              <span class="fv-stat-label">Speaking</span>
+              <span class="fv-stat-value dim" id="fvSpeakVal">silent</span>
+            </div>
+            <div class="fv-stat">
+              <span class="fv-stat-icon">📡</span>
+              <span class="fv-stat-label">Backend</span>
+              <span class="fv-stat-value dim" id="fvBackendVal">offline</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- MAR progress bar -->
+        <div class="fv-mar-bar-wrap" title="Mouth Aspect Ratio (higher = more open)">
+          <div class="fv-mar-bar" id="fvMarBar"></div>
+        </div>
+
+        <!-- Action buttons -->
+        <div class="fv-btn-row" style="margin-top:8px">
+          <button class="fv-btn green" id="fvEnrollBtn">⊕ Enroll Face</button>
+          <button class="fv-btn red"   id="fvClearBtn">✕ Clear</button>
+        </div>
+        <div style="font-size:9px;color:var(--muted);margin-top:5px;line-height:1.5">
+          GPU via MediaPipe FaceMesh (478 pts) · face_recognition identity · lip MAR tracking
+        </div>
+      </div>
+    </div>
+
     <!-- ── Transcript card ────────────────────────────────────────────────── -->
     <div class="card">
       <div class="transcript" id="transcript">
@@ -528,6 +675,7 @@
     <kbd>close BTCUSDT</kbd>
   </div>
 
-  <script src="popup.js"></script>
+  <script src="face-vision.js"></script>
+<script src="popup.js"></script>
 </body>
 </html>

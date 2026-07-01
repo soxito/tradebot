@@ -634,3 +634,140 @@ setInterval(() => {
     })
   }
 }, 10_000)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Face Vision Integration
+// ─────────────────────────────────────────────────────────────────────────────
+;(function initFaceVision () {
+  const fvSwitch     = document.getElementById('faceVisionSwitch')
+  const fvBody       = document.getElementById('fvBody')
+  const fvWrap       = document.getElementById('fvWrap')
+  const fvNoCamera   = document.getElementById('fvNoCamera')
+  const fvVideo      = document.getElementById('fvVideo')
+  const fvCanvas     = document.getElementById('fvCanvas')
+  const fvEnrollBtn  = document.getElementById('fvEnrollBtn')
+  const fvClearBtn   = document.getElementById('fvClearBtn')
+  const fvMarBar     = document.getElementById('fvMarBar')
+  const fvMarVal     = document.getElementById('fvMarVal')
+  const fvSpeakVal   = document.getElementById('fvSpeakVal')
+  const fvIdentityVal= document.getElementById('fvIdentityVal')
+  const fvBackendVal = document.getElementById('fvBackendVal')
+  const fvWsDot      = document.getElementById('fvWsDot')
+  const fvTalking    = document.getElementById('fvTalkingBadge')
+
+  if (!fvSwitch || !JarvisFaceVision) return
+
+  let fvEnabled = false
+
+  // ── Persist on/off across popup opens ──────────────────────────────────
+  api.storage.local.get(['faceVisionEnabled'], (r) => {
+    fvEnabled = !!r.faceVisionEnabled
+    applyFaceVisionState(fvEnabled, false)
+  })
+
+  applySwitch(fvSwitch, fvEnabled)
+
+  fvSwitch.addEventListener('click', async () => {
+    fvEnabled = !fvEnabled
+    applySwitch(fvSwitch, fvEnabled)
+    api.storage.local.set({ faceVisionEnabled: fvEnabled })
+    applyFaceVisionState(fvEnabled, true)
+  })
+
+  async function applyFaceVisionState (on, doStart) {
+    fvBody.style.display = on ? 'block' : 'none'
+    if (!on) {
+      JarvisFaceVision.stopCamera()
+      fvWrap.style.display    = 'none'
+      fvNoCamera.style.display = 'flex'
+      fvTalking.classList.remove('visible')
+      return
+    }
+    if (!doStart) return
+    await JarvisFaceVision.init(fvVideo, fvCanvas)
+    await JarvisFaceVision.startCamera()
+    fvWrap.style.display    = 'block'
+    fvNoCamera.style.display = 'none'
+  }
+
+  // ── Events from face-vision.js ──────────────────────────────────────────
+  JarvisFaceVision.on('camera', ({ active }) => {
+    if (active) {
+      fvWrap.style.display     = 'block'
+      fvNoCamera.style.display = 'none'
+    } else {
+      fvWrap.style.display     = 'none'
+      fvNoCamera.style.display = 'flex'
+    }
+  })
+
+  JarvisFaceVision.on('ws', ({ connected }) => {
+    fvWsDot.classList.toggle('on', connected)
+    fvBackendVal.textContent = connected ? 'connected' : 'offline'
+    fvBackendVal.className   = 'fv-stat-value ' + (connected ? 'ok' : 'warn')
+  })
+
+  JarvisFaceVision.on('frame', ({ facePresent, mar, isTalking, identityMatch }) => {
+    // MAR bar
+    const pct = Math.min(mar / 0.65, 1) * 100
+    fvMarBar.style.width      = pct + '%'
+    fvMarBar.style.background = isTalking ? '#22c55e' : '#06b6d4'
+    fvMarVal.textContent      = mar.toFixed(3)
+    fvMarVal.className        = 'fv-stat-value ' + (isTalking ? 'ok' : 'cyan')
+
+    // Talking
+    fvSpeakVal.textContent = isTalking ? 'TALKING' : 'silent'
+    fvSpeakVal.className   = 'fv-stat-value ' + (isTalking ? 'ok' : 'dim')
+    fvTalking.classList.toggle('visible', isTalking)
+
+    // Identity
+    const enrolled = JarvisFaceVision.isEnrolled()
+    if (!facePresent) {
+      fvIdentityVal.textContent = 'no face'
+      fvIdentityVal.className   = 'fv-stat-value dim'
+    } else if (!enrolled) {
+      fvIdentityVal.textContent = 'not enrolled'
+      fvIdentityVal.className   = 'fv-stat-value warn'
+    } else {
+      fvIdentityVal.textContent = identityMatch ? '✓ YOU' : '? unknown'
+      fvIdentityVal.className   = 'fv-stat-value ' + (identityMatch ? 'ok' : 'warn')
+    }
+  })
+
+  JarvisFaceVision.on('enrolling', ({ stage }) => {
+    fvEnrollBtn.textContent  = stage === 'start' ? '⟳ Enrolling…' : '⟳ Sampling…'
+    fvEnrollBtn.disabled     = true
+  })
+
+  JarvisFaceVision.on('enrolled', ({ success, cleared }) => {
+    fvEnrollBtn.textContent = '⊕ Enroll Face'
+    fvEnrollBtn.disabled    = false
+    if (success) {
+      fvEnrollBtn.textContent = '✓ Enrolled!'
+      setTimeout(() => { fvEnrollBtn.textContent = '⊕ Re-Enroll' }, 2500)
+    } else if (cleared) {
+      fvIdentityVal.textContent = 'cleared'
+    }
+  })
+
+  JarvisFaceVision.on('error', ({ msg }) => {
+    fvEnrollBtn.textContent = '⊕ Enroll Face'
+    fvEnrollBtn.disabled    = false
+    console.warn('[FaceVision]', msg)
+  })
+
+  // ── Enroll / Clear buttons ─────────────────────────────────────────────
+  fvEnrollBtn.addEventListener('click', () => JarvisFaceVision.enrollFace())
+  fvClearBtn.addEventListener('click',  () => {
+    if (confirm('Clear enrolled face?')) JarvisFaceVision.clearEnrollment()
+  })
+
+  // ── If face vision was previously on, auto-start ───────────────────────
+  if (fvEnabled) {
+    JarvisFaceVision.init(fvVideo, fvCanvas).then(() => {
+      JarvisFaceVision.startCamera()
+      fvWrap.style.display     = 'block'
+      fvNoCamera.style.display = 'none'
+    })
+  }
+})()
