@@ -116,6 +116,25 @@
     return faceState.talking || (Date.now() - lastMouthActiveAt) < MOUTH_WINDOW_MS
   }
 
+  // ── Camera barge-in ───────────────────────────────────────────────────────
+  // The camera sees the USER's mouth moving while JARVIS is reading a reply →
+  // cut the TTS instantly so JARVIS stops reading and transcribes the user.
+  // Identity-checked: an enrolled profile with a non-matching face (a stranger)
+  // must never be able to cut JARVIS off.
+  function maybeCameraBargeIn() {
+    if (!pageSpeaking || !faceState.talking || !faceFresh()) return
+    if (faceState.enrolled && !faceState.match) return   // known stranger → ignore
+    try { window.speechSynthesis.cancel() } catch { /* noop */ }
+    speechQueue.length = 0
+    speechBusy = false
+    pageSpeaking = false
+    // Short echo tail: the speakers may still ring for a moment after cancel().
+    echoGuardUntil = Date.now() + 300
+    toPage({ type: 'interrupt' })
+    toPage({ type: 'speak-status', speaking: false, allowBargeIn: false })
+    badge('▶', '#06b6d4')
+  }
+
   // Combined identity gate — single source of truth for "should we transcribe".
   // The audio voice-ID (pageVoiceMatch) gates speech. Face vision:
   //   • Matched face  → reinforces (trust, returns true).
@@ -1225,6 +1244,8 @@
             ts:      Date.now(),
           }
           if (faceState.talking) lastMouthActiveAt = Date.now()
+          // Camera barge-in: user talking on camera while JARVIS reads → stop TTS.
+          maybeCameraBargeIn()
           try {
             api.runtime.sendMessage({
               type: 'face-vision-update',
@@ -1289,6 +1310,8 @@
               ts:      msg.ts || Date.now(),
             }
             if (faceState.talking) lastMouthActiveAt = Date.now()
+            // Camera barge-in: user talking on camera while JARVIS reads → stop TTS.
+            maybeCameraBargeIn()
             // Mirror the visual "talking" onto the page robot so it reacts in
             // sync with the mouth (nice-to-have; page may ignore it).
             try { toPage({ type: 'face-talking', talking: faceState.talking, match: faceState.match }) } catch { /* noop */ }

@@ -621,3 +621,84 @@ api.runtime.onStartup.addListener(() => {
 })
 
 console.log('[JARVIS-BG] v3.0 ready — unified crypto+MT5 monitor + 15-min analysis')
+
+// ── Memory Tree surfacing (OpenHuman-style) ───────────────────────────────────
+// Poll JARVIS's Memory Tree for NEW high-importance facts (news, insights it
+// learned via the 15-min auto-fetch loop) and surface them as desktop
+// notifications + spoken alerts — so JARVIS proactively tells you what changed.
+const MEMORY_POLL_MS   = 90_000   // 90 s
+const MEMORY_MIN_IMP   = 0.72     // only genuinely important memories
+const seenMemoryIds    = new Set()
+let memoryPrimed       = false    // first pass just records ids (no backlog spam)
+
+async function doMemoryPoll() {
+  if (!monitorEnabled) return
+  try {
+    const data = await apiFetch(
+      `/plugins/agent-paul/jarvis/memory/new?since_minutes=30&min_importance=${MEMORY_MIN_IMP}`
+    )
+    const items = (data && data.items) || []
+    if (!memoryPrimed) {
+      for (const it of items) seenMemoryIds.add(it.id)
+      memoryPrimed = true
+      return
+    }
+    for (const it of items) {
+      if (seenMemoryIds.has(it.id)) continue
+      seenMemoryIds.add(it.id)
+      const title = it.symbol ? `🧠 ${coinName(it.symbol)} — new insight` : '🧠 JARVIS learned something'
+      const body = (it.summary || it.title || '').slice(0, 140)
+      if (body) {
+        showNotification(title, body)
+        speakText(body.slice(0, 220))
+      }
+    }
+    // keep the seen-set bounded
+    if (seenMemoryIds.size > 500) {
+      const trim = Array.from(seenMemoryIds).slice(-300)
+      seenMemoryIds.clear(); trim.forEach((id) => seenMemoryIds.add(id))
+    }
+  } catch { /* backend offline — stay quiet */ }
+}
+
+setInterval(doMemoryPoll, MEMORY_POLL_MS)
+
+// ── Subconscious activity surfacing (OpenHuman heartbeat) ─────────────────────
+// Poll JARVIS's subconscious activity feed and speak/notify when it makes real
+// progress on a goal while you're away ("keeps thinking after you stop typing").
+const ACTIVITY_POLL_MS = 120_000  // 2 min
+const seenActivityIds  = new Set()
+let activityPrimed     = false
+
+async function doActivityPoll() {
+  if (!monitorEnabled) return
+  try {
+    const data = await apiFetch('/plugins/agent-paul/jarvis/activity?limit=15')
+    const items = (data && data.items) || []
+    if (!activityPrimed) {
+      for (const it of items) seenActivityIds.add(it.id)
+      activityPrimed = true
+      return
+    }
+    for (const it of items) {
+      if (seenActivityIds.has(it.id)) continue
+      seenActivityIds.add(it.id)
+      // Only surface meaningful progress: goal work that acted, or approvals needed.
+      const isGoalAct = it.kind === 'goal' && it.state === 'acted'
+      const needsApproval = it.state === 'awaiting_approval'
+      if (!isGoalAct && !needsApproval) continue
+      const body = (it.summary || it.task_name || '').slice(0, 150)
+      if (!body) continue
+      const title = needsApproval ? '🫀 JARVIS needs your approval' : '🫀 JARVIS made progress'
+      showNotification(title, body)
+      speakText(body.slice(0, 200))
+    }
+    if (seenActivityIds.size > 400) {
+      const trim = Array.from(seenActivityIds).slice(-250)
+      seenActivityIds.clear(); trim.forEach((id) => seenActivityIds.add(id))
+    }
+  } catch { /* backend offline — stay quiet */ }
+}
+
+setInterval(doActivityPoll, ACTIVITY_POLL_MS)
+
