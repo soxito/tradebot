@@ -385,6 +385,14 @@ class PortfolioSummary(BaseModel):
 
 # ── Unified monitor models ─────────────────────────────────────────────────────
 
+class CryptoAccountSummary(BaseModel):
+    exchange: str
+    currency: str = "USDT"
+    total: float = 0.0   # total equity / wallet balance
+    free: float = 0.0    # available (not used as margin)
+    used: float = 0.0    # margin in use
+
+
 class MT5AccountSummary(BaseModel):
     account_id: int
     name: str
@@ -404,6 +412,7 @@ class MT5AccountSummary(BaseModel):
 class UnifiedMonitorResponse(BaseModel):
     # Crypto (all exchanges)
     crypto_positions: List[Position] = []
+    crypto_accounts: List[CryptoAccountSummary] = []   # per-exchange balances
     crypto_total_pnl: float = 0.0
     crypto_total_notional: float = 0.0
     # MT5 (all accounts)
@@ -483,9 +492,17 @@ def _safe_float(val, default: float = 0.0) -> float:
 # Fallback version only — the real version is ALWAYS read live from
 # jarvis-extension/manifest.json (see _ext_version()). Keep this in sync so a
 # missing manifest never advertises a stale version.
-_EXT_VERSION = "3.5.5"
+_EXT_VERSION = "3.6.4"
 _EXT_RELEASED = "2026-07-02"
 _EXT_CHANGELOG = [
+    "Fix read-aloud silently dropped when pageSpeaking stuck true",
+    "Fix accounts not shown in popup — lastUnifiedData now cached in background and used for instant account balance display on popup open and in 10s auto-refresh",
+    "Fix accounts loading + trades not read aloud",
+    "bump to v3.6.2",
+    "JARVIS Memory Tree — the assistant now folds news, positions and trades into a scored, hierarchical long-term memory every 15 minutes",
+    "SuperContext — on the first message of a chat JARVIS auto-sweeps its memory, news and brain-map for your exact question and pre-loads the answer",
+    "Goals & Todos — set a durable goal and JARVIS builds a kanban with you and works it in the background (read-only research, never auto-trades)",
+    "Proactive memory alerts — the extension now surfaces newly-learned high-importance facts as desktop notifications",
     "Camera mouth-movement now gates hearing in real time — JARVIS only listens while it sees your lips move, so its own TTS voice can never be self-transcribed while the camera is live",
     "Unknown-face lockout restored — a stranger can't drive JARVIS, but only once you've enrolled your own face (unenrolled never blocks)",
     "TTS self-hearing fixed for real — the page now passes the exact words it speaks so JARVIS never transcribes its own AI voice",
@@ -866,6 +883,34 @@ async def get_unified_monitor(
     except Exception as exc:
         logger.warning(f"[JARVIS unified-monitor] crypto positions failed: {exc}")
 
+    # ── Crypto exchange balances ──────────────────────────────────────────────
+    # Fetch USDT balance from every connected exchange so the popup shows real
+    # wallet/equity alongside MT5 accounts. Each exchange is isolated — one
+    # failure never drops the others.
+    crypto_accounts: List[CryptoAccountSummary] = []
+    try:
+        ex_list_bal = exchange_manager.get_all_exchanges()
+        for ex_enum in ex_list_bal:
+            connector = exchange_manager.get_exchange(ex_enum)
+            if not connector:
+                continue
+            try:
+                bal = await connector.get_balance(currency="USDT")
+                # CCXT returns {currency: {free, used, total}} or {free, used, total}
+                if isinstance(bal, dict):
+                    usdt = bal.get("USDT") or bal  # ccxt full vs single-currency
+                    crypto_accounts.append(CryptoAccountSummary(
+                        exchange=ex_enum.value.capitalize(),
+                        currency="USDT",
+                        total=float(usdt.get("total") or 0),
+                        free=float(usdt.get("free") or 0),
+                        used=float(usdt.get("used") or 0),
+                    ))
+            except Exception as bal_exc:
+                logger.debug(f"[JARVIS unified-monitor] balance fetch skipped for {ex_enum.value}: {bal_exc}")
+    except Exception as exc:
+        logger.debug(f"[JARVIS unified-monitor] crypto balance fetch failed: {exc}")
+
     # ── MT5 accounts + positions ─────────────────────────────────────────────
     mt5_accounts: List[MT5AccountSummary] = []
     mt5_total_balance = 0.0
@@ -984,6 +1029,7 @@ async def get_unified_monitor(
 
     return UnifiedMonitorResponse(
         crypto_positions=crypto_positions,
+        crypto_accounts=crypto_accounts,
         crypto_total_pnl=crypto_pnl,
         crypto_total_notional=sum(_safe_float(p.notional) for p in crypto_positions),
         mt5_accounts=mt5_accounts,
@@ -1967,6 +2013,31 @@ async def _analyze_symbol(symbol: str, original_cmd: str, ex_name: Optional[str]
         f"This is a proposal — say the execute command to confirm, Sir."
     )
 
+    # ── Kronos ML forecast (optional plugin — graceful, never breaks) ────────
+    kronos_info = None
+    try:
+        from plugins.KronosForecastPlugin.backend.services import forecast_service as _kronos
+        _ex_id = ex_list[0].value if ex_list else "bitget"
+        _fc = await _kronos.run_forecast_cached(_ex_id, ccxt_sym, "4h", pred_len=12)
+        if _fc and _fc.signal:
+            s = _fc.signal
+            kronos_info = {
+                "direction": s.direction, "pct_change": s.pct_change,
+                "confidence": s.confidence, "target_price": s.target_price,
+                "engine": _fc.engine,
+            }
+            detail += (
+                f"\n\nKRONOS ML FORECAST ({_fc.engine}) — next 12×4h\n"
+                f"Direction: {s.direction.upper()}  |  {s.pct_change:+.2f}%  "
+                f"|  Target {s.target_price:.4g}  |  {int(s.confidence*100)}% confidence"
+            )
+            speech += (
+                f" Kronos forecasts {s.direction} {s.pct_change:+.1f} percent "
+                f"over the next two days at {int(s.confidence*100)} percent confidence."
+            )
+    except Exception as _ke:
+        logger.debug(f"[JARVIS] Kronos forecast skipped: {_ke}")
+
     return CommandResult(
         ok=True, action="analyze",
         detail=detail,
@@ -1976,6 +2047,7 @@ async def _analyze_symbol(symbol: str, original_cmd: str, ex_name: Optional[str]
             "sl": sl, "tp1": tp1, "tp2": tp2,
             "rsi": rsi, "trend": trend, "ema50": round(ema50, 6),
             "ema200": round(ema200, 6), "confirm_command": confirm_cmd,
+            "kronos": kronos_info,
             "WARNING": "NOT EXECUTED — say the confirm_command to place the order",
         },
     )

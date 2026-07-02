@@ -339,17 +339,40 @@ function renderMonitorData(data) {
   const balanceEl = document.getElementById('accountBalances')
   if (balanceEl && data) {
     let balHtml = ''
-    // Crypto
-    if (data.crypto_total_pnl !== undefined) {
-      const cpnl = Number(data.crypto_total_pnl || 0).toFixed(2)
-      const cpnlClass = data.crypto_total_pnl >= 0 ? 'pos' : 'neg'
-      const cpnlSign = data.crypto_total_pnl >= 0 ? '+' : ''
+
+    // ── Crypto exchange accounts (real wallet balance per exchange) ──────────
+    for (const acct of (data.crypto_accounts || [])) {
+      const total = Number(acct.total || 0).toFixed(2)
+      const free  = Number(acct.free  || 0).toFixed(2)
+      const used  = Number(acct.used  || 0).toFixed(2)
+      const pnl   = Number(data.crypto_total_pnl || 0)
+      const pnlSign  = pnl >= 0 ? '+' : ''
+      const pnlClass = pnl >= 0 ? 'pos' : 'neg'
       balHtml += `<div class="bal-row">
-        <span class="bal-label">Crypto PnL</span>
-        <span class="bal-value ${cpnlClass}">${cpnlSign}${cpnl} USDT</span>
+        <span class="bal-label">${escapeHtml(acct.exchange)} (${escapeHtml(acct.currency || 'USDT')})</span>
+        <span class="bal-value">${total} USDT</span>
+        <span class="bal-fpnl ${pnlClass}" title="Open PnL">${pnlSign}${pnl.toFixed(2)}</span>
+      </div>
+      <div class="bal-row" style="padding-top:0;font-size:9px;color:var(--muted)">
+        <span></span>
+        <span>free ${free} · margin ${used}</span>
       </div>`
     }
-    // MT5 accounts
+
+    // Fallback: if no per-exchange data yet, show total PnL only
+    if (!data.crypto_accounts || data.crypto_accounts.length === 0) {
+      if (data.crypto_total_pnl !== undefined) {
+        const cpnl = Number(data.crypto_total_pnl || 0).toFixed(2)
+        const cpnlClass = data.crypto_total_pnl >= 0 ? 'pos' : 'neg'
+        const cpnlSign  = data.crypto_total_pnl >= 0 ? '+' : ''
+        balHtml += `<div class="bal-row">
+          <span class="bal-label">Crypto PnL</span>
+          <span class="bal-value ${cpnlClass}">${cpnlSign}${cpnl} USDT</span>
+        </div>`
+      }
+    }
+
+    // ── MT5 accounts ──────────────────────────────────────────────────────────
     for (const acct of (data.mt5_accounts || [])) {
       const eq = Number(acct.equity || 0).toFixed(2)
       const fpnl = Number(acct.floating_pnl || 0).toFixed(2)
@@ -361,6 +384,7 @@ function renderMonitorData(data) {
         <span class="bal-fpnl ${fpnlClass}">${fpnlSign}${fpnl}</span>
       </div>`
     }
+
     balanceEl.innerHTML = balHtml || '<div class="pos-empty" style="padding:4px">No accounts connected</div>'
   }
 
