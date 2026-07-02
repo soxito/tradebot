@@ -280,7 +280,9 @@ function renderPositions(positions) {
 }
 
 function loadPositionsFromBackground() {
-  // Step 1: restore settings + last-known crypto positions immediately
+  // Step 1: get-state now includes lastUnifiedData (last background poll result).
+  // Render account balances IMMEDIATELY from cached data so the popup never
+  // stays stuck on "Loading accounts…" waiting for a fresh backend fetch.
   api.runtime.sendMessage({ type: 'get-state' }, (resp) => {
     if (api.runtime.lastError || !resp) return
     monitorEnabled = !!resp.monitorEnabled
@@ -288,11 +290,12 @@ function loadPositionsFromBackground() {
     applySwitch(els.monitorSwitch, monitorEnabled)
     applySwitch(els.ttsSwitch,     ttsEnabled)
     if (resp.lastAnalysisResult) renderAnalysis(resp.lastAnalysisResult)
+    // Immediately render accounts from the cached last poll — no backend round-trip
+    if (resp.lastUnifiedData) renderMonitorData(resp.lastUnifiedData)
+    else if (resp.positions && resp.positions.length) renderPositions(resp.positions)
   })
-  // Step 2: immediately fetch full unified data (accounts + MT5 + crypto) so
-  // the Account Balances section never stays stuck at "Loading accounts…".
-  // This was the bug: get-state only returned crypto positions and the account
-  // balance panel was never populated until the next 10 s background poll.
+  // Step 2: also kick a fresh refresh so data is current (non-blocking — the
+  // cached render above already cleared the "Loading accounts…" placeholder).
   api.runtime.sendMessage({ type: 'refresh-positions' }, (resp) => {
     if (api.runtime.lastError || !resp) return
     if (resp.data) renderMonitorData(resp.data)
@@ -637,15 +640,28 @@ document.querySelectorAll('.avatar-chip').forEach(chip => {
   }
 })()
 
-// Auto-refresh every 10 s while popup is open (matches background poll)
+// Auto-refresh every 10 s while popup is open (matches background poll).
+// Uses get-state (fast, no backend hit) to refresh ALL sections including
+// Account Balances via lastUnifiedData (fixed: previously only crypto positions
+// were refreshed, leaving MT5 accounts and balance bar stale).
 setInterval(() => {
-  if (monitorEnabled) {
-    api.runtime.sendMessage({ type: 'get-state' }, (resp) => {
-      if (!resp) return
-      if (resp.positions) renderPositions(resp.positions)
-      if (resp.lastAnalysisResult) renderAnalysis(resp.lastAnalysisResult)
-    })
-  }
+  api.runtime.sendMessage({ type: 'get-state' }, (resp) => {
+    if (!resp) return
+    // Always update monitor/tts switch state
+    if (resp.monitorEnabled !== undefined) {
+      monitorEnabled = !!resp.monitorEnabled
+      ttsEnabled = !!resp.ttsEnabled
+      applySwitch(els.monitorSwitch, monitorEnabled)
+      applySwitch(els.ttsSwitch, ttsEnabled)
+    }
+    // Refresh full account balances + positions from cached unified data
+    if (resp.lastUnifiedData) {
+      renderMonitorData(resp.lastUnifiedData)
+    } else if (resp.positions) {
+      renderPositions(resp.positions)
+    }
+    if (resp.lastAnalysisResult) renderAnalysis(resp.lastAnalysisResult)
+  })
 }, 10_000)
 
 // ─────────────────────────────────────────────────────────────────────────────

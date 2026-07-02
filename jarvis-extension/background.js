@@ -34,6 +34,7 @@ let monitorEnabled     = false
 let ttsEnabled         = true
 let pollTimer          = null
 let lastAnalysisResult = null  // cached from most recent 15-min or on-demand run
+let lastUnifiedData    = null  // last successful unified-monitor response (for instant popup load)
 let defaultMt5Account  = null  // first configured MT5 account ID
 let coinNames          = {}    // { "BTCUSDT": "Bitcoin", "BTC/USDT": "Bitcoin", ... }
 let coinNamesFetchedAt = 0     // epoch ms of last name-map fetch
@@ -212,6 +213,7 @@ function mt5PosKey(acctId, p) {
 }
 
 function handleUnifiedUpdate(data) {
+  lastUnifiedData = data  // cache for instant popup loads via get-state
   const cryptoPositions = data.crypto_positions || []
   const mt5Accounts     = data.mt5_accounts || []
 
@@ -485,6 +487,7 @@ api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         positionCount: Object.keys(positionSnapshot).length + Object.keys(mt5Snapshot).length,
         positions: Object.values(positionSnapshot),
         lastAnalysisResult,
+        lastUnifiedData,
         defaultMt5Account,
       })
       break

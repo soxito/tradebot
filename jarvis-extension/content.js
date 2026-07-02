@@ -58,6 +58,7 @@
   let manuallyStopped = false
   let restartDelay = 500  // exponential back-off starting value (ms)
   let pageSpeaking = false
+  let pageSpeakingSetAt = 0  // timestamp when pageSpeaking was last set true (deadman reset)
   let pageVoiceMatch = true  // updated by page's voiceMatch loop; gates dispatch when false
   let learnedVocab = {}     // cached from chrome.storage, boosts pickBest() scoring
 
@@ -128,6 +129,7 @@
     speechQueue.length = 0
     speechBusy = false
     pageSpeaking = false
+    pageSpeakingSetAt = 0
     // Short echo tail: the speakers may still ring for a moment after cancel().
     echoGuardUntil = Date.now() + 300
     toPage({ type: 'interrupt' })
@@ -353,6 +355,7 @@
     // Set pageSpeaking=true BEFORE speaking so onresult ignores our own TTS.
     // allowBargeIn:true keeps recognition alive so the user can cut in by voice.
     pageSpeaking = true
+    pageSpeakingSetAt = Date.now()
     toPage({ type: 'speak-status', speaking: true, allowBargeIn: true })
     utt.onend  = () => {
       speechBusy = false
@@ -363,6 +366,7 @@
         clearTimeout(restartTimer)
         restartTimer = setTimeout(() => {
           pageSpeaking = false
+          pageSpeakingSetAt = 0
           echoGuardUntil = Date.now() + 900
           toPage({ type: 'speak-status', speaking: false, allowBargeIn: false })
         }, 900)
@@ -375,6 +379,7 @@
         clearTimeout(restartTimer)
         restartTimer = setTimeout(() => {
           pageSpeaking = false
+          pageSpeakingSetAt = 0
           echoGuardUntil = Date.now() + 900
           toPage({ type: 'speak-status', speaking: false, allowBargeIn: false })
         }, 900)
@@ -386,7 +391,16 @@
 
   function drainSpeechQueue() {
     if (speechBusy || speechQueue.length === 0) return
+    // Dead-man reset: if pageSpeaking has been stuck true for > 30 s with no
+    // speech-end event (e.g. the page crashed mid-audio), clear it so future
+    // TTS calls are not permanently silenced.
+    if (pageSpeaking && pageSpeakingSetAt > 0 && (Date.now() - pageSpeakingSetAt) > 30000) {
+      pageSpeaking = false
+      pageSpeakingSetAt = 0
+      echoGuardUntil = 0
+    }
     pageSpeaking = true  // stay muted between consecutive TTS items
+    pageSpeakingSetAt = Date.now()
     silenceMicNow()      // abort any partial recognition between queue items
     const next = speechQueue.shift()
     speakNow(next)
@@ -411,12 +425,17 @@
       window.postMessage({ __jarvisPage: true, type: 'jarvis-speak', text: String(text) }, window.location.origin)
       clearTimeout(pageSpeakFallbackTimer)
       pageSpeakFallbackTimer = setTimeout(() => {
-        // If the page started speaking within the window, it owns this utterance.
-        if (pageSpeaking || (Date.now() - pageSpeakAckAt) < 1200) return
-        // No page response → speak locally so the user still hears JARVIS.
+        // If the page acknowledged this utterance within 2 s (speak-status:true was
+        // received after the pageSpeakAckAt reset above), it owns the audio.
+        // NOTE: we deliberately do NOT check `pageSpeaking` here — that flag can
+        // get stuck true if a previous TTS session never sent speak-status:false
+        // (e.g. audio error, unmount). Relying only on pageSpeakAckAt means a
+        // stale pageSpeaking=true can never silently swallow a background alert.
+        if ((Date.now() - pageSpeakAckAt) < 2000) return
+        // No page ack within 2 s → speak locally so the user still hears JARVIS.
         speechQueue.push(text)
         drainSpeechQueue()
-      }, 450)
+      }, 600)
       return
     } catch { /* fall through to local speech */ }
     speechQueue.push(text)
@@ -1184,6 +1203,7 @@
         case 'speak-status':
           pageSpeaking = !!d.speaking
           if (d.speaking) {
+            pageSpeakingSetAt = Date.now()  // track when we last went true (deadman)
             pageSpeakAckAt = Date.now()  // page is handling TTS (universal voice)
             // The page tells us the exact text it is about to speak so the
             // self-echo filter can reject that text if the mic hears it back.
@@ -1192,6 +1212,7 @@
             // TTS sets lastSpokenText).
             if (d.text) lastSpokenText = normSpeech(d.text)
           } else {
+            pageSpeakingSetAt = 0  // cleared
             // Page finished speaking → open the echo-tail guard.
             echoGuardUntil = Date.now() + 900
           }
