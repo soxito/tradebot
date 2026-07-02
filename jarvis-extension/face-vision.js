@@ -304,9 +304,11 @@
     lastLandmarks = data.landmarks || []
     lastBox       = data.box || null
 
-    // Hysteresis for talking state
-    if (currentMAR > MAR_TALKING)    isTalking = true
-    else if (currentMAR < MAR_SILENCE) isTalking = false
+    // Hysteresis for talking state — open on MAR OR jawOpen so soft speech
+    // (closed-mouth consonants) still registers as talking for the hearing gate.
+    const jawOpen = data.jaw_open || 0
+    if (currentMAR > MAR_TALKING || jawOpen > 0.18) isTalking = true
+    else if (currentMAR < MAR_SILENCE && jawOpen < 0.10) isTalking = false
     // Between thresholds: keep current state (hysteresis)
 
     // Record lip history

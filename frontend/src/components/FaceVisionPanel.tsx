@@ -149,8 +149,8 @@ export default function FaceVisionPanel() {
 
       // Hysteresis on talking
       let talking = talkingRef.current
-      if (marVal > MAR_TALKING || (data.jaw_open || 0) > 0.25) talking = true
-      else if (marVal < MAR_SILENCE) talking = false
+    if (marVal > MAR_TALKING || (data.jaw_open || 0) > 0.18) talking = true
+    else if (marVal < MAR_SILENCE && (data.jaw_open || 0) < 0.10) talking = false
       talkingRef.current = talking
       setIsTalking(talking)
 

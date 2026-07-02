@@ -102,6 +102,20 @@
   const FACE_FRESH_MS = 2500
   function faceFresh() { return faceState.ts > 0 && (Date.now() - faceState.ts) < FACE_FRESH_MS }
 
+  // ── Mouth-activity gate (the definitive self-hearing fix) ───────────────────
+  // When the camera is live, JARVIS only listens while it can SEE the user's
+  // mouth moving. JARVIS's own TTS never moves the user's mouth, so its voice is
+  // physically impossible to self-transcribe. As soon as the user talks and the
+  // camera detects it, hearing opens; when the mouth closes it shuts again.
+  let lastMouthActiveAt = 0
+  const MOUTH_WINDOW_MS = 1500   // keep hearing briefly after the last mouth motion
+  function mouthGateOpen() {
+    if (!faceFresh()) return true                 // camera off → no gating (normal voice)
+    // Camera live → hear ONLY while the mouth is (or was just) moving. JARVIS's
+    // own TTS never moves the user's mouth, so its voice can never open this gate.
+    return faceState.talking || (Date.now() - lastMouthActiveAt) < MOUTH_WINDOW_MS
+  }
+
   // Combined identity gate — single source of truth for "should we transcribe".
   // The audio voice-ID (pageVoiceMatch) gates speech. Face vision:
   //   • Matched face  → reinforces (trust, returns true).
@@ -701,7 +715,7 @@
           if (res.used_deepgram && res.text && res.text.trim()) {
             const txt = cleanFiller(res.text.trim()) || res.text.trim()
             const echo = (pageSpeaking || Date.now() < echoGuardUntil) && isSelfEcho(txt)
-            if (!pageSpeaking && voiceOK && !echo) mirrorTranscript(txt, true)
+            if (!pageSpeaking && voiceOK && !echo && mouthGateOpen()) mirrorTranscript(txt, true)
             handleTranscript(txt, true)
           } else if (res.used_deepgram === false && res.reason === 'budget_capped') {
             dgPaused = true
@@ -897,6 +911,12 @@
     //    both while it is speaking AND during the echo-tail window after. ─────
     if ((pageSpeaking || Date.now() < echoGuardUntil) && isSelfEcho(transcript)) return
 
+    // ── Mouth-activity gate: when the camera is live, only hear while the
+    //    user's mouth is actually moving on camera. This is the definitive
+    //    self-hearing fix — JARVIS's TTS never moves YOUR mouth, so its own
+    //    voice can never be transcribed while the camera is watching. ─────────
+    if (!mouthGateOpen()) return
+
     // ── Barge-in while JARVIS is speaking ──────────────────────────────────
     if (pageSpeaking) {
       // Only a real wake from the calibrated user cuts JARVIS off — never its
@@ -1043,7 +1063,7 @@
           // JARVIS's own TTS, and (when voice-ID is on) never show other people.
           const voiceOK = passesIdentityGate()
           const echo = (pageSpeaking || Date.now() < echoGuardUntil) && isSelfEcho(transcript)
-          if (!pageSpeaking && voiceOK && !echo) mirrorTranscript(transcript, isFinal)
+          if (!pageSpeaking && voiceOK && !echo && mouthGateOpen()) mirrorTranscript(transcript, isFinal)
 
           // Single shared wake / conversation / command pipeline.
           handleTranscript(transcript, isFinal)
@@ -1204,6 +1224,7 @@
             mar:     d.mar || 0,
             ts:      Date.now(),
           }
+          if (faceState.talking) lastMouthActiveAt = Date.now()
           try {
             api.runtime.sendMessage({
               type: 'face-vision-update',
@@ -1267,6 +1288,7 @@
               mar:     msg.mar || 0,
               ts:      msg.ts || Date.now(),
             }
+            if (faceState.talking) lastMouthActiveAt = Date.now()
             // Mirror the visual "talking" onto the page robot so it reacts in
             // sync with the mouth (nice-to-have; page may ignore it).
             try { toPage({ type: 'face-talking', talking: faceState.talking, match: faceState.match }) } catch { /* noop */ }
