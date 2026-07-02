@@ -279,10 +279,21 @@ function renderPositions(positions) {
   }).join('')
 }
 
+const BACKEND_URL = 'http://127.0.0.1:1448/api/v1'
+
+// Direct fetch from backend — bypasses the background service worker so MV3
+// restart races can never leave the popup stuck at "Loading accounts…".
+// The popup extension page is whitelisted in the manifest connect-src.
+async function fetchUnifiedMonitor(sync = false) {
+  const url = `${BACKEND_URL}/jarvis/unified-monitor${sync ? '?sync=true' : ''}`
+  const resp = await fetch(url, { signal: AbortSignal.timeout(8000) })
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+  return resp.json()
+}
+
 function loadPositionsFromBackground() {
-  // Step 1: get-state now includes lastUnifiedData (last background poll result).
-  // Render account balances IMMEDIATELY from cached data so the popup never
-  // stays stuck on "Loading accounts…" waiting for a fresh backend fetch.
+  // Step 1: sync settings/switches/analysis from background service worker
+  // (lightweight — no backend fetch, returns instantly from SW memory).
   api.runtime.sendMessage({ type: 'get-state' }, (resp) => {
     if (api.runtime.lastError || !resp) return
     monitorEnabled = !!resp.monitorEnabled
@@ -290,25 +301,35 @@ function loadPositionsFromBackground() {
     applySwitch(els.monitorSwitch, monitorEnabled)
     applySwitch(els.ttsSwitch,     ttsEnabled)
     if (resp.lastAnalysisResult) renderAnalysis(resp.lastAnalysisResult)
-    // Immediately render accounts from the cached last poll — no backend round-trip
+    // Use cached unified data if available (instant, no network)
     if (resp.lastUnifiedData) renderMonitorData(resp.lastUnifiedData)
-    else if (resp.positions && resp.positions.length) renderPositions(resp.positions)
   })
-  // Step 2: also kick a fresh refresh so data is current (non-blocking — the
-  // cached render above already cleared the "Loading accounts…" placeholder).
-  api.runtime.sendMessage({ type: 'refresh-positions' }, (resp) => {
-    if (api.runtime.lastError || !resp) return
-    if (resp.data) renderMonitorData(resp.data)
-  })
+  // Step 2: fetch live account data DIRECTLY from backend (bypasses SW so MV3
+  // service-worker restarts can never block or drop this response).
+  fetchUnifiedMonitor(false)
+    .then(data => renderMonitorData(data))
+    .catch(() => {
+      // Backend offline or slow — try once more via the SW path as fallback
+      api.runtime.sendMessage({ type: 'refresh-positions' }, (resp) => {
+        if (api.runtime.lastError || !resp) return
+        if (resp.data) renderMonitorData(resp.data)
+      })
+    })
 }
 
 function refreshPositions() {
   els.refreshBtn.textContent = '…'
-  api.runtime.sendMessage({ type: 'refresh-positions' }, (resp) => {
-    els.refreshBtn.textContent = '⟳'
-    if (api.runtime.lastError || !resp) return
-    if (resp.data) renderMonitorData(resp.data)
-  })
+  // Direct fetch with sync=true (live MT5 balance pull) — bypasses the SW
+  fetchUnifiedMonitor(true)
+    .then(data => { els.refreshBtn.textContent = '⟳'; renderMonitorData(data) })
+    .catch(() => {
+      // Fallback to SW path
+      api.runtime.sendMessage({ type: 'refresh-positions' }, (resp) => {
+        els.refreshBtn.textContent = '⟳'
+        if (api.runtime.lastError || !resp) return
+        if (resp.data) renderMonitorData(resp.data)
+      })
+    })
 }
 
 // ── Unified monitor rendering ────────────────────────────────────────────────
@@ -640,28 +661,25 @@ document.querySelectorAll('.avatar-chip').forEach(chip => {
   }
 })()
 
-// Auto-refresh every 10 s while popup is open (matches background poll).
-// Uses get-state (fast, no backend hit) to refresh ALL sections including
-// Account Balances via lastUnifiedData (fixed: previously only crypto positions
-// were refreshed, leaving MT5 accounts and balance bar stale).
+// Auto-refresh every 10 s while popup is open.
+// Direct backend fetch keeps account balances current regardless of whether the
+// background service worker has polled recently.
 setInterval(() => {
+  // Keep settings/switches/analysis in sync from SW (cheap, no backend)
   api.runtime.sendMessage({ type: 'get-state' }, (resp) => {
     if (!resp) return
-    // Always update monitor/tts switch state
     if (resp.monitorEnabled !== undefined) {
       monitorEnabled = !!resp.monitorEnabled
       ttsEnabled = !!resp.ttsEnabled
       applySwitch(els.monitorSwitch, monitorEnabled)
       applySwitch(els.ttsSwitch, ttsEnabled)
     }
-    // Refresh full account balances + positions from cached unified data
-    if (resp.lastUnifiedData) {
-      renderMonitorData(resp.lastUnifiedData)
-    } else if (resp.positions) {
-      renderPositions(resp.positions)
-    }
     if (resp.lastAnalysisResult) renderAnalysis(resp.lastAnalysisResult)
   })
+  // Refresh account data directly from backend
+  fetchUnifiedMonitor(false)
+    .then(data => renderMonitorData(data))
+    .catch(() => { /* backend offline — keep existing display */ })
 }, 10_000)
 
 // ─────────────────────────────────────────────────────────────────────────────
