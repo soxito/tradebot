@@ -337,7 +337,7 @@
     emit('frame', { facePresent, mar: currentMAR, isTalking, identityMatch })
 
     // Notify background.js
-    _notifyBackground({ facePresent, isTalking, mar: currentMAR, identityMatch })
+    _notifyBackground({ facePresent, isTalking, mar: currentMAR, identityMatch, enrolled: isEnrolled })
 
     // Draw canvas overlay
     _drawOverlay()

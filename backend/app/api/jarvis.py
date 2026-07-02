@@ -483,9 +483,11 @@ def _safe_float(val, default: float = 0.0) -> float:
 # Fallback version only — the real version is ALWAYS read live from
 # jarvis-extension/manifest.json (see _ext_version()). Keep this in sync so a
 # missing manifest never advertises a stale version.
-_EXT_VERSION = "3.5.3"
+_EXT_VERSION = "3.5.4"
 _EXT_RELEASED = "2026-07-02"
 _EXT_CHANGELOG = [
+    "Unknown-face lockout restored — a stranger can't drive JARVIS, but only once you've enrolled your own face (unenrolled never blocks)",
+    "TTS self-hearing fixed for real — the page now passes the exact words it speaks so JARVIS never transcribes its own AI voice",
     "Fix: enabling Face Vision no longer stops JARVIS from hearing you (face is now additive-only, never mutes voice)",
     "JARVIS no longer transcribes its own voice while reading to you (self-echo guard + echo-tail window)",
     "Background sound and faint/other-room voices no longer wake JARVIS — only real near-mic user speech",

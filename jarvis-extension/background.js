@@ -541,7 +541,7 @@ api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     // relayed to content.js so the page-level speech recogniser can use the
     // visual "talking" signal to stay in sync with the microphone.
     case 'face-vision-update': {
-      const { facePresent, isTalking, mar, identityMatch } = msg
+      const { facePresent, isTalking, mar, identityMatch, enrolled } = msg
       faceVisionState.facePresent    = !!facePresent
       faceVisionState.isTalking      = !!isTalking
       faceVisionState.mar            = mar || 0
@@ -556,7 +556,7 @@ api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             (tabs || []).forEach((t) => {
               api.tabs.sendMessage(t.id, {
                 type: 'face-vision-state',
-                facePresent, isTalking, mar, identityMatch,
+                facePresent, isTalking, mar, identityMatch, enrolled,
                 ts: faceVisionState.lastUpdateMs,
               }).catch?.(() => {})
             })

@@ -1671,7 +1671,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
         // `allowBargeIn` tells the extension whether to keep its mic open during
         // speech (so the user can cut in) or fully stop until JARVIS finishes.
         window.postMessage(
-          { __jarvisPage: true, type: 'speak-status', speaking, allowBargeIn },
+          { __jarvisPage: true, type: 'speak-status', speaking, allowBargeIn, text: speaking ? clean : undefined },
           window.location.origin,
         )
       } catch { /* noop */ }

@@ -98,19 +98,24 @@
   // while the popup camera is active. When fresh, the user's matched face acts
   // as a positive reinforcement for the voice gate (speech + face in sync) and
   // an unknown face tightens it. When stale (popup closed) speech is voice-only.
-  let faceState = { present: false, talking: false, match: false, mar: 0, ts: 0 }
+  let faceState = { present: false, talking: false, match: false, enrolled: false, mar: 0, ts: 0 }
   const FACE_FRESH_MS = 2500
   function faceFresh() { return faceState.ts > 0 && (Date.now() - faceState.ts) < FACE_FRESH_MS }
 
   // Combined identity gate — single source of truth for "should we transcribe".
-  // The audio voice-ID (pageVoiceMatch) is the ONLY thing that can gate speech.
-  // Face vision is purely ADDITIVE: a matched face reinforces the gate, but the
-  // face signal never blocks hearing on its own (an unenrolled or absent face
-  // must never make JARVIS deaf).
+  // The audio voice-ID (pageVoiceMatch) gates speech. Face vision:
+  //   • Matched face  → reinforces (trust, returns true).
+  //   • ENROLLED but a DIFFERENT (unmatched) face is present → blocks: a known
+  //     stranger should not be able to drive JARVIS.
+  //   • Not enrolled / no face → never blocks; falls back to pure voice-ID so
+  //     enabling Face Vision can never make JARVIS deaf.
   function passesIdentityGate() {
     const voiceOK = !settings.requireVoiceMatch || pageVoiceMatch
-    if (faceFresh() && faceState.present && faceState.match) return true // matched face → trust
-    return voiceOK  // face never blocks; fall back to pure voice-ID
+    if (faceFresh() && faceState.present) {
+      if (faceState.match) return true                       // your face → trust
+      if (faceState.enrolled) return false                   // enrolled + stranger → block
+    }
+    return voiceOK  // unenrolled / no face → voice-ID only
   }
 
   // ── Conversation continuity ────────────────────────────────────────────────
@@ -1139,7 +1144,18 @@
           break
         case 'speak-status':
           pageSpeaking = !!d.speaking
-          if (d.speaking) pageSpeakAckAt = Date.now()  // page is handling TTS (universal voice)
+          if (d.speaking) {
+            pageSpeakAckAt = Date.now()  // page is handling TTS (universal voice)
+            // The page tells us the exact text it is about to speak so the
+            // self-echo filter can reject that text if the mic hears it back.
+            // This is essential when PaulChat speaks its own AI response WITHOUT
+            // going through the extension's queueSpeak (which is where our own
+            // TTS sets lastSpokenText).
+            if (d.text) lastSpokenText = normSpeech(d.text)
+          } else {
+            // Page finished speaking → open the echo-tail guard.
+            echoGuardUntil = Date.now() + 900
+          }
           // While JARVIS is talking we must never transcribe its own voice. Two
           // modes, chosen by the page via `allowBargeIn`:
           //   • allowBargeIn = false → fully stop the mic (zero self-hearing).
@@ -1184,6 +1200,7 @@
             present: !!d.facePresent,
             talking: !!d.isTalking,
             match:   !!d.identityMatch,
+            enrolled: !!d.enrolled,
             mar:     d.mar || 0,
             ts:      Date.now(),
           }
@@ -1194,6 +1211,7 @@
               isTalking: faceState.talking,
               mar: faceState.mar,
               identityMatch: faceState.match,
+              enrolled: faceState.enrolled,
             }).catch?.(() => {})
           } catch { /* noop */ }
           break
@@ -1245,6 +1263,7 @@
               present: !!msg.facePresent,
               talking: !!msg.isTalking,
               match:   !!msg.identityMatch,
+              enrolled: !!msg.enrolled,
               mar:     msg.mar || 0,
               ts:      msg.ts || Date.now(),
             }

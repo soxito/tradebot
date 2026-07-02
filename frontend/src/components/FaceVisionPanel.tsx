@@ -129,12 +129,12 @@ export default function FaceVisionPanel() {
     (present: boolean, talking: boolean, matched: boolean, marVal: number) => {
       try {
         window.postMessage(
-          { __jarvisPage: true, type: 'jarvis-face-state', facePresent: present, isTalking: talking, identityMatch: matched, mar: marVal },
+          { __jarvisPage: true, type: 'jarvis-face-state', facePresent: present, isTalking: talking, identityMatch: matched, enrolled, mar: marVal },
           window.location.origin,
         )
       } catch { /* noop */ }
     },
-    [],
+    [enrolled],
   )
 
   // ── Handle a backend result ────────────────────────────────────────────
