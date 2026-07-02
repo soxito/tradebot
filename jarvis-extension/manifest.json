@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "JARVIS Voice Assistant \u2014 TradeBot",
-  "version": "3.5.2",
+  "version": "3.5.3",
   "description": "Real-time crypto + MT5 account monitor, 15-minute position analysis, on-demand AI analysis, voice commands, spoken trade alerts, and GPU-accelerated face vision with lip tracking for TradeBot. v3.4: Face detection, identity recognition, and lip/mouth motion tracking using MediaPipe GPU.",
   "permissions": [
     "notifications",

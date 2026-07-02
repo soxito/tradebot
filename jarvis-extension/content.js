@@ -103,13 +103,14 @@
   function faceFresh() { return faceState.ts > 0 && (Date.now() - faceState.ts) < FACE_FRESH_MS }
 
   // Combined identity gate — single source of truth for "should we transcribe".
-  // Blends the audio voice-ID (pageVoiceMatch) with the visual face signal.
+  // The audio voice-ID (pageVoiceMatch) is the ONLY thing that can gate speech.
+  // Face vision is purely ADDITIVE: a matched face reinforces the gate, but the
+  // face signal never blocks hearing on its own (an unenrolled or absent face
+  // must never make JARVIS deaf).
   function passesIdentityGate() {
     const voiceOK = !settings.requireVoiceMatch || pageVoiceMatch
-    if (!faceFresh()) return voiceOK                     // face vision off → voice-only (unchanged)
-    if (faceState.present && faceState.match) return true // your matched face → trust it
-    if (settings.requireVoiceMatch && faceState.present && !faceState.match) return false // stranger → block
-    return voiceOK
+    if (faceFresh() && faceState.present && faceState.match) return true // matched face → trust
+    return voiceOK  // face never blocks; fall back to pure voice-ID
   }
 
   // ── Conversation continuity ────────────────────────────────────────────────
@@ -893,9 +894,9 @@
 
     // ── Barge-in while JARVIS is speaking ──────────────────────────────────
     if (pageSpeaking) {
-      // Only a real, near-mic wake from the calibrated user cuts JARVIS off —
-      // never its own speech (isSelfEcho) and never faint background.
-      if (voiceOK && hasWake(transcript) && !isSelfEcho(transcript) && recentlyLoud()) {
+      // Only a real wake from the calibrated user cuts JARVIS off — never its
+      // own speech (isSelfEcho).
+      if (voiceOK && hasWake(transcript) && !isSelfEcho(transcript)) {
         toPage({ type: 'interrupt' })
         pageSpeaking = false
         awaitingCommand = true
@@ -920,10 +921,8 @@
     if (!awaitingCommand) {
       // Enter the command phase via the wake word OR — while the conversation
       // window is open — via any substantive follow-up (no wake required).
-      // Both require recent near-mic loudness so faint background never wakes it.
-      const loudEnough    = recentlyLoud()
-      const woke          = isFinal && hasWake(transcript) && loudEnough
-      const convoFollowUp = isFinal && inConversation && !hasWake(transcript) && transcript.trim().length > 2 && loudEnough
+      const woke          = isFinal && hasWake(transcript)
+      const convoFollowUp = isFinal && inConversation && !hasWake(transcript) && transcript.trim().length > 2
       if (woke || convoFollowUp) {
         awaitingCommand = true
         commandBuffer   = woke ? stripWake(transcript) : transcript.trim()
