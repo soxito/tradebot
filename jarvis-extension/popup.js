@@ -280,14 +280,22 @@ function renderPositions(positions) {
 }
 
 function loadPositionsFromBackground() {
+  // Step 1: restore settings + last-known crypto positions immediately
   api.runtime.sendMessage({ type: 'get-state' }, (resp) => {
     if (api.runtime.lastError || !resp) return
     monitorEnabled = !!resp.monitorEnabled
     ttsEnabled     = !!resp.ttsEnabled
     applySwitch(els.monitorSwitch, monitorEnabled)
     applySwitch(els.ttsSwitch,     ttsEnabled)
-    renderPositions(resp.positions || [])
     if (resp.lastAnalysisResult) renderAnalysis(resp.lastAnalysisResult)
+  })
+  // Step 2: immediately fetch full unified data (accounts + MT5 + crypto) so
+  // the Account Balances section never stays stuck at "Loading accounts…".
+  // This was the bug: get-state only returned crypto positions and the account
+  // balance panel was never populated until the next 10 s background poll.
+  api.runtime.sendMessage({ type: 'refresh-positions' }, (resp) => {
+    if (api.runtime.lastError || !resp) return
+    if (resp.data) renderMonitorData(resp.data)
   })
 }
 
