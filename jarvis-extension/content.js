@@ -61,6 +61,38 @@
   let pageVoiceMatch = true  // updated by page's voiceMatch loop; gates dispatch when false
   let learnedVocab = {}     // cached from chrome.storage, boosts pickBest() scoring
 
+  // ── Self-voice + background-noise rejection ─────────────────────────────────
+  // These harden two things the user reported:
+  //   1. JARVIS must NEVER transcribe its own TTS (heard through the speakers)
+  //      — even during the echo tail right after it finishes speaking.
+  //   2. Faint background sound / other-room voices must NOT activate JARVIS —
+  //      only real, near-mic user speech should.
+  let lastSpokenText  = ''    // normalised text JARVIS last spoke (self-echo filter)
+  let echoGuardUntil  = 0     // ignore transcripts until this ts (post-TTS echo tail)
+  let lastLoudAt      = 0     // last time mic energy crossed the speech threshold
+  const WAKE_ENERGY   = 0.05  // min mic energy that counts as real nearby speech
+  const LOUD_WINDOW_MS = 1800 // a wake is only valid if speech was loud within this
+
+  function normSpeech(s) {
+    return String(s || '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim()
+  }
+  // True when the transcript is mostly words JARVIS just spoke → it's our own
+  // TTS echoing back through the mic, not the user.
+  function isSelfEcho(transcript) {
+    if (!lastSpokenText) return false
+    const words = normSpeech(transcript).split(' ').filter(w => w.length > 2)
+    if (words.length === 0) return false
+    let hit = 0
+    for (const w of words) if (lastSpokenText.includes(w)) hit++
+    return (hit / words.length) >= 0.6
+  }
+  // True when speech was recently loud enough to be the user (not faint noise).
+  // Fails open when the frequency analyser isn't running (can't measure).
+  function recentlyLoud() {
+    if (!freqAnalyser) return true
+    return (Date.now() - lastLoudAt) < LOUD_WINDOW_MS
+  }
+
   // ── Face Vision sync state ──────────────────────────────────────────────────
   // Relayed from the popup (face-vision.js → background → here). Only "fresh"
   // while the popup camera is active. When fresh, the user's matched face acts
@@ -292,6 +324,7 @@
         clearTimeout(restartTimer)
         restartTimer = setTimeout(() => {
           pageSpeaking = false
+          echoGuardUntil = Date.now() + 900
           toPage({ type: 'speak-status', speaking: false, allowBargeIn: false })
         }, 900)
       }
@@ -303,6 +336,7 @@
         clearTimeout(restartTimer)
         restartTimer = setTimeout(() => {
           pageSpeaking = false
+          echoGuardUntil = Date.now() + 900
           toPage({ type: 'speak-status', speaking: false, allowBargeIn: false })
         }, 900)
       }
@@ -321,6 +355,9 @@
 
   function queueSpeak(text) {
     if (!text) return
+    // Remember what JARVIS is about to say so we can reject it if the mic hears
+    // it echo back (self-voice guard).
+    lastSpokenText = normSpeech(text)
     // ── Universal voice ──────────────────────────────────────────────────────
     // Prefer routing speech through the in-page JARVIS (PaulChat) so EVERY
     // utterance uses the voice the user selected in the chat (OpenAI aiVoice or
@@ -466,6 +503,9 @@
             const mx = Math.max(...raw, 1)
             freqBands  = raw.map(v => v / mx)
             freqEnergy = raw.reduce((a, v) => a + v, 0) / raw.length / 255
+            // Track the last moment real near-mic speech was present so the wake
+            // logic can reject faint background sound.
+            if (freqEnergy > WAKE_ENERGY) lastLoudAt = Date.now()
 
             // v3.1: the in-page binary panel is removed — the 3D robot is the
             // visual now. We still relay freq data to the popup mini-canvas.
@@ -654,7 +694,8 @@
           if (!res) return
           if (res.used_deepgram && res.text && res.text.trim()) {
             const txt = cleanFiller(res.text.trim()) || res.text.trim()
-            if (!pageSpeaking && voiceOK) mirrorTranscript(txt, true)
+            const echo = (pageSpeaking || Date.now() < echoGuardUntil) && isSelfEcho(txt)
+            if (!pageSpeaking && voiceOK && !echo) mirrorTranscript(txt, true)
             handleTranscript(txt, true)
           } else if (res.used_deepgram === false && res.reason === 'budget_capped') {
             dgPaused = true
@@ -846,9 +887,15 @@
     if (!transcript) return
     const voiceOK = passesIdentityGate()
 
+    // ── Self-voice guard: drop JARVIS's own TTS echoing back through the mic,
+    //    both while it is speaking AND during the echo-tail window after. ─────
+    if ((pageSpeaking || Date.now() < echoGuardUntil) && isSelfEcho(transcript)) return
+
     // ── Barge-in while JARVIS is speaking ──────────────────────────────────
     if (pageSpeaking) {
-      if (voiceOK && hasWake(transcript)) {
+      // Only a real, near-mic wake from the calibrated user cuts JARVIS off —
+      // never its own speech (isSelfEcho) and never faint background.
+      if (voiceOK && hasWake(transcript) && !isSelfEcho(transcript) && recentlyLoud()) {
         toPage({ type: 'interrupt' })
         pageSpeaking = false
         awaitingCommand = true
@@ -873,8 +920,10 @@
     if (!awaitingCommand) {
       // Enter the command phase via the wake word OR — while the conversation
       // window is open — via any substantive follow-up (no wake required).
-      const woke          = isFinal && hasWake(transcript)
-      const convoFollowUp = isFinal && inConversation && !hasWake(transcript) && transcript.trim().length > 2
+      // Both require recent near-mic loudness so faint background never wakes it.
+      const loudEnough    = recentlyLoud()
+      const woke          = isFinal && hasWake(transcript) && loudEnough
+      const convoFollowUp = isFinal && inConversation && !hasWake(transcript) && transcript.trim().length > 2 && loudEnough
       if (woke || convoFollowUp) {
         awaitingCommand = true
         commandBuffer   = woke ? stripWake(transcript) : transcript.trim()
@@ -989,7 +1038,8 @@
           // Echo + voice gate for the popup transcript mirror: never show
           // JARVIS's own TTS, and (when voice-ID is on) never show other people.
           const voiceOK = passesIdentityGate()
-          if (!pageSpeaking && voiceOK) mirrorTranscript(transcript, isFinal)
+          const echo = (pageSpeaking || Date.now() < echoGuardUntil) && isSelfEcho(transcript)
+          if (!pageSpeaking && voiceOK && !echo) mirrorTranscript(transcript, isFinal)
 
           // Single shared wake / conversation / command pipeline.
           handleTranscript(transcript, isFinal)
@@ -1111,10 +1161,9 @@
               stopRecognition()
             }
           } else if (settings.enabled) {
-            // JARVIS finished — resume normal listening shortly after (the small
-            // delay swallows any audio echo tail). If a conversation is active,
-            // refresh its window so the user can reply immediately without the
-            // wake word.
+            // JARVIS finished — open an echo-tail guard so the trailing speaker
+            // echo isn't transcribed, then resume normal listening shortly after.
+            echoGuardUntil = Date.now() + 900
             if (inConversation) enterConversation()
             manuallyStopped = false
             clearTimeout(restartTimer)
