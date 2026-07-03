@@ -1381,6 +1381,31 @@ async def _dispatch(cmd: str, ex: Optional[str]) -> CommandResult:  # noqa: C901
             ex_name=ex,
         )
 
+    # ── analyse ALL open positions with news context ───────────────────────────
+    # MUST be checked BEFORE the general _ana_m block.  Without this guard,
+    # "analyse current positions" matches the _ana_m pattern and JARVIS tries
+    # to resolve "CURRENT" as a Bitget trading pair — returning a nonsense
+    # "Did you mean CETUS?" error instead of the intended portfolio review.
+    #
+    # Catches phrases like:
+    #   "analyse current positions"         "analyze my positions"
+    #   "with coming news analyse positions" "how will today's news impact my positions"
+    #   "news impact on positions"          "positions and today's news"
+    _NEWS_POS_PAT = re.compile(
+        r'(?:'
+        r'(?:analys[ei]|analyze|assess|review|check)\s+'
+            r'(?:(?:my|all|open|current|the)\s+)?positions?'
+        r'|(?:news|headlines?|market\s+news)\s+(?:impact|affect|effect)\s+'
+            r'(?:on\s+)?(?:(?:my|current|open)\s+)?positions?'
+        r'|how\s+will\s+(?:\w+\s+){0,4}news\s+(?:impact|affect)\s+'
+            r'(?:(?:my|current|open)\s+)?positions?'
+        r'|positions?\s+(?:and|with|given|considering)\s+(?:\w+\s+){0,3}news'
+        r')',
+        re.IGNORECASE,
+    )
+    if _NEWS_POS_PAT.search(cmd):
+        return await _analyze_positions_with_news(cmd)
+
     # ── market analysis / monitor / sniper commands ────────────────────────────
     # These MUST be intercepted here so the AI page-handler CANNOT hallucinate
     # a fake execution.  We do real on-chain analysis and PROPOSE a trade —
@@ -2468,6 +2493,111 @@ async def _list_positions() -> CommandResult:
         detail="\n".join(lines),
         speech=speech,
     )
+
+
+async def _analyze_positions_with_news(cmd: str) -> CommandResult:
+    """
+    Fetch every open position + recent news articles, then build a natural-language
+    summary of how today's headlines may affect each trade.
+
+    Called when the user says things like:
+      "analyse current positions"
+      "with coming news analyse my positions"
+      "how will today's news impact my open positions"
+    """
+    # 1. Fetch all open positions ───────────────────────────────────────────
+    positions = await get_all_positions()
+    if not positions:
+        msg = "You have no open positions, Sir. Nothing to analyse against the news."
+        return CommandResult(ok=True, action="news_position_analysis", detail=msg, speech=msg)
+
+    # 2. Fetch recent news + sentiment scores from the database ─────────────
+    news_lines: List[str] = []
+    sentiment_by_symbol: Dict[str, float] = {}
+
+    try:
+        from app.core.database import AsyncSessionLocal
+        from app.sentiment.enhanced_service import EnhancedSentimentService
+
+        async with AsyncSessionLocal() as db:
+            articles = await EnhancedSentimentService.get_articles(db, hours=24, limit=30)
+            all_sentiment = await EnhancedSentimentService.get_all_latest(db)
+
+            for s in all_sentiment:
+                sym = (s.get("symbol") or "").upper()
+                score = s.get("score")
+                if sym and score is not None:
+                    sentiment_by_symbol[sym] = float(score)
+
+            for art in articles[:15]:
+                title = art.get("title") or ""
+                source = art.get("source") or ""
+                if title:
+                    news_lines.append(f"• [{source}] {title}")
+    except Exception as e:
+        logger.warning(f"[JARVIS] news fetch for position analysis failed: {e}")
+
+    # 3. Build per-position impact notes ────────────────────────────────────
+    detail_parts: List[str] = []
+    speech_parts: List[str] = []
+
+    for p in positions:
+        # Strip quote currency so "BTCUSDT" → "BTC" for sentiment lookup.
+        base = p.symbol.replace("USDT", "").replace("USDC", "").replace("/", "")
+        pnl_dir = "up" if p.pnl >= 0 else "down"
+
+        # Look up sentiment score (try both forms e.g. "BTC" and "BTCUSDT").
+        score = sentiment_by_symbol.get(base) or sentiment_by_symbol.get(p.symbol)
+        if score is not None:
+            if score >= 0.3:
+                sentiment_label = "bullish"
+                impact = "supporting this trade" if p.side == "long" else "working against this trade"
+            elif score <= -0.3:
+                sentiment_label = "bearish"
+                impact = "working against this trade" if p.side == "long" else "supporting this trade"
+            else:
+                sentiment_label = "neutral"
+                impact = "no strong directional bias"
+        else:
+            sentiment_label = "no data"
+            impact = "impact unknown"
+
+        detail_parts.append(
+            f"{p.symbol} {p.side.upper()} | "
+            f"entry {p.entry_price:.6g} → mark {p.mark_price:.6g} | "
+            f"PnL {p.pnl:+.2f} USDT ({p.pnl_pct:+.2f}%) | "
+            f"news sentiment: {sentiment_label} → {impact}"
+        )
+        speech_parts.append(
+            f"{base} {p.side} is {pnl_dir} {abs(p.pnl_pct):.1f}% — "
+            f"news sentiment is {sentiment_label}, {impact}"
+        )
+
+    # 4. Assemble the full response ──────────────────────────────────────────
+    news_block = (
+        "Latest headlines (last 24 h):\n" + "\n".join(news_lines[:10])
+        if news_lines
+        else "No recent news articles found — try refreshing sentiment data."
+    )
+
+    detail = (
+        f"News Impact Analysis — {len(positions)} open position(s)\n\n"
+        + "\n".join(detail_parts)
+        + f"\n\n{news_block}"
+    )
+
+    speech = (
+        f"Here is the news impact summary for your "
+        f"{len(positions)} open position{'s' if len(positions) > 1 else ''}, Sir. "
+        + " ".join(speech_parts[:5])
+        + (
+            f" I found {len(news_lines)} headlines from the last 24 hours."
+            if news_lines
+            else " No recent news in the database."
+        )
+    )
+
+    return CommandResult(ok=True, action="news_position_analysis", detail=detail, speech=speech)
 
 
 async def _position_status(symbol: str, ex_name: Optional[str]) -> CommandResult:
