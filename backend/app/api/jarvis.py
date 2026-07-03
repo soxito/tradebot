@@ -1393,12 +1393,17 @@ async def _dispatch(cmd: str, ex: Optional[str]) -> CommandResult:  # noqa: C901
     #   "news impact on positions"          "positions and today's news"
     _NEWS_POS_PAT = re.compile(
         r'(?:'
+        # "analyse [my [current]] positions"  — allow up to 3 modifier words
+        # e.g. "analyse my current open positions"
         r'(?:analys[ei]|analyze|assess|review|check)\s+'
-            r'(?:(?:my|all|open|current|the)\s+)?positions?'
+            r'(?:(?:my|all|open|current|the|latest|active|live|existing|today[\w]*)\s+){0,3}positions?'
+        # "news impact on [my] positions"
         r'|(?:news|headlines?|market\s+news)\s+(?:impact|affect|effect)\s+'
-            r'(?:on\s+)?(?:(?:my|current|open)\s+)?positions?'
-        r'|how\s+will\s+(?:\w+\s+){0,4}news\s+(?:impact|affect)\s+'
-            r'(?:(?:my|current|open)\s+)?positions?'
+            r'(?:on\s+)?(?:(?:my|current|open|the)\s+){0,2}positions?'
+        # "how will today's news impact my positions"
+        r'|how\s+will\s+(?:\w+\s+){0,5}news\s+(?:impact|affect)\s+'
+            r'(?:(?:my|current|open|the)\s+){0,2}positions?'
+        # "positions and/with today's news"
         r'|positions?\s+(?:and|with|given|considering)\s+(?:\w+\s+){0,3}news'
         r')',
         re.IGNORECASE,
