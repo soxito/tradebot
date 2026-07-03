@@ -2502,8 +2502,9 @@ async def _list_positions() -> CommandResult:
 
 async def _analyze_positions_with_news(cmd: str) -> CommandResult:
     """
-    Fetch every open position + recent news articles, then build a natural-language
-    summary of how today's headlines may affect each trade.
+    Fetch every open position + recent news articles, match headlines to each
+    position by token symbol, then call the AI router for a real qualitative
+    impact analysis.  Falls back to a structured table if AI is unavailable.
 
     Called when the user says things like:
       "analyse current positions"
@@ -2516,92 +2517,156 @@ async def _analyze_positions_with_news(cmd: str) -> CommandResult:
         msg = "You have no open positions, Sir. Nothing to analyse against the news."
         return CommandResult(ok=True, action="news_position_analysis", detail=msg, speech=msg)
 
-    # 2. Fetch recent news + sentiment scores from the database ─────────────
-    news_lines: List[str] = []
-    sentiment_by_symbol: Dict[str, float] = {}
-
+    # 2. Fetch recent news articles from the DB (each article already has
+    #    a pre-parsed 'symbols' list, 'sentiment_score', 'sentiment_label')
+    articles: List[Dict[str, Any]] = []
     try:
         from app.core.database import AsyncSessionLocal
         from app.sentiment.enhanced_service import EnhancedSentimentService
-
         async with AsyncSessionLocal() as db:
-            articles = await EnhancedSentimentService.get_articles(db, hours=24, limit=30)
-            all_sentiment = await EnhancedSentimentService.get_all_latest(db)
-
-            for s in all_sentiment:
-                sym = (s.get("symbol") or "").upper()
-                score = s.get("score")
-                if sym and score is not None:
-                    sentiment_by_symbol[sym] = float(score)
-
-            for art in articles[:15]:
-                title = art.get("title") or ""
-                source = art.get("source") or ""
-                if title:
-                    news_lines.append(f"• [{source}] {title}")
+            articles = await EnhancedSentimentService.get_articles(db, hours=24, limit=50)
     except Exception as e:
         logger.warning(f"[JARVIS] news fetch for position analysis failed: {e}")
 
-    # 3. Build per-position impact notes ────────────────────────────────────
-    detail_parts: List[str] = []
-    speech_parts: List[str] = []
-
+    # 3. Match articles to each position by base-token symbol ───────────────
+    #    An article's 'symbols' field is a list like ["BTC", "ETH", "PEPE"].
+    position_bases: Dict[str, str] = {}   # base → full symbol  e.g. "UNI" → "UNIUSDT"
     for p in positions:
-        # Strip quote currency so "BTCUSDT" → "BTC" for sentiment lookup.
         base = p.symbol.replace("USDT", "").replace("USDC", "").replace("/", "")
-        pnl_dir = "up" if p.pnl >= 0 else "down"
+        position_bases[base.upper()] = p.symbol
 
-        # Look up sentiment score (try both forms e.g. "BTC" and "BTCUSDT").
-        score = sentiment_by_symbol.get(base) or sentiment_by_symbol.get(p.symbol)
-        if score is not None:
-            if score >= 0.3:
-                sentiment_label = "bullish"
-                impact = "supporting this trade" if p.side == "long" else "working against this trade"
-            elif score <= -0.3:
-                sentiment_label = "bearish"
-                impact = "working against this trade" if p.side == "long" else "supporting this trade"
-            else:
-                sentiment_label = "neutral"
-                impact = "no strong directional bias"
+    pos_articles: Dict[str, List[Dict]] = {b: [] for b in position_bases}
+    general_articles: List[Dict] = []
+
+    for art in articles:
+        syms_raw: List[str] = art.get("symbols") or []
+        syms_up = [s.upper() for s in syms_raw]
+        matched_bases = [b for b in position_bases if b in syms_up]
+        if matched_bases:
+            for b in matched_bases:
+                pos_articles[b].append(art)
         else:
-            sentiment_label = "no data"
-            impact = "impact unknown"
+            general_articles.append(art)
 
-        detail_parts.append(
+    # 4. Build a compact prompt for the AI ──────────────────────────────────
+    position_prompt_lines: List[str] = []
+    for p in positions:
+        base = p.symbol.replace("USDT", "").replace("USDC", "").replace("/", "").upper()
+        pnl_arrow = "▲" if p.pnl >= 0 else "▼"
+        line = (
+            f"- {base} {p.side.upper()} | "
+            f"entry ${p.entry_price:.6g} → mark ${p.mark_price:.6g} | "
+            f"PnL {pnl_arrow} {abs(p.pnl):.2f} USDT ({p.pnl_pct:+.2f}%)"
+        )
+        arts = pos_articles.get(base, [])[:3]
+        for a in arts:
+            score = a.get("sentiment_score")
+            label = (
+                a.get("sentiment_label")
+                or ("BULLISH" if (score or 0) > 0.1 else "BEARISH" if (score or 0) < -0.1 else "NEUTRAL")
+            )
+            line += f"\n  [{label}] {(a.get('title') or '')[:120]}"
+        if not arts:
+            line += "\n  (no specific headlines today)"
+        position_prompt_lines.append(line)
+
+    general_headlines_text = ""
+    if general_articles:
+        general_headlines_text = "\n\nGeneral market headlines:\n" + "\n".join(
+            f"- {(a.get('title') or '')[:120]}" for a in general_articles[:6]
+        )
+
+    total_arts = len(articles)
+    prompt_body = (
+        "My open trading positions with today's matching news:\n"
+        + "\n".join(position_prompt_lines)
+        + general_headlines_text
+        + f"\n\n({total_arts} total headlines from the last 24 hours)\n\n"
+        "Task: For EACH position, write one clear sentence explaining how today's news "
+        "may help or hurt that trade.  For positions with no specific news, briefly "
+        "note if the general headlines are bullish or bearish for the overall market. "
+        "End with a 1-sentence overall portfolio risk note.  Be direct and concise."
+    )
+
+    # 5. Ask the AI router for a real qualitative analysis ──────────────────
+    ai_detail: Optional[str] = None
+    try:
+        from app.core.database import AsyncSessionLocal
+        from plugins.AiMarketAnalyst.backend.services.ai_router import db_chat
+
+        async with AsyncSessionLocal() as db:
+            resp = await db_chat(
+                db,
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are JARVIS, a sharp trading assistant. "
+                            "Give factual, direct analysis — no filler phrases."
+                        ),
+                    },
+                    {"role": "user", "content": prompt_body},
+                ],
+                max_tokens=700,
+                temperature=0.25,
+                agent_name="jarvis-news-position-analysis",
+                source="jarvis",
+            )
+            if resp.get("ok") and resp.get("content"):
+                ai_detail = str(resp["content"]).strip()
+    except Exception as e:
+        logger.warning(f"[JARVIS] AI analysis for news/positions failed: {e}")
+
+    # 6. Return AI response when available ──────────────────────────────────
+    if ai_detail:
+        n_pos = len(positions)
+        speech = (
+            f"News impact analysis for your {n_pos} open position{'s' if n_pos > 1 else ''}, Sir. "
+            + ai_detail[:480].replace("\n", " ")
+        )
+        return CommandResult(
+            ok=True, action="news_position_analysis",
+            detail=ai_detail,
+            speech=speech,
+        )
+
+    # 7. Structured fallback (AI unavailable) ───────────────────────────────
+    detail_parts: List[str] = []
+    for p in positions:
+        base = p.symbol.replace("USDT", "").replace("USDC", "").replace("/", "").upper()
+        arts = pos_articles.get(base, [])
+        pnl_arrow = "▲" if p.pnl >= 0 else "▼"
+        line = (
             f"{p.symbol} {p.side.upper()} | "
             f"entry {p.entry_price:.6g} → mark {p.mark_price:.6g} | "
-            f"PnL {p.pnl:+.2f} USDT ({p.pnl_pct:+.2f}%) | "
-            f"news sentiment: {sentiment_label} → {impact}"
+            f"PnL {pnl_arrow} {abs(p.pnl):.2f} USDT ({p.pnl_pct:+.2f}%)"
         )
-        speech_parts.append(
-            f"{base} {p.side} is {pnl_dir} {abs(p.pnl_pct):.1f}% — "
-            f"news sentiment is {sentiment_label}, {impact}"
-        )
+        if arts:
+            for a in arts[:2]:
+                score = a.get("sentiment_score")
+                label = (
+                    a.get("sentiment_label")
+                    or ("BULLISH" if (score or 0) > 0.1 else "BEARISH" if (score or 0) < -0.1 else "NEUTRAL")
+                )
+                line += f"\n  [{label}] {(a.get('title') or '')[:100]}"
+        else:
+            line += "\n  No specific news today"
+        detail_parts.append(line)
 
-    # 4. Assemble the full response ──────────────────────────────────────────
-    news_block = (
-        "Latest headlines (last 24 h):\n" + "\n".join(news_lines[:10])
-        if news_lines
-        else "No recent news articles found — try refreshing sentiment data."
-    )
+    if general_articles:
+        detail_parts.append(
+            "\nGeneral market headlines:\n"
+            + "\n".join(f"  • {(a.get('title') or '')[:100]}" for a in general_articles[:5])
+        )
 
     detail = (
-        f"News Impact Analysis — {len(positions)} open position(s)\n\n"
-        + "\n".join(detail_parts)
-        + f"\n\n{news_block}"
+        f"News Impact — {len(positions)} positions · {total_arts} headlines (last 24 h)\n\n"
+        + "\n\n".join(detail_parts)
     )
-
     speech = (
-        f"Here is the news impact summary for your "
-        f"{len(positions)} open position{'s' if len(positions) > 1 else ''}, Sir. "
-        + " ".join(speech_parts[:5])
-        + (
-            f" I found {len(news_lines)} headlines from the last 24 hours."
-            if news_lines
-            else " No recent news in the database."
-        )
+        f"I matched {total_arts} headlines against your {len(positions)} positions. "
+        "AI analysis is unavailable — check the details panel for the headline breakdown."
     )
-
     return CommandResult(ok=True, action="news_position_analysis", detail=detail, speech=speech)
 
 
