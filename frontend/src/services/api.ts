@@ -792,6 +792,43 @@ export const apiClient = {
       api.post('/jarvis/voice-brain/identify', { bands, centroid }),
     markAlertRead: (id: string) => api.patch(`/plugins/agent-paul/alerts/${id}/read`),
     clearAlerts: () => api.delete('/plugins/agent-paul/alerts'),
+    // ── JARVIS brain (OpenHuman-inspired: Memory Tree, Goals/Todos, Idle) ──
+    memoryStats: () => api.get('/plugins/agent-paul/jarvis/memory/stats'),
+    memoryNew: (sinceMinutes?: number, minImportance?: number) =>
+      api.get('/plugins/agent-paul/jarvis/memory/new', {
+        params: { ...(sinceMinutes ? { since_minutes: sinceMinutes } : {}),
+                  ...(minImportance != null ? { min_importance: minImportance } : {}) },
+      }),
+    memoryRollup: () => api.post('/plugins/agent-paul/jarvis/memory/rollup'),
+    autoFetchStatus: () => api.get('/plugins/agent-paul/jarvis/auto-fetch/status'),
+    autoFetchRun: () => api.post('/plugins/agent-paul/jarvis/auto-fetch/run'),
+    getGoals: (sessionKey?: string, includeDone = true, scope?: string) =>
+      api.get('/plugins/agent-paul/jarvis/goals', {
+        params: { ...(sessionKey ? { session_key: sessionKey } : {}),
+                  ...(scope ? { scope } : {}), include_done: includeDone },
+      }),
+    createGoal: (data: { title: string; detail?: string; session_key?: string; scope?: string; priority?: number; token_budget?: number }) =>
+      api.post('/plugins/agent-paul/jarvis/goals', data),
+    updateGoal: (id: number, data: any) => api.patch(`/plugins/agent-paul/jarvis/goals/${id}`, data),
+    deleteGoal: (id: number) => api.delete(`/plugins/agent-paul/jarvis/goals/${id}`),
+    /** Reflect agent — reviews long-term goals vs memory, bootstraps if empty. */
+    reflectGoals: () => api.post('/plugins/agent-paul/jarvis/goals/reflect'),
+    getTodos: (sessionKey?: string, goalId?: number) =>
+      api.get('/plugins/agent-paul/jarvis/todos', {
+        params: { ...(sessionKey ? { session_key: sessionKey } : {}), ...(goalId != null ? { goal_id: goalId } : {}) },
+      }),
+    createTodo: (data: { title: string; goal_id?: number; session_key?: string; status?: string; detail?: string; needs_approval?: boolean }) =>
+      api.post('/plugins/agent-paul/jarvis/todos', data),
+    updateTodo: (id: number, data: any) => api.patch(`/plugins/agent-paul/jarvis/todos/${id}`, data),
+    deleteTodo: (id: number) => api.delete(`/plugins/agent-paul/jarvis/todos/${id}`),
+    idleStatus: () => api.get('/plugins/agent-paul/jarvis/idle-status'),
+    idleRun: (sessionKey?: string) =>
+      api.post('/plugins/agent-paul/jarvis/idle-run', { session_key: sessionKey || 'default' }),
+    // Subconscious heartbeat (OpenHuman-style "keeps thinking")
+    subconsciousStatus: () => api.get('/plugins/agent-paul/jarvis/subconscious/status'),
+    subconsciousTick: () => api.post('/plugins/agent-paul/jarvis/subconscious/tick'),
+    activityFeed: (limit = 30) =>
+      api.get('/plugins/agent-paul/jarvis/activity', { params: { limit } }),
     startMt5Monitor: () => api.post('/plugins/agent-paul/mt5-monitor/start'),
     stopMt5Monitor: () => api.post('/plugins/agent-paul/mt5-monitor/stop'),
     getMt5MonitorStatus: () => api.get('/plugins/agent-paul/mt5-monitor/status'),
@@ -858,6 +895,10 @@ export const apiClient = {
   },
 
   // ── Obsidian Knowledge Vault ─────────────────────────────────────────────
+  // ─── Market Overview ──────────────────────────────────────────────────────
+  getMarketOverview: () => api.get('/market/overview'),
+  getMarketHistory:  (days = 30) => api.get('/market/history', { params: { days } }),
+
   obsidian: {
     status: () => api.get('/plugins/obsidian-knowledge/status'),
     listNotes: (params?: { note_type?: string; symbol?: string; limit?: number; offset?: number }) =>
@@ -883,6 +924,30 @@ export const apiClient = {
     }) => api.post('/plugins/obsidian-knowledge/insights/harvest', data),
     learningActivity: () => api.get('/plugins/obsidian-knowledge/learning-activity'),
     liveFeed: (limit?: number) => api.get('/plugins/obsidian-knowledge/live-feed', { params: limit ? { limit } : {} }),
+  },
+
+  // ── Kronos Forecast Plugin (K-line foundation model) ─────────────────────
+  kronos: {
+    /** Model status: real Kronos loaded vs heuristic fallback, device, etc. */
+    status: () => api.get('/plugins/kronos/status'),
+    /** Full forecast: predicted candles + confidence bands + signal + overlays. */
+    forecast: (
+      exchange: string,
+      symbol: string,
+      params?: { timeframe?: string; lookback?: number; pred_len?: number; samples?: number; temperature?: number; top_p?: number },
+    ) => api.get(`/plugins/kronos/forecast/${exchange}/${symbol.replace('/', '')}`, { params }),
+    /** Lightweight overlay payload (overlays + markers + signal) for any chart. */
+    overlay: (
+      exchange: string,
+      symbol: string,
+      params?: { timeframe?: string; pred_len?: number; samples?: number },
+    ) => api.get(`/plugins/kronos/overlay/${exchange}/${symbol.replace('/', '')}`, { params }),
+    /** Compact speech-friendly forecast for JARVIS. */
+    jarvis: (symbol: string, params?: { exchange?: string; timeframe?: string; pred_len?: number }) =>
+      api.get(`/plugins/kronos/jarvis/${symbol.replace('/', '')}`, { params }),
+    /** Batch forecast several symbols at once. */
+    batch: (data: { exchange?: string; timeframe?: string; symbols: string[]; lookback?: number; pred_len?: number; samples?: number }) =>
+      api.post('/plugins/kronos/batch', data),
   },
 };
 

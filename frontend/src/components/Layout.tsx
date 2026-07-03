@@ -27,6 +27,7 @@ import {
   Rocket,
   Crosshair,
   CandlestickChart,
+  BarChart2,
   Cpu,
   Monitor,
   Rewind,
@@ -39,6 +40,7 @@ import {
   AudioWaveform,
   Atom,
   Puzzle,
+  Telescope,
 } from 'lucide-react';
 
 const navItems = [
@@ -50,10 +52,12 @@ const navItems = [
   { href: '/trending', label: 'Trending', icon: TrendingUp },
   { href: '/strategies', label: 'Strategies', icon: Zap },
   { href: '/sentiment', label: 'Sentiment', icon: Brain },
+  { href: '/market-cap', label: 'Market Cap', icon: BarChart2 },
   { href: '/pump-monitor', label: 'Pump Monitor', icon: Rocket },
   { href: '/rug-pulled', label: 'Rug Pulled', icon: Skull },
   { href: '/sniper-signals', label: 'Sniper Signals', icon: Crosshair },
   { href: '/smart-money-concepts', label: 'Smart Money Concepts', icon: CandlestickChart },
+  { href: '/kronos-forecast', label: 'Kronos Forecast', icon: Telescope },
   { href: '/delistings', label: 'Delistings', icon: AlertTriangle },
   { href: '/agents', label: 'AI Agents', icon: Bot },
   { href: '/custom-agents', label: 'Custom Agents', icon: Cpu },
