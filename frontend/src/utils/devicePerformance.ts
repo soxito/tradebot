@@ -34,44 +34,49 @@ export interface PerfProfile {
   shadows: boolean
   /** Whether the Three.js robot uses MSAA antialiasing. */
   antialias: boolean
+  /** Whether the orb may use canvas shadowBlur glow (very expensive on weak GPUs). */
+  orbGlow: boolean
 }
 
 export const PERF_PROFILES: Record<PerfTier, PerfProfile> = {
   low: {
     tier: 'low',
-    particleScale: 0.32,
-    cloudScale: 0.30,
-    sparkCap: 60,
-    ribbonSegs: 56,
+    particleScale: 0.25,
+    cloudScale: 0.20,
+    sparkCap: 40,
+    ribbonSegs: 48,
     dprCap: 1,
     robotDprCap: 1,
     fpsTarget: 30,
     shadows: false,
     antialias: false,
+    orbGlow: false,
   },
   medium: {
     tier: 'medium',
-    particleScale: 0.55,
-    cloudScale: 0.50,
-    sparkCap: 110,
-    ribbonSegs: 84,
-    dprCap: 1.5,
+    particleScale: 0.45,
+    cloudScale: 0.40,
+    sparkCap: 90,
+    ribbonSegs: 72,
+    dprCap: 1.25,
     robotDprCap: 1.25,
-    fpsTarget: 45,
+    fpsTarget: 40,
     shadows: false,
     antialias: true,
+    orbGlow: false,
   },
   high: {
     tier: 'high',
-    particleScale: 0.82,
-    cloudScale: 0.82,
-    sparkCap: 170,
-    ribbonSegs: 118,
-    dprCap: 2,
+    particleScale: 0.78,
+    cloudScale: 0.78,
+    sparkCap: 160,
+    ribbonSegs: 112,
+    dprCap: 1.75,
     robotDprCap: 1.5,
     fpsTarget: 60,
     shadows: true,
     antialias: true,
+    orbGlow: true,
   },
   ultra: {
     tier: 'ultra',
@@ -84,6 +89,7 @@ export const PERF_PROFILES: Record<PerfTier, PerfProfile> = {
     fpsTarget: 60,
     shadows: true,
     antialias: true,
+    orbGlow: true,
   },
 }
 

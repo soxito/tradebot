@@ -230,6 +230,7 @@ function useSoxOrb(
       if (typeof document !== 'undefined' && document.hidden) return
       // Live quality profile — scales frame-rate, particles & DPR to the machine.
       const q = qualityRef?.current ?? PERF_PROFILES.high
+      const glow = q.orbGlow   // shadowBlur is a canvas perf-killer on weak GPUs
       const frameMs = 1000 / q.fpsTarget
       const ts = now || (typeof performance !== 'undefined' ? performance.now() : Date.now())
       if (ts - lastFrame < frameMs) return
@@ -314,7 +315,7 @@ function useSoxOrb(
           const a  = Math.max(0, (1 - ring.phase) * 0.78 * waveMix)
           if (a < 0.007) continue
           ctx.shadowColor = `rgba(${BLUE[0]},${BLUE[1]},${BLUE[2]},${(a * 0.55).toFixed(3)})`
-          ctx.shadowBlur  = 7 * (1 - ring.phase)
+          ctx.shadowBlur  = glow ? 7 * (1 - ring.phase) : 0
           ctx.strokeStyle = `rgba(${BLUE[0]},${BLUE[1]},${BLUE[2]},${a.toFixed(3)})`
           ctx.lineWidth   = Math.max(0.25, 2.6 - ring.phase * 2.4)
           ctx.beginPath(); ctx.arc(cx, cy, rr, 0, Math.PI * 2); ctx.stroke()
@@ -438,13 +439,13 @@ function useSoxOrb(
       if (ringMix > 0.03) {
         // Innermost bright ring (solid, full circle)
         ctx.shadowColor = 'rgba(255,180,0,0.95)'
-        ctx.shadowBlur  = 48 * ringMix
+        ctx.shadowBlur  = glow ? 48 * ringMix : 0
         ctx.lineWidth   = 4.8 * ringMix
         ctx.strokeStyle = `rgba(${GOLD[0]},${GOLD[1]},${GOLD[2]},${(0.92 * ringMix).toFixed(3)})`
         ctx.beginPath(); ctx.arc(cx, cy, R * 0.60, 0, Math.PI * 2); ctx.stroke()
 
         // Second ring (slightly wider, dimmer)
-        ctx.shadowBlur  = 28 * ringMix
+        ctx.shadowBlur  = glow ? 28 * ringMix : 0
         ctx.lineWidth   = 2.2 * ringMix
         ctx.strokeStyle = `rgba(255,200,80,${(0.58 * ringMix).toFixed(3)})`
         ctx.beginPath(); ctx.arc(cx, cy, R * 0.68, 0, Math.PI * 2); ctx.stroke()
@@ -482,7 +483,7 @@ function useSoxOrb(
       if (goldMix > 0.42) {
         const bra = Math.min(1, (goldMix - 0.42) / 0.58) * 0.68
         ctx.shadowColor = `rgba(${BLUE[0]},${BLUE[1]},${BLUE[2]},${(bra * 0.85).toFixed(3)})`
-        ctx.shadowBlur  = 22
+        ctx.shadowBlur  = glow ? 22 : 0
         ctx.lineWidth   = 2.8
         ctx.strokeStyle = `rgba(${BLUE[0]},${BLUE[1]},${BLUE[2]},${bra.toFixed(3)})`
         ctx.beginPath(); ctx.arc(cx, cy, R * 0.50, 0, Math.PI * 2); ctx.stroke()

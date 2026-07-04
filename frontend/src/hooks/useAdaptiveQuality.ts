@@ -40,12 +40,10 @@ export function useAdaptiveQuality(): AdaptiveQuality {
   const deviceRef = useRef(detectDevice())
   const ceilingIdxRef = useRef(PERF_TIERS.indexOf(detectStaticTier(deviceRef.current)))
 
-  // Start conservatively (never boot straight into a heavy tier — that is what
-  // froze weak machines) and let the FPS monitor earn its way up to the
-  // hardware ceiling. Cap the starting tier at 'medium'.
-  const startIdxRef = useRef(
-    Math.min(ceilingIdxRef.current, PERF_TIERS.indexOf('medium')),
-  )
+  // Always START at the lowest tier and ramp UP only if the FPS monitor sees
+  // headroom. A weak machine can freeze on the first heavy frame before the
+  // monitor ever gets to run, so we never begin heavy — we earn it.
+  const startIdxRef = useRef(0)
 
   const [tier, setTier] = useState<PerfTier>(PERF_TIERS[startIdxRef.current])
   const [fps, setFps] = useState(0)
@@ -99,11 +97,18 @@ export function useAdaptiveQuality(): AdaptiveQuality {
         badStreak++
         goodStreak = 0
         if (badStreak >= DOWNGRADE_STREAK) { setIdx(idx - 1); badStreak = 0 }
-      } else if (measured >= 57 && idx < ceilingIdxRef.current) {
-        // Comfortable headroom and below our hardware ceiling — climb slowly.
-        goodStreak++
+      } else if (idx < ceilingIdxRef.current) {
+        // Only climb if we comfortably clear the NEXT tier's frame target,
+        // proving real headroom (the loop throttles to the current target, so
+        // an absolute threshold would never be met from a low starting tier).
+        const nextTarget = PERF_PROFILES[PERF_TIERS[idx + 1]].fpsTarget
         badStreak = 0
-        if (goodStreak >= UPGRADE_STREAK) { setIdx(idx + 1); goodStreak = 0 }
+        if (measured >= nextTarget * 0.95) {
+          goodStreak++
+          if (goodStreak >= UPGRADE_STREAK) { setIdx(idx + 1); goodStreak = 0 }
+        } else {
+          goodStreak = 0
+        }
       } else {
         badStreak = 0
         goodStreak = 0
