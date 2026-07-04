@@ -89,6 +89,108 @@ def _read_dotenv() -> Dict[str, str]:
 
 _DOTENV = _read_dotenv()
 
+# ── System resource detection ─────────────────────────────────────────────────
+# Detect the host's CPU cores + total RAM once at startup and derive settings so
+# the app runs within the machine's means (Node heap size for the frontend, ML
+# thread caps for the backend, and a UI quality-tier hint for the browser).
+_RESOURCES: Optional[Dict[str, object]] = None
+
+
+def _total_ram_bytes() -> int:
+    system = platform.system().lower()
+    try:
+        if system == "darwin":
+            r = subprocess.run(["sysctl", "-n", "hw.memsize"],
+                               capture_output=True, text=True, timeout=5)
+            if r.returncode == 0 and r.stdout.strip().isdigit():
+                return int(r.stdout.strip())
+        elif system == "linux":
+            for ln in Path("/proc/meminfo").read_text().splitlines():
+                if ln.startswith("MemTotal:"):
+                    return int(ln.split()[1]) * 1024  # kB → bytes
+    except Exception:
+        pass
+    # Portable fallback (POSIX)
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except Exception:
+        return 8 * 1024 ** 3  # assume 8 GB if truly unknown
+
+
+def _physical_cores(logical: int) -> int:
+    system = platform.system().lower()
+    try:
+        if system == "darwin":
+            r = subprocess.run(["sysctl", "-n", "hw.physicalcpu"],
+                               capture_output=True, text=True, timeout=5)
+            if r.returncode == 0 and r.stdout.strip().isdigit():
+                return int(r.stdout.strip())
+        elif system == "linux":
+            import re
+            ids = set(re.findall(r"core id\s*:\s*(\d+)", Path("/proc/cpuinfo").read_text()))
+            if ids:
+                return len(ids)
+    except Exception:
+        pass
+    return logical
+
+
+def detect_resources() -> Dict[str, object]:
+    """Detect CPU + RAM and derive resource-aware settings for the app."""
+    logical = os.cpu_count() or 4
+    physical = _physical_cores(logical)
+    ram_gb = _total_ram_bytes() / (1024 ** 3)
+
+    # Node heap for the Next.js dev server — leave plenty of RAM for the OS and
+    # the browser (which is the real memory hog on 8 GB laptops).
+    if ram_gb <= 9:          # ~8 GB machines (e.g. Apple M2 2022)
+        node_heap = 1536
+    elif ram_gb <= 17:       # ~16 GB machines (e.g. M2 Pro)
+        node_heap = 3072
+    else:
+        node_heap = 4096
+
+    # ML/BLAS thread cap — leave 2 cores for the event loop + OS so torch/numpy
+    # can't saturate the CPU and stall the API on smaller machines.
+    ml_threads = max(2, physical - 2) if physical > 4 else max(1, physical)
+
+    # UI quality-tier hint for the frontend (mirrors devicePerformance.ts).
+    lc = logical
+    if lc <= 4:
+        ui_tier = "low"
+    elif lc <= 8:
+        ui_tier = "medium"
+    elif lc <= 10:
+        ui_tier = "high"
+    else:
+        ui_tier = "ultra"
+    if ram_gb <= 9 and ui_tier in ("high", "ultra"):
+        ui_tier = "medium"
+
+    return {
+        "logical": logical,
+        "physical": physical,
+        "ram_gb": round(ram_gb, 1),
+        "node_heap_mb": node_heap,
+        "ml_threads": ml_threads,
+        "ui_tier": ui_tier,
+    }
+
+
+def get_resources() -> Dict[str, object]:
+    global _RESOURCES
+    if _RESOURCES is None:
+        _RESOURCES = detect_resources()
+    return _RESOURCES
+
+
+def print_resources() -> None:
+    r = get_resources()
+    header("System resources")
+    ok(f"CPU: {r['physical']} physical / {r['logical']} logical cores")
+    ok(f"RAM: {r['ram_gb']} GB")
+    info(f"Frontend Node heap: {r['node_heap_mb']} MB  ·  backend ML threads: {r['ml_threads']}  ·  UI tier: {str(r['ui_tier']).upper()}")
+
 MT5_API_URL   = _DOTENV.get("MT5_API_URL", os.environ.get("MT5_API_URL", "http://localhost:8092"))
 MT5_IMAGE     = "timurila/mt5rest"     # Docker image for mtapi-io REST bridge
 MT5_CONTAINER = "mt5rest"
@@ -1449,6 +1551,15 @@ def start_backend(pg_port: int, redis_port: int, mode: str) -> bool:
     env.setdefault("PAUL_HEARTBEAT_GOAL_CONTINUATION", PAUL_HEARTBEAT_GOAL_CONTINUATION)
     env.setdefault("PAUL_HEARTBEAT_TICK_SECONDS", PAUL_HEARTBEAT_TICK_SECONDS)
 
+    # Resource-aware ML/BLAS thread caps so torch/numpy (Kronos, sentiment) can't
+    # saturate the CPU and stall the API on smaller machines (e.g. 8-core M2).
+    _res = get_resources()
+    _ml = str(_res["ml_threads"])
+    for _k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+               "OPENBLAS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "TORCH_NUM_THREADS"):
+        env.setdefault(_k, _ml)
+    env.setdefault("TOKENIZERS_PARALLELISM", "false")
+
     with open(log_file, "w") as lf:
         proc = subprocess.Popen(
             [str(UVICORN_BIN), "app.main:app",
@@ -1493,10 +1604,20 @@ def start_frontend() -> bool:
     info(f"Starting Next.js frontend on :{FRONTEND_PORT} …")
     log_file = ROOT / "frontend.log"
 
+    # Size the Node heap + pass a UI quality-tier hint based on the machine's RAM
+    # and cores, so the dev server doesn't OOM/GC-thrash on smaller laptops and
+    # the browser can start at an appropriate graphics tier.
+    _res = get_resources()
+    _node_opts = os.environ.get("NODE_OPTIONS", "")
+    if "max-old-space-size" not in _node_opts:
+        _node_opts = f"{_node_opts} --max-old-space-size={_res['node_heap_mb']}".strip()
+
     env = {
         **os.environ,
         "NEXT_PUBLIC_API_URL": f"http://localhost:{BACKEND_PORT}/api/v1",
         "PORT": str(FRONTEND_PORT),
+        "NODE_OPTIONS": _node_opts,
+        "NEXT_PUBLIC_PERF_TIER": str(_res["ui_tier"]),
     }
 
     with open(log_file, "w") as lf:
@@ -1619,6 +1740,7 @@ def main() -> None:
         sys.exit(1)
 
     header(f"TradeBot Startup  [{mode.upper()} mode]")
+    print_resources()
     results: Dict[str, bool] = {}
 
     # ── 0. Integrations ───────────────────────────────────────────────────────

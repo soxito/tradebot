@@ -146,6 +146,13 @@ export function detectStaticTier(info: DeviceInfo = detectDevice()): PerfTier {
   if (memGB != null && memGB <= 4 && tier !== 'low') {
     tier = 'medium'
   }
+
+  // Optional server-provided ceiling from start.py (NEXT_PUBLIC_PERF_TIER).
+  // Only ever caps DOWN — it can never force a weak browser into a heavier tier.
+  const hint = (typeof process !== 'undefined' ? process.env.NEXT_PUBLIC_PERF_TIER : undefined) as PerfTier | undefined
+  if (hint && PERF_TIERS.includes(hint)) {
+    tier = PERF_TIERS[Math.min(PERF_TIERS.indexOf(tier), PERF_TIERS.indexOf(hint))]
+  }
   return tier
 }
 
