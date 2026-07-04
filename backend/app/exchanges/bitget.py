@@ -301,6 +301,53 @@ class BitgetConnector(ExchangeConnector):
         )
         return result.get("data", [])
 
+    async def detect_symbol_margin_mode(
+        self,
+        symbol: str,
+        margin_coin: str,
+        product_type: str = "USDT-FUTURES",
+    ) -> Optional[str]:
+        """Return the margin mode ('crossed'/'isolated') already in use on this
+        symbol from an open position or a pending order, or None when the symbol
+        is flat.
+
+        Bitget rejects an order whose marginMode differs from an existing
+        position/order on the same symbol (error 45117), and also forbids
+        changing the margin mode while a position/order is open. Callers should
+        honour the returned mode instead of forcing their own.
+        """
+        # 1) Open position takes precedence.
+        try:
+            positions = await self.get_futures_positions(
+                product_type=product_type, margin_coin=margin_coin
+            )
+            for p in positions:
+                if (p.get("symbol") or "").upper() != symbol.upper():
+                    continue
+                try:
+                    total = float(p.get("total") or 0)
+                except (TypeError, ValueError):
+                    total = 0.0
+                mode = p.get("marginMode")
+                if total != 0 and mode:
+                    return mode
+        except Exception as e:  # non-fatal — fall through to order probe
+            logger.debug(f"[{self.exchange_name}] position mode probe failed for {symbol}: {e}")
+
+        # 2) Otherwise, any pending entrusted order pins the mode too.
+        try:
+            orders = await self.get_futures_open_orders(
+                product_type=product_type, symbol=symbol
+            )
+            for o in orders:
+                mode = o.get("marginMode")
+                if mode:
+                    return mode
+        except Exception as e:
+            logger.debug(f"[{self.exchange_name}] open-order mode probe failed for {symbol}: {e}")
+
+        return None
+
     async def create_futures_order(
         self,
         symbol: str,
@@ -328,20 +375,57 @@ class BitgetConnector(ExchangeConnector):
         )
 
         if trade_side == "open":
-            await self.set_margin_mode(
+            # Bitget forbids changing the margin mode / leverage while a
+            # position or pending order exists on the symbol (error 45117), and
+            # a new order's marginMode MUST match the symbol's existing mode.
+            # So detect the symbol's current mode first and honour it; only when
+            # the symbol is completely flat do we apply the requested mode.
+            existing_mode = await self.detect_symbol_margin_mode(
                 symbol=symbol,
                 margin_coin=margin_coin,
-                margin_mode=margin_mode,
                 product_type=product_type,
             )
+            if existing_mode:
+                if existing_mode != margin_mode:
+                    logger.info(
+                        f"[{self.exchange_name}] {symbol} already has an open position/order in "
+                        f"'{existing_mode}' mode — using it instead of requested '{margin_mode}'"
+                    )
+                margin_mode = existing_mode
+            else:
+                # Symbol is flat — safe to set the requested margin mode.
+                try:
+                    await self.set_margin_mode(
+                        symbol=symbol,
+                        margin_coin=margin_coin,
+                        margin_mode=margin_mode,
+                        product_type=product_type,
+                    )
+                except Exception as e:
+                    if "45117" in str(e):
+                        logger.info(
+                            f"[{self.exchange_name}] Keeping existing margin mode for {symbol} "
+                            f"(position/order already open, cannot switch to {margin_mode})"
+                        )
+                    else:
+                        raise
             if leverage is not None:
-                await self.set_leverage(
-                    symbol=symbol,
-                    margin_coin=margin_coin,
-                    leverage=leverage,
-                    hold_side="long" if side == "buy" else "short",
-                    product_type=product_type,
-                )
+                try:
+                    await self.set_leverage(
+                        symbol=symbol,
+                        margin_coin=margin_coin,
+                        leverage=leverage,
+                        hold_side="long" if side == "buy" else "short",
+                        product_type=product_type,
+                    )
+                except Exception as e:
+                    if "45117" in str(e):
+                        logger.info(
+                            f"[{self.exchange_name}] Keeping existing leverage for {symbol} "
+                            f"(position/order already open, cannot switch to {leverage}x)"
+                        )
+                    else:
+                        raise
 
         # Round price and size to contract precision
         prec = BitgetConnector._precision_cache.get(symbol) or BitgetConnector._precision_cache.get(symbol.replace("USDT", "/USDT"))
@@ -361,19 +445,37 @@ class BitgetConnector(ExchangeConnector):
             if take_profit is not None:
                 tp_str = str(round(take_profit, price_place))
 
-        result = await self.native_client.place_futures_order(
-            symbol=symbol,
-            margin_coin=margin_coin,
-            side=side,
-            order_type=order_type,
-            size=size,
-            price=price,
-            margin_mode=margin_mode,
-            trade_side=trade_side,
-            product_type=product_type,
-            preset_stop_loss_price=sl_str,
-            preset_stop_surplus_price=tp_str,
-        )
+        # Placing an order while a position/pending order exists on the symbol
+        # requires the order's marginMode to match the position's current mode,
+        # otherwise Bitget returns 45117. If that happens, retry once with the
+        # opposite margin mode so the order still goes through.
+        async def _place(mode: str):
+            return await self.native_client.place_futures_order(
+                symbol=symbol,
+                margin_coin=margin_coin,
+                side=side,
+                order_type=order_type,
+                size=size,
+                price=price,
+                margin_mode=mode,
+                trade_side=trade_side,
+                product_type=product_type,
+                preset_stop_loss_price=sl_str,
+                preset_stop_surplus_price=tp_str,
+            )
+
+        try:
+            result = await _place(margin_mode)
+        except Exception as e:
+            if "45117" in str(e):
+                alt_mode = "crossed" if margin_mode == "isolated" else "isolated"
+                logger.info(
+                    f"[{self.exchange_name}] {symbol} already has an open position/order in "
+                    f"'{alt_mode}' mode; retrying order in that mode instead of '{margin_mode}'"
+                )
+                result = await _place(alt_mode)
+            else:
+                raise
         order_data = result.get("data", {})
         logger.info(f"[{self.exchange_name}] Futures order created: {order_data.get('orderId', 'unknown')}")
         return order_data
