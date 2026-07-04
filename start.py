@@ -1688,6 +1688,62 @@ def status() -> None:
 
 
 # ── Summary table ─────────────────────────────────────────────────────────────
+def print_sox_banner(mode: str, pg_port: int, redis_port: int) -> None:
+    """Branded SOX TRADE BOT status display shown after a successful start."""
+    r = get_resources()
+    CY, GN, B, RS, GD, DIM = C.CYAN, C.GREEN, C.BOLD, C.RESET, "\033[38;5;214m", "\033[2m"
+
+    logo = [
+        "███████╗ ██████╗ ██╗  ██╗",
+        "██╔════╝██╔═══██╗╚██╗██╔╝",
+        "███████╗██║   ██║ ╚███╔╝ ",
+        "╚════██║██║   ██║ ██╔██╗ ",
+        "███████║╚██████╔╝██╔╝ ██╗",
+        "╚══════╝ ╚═════╝ ╚═╝  ╚═╝",
+    ]
+    print()
+    for ln in logo:
+        print(f"    {B}{CY}{ln}{RS}")
+    print(f"    {B}{GD}S O X   T R A D E   B O T{RS}")
+    print(f"    {DIM}{CY}Strategic Operations eXchange{RS}")
+    print()
+
+    W = 58  # visible width between the box borders
+
+    def line(left: str = "╠", fill: str = "═", right: str = "╣") -> str:
+        return f"{CY}{left}{fill * W}{right}{RS}"
+
+    def row(label: str, value: str, vcol: str = "", dot: str = "") -> str:
+        # Pad using the plain (uncoloured) text so alignment stays correct.
+        plain = f"  {label:<11}{dot}{value}"
+        pad = max(0, W - len(plain))
+        dot_c = f"{GN}{dot}{RS}" if dot else ""
+        return (
+            f"{CY}║{RS}  {CY}{label:<11}{RS}{dot_c}{vcol}{value}{RS}"
+            f"{' ' * pad}{CY}║{RS}"
+        )
+
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    tz = _DOTENV.get("TZ", "")
+
+    print(line("╔", "═", "╗"))
+    print(row("STATUS", "ALL SYSTEMS ONLINE", GN + B, dot="● "))
+    print(row("STARTED", f"{ts}{('  ' + tz) if tz else ''}"))
+    print(line())
+    print(row("CPU", f"{r['physical']} cores / {r['logical']} threads"))
+    print(row("RAM", f"{r['ram_gb']} GB"))
+    print(row("GRAPHICS", f"{str(r['ui_tier']).upper()} tier (auto)"))
+    print(row("DB MODE", f"{mode}  ·  pg :{pg_port}  ·  redis :{redis_port}"))
+    print(line())
+    print(row("FRONTEND", f"http://localhost:{FRONTEND_PORT}", CY))
+    print(row("BACKEND", f"http://localhost:{BACKEND_PORT}/api/v1", CY))
+    print(row("API DOCS", f"http://localhost:{BACKEND_PORT}/docs", CY))
+    print(row("MT5 REST", MT5_API_URL, CY))
+    print(row("HEADROOM", f"{HEADROOM_URL}/dashboard", CY))
+    print(line("╚", "═", "╝"))
+    print(f"\n  {DIM}Logs:{RS} {ROOT}/backend.log  |  {ROOT}/frontend.log\n")
+
+
 def print_summary(results: Dict[str, bool], mode: str, pg_port: int, redis_port: int) -> None:
     header("TradeBot Startup Summary")
     sep()
@@ -1697,15 +1753,7 @@ def print_summary(results: Dict[str, bool], mode: str, pg_port: int, redis_port:
         print(f"  {symbol}  {svc}")
     sep()
     if all_ok:
-        print(f"\n  {C.BOLD}{C.GREEN}All services started successfully!{C.RESET}\n")
-        print(f"  {C.CYAN}Headroom →{C.RESET}  {HEADROOM_URL}/dashboard")
-        print(f"  {C.CYAN}Obsidian →{C.RESET}  vault at {OBSIDIAN_VAULT_DIR}")
-        print(f"  {C.CYAN}Frontend  →{C.RESET}  http://localhost:{FRONTEND_PORT}")
-        print(f"  {C.CYAN}Backend   →{C.RESET}  http://localhost:{BACKEND_PORT}/api/v1")
-        print(f"  {C.CYAN}API docs  →{C.RESET}  http://localhost:{BACKEND_PORT}/docs")
-        print(f"  {C.CYAN}MT5 REST  →{C.RESET}  {MT5_API_URL}")
-        print(f"  {C.CYAN}DB mode   →{C.RESET}  {mode} (pg :{pg_port}, redis :{redis_port})")
-        print(f"\n  Logs: {ROOT}/backend.log  |  {ROOT}/frontend.log\n")
+        print_sox_banner(mode, pg_port, redis_port)
     else:
         failed = [k for k, v in results.items() if not v]
         print(f"\n  {C.RED}{C.BOLD}Some services failed to start:{C.RESET} {', '.join(failed)}")
