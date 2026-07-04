@@ -17,6 +17,7 @@ import {
   Mic, MicOff, Volume2, VolumeX, Ear, Settings, Play,
 } from 'lucide-react'
 import type { RobotState, AvatarStyle } from './JarvisRobot'
+import { detectStaticTier } from '@/utils/devicePerformance'
 
 // 3D robot avatar — loaded client-side only (Three.js needs the DOM/WebGL).
 const JarvisRobotAvatar = dynamic(() => import('./JarvisRobotAvatar'), { ssr: false })
@@ -839,6 +840,21 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
   const [avatarStyle, setAvatarStyle] = useState<AvatarStyle>(
     () => ((typeof window !== 'undefined' && localStorage.getItem('paul.avatarStyle')) as AvatarStyle) || 'cyan'
   )
+  // Only mount the heavy WebGL robot on capable machines (high/ultra tier) so
+  // the app always loads on weaker laptops (e.g. Apple M2 8GB, which the WebGL
+  // scene could otherwise hang at startup). The lightweight floating chat button
+  // is always shown as a fallback. Override with localStorage 'paul.forceRobot'
+  // = '1' (force on) or '0' (force off).
+  const [robotAllowed, setRobotAllowed] = useState(false)
+  useEffect(() => {
+    try {
+      const forced = localStorage.getItem('paul.forceRobot')
+      if (forced === '1') { setRobotAllowed(true); return }
+      if (forced === '0') { setRobotAllowed(false); return }
+    } catch { /* noop */ }
+    const t = detectStaticTier()
+    setRobotAllowed(t === 'high' || t === 'ultra')
+  }, [])
   // Live voice energy 0..1 (updated by the mini-engine RAF loop) for robot motion
   const robotEnergyRef = useRef(0)
   const [robotEnergy, setRobotEnergy] = useState(0)
@@ -3568,7 +3584,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
       {/* ── 3D JARVIS robot avatar — floats on every page, click to open chat ──
            Suppressed where the host page renders its own JARVIS visual (e.g. the
            JARVIS Room's energy core), so the robot doesn't float over it. */}
-      {!hideRobot && (
+      {!hideRobot && robotAllowed && (
         <JarvisRobotAvatar
           state={robotState}
           energy={robotEnergy}
