@@ -13,6 +13,7 @@
  */
 import { useEffect, useRef } from 'react'
 import * as THREE from 'three'
+import { detectStaticProfile } from '@/utils/devicePerformance'
 
 export type RobotState = 'idle' | 'walking' | 'listening' | 'thinking' | 'talking'
 export type AvatarStyle = 'cyan' | 'purple' | 'gold' | 'crimson' | 'emerald'
@@ -53,15 +54,19 @@ export default function JarvisRobot({
     const mount = mountRef.current
     if (!mount) return
 
+    // Detect the machine's graphics tier so the robot matches the device
+    // (e.g. Apple M2 8GB → high, M2 Pro 16GB → ultra; weak machines → low).
+    const gfx = detectStaticProfile()
+
     let renderer: THREE.WebGLRenderer
     try {
-      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true })
+      renderer = new THREE.WebGLRenderer({ antialias: gfx.antialias, alpha: true })
     } catch {
       return
     }
     renderer.setSize(size, size)
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
-    renderer.shadowMap.enabled = true
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, gfx.robotDprCap))
+    renderer.shadowMap.enabled = gfx.shadows
     renderer.shadowMap.type = THREE.PCFSoftShadowMap
     mount.appendChild(renderer.domElement)
 
@@ -76,7 +81,7 @@ export default function JarvisRobot({
     scene.add(new THREE.AmbientLight(0x334466, 0.7))
     const keyLight = new THREE.DirectionalLight(0xffffff, 1.2)
     keyLight.position.set(3, 5, 5)
-    keyLight.castShadow = true
+    keyLight.castShadow = gfx.shadows
     scene.add(keyLight)
     const rimLight = new THREE.PointLight(theme.glow, 2.0, 18)
     rimLight.position.set(-3, 2, 3)
@@ -397,9 +402,14 @@ export default function JarvisRobot({
     const clock = new THREE.Clock()
     let blink = 0
     let nextBlink = 2 + Math.random() * 3
+    let lastRender = 0
+    const robotFrameMs = 1000 / gfx.fpsTarget   // throttle to the device's tier
 
     const animate = () => {
       raf = requestAnimationFrame(animate)
+      const nowMs = (typeof performance !== 'undefined' ? performance.now() : Date.now())
+      if (nowMs - lastRender < robotFrameMs) return
+      lastRender = nowMs
       const t = clock.getElapsedTime()
       const dt = clock.getDelta()
       const st = stateRef.current

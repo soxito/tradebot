@@ -18,6 +18,8 @@ import dynamic from 'next/dynamic'
 import Head from 'next/head'
 import { useRouter } from 'next/router'
 import { apiClient } from '@/services/api'
+import { useAdaptiveQuality } from '@/hooks/useAdaptiveQuality'
+import { PerfProfile, PerfTier, PERF_PROFILES } from '@/utils/devicePerformance'
 
 const PaulChat = dynamic(() => import('@/components/PaulChat'), { ssr: false })
 const TradingViewWidget = dynamic(() => import('@/components/TradingViewWidget'), { ssr: false })
@@ -96,6 +98,14 @@ function isLongSide(side: string): boolean {
   const s = (side || '').toLowerCase()
   return s === 'long' || s === 'buy' || s === 'bid'
 }
+function gfxTierColor(tier: PerfTier): string {
+  switch (tier) {
+    case 'low':    return '#f87171'
+    case 'medium': return '#fbbf24'
+    case 'high':   return '#7df3dd'
+    default:       return '#4ade80'  // ultra
+  }
+}
 
 // ── S.O.X orb state machine ───────────────────────────────────────────────────
 type SoxState = 'idle' | 'listening' | 'thinking' | 'talking'
@@ -116,6 +126,7 @@ const STATE_TARGETS: Record<SoxState, { energy: number; gold: number; wave: numb
 function useSoxOrb(
   canvasRef: React.RefObject<HTMLCanvasElement | null>,
   stateRef:  React.MutableRefObject<SoxState>,
+  qualityRef?: React.MutableRefObject<PerfProfile>,
 ) {
   const rafRef = useRef<number>(0)
 
@@ -125,10 +136,14 @@ function useSoxOrb(
     const ctx = canvas.getContext('2d')
     if (!ctx) return
 
-    let W = 0, H = 0, DPR = Math.min(window.devicePixelRatio || 1, 2)
+    const q0 = qualityRef?.current ?? PERF_PROFILES.high
+    let W = 0, H = 0, DPR = Math.min(window.devicePixelRatio || 1, q0.dprCap)
+    let appliedDprCap = q0.dprCap
     const resize = () => {
+      const q = qualityRef?.current ?? PERF_PROFILES.high
+      appliedDprCap = q.dprCap
       W = canvas.clientWidth; H = canvas.clientHeight
-      DPR = Math.min(window.devicePixelRatio || 1, 2)
+      DPR = Math.min(window.devicePixelRatio || 1, q.dprCap)
       canvas.width  = Math.max(1, Math.floor(W * DPR))
       canvas.height = Math.max(1, Math.floor(H * DPR))
       ctx.setTransform(DPR, 0, 0, DPR, 0, 0)
@@ -209,14 +224,18 @@ function useSoxOrb(
     const WHITE:  [number,number,number] = [220, 240, 255]
 
     let lastFrame = 0
-    const FRAME_MS = 1000 / 60   // 60 fps
 
     const draw = (now?: number) => {
       rafRef.current = requestAnimationFrame(draw)
       if (typeof document !== 'undefined' && document.hidden) return
+      // Live quality profile — scales frame-rate, particles & DPR to the machine.
+      const q = qualityRef?.current ?? PERF_PROFILES.high
+      const frameMs = 1000 / q.fpsTarget
       const ts = now || (typeof performance !== 'undefined' ? performance.now() : Date.now())
-      if (ts - lastFrame < FRAME_MS) return
+      if (ts - lastFrame < frameMs) return
       lastFrame = ts
+      // Re-apply canvas resolution when the tier (and thus DPR cap) changes.
+      if (q.dprCap !== appliedDprCap) resize()
       t += 0.68   // slightly slower t to stay equivalent to old 40fps feel
 
       const tgt = STATE_TARGETS[stateRef.current] || STATE_TARGETS.idle
@@ -259,7 +278,9 @@ function useSoxOrb(
         ctx.strokeStyle = `rgba(${cloudC[0]},${cloudC[1]},${cloudC[2]},${(0.06 + energy * 0.08).toFixed(3)})`
         ctx.beginPath(); ctx.arc(cx, cy, R * 1.42, 0, Math.PI * 2); ctx.stroke()
 
-        for (const p of cloud) {
+        const cloudN = Math.floor(cloud.length * q.cloudScale)
+        for (let ci = 0; ci < cloudN; ci++) {
+          const p = cloud[ci]
           p.a += p.da * (1 + energy * 0.7)
           const pulse = 1 + Math.sin(t * 0.006 + p.a * 2.5) * 0.04 * energy
           const rr = R * p.r * pulse
@@ -316,7 +337,7 @@ function useSoxOrb(
       // ══════════════════════════════════════════════════════════════════════
       if (goldMix > 0.28) {
         const spawnRate = 0.55 * goldMix
-        if (Math.random() < spawnRate && sparks.length < 200) {
+        if (Math.random() < spawnRate && sparks.length < q.sparkCap) {
           // Spawn across a wide area so the cloud matches the reference's blob shape
           const spawnR = Math.random() < 0.65 ? R * 0.35 : R * (0.35 + Math.random() * 0.75)
           const spawnA = Math.random() * Math.PI * 2
@@ -354,6 +375,7 @@ function useSoxOrb(
       // ══════════════════════════════════════════════════════════════════════
       // 4. MAIN PARTICLE LAYERS
       // ══════════════════════════════════════════════════════════════════════
+      const pScale = q.particleScale
       const layer = (
         parts: P[],
         color: [number,number,number],
@@ -361,7 +383,9 @@ function useSoxOrb(
         turb: number,
         aScale = 1,
       ) => {
-        for (const p of parts) {
+        const n = Math.floor(parts.length * pScale)
+        for (let li = 0; li < n; li++) {
+          const p = parts[li]
           p.a += p.s * spin * dir
           const wob = Math.sin(p.a * 5 + t * 0.038 + p.r * 7) * (turb * (1 + goldMix * 0.85))
           const rr = R * (p.r + wob)
@@ -386,7 +410,7 @@ function useSoxOrb(
       // Multiple overlapping ribbons create the flowing mesh visible in the reference.
       // ══════════════════════════════════════════════════════════════════════
       if (ringMix > 0.04) {
-        const SEGS = 130
+        const SEGS = q.ribbonSegs
         for (const rib of ribbons) {
           const col   = mixRGB(TEAL, GOLD, rib.cm)
           const alpha = (0.26 + energy * 0.14) * ringMix
@@ -758,10 +782,15 @@ export default function SoxRoom() {
   const router    = useRouter()
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
 
+  // Adaptive graphics — auto-scales the orb & robot to the machine's specs
+  // (e.g. Apple M2 8GB → high, M2 Pro 16GB → ultra) and downgrades live if
+  // frames drop, so the room never lags.
+  const { profileRef: gfxProfileRef, tier: gfxTier, fps: gfxFps, label: gfxLabel } = useAdaptiveQuality()
+
   // S.O.X live state
   const stateRef = useRef<SoxState>('idle')
   const [soxState, setSoxState] = useState<SoxState>('idle')
-  useSoxOrb(canvasRef, stateRef)
+  useSoxOrb(canvasRef, stateRef, gfxProfileRef)
 
   useEffect(() => {
     const sp = { v: false }, th = { v: false }, li = { v: false }, idle = { v: false }
@@ -1210,6 +1239,14 @@ export default function SoxRoom() {
             <span style={{ fontSize: 9, color: '#c4b5fd', letterSpacing: '0.14em' }}>SYSTEM &middot; CPU / RAM</span>
             <span style={{ fontSize: 9, color: '#64748b' }}>{sysStats?.available ? `${sysStats.cpu_count} cores` : 'n/a'}</span>
           </div>
+          {/* Adaptive graphics tier — auto-tuned to keep the room smooth */}
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 7, fontSize: 11 }}>
+            <span style={{ color: '#94a3b8' }}>GFX</span>
+            <span style={{ color: gfxTierColor(gfxTier), fontWeight: 700, fontFamily: 'monospace' }}>
+              {gfxTier.toUpperCase()} &middot; {gfxFps || '\u00B7\u00B7'} fps
+            </span>
+          </div>
+          <div style={{ fontSize: 8.5, color: '#64748b', marginTop: 2, fontFamily: 'monospace' }}>{gfxLabel} &middot; auto-tuned</div>
           {sysStats?.available ? (
             <>
               <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 7, fontSize: 11 }}>

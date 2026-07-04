@@ -71,24 +71,76 @@ async def _fetch_forex_ohlcv(symbol: str, timeframe: str, limit: int) -> List[li
         return []
 
 
+_OHLCV_QUOTES = ("USDT", "USDC", "USD", "BTC", "ETH", "EUR", "DAI", "TUSD")
+
+
+def _symbol_variants(symbol: str) -> List[str]:
+    """Return de-duplicated symbol spellings to try (with and without the
+    BASE/QUOTE slash), since connectors expect different formats
+    (e.g. ccxt wants 'BTC/USDT', some callers pass 'BTCUSDT')."""
+    s = (symbol or "").strip().upper()
+    variants: List[str] = []
+
+    def _add(v: str) -> None:
+        if v and v not in variants:
+            variants.append(v)
+
+    _add(s)
+    if "/" in s:
+        _add(s.replace("/", ""))
+    else:
+        for q in _OHLCV_QUOTES:
+            if s.endswith(q) and len(s) > len(q):
+                _add(f"{s[:-len(q)]}/{q}")
+                break
+    return variants
+
+
 async def _fetch_ohlcv(exchange: str, symbol: str, timeframe: str, limit: int) -> List[list]:
     # Route forex / metals through the dedicated provider first.
     if _is_forex(symbol):
         rows = await _fetch_forex_ohlcv(symbol, timeframe, limit)
         if rows:
             return rows
-    exch = None
+
+    # Build the ordered list of exchanges to try: the requested one first, then
+    # every other initialised exchange as a fallback. A symbol the primary
+    # exchange doesn't list (which otherwise yields "No OHLCV data available")
+    # can still resolve on another exchange that does.
+    candidates: List = []
     try:
-        exch = exchange_manager.get_exchange(SupportedExchange(exchange))
+        req = exchange_manager.get_exchange(SupportedExchange(exchange))
+        if req is not None:
+            candidates.append(req)
     except (ValueError, Exception):
-        exch = None
-    if exch is None:
-        available = exchange_manager.get_all_exchanges()
-        if available:
-            exch = exchange_manager.get_exchange(available[0])
-    if exch is None:
+        pass
+    for ex_id in exchange_manager.get_all_exchanges():
+        ex = exchange_manager.get_exchange(ex_id)
+        if ex is not None and ex not in candidates:
+            candidates.append(ex)
+    if not candidates:
+        logger.warning(f"[Kronos] No exchanges initialised — cannot fetch OHLCV for {symbol}")
         return []
-    return await exch.get_ohlcv(symbol, timeframe, limit)
+
+    variants = _symbol_variants(symbol)
+    last_err: Optional[Exception] = None
+    for ex in candidates:
+        ex_name = getattr(ex, "exchange_name", ex.__class__.__name__)
+        for sym in variants:
+            try:
+                rows = await ex.get_ohlcv(sym, timeframe, limit)
+                if rows and len(rows) >= 5:
+                    return rows
+            except Exception as e:  # try the next spelling / exchange
+                last_err = e
+                logger.debug(f"[Kronos] OHLCV {ex_name} {sym} {timeframe} failed: {e}")
+                continue
+    if last_err:
+        logger.warning(
+            f"[Kronos] OHLCV unavailable for {symbol} {timeframe} on all "
+            f"{len(candidates)} exchange(s); last error: {last_err}"
+        )
+    return []
 
 
 def _rows_to_frame(rows: List[list]) -> Tuple[pd.DataFrame, pd.Series]:
@@ -329,7 +381,7 @@ async def run_forecast(
             exchange=exchange, symbol=symbol, timeframe=timeframe, engine="unavailable",
             model_name=active_model_name, lookback=lookback, pred_len=pred_len,
             samples=samples, anchor_time=0, anchor_price=0.0,
-            note="No OHLCV data available for this symbol/exchange.",
+            note=f"No OHLCV data for {symbol} ({timeframe}) on any connected exchange — check the symbol or try another timeframe.",
         )
 
     df, x_ts = _rows_to_frame(rows)

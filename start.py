@@ -93,6 +93,16 @@ MT5_API_URL   = _DOTENV.get("MT5_API_URL", os.environ.get("MT5_API_URL", "http:/
 MT5_IMAGE     = "timurila/mt5rest"     # Docker image for mtapi-io REST bridge
 MT5_CONTAINER = "mt5rest"
 
+# ── Kronos forecaster + OpenHuman (Agent Paul subconscious) config ─────────────
+# Make the ML forecaster and the "keeps thinking" idle brain explicit at launch.
+# A user's shell / .env still wins — these are applied to the backend env with
+# setdefault(), so they only fill in values that aren't already set.
+KRONOS_MODEL_NAME = _DOTENV.get("KRONOS_MODEL_NAME", os.environ.get("KRONOS_MODEL_NAME", "NeoQuasar/Kronos-base"))
+KRONOS_DEVICE     = _DOTENV.get("KRONOS_DEVICE", os.environ.get("KRONOS_DEVICE", ""))  # "" = auto (cuda/mps/cpu)
+PAUL_HEARTBEAT_ENABLED = _DOTENV.get("PAUL_HEARTBEAT_ENABLED", os.environ.get("PAUL_HEARTBEAT_ENABLED", "1"))
+PAUL_HEARTBEAT_GOAL_CONTINUATION = _DOTENV.get("PAUL_HEARTBEAT_GOAL_CONTINUATION", os.environ.get("PAUL_HEARTBEAT_GOAL_CONTINUATION", "1"))
+PAUL_HEARTBEAT_TICK_SECONDS = _DOTENV.get("PAUL_HEARTBEAT_TICK_SECONDS", os.environ.get("PAUL_HEARTBEAT_TICK_SECONDS", "300"))
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def port_open(host: str, port: int, timeout: float = 1.0) -> bool:
     try:
@@ -1363,6 +1373,42 @@ def ensure_npm_deps() -> bool:
 
 
 # ── Backend ───────────────────────────────────────────────────────────────────
+def warmup_kronos_and_openhuman() -> None:
+    """Confirm the Kronos forecaster is loaded and kick the OpenHuman subconscious.
+
+    - Kronos: /plugins/kronos/status reports the active model + whether the real
+      weights loaded (vs the heuristic fallback).
+    - OpenHuman: hitting /plugins/agent-paul/jarvis/subconscious/status calls the
+      loop's ensure_started() so the idle "keeps thinking" brain starts now
+      instead of waiting for the first UI poll.
+    """
+    base = f"http://localhost:{BACKEND_PORT}/api/v1"
+
+    ks = http_json(f"{base}/plugins/kronos/status", timeout=8)
+    if ks:
+        model = ks.get("model_name") or KRONOS_MODEL_NAME
+        engine = ks.get("engine") or ("kronos" if ks.get("available") else "heuristic")
+        device = ks.get("device") or "auto"
+        if ks.get("available"):
+            ok(f"Kronos forecaster ready — {model} on {device} ({engine})")
+        else:
+            warn(f"Kronos in heuristic fallback ({model}) — run setup_kronos.sh to load weights")
+    else:
+        warn("Kronos status not ready yet (model may still be warm-loading)")
+
+    ss = http_json(f"{base}/plugins/agent-paul/jarvis/subconscious/status", timeout=8)
+    if ss is not None:
+        if ss.get("running"):
+            tick = ss.get("tick_seconds", "?")
+            ok(f"OpenHuman subconscious running (Agent Paul idle brain, tick {tick}s)")
+        elif ss.get("enabled"):
+            warn("OpenHuman subconscious enabled but not running yet (will start on next tick)")
+        else:
+            warn("OpenHuman subconscious disabled (set PAUL_HEARTBEAT_ENABLED=1)")
+    else:
+        warn("OpenHuman subconscious status not reachable yet (plugin still loading)")
+
+
 def start_backend(pg_port: int, redis_port: int, mode: str) -> bool:
     if port_open("localhost", BACKEND_PORT, 0.5):
         ok(f"Backend already running on :{BACKEND_PORT}")
@@ -1393,6 +1439,16 @@ def start_backend(pg_port: int, redis_port: int, mode: str) -> bool:
     # Always inject MT5_API_URL so backend can reach the REST bridge
     env.setdefault("MT5_API_URL", MT5_API_URL)
 
+    # Kronos forecaster + OpenHuman subconscious — explicit config so the ML
+    # forecaster and the idle "keeps thinking" brain are always configured.
+    # (env/.env already loaded above still win via setdefault.)
+    env.setdefault("KRONOS_MODEL_NAME", KRONOS_MODEL_NAME)
+    if KRONOS_DEVICE:
+        env.setdefault("KRONOS_DEVICE", KRONOS_DEVICE)
+    env.setdefault("PAUL_HEARTBEAT_ENABLED", PAUL_HEARTBEAT_ENABLED)
+    env.setdefault("PAUL_HEARTBEAT_GOAL_CONTINUATION", PAUL_HEARTBEAT_GOAL_CONTINUATION)
+    env.setdefault("PAUL_HEARTBEAT_TICK_SECONDS", PAUL_HEARTBEAT_TICK_SECONDS)
+
     with open(log_file, "w") as lf:
         proc = subprocess.Popen(
             [str(UVICORN_BIN), "app.main:app",
@@ -1415,6 +1471,7 @@ def start_backend(pg_port: int, redis_port: int, mode: str) -> bool:
             ok("Backend /health endpoint OK")
         else:
             warn("Backend port open but /health not ready yet (still loading plugins)")
+        warmup_kronos_and_openhuman()
         return True
     # Print last lines of log on failure
     try:
