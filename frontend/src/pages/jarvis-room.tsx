@@ -590,6 +590,169 @@ function DraggablePanel({
   )
 }
 
+// ── Goals & Todos panel (OpenHuman-style goal system + kanban) ──────────────
+interface SoxGoal { id: number; title: string; detail?: string; status: string; scope?: string; priority: number; progress: number; token_budget?: number; spent_tokens?: number }
+interface SoxTodo { id: number; goal_id?: number; title: string; status: string; created_by: string; needs_approval: boolean; approval_mode?: string }
+interface SoxActivity { id: number; kind: string; task_name?: string; decision?: string; state: string; summary?: string; created_at?: string }
+
+const TODO_COLS: { key: string; label: string }[] = [
+  { key: 'todo', label: 'To Do' },
+  { key: 'in_progress', label: 'Doing' },
+  { key: 'awaiting_approval', label: 'Approve' },
+  { key: 'done', label: 'Done' },
+]
+// Quick-move targets shown per card (excludes the card's current column).
+const MOVE_TARGETS: { key: string; label: string; bg: string; fg: string }[] = [
+  { key: 'todo', label: '◀', bg: 'rgba(255,255,255,0.06)', fg: '#94a3b8' },
+  { key: 'in_progress', label: '▶', bg: 'rgba(96,165,250,0.14)', fg: '#93c5fd' },
+  { key: 'done', label: '✓', bg: 'rgba(74,222,128,0.14)', fg: '#4ade80' },
+]
+
+function GoalsTodosPanel({ sessionKey }: { sessionKey: string }) {
+  const [goals, setGoals] = useState<SoxGoal[]>([])
+  const [todos, setTodos] = useState<SoxTodo[]>([])
+  const [activity, setActivity] = useState<SoxActivity[]>([])
+  const [newGoal, setNewGoal] = useState('')
+  const [newTodo, setNewTodo] = useState('')
+  const [idleThinking, setIdleThinking] = useState(false)
+
+  const load = useCallback(async () => {
+    try {
+      const [g, t, a] = await Promise.all([
+        apiClient.jarvis.getGoals(sessionKey),
+        apiClient.jarvis.getTodos(sessionKey),
+        apiClient.jarvis.activityFeed(8),
+      ])
+      setGoals(g.data?.goals || [])
+      setTodos(t.data?.todos || [])
+      setActivity(a.data?.items || [])
+    } catch { /* backend offline — stay quiet */ }
+  }, [sessionKey])
+
+  useEffect(() => {
+    load()
+    const id = setInterval(load, 15000)
+    return () => clearInterval(id)
+  }, [load])
+
+  // Idle status poll → drives the "thinking" chip
+  useEffect(() => {
+    let alive = true
+    const poll = async () => {
+      try { const r = await apiClient.jarvis.idleStatus(); if (alive) setIdleThinking(!!r.data?.thinking) } catch { /* noop */ }
+    }
+    poll()
+    const id = setInterval(poll, 6000)
+    return () => { alive = false; clearInterval(id) }
+  }, [])
+
+  const activeGoal = goals.find(g => g.status === 'active') || goals[0]
+
+  const addGoal = async () => {
+    const title = newGoal.trim(); if (!title) return
+    setNewGoal('')
+    try { await apiClient.jarvis.createGoal({ title, session_key: sessionKey, scope: 'thread' }); load() } catch { /* noop */ }
+  }
+  const addTodo = async () => {
+    const title = newTodo.trim(); if (!title) return
+    setNewTodo('')
+    try { await apiClient.jarvis.createTodo({ title, session_key: sessionKey, goal_id: activeGoal?.id }); load() } catch { /* noop */ }
+  }
+  const moveTodo = async (t: SoxTodo, status: string) => {
+    try { await apiClient.jarvis.updateTodo(t.id, { status }); load() } catch { /* noop */ }
+  }
+  const runIdle = async () => {
+    try { await apiClient.jarvis.idleRun(sessionKey); setTimeout(load, 800) } catch { /* noop */ }
+  }
+  const reflect = async () => {
+    try { await apiClient.jarvis.reflectGoals(); setTimeout(load, 600) } catch { /* noop */ }
+  }
+
+  const inp: React.CSSProperties = { flex: 1, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(45,226,197,0.22)', borderRadius: 8, padding: '7px 10px', color: '#e2e8f0', fontSize: 12, fontFamily: 'monospace', outline: 'none' }
+  const chip: React.CSSProperties = { fontSize: 9, padding: '2px 7px', borderRadius: 6, letterSpacing: '0.08em', fontFamily: 'monospace' }
+  const pct = Math.round((activeGoal?.progress || 0) * 100)
+  const budgetPct = activeGoal?.token_budget ? Math.min(100, Math.round(((activeGoal.spent_tokens || 0) / activeGoal.token_budget) * 100)) : null
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
+      {/* Active goal */}
+      <div style={{ background: 'rgba(6,14,26,0.88)', border: '1px solid rgba(250,204,21,0.30)', borderRadius: 10, padding: '9px 11px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <span style={{ fontSize: 9, color: '#fde68a', letterSpacing: '0.14em' }}>ACTIVE GOAL</span>
+          <span style={{ ...chip, background: idleThinking ? 'rgba(250,204,21,0.18)' : 'rgba(255,255,255,0.05)', color: idleThinking ? '#fde047' : '#64748b' }}>
+            {idleThinking ? '◍ thinking…' : 'idle'}
+          </span>
+        </div>
+        {activeGoal ? (
+          <>
+            <div style={{ fontSize: 13, color: '#e2e8f0', fontWeight: 700, marginTop: 5 }}>🎯 {activeGoal.title}</div>
+            <div style={{ height: 5, background: 'rgba(255,255,255,0.08)', borderRadius: 4, marginTop: 7, overflow: 'hidden' }}>
+              <div style={{ height: '100%', width: `${pct}%`, background: 'linear-gradient(90deg,#facc15,#f59e0b)' }} />
+            </div>
+            {budgetPct != null && (
+              <div style={{ fontSize: 8.5, color: budgetPct >= 100 ? '#f87171' : '#64748b', marginTop: 4, fontFamily: 'monospace' }}>
+                budget {activeGoal.spent_tokens || 0}/{activeGoal.token_budget} tok{budgetPct >= 100 ? ' · budget-limited' : ''}
+              </div>
+            )}
+          </>
+        ) : (
+          <div style={{ fontSize: 11, color: '#475569', marginTop: 6 }}>No goal yet. Add one below — JARVIS works it during idle time.</div>
+        )}
+        <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
+          <input value={newGoal} onChange={e => setNewGoal(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') addGoal() }} placeholder="New goal…" style={inp} />
+          <button onClick={runIdle} title="Run one read-only research step now" style={{ background: 'rgba(250,204,21,0.16)', border: '1px solid rgba(250,204,21,0.45)', borderRadius: 8, color: '#fde047', fontSize: 11, padding: '0 10px', cursor: 'pointer', fontFamily: 'monospace' }}>Work</button>
+          <button onClick={reflect} title="Reflect: review long-term goals against memory" style={{ background: 'rgba(167,139,250,0.16)', border: '1px solid rgba(167,139,250,0.45)', borderRadius: 8, color: '#c4b5fd', fontSize: 11, padding: '0 10px', cursor: 'pointer', fontFamily: 'monospace' }}>Reflect</button>
+        </div>
+      </div>
+
+      {/* Kanban */}
+      <div style={{ display: 'flex', gap: 6 }}>
+        {TODO_COLS.map(col => (
+          <div key={col.key} style={{ flex: 1, background: 'rgba(6,14,24,0.7)', border: '1px solid rgba(45,226,197,0.16)', borderRadius: 9, padding: 6, minHeight: 70 }}>
+            <div style={{ fontSize: 8.5, color: '#7df3dd', letterSpacing: '0.1em', marginBottom: 5, textAlign: 'center' }}>{col.label.toUpperCase()}</div>
+            {todos.filter(t => t.status === col.key).map(t => (
+              <div key={t.id} style={{ background: 'rgba(255,255,255,0.04)', border: `1px solid ${t.created_by === 'jarvis' ? 'rgba(250,204,21,0.3)' : 'rgba(255,255,255,0.09)'}`, borderRadius: 7, padding: '5px 6px', marginBottom: 5, fontSize: 10, color: '#cbd5e1', fontFamily: 'monospace' }}>
+                <div style={{ lineHeight: 1.3 }}>{t.created_by === 'jarvis' ? '🤖 ' : ''}{t.title}</div>
+                <div style={{ display: 'flex', gap: 4, marginTop: 4, flexWrap: 'wrap' }}>
+                  {col.key === 'awaiting_approval' ? (
+                    <>
+                      <button onClick={() => moveTodo(t, 'done')} title="Approve" style={{ ...chip, background: 'rgba(74,222,128,0.14)', color: '#4ade80', border: 'none', cursor: 'pointer' }}>✓ approve</button>
+                      <button onClick={() => moveTodo(t, 'rejected')} title="Reject" style={{ ...chip, background: 'rgba(248,113,113,0.14)', color: '#f87171', border: 'none', cursor: 'pointer' }}>✗ reject</button>
+                    </>
+                  ) : (
+                    MOVE_TARGETS.filter(m => m.key !== col.key).map(m => (
+                      <button key={m.key} onClick={() => moveTodo(t, m.key)} style={{ ...chip, background: m.bg, color: m.fg, border: 'none', cursor: 'pointer' }}>{m.label}</button>
+                    ))
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+      <div style={{ display: 'flex', gap: 6 }}>
+        <input value={newTodo} onChange={e => setNewTodo(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') addTodo() }} placeholder="Add a task…" style={inp} />
+        <button onClick={addTodo} disabled={!newTodo.trim()} style={{ background: newTodo.trim() ? 'rgba(45,226,197,0.2)' : 'rgba(255,255,255,0.04)', border: '1px solid rgba(45,226,197,0.42)', borderRadius: 8, color: '#7df3dd', fontSize: 12, padding: '0 12px', cursor: newTodo.trim() ? 'pointer' : 'not-allowed', fontFamily: 'monospace' }}>Add</button>
+      </div>
+
+      {/* Subconscious activity feed — the "keeps thinking" heartbeat */}
+      {activity.length > 0 && (
+        <div style={{ background: 'rgba(6,14,24,0.7)', border: '1px solid rgba(167,139,250,0.18)', borderRadius: 9, padding: '7px 9px' }}>
+          <div style={{ fontSize: 8.5, color: '#c4b5fd', letterSpacing: '0.12em', marginBottom: 5 }}>🫀 SUBCONSCIOUS</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 3, maxHeight: 96, overflowY: 'auto' }}>
+            {activity.map(a => (
+              <div key={a.id} style={{ fontSize: 9.5, color: '#94a3b8', fontFamily: 'monospace', lineHeight: 1.3 }}>
+                <span style={{ color: a.state === 'acted' ? '#4ade80' : a.state === 'awaiting_approval' ? '#fbbf24' : '#475569' }}>●</span>{' '}
+                {a.summary || a.task_name}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Main page ─────────────────────────────────────────────────────────────────
 export default function SoxRoom() {
   const router    = useRouter()
@@ -601,9 +764,9 @@ export default function SoxRoom() {
   useSoxOrb(canvasRef, stateRef)
 
   useEffect(() => {
-    const sp = { v: false }, th = { v: false }, li = { v: false }
+    const sp = { v: false }, th = { v: false }, li = { v: false }, idle = { v: false }
     const recompute = () => {
-      const next: SoxState = sp.v ? 'talking' : th.v ? 'thinking' : li.v ? 'listening' : 'idle'
+      const next: SoxState = sp.v ? 'talking' : (th.v || idle.v) ? 'thinking' : li.v ? 'listening' : 'idle'
       stateRef.current = next; setSoxState(next)
     }
     const onMsg = (e: MessageEvent) => {
@@ -614,7 +777,15 @@ export default function SoxRoom() {
       if (d.type === 'jarvis-activity') { li.v = !!d.listening; th.v = !!d.thinking; recompute() }
     }
     window.addEventListener('message', onMsg)
-    return () => window.removeEventListener('message', onMsg)
+    // Idle-worker poll — when JARVIS is researching a goal in the background,
+    // the orb glows 'thinking' even while the user is quiet.
+    let idleAlive = true
+    const pollIdle = async () => {
+      try { const r = await apiClient.jarvis.idleStatus(); if (idleAlive) { idle.v = !!r.data?.thinking; recompute() } } catch { /* noop */ }
+    }
+    pollIdle()
+    const idleTimer = setInterval(pollIdle, 6000)
+    return () => { idleAlive = false; clearInterval(idleTimer); window.removeEventListener('message', onMsg) }
   }, [])
 
   // ── Widgets ───────────────────────────────────────────────────────────────
@@ -1013,6 +1184,14 @@ export default function SoxRoom() {
         color="rgba(6,182,212,0.34)"
       >
         <FaceVisionPanel />
+      </DraggablePanel>
+
+      {/* ═══ DRAGGABLE — GOALS & TODOS ═══ */}
+      <DraggablePanel
+        id="sox-goals" title="GOALS &amp; TODOS" defaultX={-360} defaultY={430} width={342}
+        color="rgba(250,204,21,0.32)"
+      >
+        <GoalsTodosPanel sessionKey="default" />
       </DraggablePanel>
 
       {/* ═══ DRAGGABLE — ACCOUNTS · LIVE ═══ */}

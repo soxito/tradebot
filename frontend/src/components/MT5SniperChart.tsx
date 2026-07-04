@@ -110,7 +110,27 @@ interface Analysis {
   structure_events?: SmcStructureEvent[]
   us_session?: { enabled: boolean; open_time: number | null; open_price: number | null; live_in_session: boolean }
   ai?: AiReview | null
+  kronos?: KronosBlock | null
   error?: string
+}
+
+interface KronosOverlay {
+  name: string
+  color: string
+  lineWidth?: number
+  lineStyle?: number
+  data: { time: number; value: number }[]
+}
+
+interface KronosBlock {
+  engine?: string
+  direction?: 'up' | 'down' | 'flat'
+  pct_change?: number
+  confidence?: number
+  target_price?: number
+  summary?: string
+  overlays?: KronosOverlay[]
+  markers?: { time: number; position: string; color: string; shape: string; text?: string }[]
 }
 
 interface BacktestStats {
@@ -328,6 +348,33 @@ function buildJarvisSummary(analysis: Analysis, symbol: string, timeframe: strin
   return parts.join(' ')
 }
 
+// ── Persisted panel config ───────────────────────────────────────────────────
+// The SMC Sniper toggles/selects (US session, AI, Max-loss cap, mute, timeframe,
+// Min RR, Risk %, Daily target) are saved to localStorage so a page refresh keeps
+// the user's last choices instead of resetting every box.
+const SNIPER_CFG_KEY = 'mt5_sniper_cfg'
+type SniperCfg = Partial<{
+  timeframe: string
+  minRR: number
+  maxLoss: number
+  useCap: boolean
+  riskPct: number
+  dailyTargetPct: number
+  usSession: boolean
+  useAI: boolean
+  voiceAnalysis: boolean
+}>
+
+function loadSniperCfg(): SniperCfg {
+  if (typeof window === 'undefined') return {}
+  try {
+    const raw = window.localStorage.getItem(SNIPER_CFG_KEY)
+    return raw ? (JSON.parse(raw) as SniperCfg) : {}
+  } catch {
+    return {}
+  }
+}
+
 // ── Component ────────────────────────────────────────────────────────────────
 
 export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', accountBalance = 0, accountCurrency = 'USD', fallbackExchange, onPlaced, orders = [], onCancelOrder, positions = [], onSymbolChange, onTimeframeChange }: Props) {
@@ -336,6 +383,7 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
   const candleSeries = useRef<ISeriesApi<'Candlestick'> | null>(null)
   const chartMounted = useRef(false)  // set false in cleanup so async callbacks don't use disposed chart
   const overlayLines = useRef<any[]>([])
+  const kronosSeries = useRef<any[]>([])
   const zonePrimitive = useRef<ZoneBoxPrimitive | null>(null)
   const livePriceLine = useRef<any>(null)
   const liveBar = useRef<{ time: number; open: number; high: number; low: number; close: number } | null>(null)
@@ -345,18 +393,19 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
 
   const [symbol, setSymbol] = useState(defaultSymbol)
   const [symbolInput, setSymbolInput] = useState(defaultSymbol)
-  const [timeframe, setTimeframe] = useState('H1')
-  const [minRR, setMinRR] = useState(2)
-  const [maxLoss, setMaxLoss] = useState(15)        // hard max $ loss the user will accept
-  const [useCap, setUseCap] = useState(false)       // false = risk-% only (no cap, fixed-fractional)
-  const [riskPct, setRiskPct] = useState(5)         // risk per trade as % of balance
-  const [dailyTargetPct, setDailyTargetPct] = useState(200)  // daily profit goal (% of balance)
-  const [usSession, setUsSession] = useState(false) // anchor entries to the US (NY) session
+  const cfg0 = useRef<SniperCfg>(loadSniperCfg()).current  // read persisted config once
+  const [timeframe, setTimeframe] = useState(cfg0.timeframe ?? 'H1')
+  const [minRR, setMinRR] = useState(cfg0.minRR ?? 2)
+  const [maxLoss, setMaxLoss] = useState(cfg0.maxLoss ?? 15)        // hard max $ loss the user will accept
+  const [useCap, setUseCap] = useState(cfg0.useCap ?? false)       // false = risk-% only (no cap, fixed-fractional)
+  const [riskPct, setRiskPct] = useState(cfg0.riskPct ?? 5)         // risk per trade as % of balance
+  const [dailyTargetPct, setDailyTargetPct] = useState(cfg0.dailyTargetPct ?? 200)  // daily profit goal (% of balance)
+  const [usSession, setUsSession] = useState(cfg0.usSession ?? false) // anchor entries to the US (NY) session
   const [btFrom, setBtFrom] = useState('')          // backtest date range (YYYY-MM-DD)
   const [btTo, setBtTo] = useState('')
   const [isFullscreen, setIsFullscreen] = useState(false)  // maximize chart to monitor
-  const [useAI, setUseAI] = useState(false)  // off by default so first auto-run is fast
-  const [voiceAnalysis, setVoiceAnalysis] = useState(true)  // JARVIS speaks analysis results
+  const [useAI, setUseAI] = useState(cfg0.useAI ?? false)  // off by default so first auto-run is fast
+  const [voiceAnalysis, setVoiceAnalysis] = useState(cfg0.voiceAnalysis ?? true)  // JARVIS speaks analysis results
   const [lot, setLot] = useState('0.01')
 
   const [loading, setLoading] = useState(true)
@@ -383,6 +432,16 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
 
   // JARVIS speech — triggered after analysis completes to narrate the results
   const speakAsJarvis = useJarvisSpeak()
+
+  // Persist panel config (checkboxes + selects) so a refresh keeps the last choices.
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    try {
+      window.localStorage.setItem(SNIPER_CFG_KEY, JSON.stringify({
+        timeframe, minRR, maxLoss, useCap, riskPct, dailyTargetPct, usSession, useAI, voiceAnalysis,
+      }))
+    } catch { /* ignore quota / privacy-mode errors */ }
+  }, [timeframe, minRR, maxLoss, useCap, riskPct, dailyTargetPct, usSession, useAI, voiceAnalysis])
 
   // Pending-order price lines drawn on the chart (separate from analysis overlays)
   const orderPriceLines = useRef<any[]>([])
@@ -654,7 +713,15 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
           const prec = precisionFor(raw.flatMap(c => [c.open, c.high, c.low, c.close]))
           cs.applyOptions({ priceFormat: { type: 'price', precision: prec, minMove: Math.pow(10, -prec) } })
           cs.setData(raw.map(c => ({ time: c.time as Time, open: c.open, high: c.high, low: c.low, close: c.close })))
-          chart.current?.timeScale().fitContent()
+          // Default zoom on page load: show the most recent bars (not all history),
+          // leaving room on the right for the Kronos forecast projection.
+          const ts = chart.current?.timeScale()
+          if (ts) {
+            const VISIBLE_BARS = 60   // recent candles visible by default
+            const RIGHT_PAD = 14      // empty bars on the right for the forecast
+            const from = Math.max(0, raw.length - VISIBLE_BARS)
+            ts.setVisibleLogicalRange({ from, to: raw.length - 1 + RIGHT_PAD })
+          }
         } catch { /* chart disposed between ref read and use */ }
       } else {
         setError('No candle data for this symbol/timeframe (MT5 history + fallback empty).')
@@ -877,6 +944,8 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
     if (!cs || !chartMounted.current) return
     overlayLines.current.forEach(l => { try { cs.removePriceLine(l) } catch {} })
     overlayLines.current = []
+    kronosSeries.current.forEach(s => { try { chart.current?.removeSeries(s) } catch {} })
+    kronosSeries.current = []
     if (!analysis) { try { cs.setMarkers([]) } catch {}; return }
 
     const add = (opts: any) => { try { overlayLines.current.push(cs.createPriceLine(opts)) } catch {} }
@@ -975,6 +1044,44 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
     const allMarkers = [...structureMarkers, ...signalMarkers]
       .sort((a, b) => (a.time as number) - (b.time as number))
     try { cs.setMarkers(allMarkers) } catch {}
+
+    // ── Kronos ML forecast overlay (purple forward line + p10/p90 band) ──────
+    // Drawn as dedicated line series so it projects into future timestamps,
+    // right off the last real candle. Works for any symbol (XAUUSD, FX, crypto)
+    // because the backend forecasts the exact candles shown here.
+    try {
+      const k = analysis.kronos
+      if (k?.overlays?.length && chart.current) {
+        k.overlays.forEach((ov, i) => {
+          const s = chart.current!.addLineSeries({
+            color: ov.color,
+            lineWidth: (ov.lineWidth ?? 2) as any,
+            lineStyle: (ov.lineStyle ?? 0) as any,
+            priceLineVisible: false,
+            lastValueVisible: false,
+            crosshairMarkerVisible: false,
+          })
+          s.setData(
+            (ov.data ?? [])
+              .filter(p => p && typeof p.time === 'number' && p.time > 0)
+              .map(p => ({ time: p.time as Time, value: p.value })),
+          )
+          // Put the Kronos direction marker on the forecast line (first series).
+          if (i === 0 && k.markers?.length) {
+            try {
+              s.setMarkers(k.markers.map(m => ({
+                time: m.time as Time,
+                position: m.position as any,
+                color: m.color,
+                shape: m.shape as any,
+                text: m.text,
+              })))
+            } catch {}
+          }
+          kronosSeries.current.push(s)
+        })
+      }
+    } catch {}
   }, [analysis, selected, signals, activeTrade])
 
   // Resize the chart when toggling fullscreen so it fills the new container.
@@ -1361,6 +1468,15 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
               </div>
               <div className="flex items-center justify-between"><span className="text-gray-400">Momentum</span><span className="text-gray-200">{analysis.momentum} · vol z {analysis.volume_z?.toFixed(2)}</span></div>
               <div className="flex items-center justify-between"><span className="text-gray-400">ATR / RSI</span><span className="text-gray-200">{analysis.atr_pct?.toFixed(2)}% · {analysis.rsi?.toFixed(0)}</span></div>
+              {analysis.kronos?.direction && (
+                <div className="flex items-center justify-between">
+                  <span className="text-gray-400">Kronos AI</span>
+                  <span className={`font-mono ${analysis.kronos.direction === 'up' ? 'text-green-400' : analysis.kronos.direction === 'down' ? 'text-red-400' : 'text-yellow-400'}`}>
+                    {(analysis.kronos.pct_change ?? 0) >= 0 ? '+' : ''}{(analysis.kronos.pct_change ?? 0).toFixed(2)}% · {Math.round((analysis.kronos.confidence ?? 0) * 100)}%
+                    <span className="text-[10px] text-gray-500 ml-1">{analysis.kronos.engine === 'kronos' ? 'ML' : 'heur'}</span>
+                  </span>
+                </div>
+              )}
               <div className="flex items-center justify-between"><span className="text-gray-400">Last</span><span className="text-gray-200 font-mono">{analysis.last_price}</span></div>
               <div className="flex items-center justify-between"><span className="text-gray-400">Source</span><span className={`text-[10px] px-1.5 py-0.5 rounded-full font-semibold ${sourceLabel === 'mt5' ? 'bg-green-900/40 text-green-400' : sourceLabel === 'none' ? 'bg-red-900/40 text-red-400' : 'bg-yellow-900/40 text-yellow-400'}`}>{sourceLabel === 'mt5' ? 'MT5 LIVE' : sourceLabel.toUpperCase()}</span></div>
             </div>

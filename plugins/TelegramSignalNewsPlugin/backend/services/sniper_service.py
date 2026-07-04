@@ -286,8 +286,26 @@ async def _ai_entry_opinion(
         "volume supports the direction. Respond with STRICT JSON: "
         '{"decision":"enter|wait|skip","entry":<number>,"confidence":<0-1>,'
         '"direction_confirmed":<true|false>,"info":"<1-sentence pair read>",'
-        '"note":"<short reason>"}.'
+        '"note":"<short reason>"}. '
+        "Also weigh kronos_ml_forecast when present (an ML K-line forecast with "
+        "direction/pct_change/confidence over the next candles): if it strongly "
+        "opposes the signal direction with decent confidence, prefer 'wait' or 'skip'."
     )
+    kronos_fc = None
+    try:
+        from plugins.KronosForecastPlugin.backend.services import forecast_service as _kronos
+        _ksym = symbol if "/" in symbol else symbol.replace("USDT", "/USDT").replace("USDC", "/USDC")
+        _kfc = await _kronos.run_forecast_cached("bitget", _ksym, "15m", pred_len=12)
+        if _kfc and _kfc.signal:
+            _ks = _kfc.signal
+            kronos_fc = {
+                "direction": _ks.direction,
+                "pct_change": round(_ks.pct_change, 3),
+                "confidence": round(_ks.confidence, 3),
+                "engine": _kfc.engine,
+            }
+    except Exception:  # noqa: BLE001
+        kronos_fc = None
     user = json.dumps(
         {
             "symbol": symbol,
@@ -302,6 +320,7 @@ async def _ai_entry_opinion(
             "resistance": resistance,
             "high_opposite_volume": opposite_volume,
             "volume_ratio": volume_ratio,
+            "kronos_ml_forecast": kronos_fc,
         },
         default=str,
     )

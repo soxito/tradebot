@@ -932,6 +932,49 @@ async def _load_candles(account_id: int, symbol: str, timeframe: str, count: int
     return candles
 
 
+async def _kronos_from_candles(candles, symbol: str, timeframe: str):
+    """Run the Kronos ML forecast on the SAME candles the SMC engine analysed.
+
+    Works for ANY symbol (XAUUSD, FX, indices, crypto) because it forecasts the
+    exact series shown on the chart rather than re-fetching from a crypto exchange.
+    Fully graceful: returns ``None`` if the Kronos plugin is unavailable or the
+    data is insufficient, so the SMC analysis never breaks.
+    """
+    try:
+        from plugins.KronosForecastPlugin.backend.services import forecast_service as _kronos
+        rows = []
+        for c in list(candles)[-400:]:
+            t = int(getattr(c, "time", 0) or 0)
+            t_ms = t * 1000 if t < 1_000_000_000_000 else t
+            rows.append([
+                t_ms, float(c.open), float(c.high), float(c.low), float(c.close),
+                float(getattr(c, "volume", 0.0) or 0.0),
+            ])
+        _tfmap = {"M1": "1m", "M5": "5m", "M15": "15m", "M30": "30m",
+                  "H1": "1h", "H4": "4h", "D1": "1d"}
+        _ktf = _tfmap.get(str(timeframe).upper(), str(timeframe).lower())
+        fc = await _kronos.forecast_from_rows(
+            rows, symbol=symbol, timeframe=_ktf, exchange="mt5", pred_len=12,
+        )
+        if not fc or not fc.signal:
+            return None
+        s = fc.signal
+        return {
+            "engine": fc.engine,
+            "direction": s.direction,
+            "pct_change": round(s.pct_change, 3),
+            "confidence": round(s.confidence, 3),
+            "target_price": s.target_price,
+            "anchor_price": fc.anchor_price,
+            "summary": s.summary,
+            "overlays": [o.model_dump() for o in (fc.overlays or [])],
+            "markers": [m.model_dump() for m in (fc.markers or [])],
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[MT5/strategy] Kronos forecast skipped: {exc}")
+        return None
+
+
 @router.get("/strategy/analyze", response_model=MT5SmcAnalyzeResponse)
 async def smc_analyze(
     account_id: int,
@@ -958,17 +1001,22 @@ async def smc_analyze(
     )
     analysis = engine.analyze(candles)
 
+    kronos_block = await _kronos_from_candles(candles, symbol, timeframe)
+
     ai_block = None
     if use_ai and not analysis.get("error") and analysis.get("signals"):
         async with AsyncSessionLocal() as db:
             try:
-                ai_block = await ai_review(db=db, symbol=symbol, timeframe=timeframe, analysis=analysis)
+                ai_block = await ai_review(
+                    db=db, symbol=symbol, timeframe=timeframe,
+                    analysis=analysis, kronos_forecast=kronos_block,
+                )
             except Exception as e:
                 logger.warning(f"[MT5/strategy] AI review failed: {e}")
                 ai_block = {"available": False, "reason": str(e)}
 
     return MT5SmcAnalyzeResponse(
-        symbol=symbol, timeframe=timeframe, ai=ai_block, **analysis,
+        symbol=symbol, timeframe=timeframe, ai=ai_block, kronos=kronos_block, **analysis,
     )
 
 
@@ -1009,17 +1057,22 @@ async def smc_analyze_data(data: MT5SmcAnalyzeDataRequest):
     )
     analysis = engine.analyze(candles)
 
+    kronos_block = await _kronos_from_candles(candles, data.symbol, data.timeframe)
+
     ai_block = None
     if data.use_ai and not analysis.get("error") and analysis.get("signals"):
         async with AsyncSessionLocal() as db:
             try:
-                ai_block = await ai_review(db=db, symbol=data.symbol, timeframe=data.timeframe, analysis=analysis)
+                ai_block = await ai_review(
+                    db=db, symbol=data.symbol, timeframe=data.timeframe,
+                    analysis=analysis, kronos_forecast=kronos_block,
+                )
             except Exception as e:
                 logger.warning(f"[MT5/strategy] AI review failed: {e}")
                 ai_block = {"available": False, "reason": str(e)}
 
     return MT5SmcAnalyzeResponse(
-        symbol=data.symbol, timeframe=data.timeframe, ai=ai_block, **analysis,
+        symbol=data.symbol, timeframe=data.timeframe, ai=ai_block, kronos=kronos_block, **analysis,
     )
 
 

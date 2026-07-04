@@ -278,3 +278,145 @@ class PaulHook(PaulBase):
     created_at = Column(DateTime, default=_now, nullable=False)
     updated_at = Column(DateTime, default=_now, onupdate=_now, nullable=False)
 
+
+# ── Memory Tree (OpenHuman-style hierarchical long-term memory) ────────────
+#
+# Sits on top of PaulKnowledge. `chunk` nodes are individual distilled facts
+# (mirrors a knowledge row); `daily`/`weekly` nodes are rolled-up summaries that
+# compress many chunks into one bounded note. Importance-scored so the
+# SuperContext scout can pull the most relevant + most important memories for a
+# given question without loading everything.
+
+
+class PaulMemoryKind(str, enum.Enum):
+    CHUNK = "chunk"      # atomic distilled fact (≤ ~3k tokens)
+    DAILY = "daily"      # one-day rollup summary
+    WEEKLY = "weekly"    # one-week rollup summary
+
+
+_MEMKIND = SQLEnum(PaulMemoryKind, name="paul_memnode_kind")
+
+
+class PaulMemoryNode(PaulBase):
+    """A node in JARVIS's hierarchical Memory Tree."""
+    __tablename__ = "paul_memory_nodes"
+
+    id = Column(Integer, primary_key=True)
+    kind = Column(_MEMKIND, default=PaulMemoryKind.CHUNK, nullable=False, index=True)
+    parent_id = Column(Integer, nullable=True, index=True)  # rollup node this chunk folds into
+
+    title = Column(String, nullable=True)
+    content = Column(Text, nullable=False)
+    summary = Column(Text, nullable=True)                   # short abstractive summary
+    symbol = Column(String, nullable=True, index=True)
+    topic = Column(String, nullable=True, index=True)       # crypto|stocks|macro|trade|system
+    source = Column(String, nullable=True)                  # feed/domain/'chat'/'auto_fetch'
+
+    importance = Column(Float, default=0.5, nullable=False, index=True)  # 0..1
+    sentiment = Column(Float, nullable=True)                # -1..1
+    checksum = Column(String, nullable=True, index=True)    # dedupe key
+    day = Column(String, nullable=True, index=True)         # YYYY-MM-DD bucket
+    knowledge_id = Column(Integer, nullable=True)           # refs paul_knowledge.id (no FK)
+
+    created_at = Column(DateTime, default=_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=_now, onupdate=_now, nullable=False)
+
+
+Index("ix_paul_memnode_kind_importance", PaulMemoryNode.kind, PaulMemoryNode.importance)
+Index("ix_paul_memnode_day_kind", PaulMemoryNode.day, PaulMemoryNode.kind)
+
+
+# ── Goals & Todos (OpenHuman-style goal system + kanban) ──────────────────
+
+
+class PaulGoalStatus(str, enum.Enum):
+    ACTIVE = "active"
+    PAUSED = "paused"
+    BUDGET_LIMITED = "budget_limited"   # tokens spent >= budget; work halts
+    ACHIEVED = "achieved"
+    ABANDONED = "abandoned"
+
+
+# OpenHuman kanban statuses (superset). Stored as plain strings (no PG enum) so
+# the set can evolve without a type migration.
+PAUL_TODO_STATUSES = (
+    "todo", "in_progress", "awaiting_approval", "ready", "blocked", "done", "rejected",
+)
+# Back-compat alias: earlier build used "backlog" for the first column.
+PAUL_TODO_STATUS_ALIASES = {"backlog": "todo"}
+
+
+class PaulGoal(PaulBase):
+    """A durable, human-editable goal JARVIS works toward.
+
+    Two tiers (OpenHuman parity):
+      - scope="account": long-term goal (session_key NULL), capped ~8, reviewed
+        by the Reflect agent against memory.
+      - scope="thread": one durable "completion contract" per conversation with
+        an optional token budget (→ budget_limited when exceeded).
+    """
+    __tablename__ = "paul_goals"
+
+    id = Column(Integer, primary_key=True)
+    title = Column(String(200), nullable=False)
+    detail = Column(Text, nullable=True)                    # acceptance criteria / notes
+    status = Column(String(24), default="active", nullable=False, index=True)
+    scope = Column(String(12), default="thread", nullable=False, index=True)  # account|thread
+    session_key = Column(String, nullable=True, index=True)  # thread this goal rides on
+    priority = Column(Integer, default=3, nullable=False)    # 1 (top) .. 5
+    token_budget = Column(Integer, nullable=True)            # optional idle-work budget
+    spent_tokens = Column(Integer, default=0, nullable=False)  # accumulated idle-work spend
+    progress = Column(Float, default=0.0, nullable=False)    # 0..1
+    reflection = Column(Text, nullable=True)                 # latest self-reflection note
+    last_worked_at = Column(DateTime, nullable=True)         # idle-continuation touchpoint
+
+    created_at = Column(DateTime, default=_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=_now, onupdate=_now, nullable=False)
+
+
+class PaulTodo(PaulBase):
+    """A kanban task JARVIS and the user build together, optionally under a goal."""
+    __tablename__ = "paul_todos"
+
+    id = Column(Integer, primary_key=True)
+    goal_id = Column(Integer, nullable=True, index=True)     # refs paul_goals.id (no FK)
+    session_key = Column(String, nullable=True, index=True)
+    title = Column(String(300), nullable=False)
+    detail = Column(Text, nullable=True)
+    status = Column(String(24), default="todo", nullable=False, index=True)
+    order_index = Column(Integer, default=0, nullable=False)
+    created_by = Column(String, default="user", nullable=False)  # user|jarvis
+    needs_approval = Column(Boolean, default=False, nullable=False)
+    approval_mode = Column(String(16), default="not_required", nullable=False)  # required|not_required
+    acceptance_criteria = Column(JSON, nullable=True)        # list[str] checklist
+    execution_plan = Column(JSON, nullable=True)             # ordered list[str]
+    outcome = Column(Text, nullable=True)                    # desired/actual outcome
+    blocker_reason = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=_now, onupdate=_now, nullable=False)
+
+
+Index("ix_paul_todos_goal_status", PaulTodo.goal_id, PaulTodo.status)
+
+
+# ── Subconscious activity log (OpenHuman-style heartbeat feed) ─────────────
+
+
+class PaulActivity(PaulBase):
+    """One entry per subconscious-tick task evaluation / idle continuation."""
+    __tablename__ = "paul_activity"
+
+    id = Column(Integer, primary_key=True)
+    kind = Column(String(24), default="task", nullable=False, index=True)  # task|goal|system
+    task_name = Column(String(120), nullable=True)
+    decision = Column(String(16), nullable=True)   # skip|act|escalate
+    state = Column(String(20), default="acted", nullable=False)  # acted|skipped|awaiting_approval|failed
+    session_key = Column(String, nullable=True, index=True)
+    goal_id = Column(Integer, nullable=True)
+    summary = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=_now, nullable=False, index=True)
+
+
+Index("ix_paul_activity_created", PaulActivity.kind, PaulActivity.created_at)
+

@@ -632,6 +632,11 @@ function pressCancel(): boolean {
   return true
 }
 
+// ── Face Vision gate constants ────────────────────────────────────────────────
+// The camera's face state is only trusted while it is "fresh" (panel streaming).
+const FACE_FRESH_MS = 2500   // face state older than this = camera off/stale
+const MOUTH_WINDOW_MS = 1500 // keep hearing briefly after the last mouth motion
+
 // ── Web Speech API (typed loosely — not in the default TS lib) ───────────────
 type SpeechRecognitionLike = any
 function getSpeechRecognition(): (new () => SpeechRecognitionLike) | null {
@@ -753,6 +758,26 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     sessionKeyRef.current = sk
   }
 
+  // ── JARVIS brain: idle "thinking" indicator (OpenHuman subconscious) ──────
+  // Polls the backend idle-status so the chat shows when JARVIS is quietly
+  // researching the active goal between your messages.
+  const [brainThinking, setBrainThinking] = useState(false)
+  const [brainNote, setBrainNote] = useState<string>('')
+  useEffect(() => {
+    let alive = true
+    const poll = async () => {
+      try {
+        const r = await apiClient.jarvis.idleStatus()
+        if (!alive) return
+        setBrainThinking(!!r.data?.thinking)
+        if (r.data?.note) setBrainNote(String(r.data.note).slice(0, 80))
+      } catch { /* backend offline — stay quiet */ }
+    }
+    poll()
+    const id = setInterval(poll, 7000)
+    return () => { alive = false; clearInterval(id) }
+  }, [])
+
   // ── Speech state ──────────────────────────────────────────────────────────
   const [speechSupported, setSpeechSupported] = useState(false)
   const [listening, setListening] = useState(false)   // mic dictation active
@@ -871,6 +896,12 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
   // extension's echo-tail window so both are synchronised.
   const postSpeechGateRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const micGatedRef = useRef(false)  // true during post-speech blackout
+  // ── Face Vision (camera) state — relayed from FaceVisionPanel postMessage ──
+  // While the camera is live, the user's moving mouth is the ground truth for
+  // "the user is talking": JARVIS's TTS can never move the user's mouth, so
+  // gating transcription on it makes self-hearing physically impossible.
+  const faceStateRef = useRef({ present: false, talking: false, match: false, enrolled: false, ts: 0 })
+  const lastMouthActiveAtRef = useRef(0)
   // Voice profile — speaker ID for noise cancellation by voice pattern matching
   const voiceMatchRef = useRef(true)           // true = accept; false = not user's voice
   const voiceMatchEnabledRef = useRef(false)   // mirror of voiceMatchEnabled for event handlers/refs
@@ -1621,6 +1652,28 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     return voiceMatchEnabledRef.current && !!loadVoiceProfile()
   }, [])
 
+  // ── Face Vision (camera) gates ────────────────────────────────────────────
+  // FaceVisionPanel broadcasts lip/identity state via postMessage. While the
+  // camera is live ("fresh"), the user's moving mouth is the definitive signal
+  // that the USER — not JARVIS's TTS — is talking.
+  const faceFresh = useCallback(() => {
+    const f = faceStateRef.current
+    return f.ts > 0 && Date.now() - f.ts < FACE_FRESH_MS
+  }, [])
+  // True when the camera positively sees the user talking right now. An
+  // enrolled profile with a non-matching face means a stranger → not the user.
+  const cameraSeesUserTalking = useCallback(() => {
+    const f = faceStateRef.current
+    if (!faceFresh() || !f.talking) return false
+    return f.match || !f.enrolled
+  }, [faceFresh])
+  // Camera off/stale → no visual gating (audio-only behaviour). Camera live →
+  // hear ONLY while the mouth is (or was just) moving on camera.
+  const mouthGateOpen = useCallback(() => {
+    if (!faceFresh()) return true
+    return faceStateRef.current.talking || Date.now() - lastMouthActiveAtRef.current < MOUTH_WINDOW_MS
+  }, [faceFresh])
+
   // ── Mic gating while JARVIS speaks ────────────────────────────────────────
   // Always aborts any active dictation/Whisper capture so a command-in-progress
   // never records JARVIS's own voice. When speaker-ID is enabled we KEEP the wake
@@ -1793,6 +1846,37 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
       window.postMessage({ __jarvisPage: true, type: 'speak-status', speaking: false }, window.location.origin)
     } catch { /* noop */ }
   }, [])
+
+  // ── Face Vision sync + camera barge-in ─────────────────────────────────────
+  // Consumes FaceVisionPanel's `jarvis-face-state` broadcasts. When the camera
+  // sees the USER start talking while JARVIS is reading a reply out loud, the
+  // TTS is cut immediately (barge-in) and dictation starts — so JARVIS stops
+  // reading and transcribes the user instead of its own voice.
+  useEffect(() => {
+    const onFaceMsg = (ev: MessageEvent) => {
+      const d: any = ev.data
+      if (ev.source !== window || !d || !d.__jarvisPage || d.type !== 'jarvis-face-state') return
+      faceStateRef.current = {
+        present: !!d.facePresent,
+        talking: !!d.isTalking,
+        match: !!d.identityMatch,
+        enrolled: !!d.enrolled,
+        ts: Date.now(),
+      }
+      if (d.isTalking) lastMouthActiveAtRef.current = Date.now()
+      // Camera barge-in: the user's mouth is moving while JARVIS is speaking →
+      // stop reading NOW and hand the mic to the user.
+      if (isSpeakingRef.current && cameraSeesUserTalking()) {
+        interruptSpeech()
+        micGatedRef.current = false  // camera confirmed it's the user — skip the echo blackout
+        if (!extVoiceReadyRef.current && !listeningRef.current) {
+          setTimeout(() => startDictationRef.current(), 150)
+        }
+      }
+    }
+    window.addEventListener('message', onFaceMsg)
+    return () => window.removeEventListener('message', onFaceMsg)
+  }, [cameraSeesUserTalking, interruptSpeech])
 
 
   // ── Mini binary engine + robot energy feed ─────────────────────────────────
@@ -2313,8 +2397,26 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
         m.id === pendingId ? { ...m, content: fullMsg, pending: false, sniperSetups: setups } : m))
       speak(cleanForSpeech(spokenMsg))
 
-    } catch {
-      finalise(`I ran into an error analysing ${symbol}, Sir. Please make sure MT5 is connected.`)
+    } catch (e: any) {
+      // Surface the real cause instead of always blaming MT5 — the backend
+      // falls back to an exchange feed (XAU/USDT) when MT5 history is empty,
+      // so a thrown error is almost always something else (timeout, backend
+      // down, account not found, or an upstream 500).
+      const status = e?.response?.status
+      const detail = e?.response?.data?.detail || e?.response?.data?.error || e?.message || ''
+      const isTimeout = e?.code === 'ECONNABORTED' || /timeout/i.test(String(detail))
+      const isNetwork = e?.code === 'ERR_NETWORK' || (!status && /network/i.test(String(e?.message || '')))
+      let msg: string
+      if (isTimeout) {
+        msg = `The ${symbol} ${timeframe} analysis timed out, Sir. The market feed was slow to respond — please try again in a moment.`
+      } else if (isNetwork) {
+        msg = `I couldn't reach the trading backend to analyse ${symbol}, Sir. The service may be starting up — please try again shortly.`
+      } else if (status === 404) {
+        msg = `I couldn't find that MT5 account while analysing ${symbol}, Sir. Please re-select an account on the MT5 Live page.`
+      } else {
+        msg = `I ran into an error analysing ${symbol} (${timeframe}), Sir${detail ? `: ${detail}` : '.'}`
+      }
+      finalise(msg)
     }
   }, [resolveCtx, speak])
 
@@ -3124,6 +3226,13 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     let finalText = ''
     let lowConfSeen = false   // a measured-but-below-threshold final was dropped
     rec.onresult = (e: any) => {
+      // Self-hearing hard gate: NEVER transcribe while JARVIS is talking (or in
+      // the post-speech echo tail) unless the camera can SEE the user's mouth
+      // moving — JARVIS's own TTS can never move the user's mouth.
+      if ((isSpeakingRef.current || micGatedRef.current) && !cameraSeesUserTalking()) return
+      // Camera gate: when the camera is live, only accept speech while the
+      // user's mouth is (or was just) moving.
+      if (!mouthGateOpen()) return
       let interim = ''
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const t = e.results[i][0].transcript
@@ -3188,7 +3297,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     dictationRef.current = rec
     setListening(true)
     try { rec.start() } catch { setListening(false) }
-  }, [aiSpeechEnabled, speak, noteAndGetThreshold, learnAndCorrect, pickAlternative])
+  }, [aiSpeechEnabled, speak, noteAndGetThreshold, learnAndCorrect, pickAlternative, cameraSeesUserTalking, mouthGateOpen])
 
   // ── Shared one-shot command dispatcher ────────────────────────────────────
   // Mirrors the dictation pipeline so a single-utterance wake ("Jarvis,
@@ -3246,6 +3355,14 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
         // Voice profile gate: when speaker ID is enabled, reject non-matching voices.
         // This is the PRIMARY defence against TV/background voices.
         if (voiceMatchEnabled && !voiceMatchRef.current) continue
+
+        // Camera gate: when the camera is live, only the user's moving mouth
+        // opens hearing — JARVIS's own TTS can never pass this, so it cannot
+        // wake (or interrupt) itself while it reads a reply.
+        if (!mouthGateOpen()) continue
+        // While JARVIS is speaking with the camera live, require the camera to
+        // actually SEE the user talking before honouring any speech.
+        if (isSpeakingRef.current && faceFresh() && !cameraSeesUserTalking()) continue
 
         // Interrupt gate: user says the wake name while JARVIS is speaking →
         // interrupt. Requires the wake phrase (not any speech) to prevent TV
@@ -3314,7 +3431,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     }
     wakeRef.current = rec
     try { rec.start() } catch { /* noop */ }
-  }, [speak, interruptSpeech, noteAndGetThreshold, canBargeIn])
+  }, [speak, interruptSpeech, noteAndGetThreshold, canBargeIn, mouthGateOpen, faceFresh, cameraSeesUserTalking])
 
   startDictationRef.current = startDictation
   startWakeRef.current = startWake
@@ -3498,9 +3615,15 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
                     <span className="w-1 h-1 rounded-full bg-green-400 animate-pulse" /> EXT
                   </span>
                 )}
+                {brainThinking && (
+                  <span className="inline-flex items-center gap-0.5 text-[8px] px-1 py-0.5 rounded bg-amber-500/20 text-amber-300 font-medium" title={brainNote || 'JARVIS is researching your active goal in the background'}>
+                    <span className="w-1 h-1 rounded-full bg-amber-300 animate-pulse" /> THINKING
+                  </span>
+                )}
               </div>
               <div className="text-[10px] text-gray-400 truncate">
-                {listening ? 'Listening…' : extConnected ? 'Say "Jarvis" (extension)' : wakeEnabled ? 'Say "Jarvis", "Paul" or "Sox"…' : 'Your JARVIS trading assistant'}
+                {brainThinking ? (brainNote ? `🧠 ${brainNote}` : '🧠 Working on your goal…')
+                  : listening ? 'Listening…' : extConnected ? 'Say "Jarvis" (extension)' : wakeEnabled ? 'Say "Jarvis", "Paul" or "Sox"…' : 'Your JARVIS trading assistant'}
               </div>
             </div>
             {speechSupported && (

@@ -1,0 +1,31 @@
+{
+  "name": "Kronos Forecast",
+  "slug": "kronos",
+  "version": "1.0.0",
+  "description": "K-line (OHLCV) price forecasting powered by the open-source Kronos foundation model (shiyu-coder/Kronos, MIT). Predicts future candles with probabilistic confidence bands, renders as overlays on every chart, and feeds a forward-looking signal into JARVIS and the AI analyst.",
+  "author": "TradeBot",
+  "requires": { "python": ">=3.10", "tradebot": ">=0.1.0" },
+  "service_provider": "backend.router",
+  "provides": {
+    "routes": ["backend/router.py"],
+    "models": ["backend/models.py"],
+    "pages": ["frontend/pages/"],
+    "overlays": true,
+    "scheduled_jobs": []
+  },
+  "permissions": [
+    "market.data.read",
+    "ai.forecast.view"
+  ],
+  "settings_keys": [
+    "kronos.model_name",
+    "kronos.tokenizer_name",
+    "kronos.device",
+    "kronos.max_context",
+    "kronos.default_lookback",
+    "kronos.default_pred_len",
+    "kronos.default_samples",
+    "kronos.temperature",
+    "kronos.top_p"
+  ]
+}

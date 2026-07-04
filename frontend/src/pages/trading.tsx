@@ -39,6 +39,9 @@ import {
 const TradingViewChart = dynamic(() => import('@/components/TradingViewChart'), {
   ssr: false,
 })
+const KronosOverlayChart = dynamic(() => import('@/components/KronosOverlayChart'), {
+  ssr: false,
+})
 const TradingViewWidget = dynamic(() => import('@/components/TradingViewWidget'), {
   ssr: false,
 })
@@ -2937,7 +2940,7 @@ export default function TradingPage() {
                 onToggleMaximize={() => setChartMaximized(m => !m)}
               />
             ) : (
-            <TradingViewChart
+            <KronosOverlayChart
               symbol={selectedSymbol}
               exchange={selectedExchange}
               timeframe={selectedTimeframe}

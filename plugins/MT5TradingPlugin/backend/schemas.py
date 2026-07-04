@@ -404,6 +404,7 @@ class MT5SmcAnalyzeResponse(BaseModel):
     signals: List[MT5SmcSignal] = []
     us_session: Optional[Dict[str, Any]] = None
     ai: Optional[Dict[str, Any]] = None
+    kronos: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
 
 

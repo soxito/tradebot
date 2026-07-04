@@ -930,21 +930,46 @@ export const apiClient = {
   kronos: {
     /** Model status: real Kronos loaded vs heuristic fallback, device, etc. */
     status: () => api.get('/plugins/kronos/status'),
-    /** Full forecast: predicted candles + confidence bands + signal + overlays. */
+    /** Published model catalogue + currently active model (with install status). */
+    models: () => api.get('/plugins/kronos/models'),
+    /** Download every published Kronos model + tokenizer into the local cache
+     *  (runs in the background on the server; poll models() for progress). */
+    installAllModels: () => api.post('/plugins/kronos/models/install-all', null, { timeout: 180000 }),
+    /** Hot-swap to a different Kronos variant (triggers a reload on the backend). */
+    switchModel: (modelId: string) => api.post('/plugins/kronos/model/switch', null, { params: { model_id: modelId }, timeout: 180000 }),
+    /** Full forecast: predicted candles + confidence bands + signal + overlays.
+     *  Longer timeout — the Kronos model can cold-start for ~45–60s. */
     forecast: (
       exchange: string,
       symbol: string,
       params?: { timeframe?: string; lookback?: number; pred_len?: number; samples?: number; temperature?: number; top_p?: number },
-    ) => api.get(`/plugins/kronos/forecast/${exchange}/${symbol.replace('/', '')}`, { params }),
+    ) => api.get(`/plugins/kronos/forecast/${exchange}/${symbol.replace('/', '')}`, { params, timeout: 120000 }),
     /** Lightweight overlay payload (overlays + markers + signal) for any chart. */
     overlay: (
       exchange: string,
       symbol: string,
       params?: { timeframe?: string; pred_len?: number; samples?: number },
-    ) => api.get(`/plugins/kronos/overlay/${exchange}/${symbol.replace('/', '')}`, { params }),
+    ) => api.get(`/plugins/kronos/overlay/${exchange}/${symbol.replace('/', '')}`, { params, timeout: 120000 }),
     /** Compact speech-friendly forecast for JARVIS. */
     jarvis: (symbol: string, params?: { exchange?: string; timeframe?: string; pred_len?: number }) =>
-      api.get(`/plugins/kronos/jarvis/${symbol.replace('/', '')}`, { params }),
+      api.get(`/plugins/kronos/jarvis/${symbol.replace('/', '')}`, { params, timeout: 120000 }),
+    /** JARVIS detailed analysis of the forecast + crypto market cap; learns each run into the brain. */
+    analyze: (
+      exchange: string,
+      symbol: string,
+      params?: { timeframe?: string; pred_len?: number; samples?: number; temperature?: number; learn?: boolean },
+    ) => api.post(`/plugins/kronos/analyze/${exchange}/${symbol.replace('/', '')}`, null, { params, timeout: 120000 }),
+    /** Executable sniper entries (entry / stop / take-profits / R:R + reasons) derived
+     *  from the Kronos forecast direction and confidence bands. */
+    sniper: (
+      exchange: string,
+      symbol: string,
+      params?: { timeframe?: string; pred_len?: number; samples?: number },
+    ) => api.get(`/plugins/kronos/sniper/${exchange}/${symbol.replace('/', '')}`, { params, timeout: 120000 }),
+    /** Live account context for placing a sniper order: openable margin, max
+     *  leverage, min size/precision, existing position, and max-open-remaining. */
+    tradability: (exchange: string, symbol: string) =>
+      api.get(`/plugins/kronos/tradability/${exchange}/${symbol.replace('/', '')}`, { timeout: 30000 }),
     /** Batch forecast several symbols at once. */
     batch: (data: { exchange?: string; timeframe?: string; symbols: string[]; lookback?: number; pred_len?: number; samples?: number }) =>
       api.post('/plugins/kronos/batch', data),

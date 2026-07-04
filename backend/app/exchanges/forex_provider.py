@@ -37,8 +37,11 @@ _CG_COIN_MAP: Dict[str, str] = {
 }
 
 # Forex symbols handled via frankfurter.app (free, no auth) — FX only, not metals
-_FRANKFURTER_FX: set = {"EURUSD", "EUR/USD", "GBPUSD", "GBP/USD",
-                        "USDJPY", "USD/JPY", "USDCHF", "AUDUSD", "NZDUSD", "USDCAD"}
+_FRANKFURTER_FX: set = {
+    "EURUSD", "EUR/USD", "GBPUSD", "GBP/USD",
+    "USDJPY", "USD/JPY", "USDCHF", "USD/CHF",
+    "AUDUSD", "AUD/USD", "NZDUSD", "NZD/USD", "USDCAD", "USD/CAD",
+}
 
 # All supported symbols
 SUPPORTED_SYMBOLS: set = set(_CG_COIN_MAP.keys()) | _FRANKFURTER_FX
@@ -170,36 +173,47 @@ async def _frankfurter_ohlcv(symbol: str, days: int = 90) -> Tuple[List[List], O
     end   = datetime.utcnow().strftime("%Y-%m-%d")
     start = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
 
-    try:
-        async with httpx.AsyncClient(timeout=12.0) as cl:
-            r = await cl.get(
-                "https://api.frankfurter.app/series",
-                params={"from": start, "to": end, "base": base, "symbols": quote},
-            )
-            r.raise_for_status()
-            data = r.json()
+    # Frankfurter v1 uses date-range path format: /v1/{start}..?base=X&symbols=Y
+    # Fall back to the old app domain if the dev domain is unreachable.
+    _FRANK_URLS = [
+        f"https://api.frankfurter.dev/v1/{start}..",
+        f"https://api.frankfurter.app/{start}..",
+    ]
 
-        rates_dict = data.get("rates", {})
-        if not rates_dict:
-            return [], None
+    data: dict = {}
+    last_err: Exception | None = None
+    for _url in _FRANK_URLS:
+        try:
+            async with httpx.AsyncClient(timeout=14.0, follow_redirects=True) as cl:
+                r = await cl.get(_url, params={"base": base, "symbols": quote})
+                r.raise_for_status()
+                data = r.json()
+                if data.get("rates"):
+                    break
+        except Exception as e:
+            last_err = e
+            continue
 
-        sorted_dates = sorted(rates_dict.keys())
-        ohlcv: List[List] = []
-        for i, date_str in enumerate(sorted_dates):
-            from datetime import timezone
-            dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            ts_ms = int(dt.timestamp() * 1000)
-            rate  = float(rates_dict[date_str].get(quote, 0) or 0)
-            if rate <= 0:
-                continue
-            prev_rate = float(rates_dict[sorted_dates[i - 1]].get(quote, rate) or rate) if i > 0 else rate
-            ohlcv.append([ts_ms, prev_rate, max(rate, prev_rate), min(rate, prev_rate), rate, 0.0])
-
-        current = ohlcv[-1][4] if ohlcv else None
-        return ohlcv, current
-    except Exception as e:
-        logger.debug(f"[ForexProvider] Frankfurter FX failed for {symbol}: {e}")
+    rates_dict = data.get("rates", {})
+    if not rates_dict:
+        if last_err:
+            logger.debug(f"[ForexProvider] Frankfurter FX failed for {symbol}: {last_err}")
         return [], None
+
+    sorted_dates = sorted(rates_dict.keys())
+    ohlcv: List[List] = []
+    for i, date_str in enumerate(sorted_dates):
+        from datetime import timezone
+        dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        ts_ms = int(dt.timestamp() * 1000)
+        rate  = float(rates_dict[date_str].get(quote, 0) or 0)
+        if rate <= 0:
+            continue
+        prev_rate = float(rates_dict[sorted_dates[i - 1]].get(quote, rate) or rate) if i > 0 else rate
+        ohlcv.append([ts_ms, prev_rate, max(rate, prev_rate), min(rate, prev_rate), rate, 0.0])
+
+    current = ohlcv[-1][4] if ohlcv else None
+    return ohlcv, current
 
 
 # ── Main public API ──────────────────────────────────────────────────────────

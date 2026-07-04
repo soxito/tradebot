@@ -382,10 +382,31 @@ async def _get_recent_trades(db: AsyncSession, limit: int = 5) -> list[dict]:
 
 
 async def build_jarvis_system_prompt(
-    db: AsyncSession, pathname: str = "/", user_msg: str = ""
+    db: AsyncSession, pathname: str = "/", user_msg: str = "",
+    session_key: str = "", first_turn: bool = False,
 ) -> str:
     """Build full JARVIS system prompt with live context injected."""
     parts: list[str] = [_JARVIS_PERSONA]
+
+    # ── SuperContext scout (first turn only): pre-load context for THIS question ──
+    if first_turn and user_msg:
+        try:
+            from plugins.AgentPaulPlugin.backend.services.context_scout import build_context_bundle
+            bundle = await build_context_bundle(db, user_msg)
+            if bundle:
+                parts.append(bundle)
+        except Exception as _sc:  # noqa
+            logger.debug(f"[JARVIS] scout inject skipped: {_sc}")
+
+    # ── Active goal + open todos (goal-directed work across the conversation) ──
+    if session_key:
+        try:
+            from plugins.AgentPaulPlugin.backend.services import goals_todos
+            goal_block = await goals_todos.prompt_block(db, session_key)
+            if goal_block:
+                parts.append(goal_block)
+        except Exception as _gb:  # noqa
+            logger.debug(f"[JARVIS] goals inject skipped: {_gb}")
 
     # ── Graphify brain-map overview ────────────────────────────────────
     overview = graph_overview(top_n=5)
@@ -857,7 +878,10 @@ async def stream_jarvis_chat(
             except Exception as te:
                 logger.debug(f"[JARVIS] auto-trade error: {te}")
 
-        system_prompt = await build_jarvis_system_prompt(db, pathname, user_msg)
+        _first_turn = len([m for m in (messages or []) if m.get("role") == "user"]) <= 1
+        system_prompt = await build_jarvis_system_prompt(
+            db, pathname, user_msg, session_key=session_key, first_turn=_first_turn
+        )
         if extra_context:
             system_prompt += extra_context
 
@@ -1061,29 +1085,35 @@ async def stream_jarvis_chat(
                 topic="general",
                 importance=0.5,
             )
-            # ── Write to Obsidian vault for self-learning ──────────────────────
-            # Every Jarvis exchange becomes a vault note so the brain can learn
-            # from its own responses over time.
+            # ── Write to ALL three JARVIS brains ───────────────────────────────
+            # 1) Obsidian vault file + VaultNote DB row (→ /vault + /intelligence live feed)
+            # 2) AI Analyst knowledge store (→ /intelligence knowledge panel)
+            # 3) PaulKnowledge (already done via record_knowledge above)
             try:
-                from plugins.ObsidianKnowledgePlugin.backend.services.vault_writer import VaultWriter
-                from plugins.ObsidianKnowledgePlugin.backend.services.obsidian_rest import get_bridge
-                _vw = VaultWriter()
-                path, ok, _ = _vw.write_jarvis_note(
-                    question=user_msg,
-                    answer=content,
-                    page=pathname,
+                from app.api.jarvis import jarvis_learn_all_brains
+                # Extract the first symbol-like token from the message for tagging.
+                import re as _rre
+                _STOP = {"WHAT", "HOW", "WHY", "WHEN", "WHERE", "WHICH", "WHO", "THE",
+                         "AND", "FOR", "WITH", "MY", "TO", "IN", "ON", "AT", "OF",
+                         "IS", "ARE", "DO", "DOES", "CAN", "SHOULD", "WILL", "COULD",
+                         "WOULD", "HAS", "HAVE", "BEEN", "BEING", "WANT", "TELL", "GIVE"}
+                _sym = next(
+                    (w.upper() for w in user_msg.split()
+                     if _rre.match(r'^[A-Z]{2,8}(USDT?|USD|BTC|ETH|SOL)?$', w.upper())
+                     and w.upper() not in _STOP),
+                    "",
                 )
-                if ok:
-                    _bridge = get_bridge()
-                    if _bridge.enabled:
-                        asyncio.create_task(
-                            _bridge.push_note(
-                                str(path.relative_to(_vw.root)),
-                                path.read_text(encoding="utf-8"),
-                            )
-                        )
+                jarvis_learn_all_brains(
+                    action="chat",
+                    symbol=_sym,
+                    summary=f"Q: {user_msg[:120]}",
+                    detail=f"Q: {user_msg[:300]}\n\nA: {content[:700]}",
+                    tags=["jarvis-chat", pathname.strip("/") or "chat"],
+                    importance=0.5,
+                    kind="insight",
+                )
             except Exception as _we:
-                logger.debug(f"[JARVIS] vault write skipped: {_we}")
+                logger.debug(f"[JARVIS] triple-brain write skipped: {_we}")
 
         # ── Explicit self-learning markers ─────────────────────────────────────
         # JARVIS is instructed to emit inline JSON blocks when it discovers a

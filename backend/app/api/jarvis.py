@@ -31,12 +31,12 @@ from app.exchanges.forex_provider import is_forex_symbol, fetch_ohlcv as forex_f
 router = APIRouter(prefix="/jarvis", tags=["jarvis"])
 
 
-# ── Dual-brain learning capture ───────────────────────────────────────────────
-# Every meaningful JARVIS action is persisted to BOTH system brains so the
-# assistant never forgets and keeps learning:
-#   1. Obsidian vault  (human-readable knowledge notes)
-#   2. PaulKnowledge   (long-term memory recalled into future chat context)
-# Fire-and-forget: never blocks the command response.
+# ── Triple-brain learning capture ────────────────────────────────────────────
+# Every JARVIS action, command, and chat response is persisted to THREE brains:
+#   1. Obsidian vault file + VaultNote DB row  → /vault list + /intelligence live feed
+#   2. AI Analyst knowledge store              → /intelligence knowledge panel
+#   3. PaulKnowledge long-term memory          → recalled into future chat context
+# Fire-and-forget: never blocks the response.
 def jarvis_brain_capture(
     action: str,
     symbol: str = "",
@@ -46,30 +46,11 @@ def jarvis_brain_capture(
     order_id: str = "",
     importance: float = 0.5,
 ) -> None:
-    """Persist a JARVIS action to both system brains (vault + knowledge base)."""
-    # Brain 1 — Obsidian vault (fire-and-forget, writes a markdown note)
-    try:
-        from plugins.ObsidianKnowledgePlugin.backend.services.vault_capture import vault_capture
-        vault_capture(
-            action_type=f"jarvis-{action}",
-            symbol=symbol,
-            summary=summary[:200],
-            detail=detail,
-            tags=tags or ["jarvis", action, symbol],
-            order_id=order_id,
-        )
-    except Exception as e:  # pragma: no cover - best effort
-        logger.debug(f"[JARVIS brain] vault capture skipped: {e}")
-
-    # Brain 2 — PaulKnowledge long-term memory (own session, fire-and-forget)
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            loop.create_task(
-                _knowledge_capture(action, symbol, summary, detail, importance)
-            )
-    except Exception as e:  # pragma: no cover - best effort
-        logger.debug(f"[JARVIS brain] knowledge capture skipped: {e}")
+    """Backward-compatible wrapper — delegates to jarvis_learn_all_brains."""
+    jarvis_learn_all_brains(
+        action=action, symbol=symbol, summary=summary, detail=detail,
+        tags=tags, order_id=order_id, importance=importance,
+    )
 
 
 async def _knowledge_capture(
@@ -96,6 +77,129 @@ async def _knowledge_capture(
             )
     except Exception as e:  # pragma: no cover - best effort
         logger.debug(f"[JARVIS brain] knowledge write skipped: {e}")
+
+
+async def _ai_analyst_capture(
+    action: str, symbol: str, summary: str, detail: str,
+    kind: str = "insight", importance: float = 0.5
+) -> None:
+    """Write to the AI Analyst knowledge brain (powers /intelligence panel)."""
+    try:
+        from app.core.database import AsyncSessionLocal
+        from plugins.AiMarketAnalyst.backend.services import knowledge_service
+        title = f"JARVIS {action}" + (f" — {symbol}" if symbol else "")
+        body = summary
+        if detail:
+            body += f"\n\n{detail[:600]}"
+        async with AsyncSessionLocal() as db:
+            await knowledge_service.store_knowledge(
+                db,
+                content=body[:1200],
+                agent_role="jarvis",
+                symbol=symbol or None,
+                kind=kind,
+                title=title,
+                weight=max(1.3, importance * 2.0),  # floor at 1.3 to stay visible
+                source="jarvis",
+            )
+    except Exception as e:
+        logger.debug(f"[JARVIS brain] AI-analyst store skipped: {e}")
+
+
+async def _vault_capture_with_db(
+    action: str, symbol: str, summary: str, detail: str,
+    tags: Optional[List[str]] = None, order_id: str = "",
+) -> None:
+    """Write a vault file AND register a VaultNote DB row so the note appears
+    in the /vault list and the /intelligence live feed."""
+    try:
+        from datetime import datetime as _dt
+        from sqlalchemy import select
+        from app.core.database import AsyncSessionLocal
+        from plugins.ObsidianKnowledgePlugin.backend.services.vault_writer import VaultWriter
+        from plugins.ObsidianKnowledgePlugin.backend.services.obsidian_rest import get_bridge
+        from plugins.ObsidianKnowledgePlugin.backend.models import VaultNote
+    except Exception:
+        return
+
+    try:
+        writer = VaultWriter()
+        path, written, cs = writer.write_action_note(
+            action_type=f"jarvis-{action}",
+            symbol=symbol,
+            summary=summary[:200],
+            detail=detail,
+            tags=tags or ["jarvis", action],
+            agent_role="jarvis",
+            order_id=order_id or "",
+        )
+        rel = str(path.relative_to(writer.root))
+    except Exception as exc:
+        logger.debug(f"[JARVIS brain] vault write skipped: {exc}")
+        return
+
+    # Register in DB so /vault + /intelligence live feed pick it up.
+    try:
+        async with AsyncSessionLocal() as db:
+            existing = (
+                await db.execute(select(VaultNote).where(VaultNote.path == rel))
+            ).scalar_one_or_none()
+            now = _dt.utcnow()
+            if existing:
+                existing.checksum = cs
+                existing.updated_at = now
+            else:
+                db.add(VaultNote(
+                    path=rel,
+                    note_type=f"jarvis-{action}",
+                    symbol=symbol or None,
+                    tags=tags or ["jarvis", action],
+                    checksum=cs,
+                    created_at=now,
+                    updated_at=now,
+                ))
+            await db.commit()
+    except Exception as exc:
+        logger.debug(f"[JARVIS brain] vault DB register skipped: {exc}")
+
+    # Best-effort live push to Obsidian app.
+    try:
+        bridge = get_bridge()
+        if getattr(bridge, "enabled", False):
+            await bridge.push_note(rel, path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+
+
+def jarvis_learn_all_brains(
+    action: str,
+    symbol: str = "",
+    summary: str = "",
+    detail: str = "",
+    tags: Optional[List[str]] = None,
+    order_id: str = "",
+    importance: float = 0.5,
+    kind: str = "insight",
+) -> None:
+    """Persist any JARVIS event to ALL three knowledge brains:
+    vault (file + DB row), AI Analyst store, and PaulKnowledge.
+    Fire-and-forget — never blocks the caller."""
+    try:
+        loop = asyncio.get_event_loop()
+        if not loop.is_running():
+            return
+        _tags = list(set((tags or []) + ["jarvis", action] + ([symbol] if symbol else [])))
+        loop.create_task(
+            _vault_capture_with_db(action, symbol, summary, detail, _tags, order_id or "")
+        )
+        loop.create_task(
+            _ai_analyst_capture(action, symbol, summary, detail, kind, importance)
+        )
+        loop.create_task(
+            _knowledge_capture(action, symbol, summary, detail, importance)
+        )
+    except Exception as e:
+        logger.debug(f"[JARVIS brain] learn_all_brains scheduling skipped: {e}")
 
 
 # ── Voice brain models ────────────────────────────────────────────────────────

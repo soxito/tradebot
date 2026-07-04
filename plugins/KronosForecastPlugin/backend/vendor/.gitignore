@@ -1,0 +1,6 @@
+# Vendored third-party model code + downloaded weights are NOT committed.
+# They are populated by scripts/setup_kronos.sh (clones shiyu-coder/Kronos, MIT).
+model/
+KRONOS_LICENSE
+*.safetensors
+*.bin

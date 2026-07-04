@@ -1,0 +1,13 @@
+# Kronos Forecast Plugin — Python dependencies
+# Installed into the backend venv by scripts/setup_kronos.sh
+# (kept out of backend/requirements.txt so the core stays lightweight
+#  and the plugin remains fully removable.)
+torch>=2.0.0
+einops>=0.8.1
+# NOTE: keep these compatible with the core backend's transformers (needs
+# huggingface_hub>=1.5.0). Do NOT pin to an old hub — it silently breaks
+# transformers/AiMarketAnalyst. Kronos loads fine on hub 1.x.
+huggingface_hub>=1.5.0
+safetensors>=0.6.2
+tqdm>=4.66.0
+# numpy + pandas are already provided by the core backend.

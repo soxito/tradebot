@@ -73,6 +73,9 @@ interface TradingViewChartProps {
   maximized?: boolean;
   onToggleMaximize?: () => void;
   onSlTpChange?: (symbol: string, side: string, sl: number | null, tp: number | null) => void;
+  /** Pre-fetched candles (lightweight-charts format) to use instead of the exchange fetch.
+   *  Used for forex/metals where the crypto exchange has no OHLCV data. */
+  initialCandles?: { time: number; open: number; high: number; low: number; close: number; volume?: number }[];
 }
 
 export default function TradingViewChart({ 
@@ -89,6 +92,7 @@ export default function TradingViewChart({
   maximized = false,
   onToggleMaximize,
   onSlTpChange,
+  initialCandles,
 }: TradingViewChartProps) {
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -114,25 +118,73 @@ export default function TradingViewChart({
 
   // Fetch real market data
   const fetchChartData = async () => {
+    // Capture the series this fetch belongs to. The chart (and this ref) is
+    // recreated whenever the symbol/exchange/timeframe changes, so a slow
+    // in-flight fetch from a *previous* symbol must never write its candles
+    // into the current chart — otherwise e.g. BTC data lands under a FOLK label.
+    const targetSeries = candlestickSeriesRef.current;
+    const targetChart = chartRef.current;
+    const isStale = () =>
+      candlestickSeriesRef.current !== targetSeries || chartRef.current !== targetChart;
+
+    const fitAndScale = () => {
+      if (!didFitRef.current) {
+        targetChart?.timeScale().fitContent();
+        // Auto-scale the price axis so candles fill the pane regardless of the
+        // token's absolute price (BTC at 60k or PEPE at 0.000001 both fit).
+        try { targetChart?.priceScale('right').applyOptions({ autoScale: true }); } catch {}
+        didFitRef.current = true;
+      }
+    };
+
     try {
       setError(null);
+
+      // If pre-fetched candles were supplied (e.g. forex/metals from Kronos),
+      // use them directly without hitting the crypto exchange endpoint.
+      if (initialCandles && initialCandles.length > 0 && targetSeries) {
+        const data = initialCandles.map((c) => ({
+          time: c.time as any,
+          open: c.open,
+          high: c.high,
+          low: c.low,
+          close: c.close,
+        }));
+        if (isStale()) return;
+        targetSeries.setData(data);
+        const allPrices = data.flatMap((c) => [c.open, c.high, c.low, c.close]).filter((p) => p > 0);
+        if (allPrices.length > 0) {
+          const precision = calcChartPrecision(allPrices);
+          const minMove = calcMinMove(allPrices);
+          targetSeries.applyOptions({ priceFormat: { type: 'price', precision, minMove } });
+        }
+        fitAndScale();
+        setLastUpdate(new Date());
+        setLoading(false);
+        return;
+      }
+
       const response = await apiClient.getOHLCV(
         exchange,
         symbol,
         timeframe,
         200  // Fetch 200 candles for good chart history
       );
-      
-      if (response.data?.data && candlestickSeriesRef.current) {
-        const data = response.data.data;
-        candlestickSeriesRef.current.setData(data);
+
+      // Bail if the symbol changed while this request was in flight — prevents
+      // stale candles from the previous symbol overwriting the new chart.
+      if (isStale() || !targetSeries) return;
+
+      const data = response.data?.data;
+      if (Array.isArray(data) && data.length > 0) {
+        targetSeries.setData(data);
 
         // Auto-detect price precision from OHLCV data (handles PEPE, SHIB etc.)
         const allPrices = data.flatMap((c: any) => [c.open, c.high, c.low, c.close]).filter((p: number) => p > 0);
         if (allPrices.length > 0) {
           const precision = calcChartPrecision(allPrices);
           const minMove = calcMinMove(allPrices);
-          candlestickSeriesRef.current.applyOptions({
+          targetSeries.applyOptions({
             priceFormat: {
               type: 'price',
               precision,
@@ -144,17 +196,24 @@ export default function TradingViewChart({
         // Fit candles to the visible area once on first load so the chart draws
         // nicely instead of showing a cramped/partial view. Subsequent background
         // refreshes preserve the user's zoom/pan.
-        if (!didFitRef.current) {
-          chartRef.current?.timeScale().fitContent();
-          didFitRef.current = true;
-        }
+        fitAndScale();
 
         setLastUpdate(new Date());
         setLoading(false);
+      } else {
+        // No data for this symbol (e.g. unknown/invalid pair). Clear any stale
+        // candles so we never show the previous symbol's chart, and surface why.
+        targetSeries.setData([]);
+        setError(response.data?.error || `No chart data for ${symbol}`);
+        setLoading(false);
       }
     } catch (err: any) {
+      if (isStale()) return;
       console.error('Failed to fetch chart data:', err);
-      setError(err.response?.data?.detail || 'Failed to load chart data');
+      // Clear stale candles on error too, so a failed load can't leave the
+      // previous symbol's chart on screen under the new symbol's label.
+      try { targetSeries?.setData([]); } catch {}
+      setError(err.response?.data?.detail || err.response?.data?.error || 'Failed to load chart data');
       setLoading(false);
     }
   };
@@ -234,7 +293,7 @@ export default function TradingViewChart({
       clearInterval(refreshInterval);
       chart.remove();
     };
-  }, [symbol, exchange, timeframe, maximized]);
+  }, [symbol, exchange, timeframe, maximized, initialCandles]);
 
   // Draw indicator overlays on the chart.
   // Custom mode does not support true multi-pane rendering, so non-main panes
@@ -611,7 +670,11 @@ export default function TradingViewChart({
               <span className={`text-sm font-mono ${
                 strategyScore > 0 ? 'text-green-400' : strategyScore < 0 ? 'text-red-400' : 'text-gray-400'
               }`}>
-                {strategyScore > 0 ? '+' : ''}{strategyScore.toFixed(4)}
+                {/* strategyScore is 0–1 when passed as a confidence ratio, or a larger
+                    number when passed as a raw score/pct. Normalise for display. */}
+                {strategyScore > 0 && strategyScore <= 1
+                  ? `${Math.round(strategyScore * 100)}%`
+                  : `${strategyScore > 0 ? '+' : ''}${strategyScore.toFixed(2)}`}
               </span>
             </div>
           )}

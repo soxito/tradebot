@@ -579,3 +579,185 @@ async def jarvis_improve(payload: JarvisImproveRequest, db: AsyncSession = Depen
         "message": "Improvement stored. I will use this in future conversations.",
     }
 
+
+# ── Memory Tree + Goals/Todos + Idle (OpenHuman-inspired) ──────────────────
+
+def _ensure_background() -> None:
+    """Lazily start background loops (app uses lifespan → no startup event)."""
+    try:
+        from plugins.AgentPaulPlugin.backend.services.auto_fetch import auto_fetch
+        auto_fetch.ensure_started(AsyncSessionLocal)
+    except Exception:
+        pass
+    try:
+        from plugins.AgentPaulPlugin.backend.services.subconscious import subconscious
+        subconscious.ensure_started(AsyncSessionLocal)
+    except Exception:
+        pass
+
+
+@router.get("/jarvis/memory/stats")
+async def memory_stats(db: AsyncSession = Depends(get_db)):
+    from plugins.AgentPaulPlugin.backend.services import memory_tree
+    _ensure_background()
+    return await memory_tree.stats(db)
+
+
+@router.get("/jarvis/memory/new")
+async def memory_new(
+    since_minutes: int = Query(20, ge=1, le=1440),
+    min_importance: float = Query(0.65, ge=0.0, le=1.0),
+    db: AsyncSession = Depends(get_db),
+):
+    """New high-importance memories — polled by the extension to surface alerts."""
+    from plugins.AgentPaulPlugin.backend.services import memory_tree
+    _ensure_background()
+    items = await memory_tree.recent_high_importance(
+        db, since_minutes=since_minutes, min_importance=min_importance
+    )
+    return {"items": items, "count": len(items)}
+
+
+@router.post("/jarvis/memory/rollup")
+async def memory_rollup(db: AsyncSession = Depends(get_db)):
+    from plugins.AgentPaulPlugin.backend.services import memory_tree
+    node = await memory_tree.rollup(db)
+    return {"ok": node is not None, "day": node.day if node else None}
+
+
+@router.get("/jarvis/auto-fetch/status")
+async def auto_fetch_status():
+    from plugins.AgentPaulPlugin.backend.services.auto_fetch import auto_fetch
+    auto_fetch.ensure_started(AsyncSessionLocal)
+    return auto_fetch.status()
+
+
+@router.post("/jarvis/auto-fetch/run")
+async def auto_fetch_run():
+    from plugins.AgentPaulPlugin.backend.services.auto_fetch import auto_fetch
+    return await auto_fetch.run_once()
+
+
+# ── Goals ──────────────────────────────────────────────────
+
+@router.get("/jarvis/goals")
+async def list_goals(
+    session_key: Optional[str] = Query(None),
+    scope: Optional[str] = Query(None, description="account | thread"),
+    include_done: bool = Query(True),
+    db: AsyncSession = Depends(get_db),
+):
+    from plugins.AgentPaulPlugin.backend.services import goals_todos
+    _ensure_background()
+    return {"goals": await goals_todos.list_goals(
+        db, session_key=session_key, scope=scope, include_done=include_done)}
+
+
+@router.post("/jarvis/goals/reflect", summary="Reflect agent: review long-term goals vs memory")
+async def reflect_goals(db: AsyncSession = Depends(get_db)):
+    """OpenHuman goals_agent — reviews account-level goals against recent memory,
+    makes minimal justified changes, and bootstraps a starter set if empty."""
+    from plugins.AgentPaulPlugin.backend.services import goals_todos
+    return await goals_todos.reflect(db)
+
+
+@router.post("/jarvis/goals")
+async def create_goal(payload: Dict[str, Any] = Body(...), db: AsyncSession = Depends(get_db)):
+    from plugins.AgentPaulPlugin.backend.services import goals_todos
+    return await goals_todos.create_goal(db, payload)
+
+
+@router.patch("/jarvis/goals/{goal_id}")
+async def update_goal(goal_id: int, payload: Dict[str, Any] = Body(...),
+                      db: AsyncSession = Depends(get_db)):
+    from plugins.AgentPaulPlugin.backend.services import goals_todos
+    try:
+        return await goals_todos.update_goal(db, goal_id, payload)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.delete("/jarvis/goals/{goal_id}")
+async def delete_goal(goal_id: int, db: AsyncSession = Depends(get_db)):
+    from plugins.AgentPaulPlugin.backend.services import goals_todos
+    await goals_todos.delete_goal(db, goal_id)
+    return {"ok": True}
+
+
+# ── Todos ──────────────────────────────────────────────────
+
+@router.get("/jarvis/todos")
+async def list_todos(
+    session_key: Optional[str] = Query(None),
+    goal_id: Optional[int] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    from plugins.AgentPaulPlugin.backend.services import goals_todos
+    return {"todos": await goals_todos.list_todos(db, session_key, goal_id)}
+
+
+@router.post("/jarvis/todos")
+async def create_todo(payload: Dict[str, Any] = Body(...), db: AsyncSession = Depends(get_db)):
+    from plugins.AgentPaulPlugin.backend.services import goals_todos
+    return await goals_todos.create_todo(db, payload)
+
+
+@router.patch("/jarvis/todos/{todo_id}")
+async def update_todo(todo_id: int, payload: Dict[str, Any] = Body(...),
+                      db: AsyncSession = Depends(get_db)):
+    from plugins.AgentPaulPlugin.backend.services import goals_todos
+    try:
+        return await goals_todos.update_todo(db, todo_id, payload)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.delete("/jarvis/todos/{todo_id}")
+async def delete_todo(todo_id: int, db: AsyncSession = Depends(get_db)):
+    from plugins.AgentPaulPlugin.backend.services import goals_todos
+    await goals_todos.delete_todo(db, todo_id)
+    return {"ok": True}
+
+
+# ── Idle continuation (read-only) ──────────────────────────
+
+@router.get("/jarvis/idle-status")
+async def idle_status():
+    from plugins.AgentPaulPlugin.backend.services import idle_worker
+    return idle_worker.current_status()
+
+
+@router.post("/jarvis/idle-run")
+async def idle_run(payload: Dict[str, Any] = Body(default={}),
+                   db: AsyncSession = Depends(get_db)):
+    """Trigger ONE read-only idle research step for the session's active goal."""
+    from plugins.AgentPaulPlugin.backend.services import idle_worker
+    session_key = (payload or {}).get("session_key") or "default"
+    return await idle_worker.run_idle_step(db, session_key)
+
+
+# ── Subconscious heartbeat (OpenHuman-style) ───────────────
+
+@router.get("/jarvis/subconscious/status")
+async def subconscious_status():
+    from plugins.AgentPaulPlugin.backend.services.subconscious import subconscious
+    subconscious.ensure_started(AsyncSessionLocal)
+    return subconscious.status()
+
+
+@router.post("/jarvis/subconscious/tick", summary="Run one heartbeat tick now")
+async def subconscious_tick():
+    from plugins.AgentPaulPlugin.backend.services.subconscious import subconscious
+    return await subconscious.run_tick()
+
+
+@router.get("/jarvis/activity", summary="Subconscious activity feed")
+async def subconscious_activity(
+    limit: int = Query(30, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+):
+    from plugins.AgentPaulPlugin.backend.services import subconscious as sc
+    _ensure_background()
+    items = await sc.list_activity(db, limit=limit)
+    return {"items": items, "count": len(items)}
+

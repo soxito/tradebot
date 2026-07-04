@@ -1,6 +1,7 @@
 import Head from 'next/head'
 import { useState, useEffect, useCallback } from 'react'
 import { apiClient } from '@/services/api'
+import KronosForecastCard from '@/components/KronosForecastCard'
 import {
   Crosshair,
   RefreshCw,
@@ -347,6 +348,7 @@ export default function SniperSignalsPage() {
                   {/* Expanded Details */}
                   {expanded && (
                     <div className="border-t border-gray-700/50 p-4 space-y-4">
+                      <KronosForecastCard symbol={sig.symbol} timeframe="15m" predLen={16} />
                       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                         {/* Entry Decision */}
                         <div className="bg-gray-900/50 rounded-lg p-4 space-y-2">

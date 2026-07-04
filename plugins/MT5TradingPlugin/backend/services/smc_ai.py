@@ -122,6 +122,7 @@ async def ai_review(
     symbol: str,
     timeframe: str,
     analysis: Dict[str, Any],
+    kronos_forecast: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Ask the DB-backed AI router to review the SMC engine's analysis.
@@ -129,12 +130,27 @@ async def ai_review(
     Uses whichever provider is active in the AI Providers panel (same as
     telegram-signals and /agents). Always returns a dict with `available` so
     the frontend degrades gracefully when no provider is configured.
+
+    ``kronos_forecast`` is the Kronos ML K-line forecast computed by the router
+    from the SAME candles the SMC engine analysed (so it works for any symbol,
+    including XAUUSD). It is folded into the model's context as a secondary
+    confirmation signal.
     """
     signals = analysis.get("signals", [])
     valid_entries = [float(s["entry"]) for s in signals if "entry" in s]
 
     if not signals:
         return {"available": False, "reason": "No setups to review"}
+
+    # Kronos ML K-line forecast (supplied by the router from the chart's candles).
+    kronos_fc = None
+    if isinstance(kronos_forecast, dict) and kronos_forecast.get("direction"):
+        kronos_fc = {
+            "direction": kronos_forecast.get("direction"),
+            "pct_change": kronos_forecast.get("pct_change"),
+            "confidence": kronos_forecast.get("confidence"),
+            "engine": kronos_forecast.get("engine"),
+        }
 
     # Compact, numbers-only context so the model cannot wander off-data.
     context = {
@@ -147,6 +163,7 @@ async def ai_review(
         "rsi": analysis.get("rsi"),
         "volume_z": analysis.get("volume_z"),
         "momentum": analysis.get("momentum"),
+        "kronos_ml_forecast": kronos_fc,
         "equilibrium": analysis.get("equilibrium"),
         "range": analysis.get("range"),
         "liquidity": analysis.get("liquidity"),

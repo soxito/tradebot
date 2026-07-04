@@ -1,0 +1,2 @@
+# Runtime state — persisted Kronos model selection (survives reload/restart)
+.selected_model.json

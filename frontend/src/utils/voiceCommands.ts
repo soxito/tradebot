@@ -62,6 +62,7 @@ export const NAV_ROUTES: { label: string; path: string; aliases: string[] }[] = 
   { label: 'Rug Pulled', path: '/rug-pulled', aliases: ['rug pulled', 'rug pulls', 'rugs'] },
   { label: 'Sniper Signals', path: '/sniper-signals', aliases: ['sniper signals', 'sniper', 'snipe'] },
   { label: 'Smart Money Concepts', path: '/smart-money-concepts', aliases: ['smart money concepts', 'smart money', 'smc', 'order blocks'] },
+  { label: 'Kronos Forecast', path: '/kronos-forecast', aliases: ['kronos forecast', 'kronos', 'forecast', 'prediction', 'predict', 'price forecast', 'ai forecast'] },
   { label: 'Delistings', path: '/delistings', aliases: ['delistings', 'delisting', 'delisted'] },
   { label: 'AI Agents', path: '/agents', aliases: ['ai agents', 'agents'] },
   { label: 'Custom Agents', path: '/custom-agents', aliases: ['custom agents', 'my agents'] },
