@@ -12,9 +12,11 @@
 # this script upgrades it to the real Kronos foundation model.
 #
 # Usage:
-#   bash plugins/KronosForecastPlugin/scripts/setup_kronos.sh              # deps + vendor
+#   bash plugins/KronosForecastPlugin/scripts/setup_kronos.sh              # deps + vendor + self-test
 #   bash plugins/KronosForecastPlugin/scripts/setup_kronos.sh --predownload # + default model
 #   bash plugins/KronosForecastPlugin/scripts/setup_kronos.sh --all         # + ALL models
+#   bash plugins/KronosForecastPlugin/scripts/setup_kronos.sh --test        # ONLY run the OHLCV/forecast self-test
+#   bash plugins/KronosForecastPlugin/scripts/setup_kronos.sh --no-test     # skip the self-test
 set -euo pipefail
 
 PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -30,8 +32,83 @@ else
 fi
 echo "==> Using Python: $PY"
 
+# ── self-test: prove OHLCV data + a forecast resolve end-to-end ──────────────
+# Run from REPO_ROOT so `app.*` and `plugins.*` imports resolve. Uses the
+# plugin's own forecast_service, which now falls back to a keyless public ccxt
+# exchange when no exchange is configured — so this must NOT print
+# "No OHLCV data available" on a fresh machine.
+run_self_test() {
+  echo "==> Self-test: fetching OHLCV + running a forecast (BTCUSDT 1h)..."
+  ( cd "$REPO_ROOT" && "$PY" - <<'PYCODE'
+import asyncio, sys, os
+sys.path.insert(0, os.getcwd())                      # REPO_ROOT (for plugins.*)
+sys.path.insert(0, os.path.join(os.getcwd(), "backend"))  # backend/ (for app.*)
+
+async def main() -> int:
+    try:
+        import ccxt  # noqa: F401
+    except Exception as e:
+        print(f"    FAIL: ccxt not importable in the backend venv: {e}")
+        return 1
+
+    from plugins.KronosForecastPlugin.backend.services import forecast_service as fs
+
+    try:
+        rows = await fs._fetch_ohlcv("binance", "BTCUSDT", "1h", 200)
+        if not rows or len(rows) < 5:
+            print("    FAIL: No OHLCV data available for this symbol/exchange.")
+            print("          (public ccxt fallback returned nothing — check network access)")
+            return 2
+        last_close = rows[-1][4]
+        print(f"    OK: fetched {len(rows)} OHLCV candles (last close ~ {last_close}).")
+
+        try:
+            resp = await fs.run_forecast("binance", "BTCUSDT", "1h")
+            n = len(getattr(resp, "forecast", []) or [])
+            engine = "Kronos model" if getattr(fs.kronos_engine, "available", False) else "heuristic fallback"
+            print(f"    OK: forecast produced {n} future candles via {engine}.")
+        except Exception as e:
+            # Data works even if the model isn't installed; surface but don't hard-fail.
+            print(f"    WARN: OHLCV works but run_forecast raised: {e}")
+
+        print("==> Self-test PASSED: OHLCV data is available.")
+        return 0
+    finally:
+        # Best-effort: close any core exchange clients so the test exits cleanly.
+        try:
+            from app.exchanges.manager import exchange_manager
+            for ex_id in list(exchange_manager.get_all_exchanges()):
+                ex = exchange_manager.get_exchange(ex_id)
+                for attr in ("close", "close_all"):
+                    fn = getattr(ex, attr, None)
+                    if callable(fn):
+                        res = fn()
+                        if asyncio.iscoroutine(res):
+                            await res
+                        break
+        except Exception:
+            pass
+
+raise SystemExit(asyncio.run(main()))
+PYCODE
+  )
+}
+
+# --test => run ONLY the self-test and exit
+if [ "${1:-}" = "--test" ]; then
+  run_self_test
+  exit $?
+fi
+
 echo "==> Installing model dependencies into backend venv..."
 "$PY" -m pip install -r "$PLUGIN_DIR/backend/requirements.txt"
+
+# Ensure ccxt is present for the keyless public-OHLCV fallback (normally a core dep).
+echo "==> Verifying ccxt is importable (required for OHLCV fallback)..."
+if ! "$PY" -c "import ccxt" >/dev/null 2>&1; then
+  echo "    ccxt missing — installing..."
+  "$PY" -m pip install "ccxt>=4.0.0"
+fi
 
 echo "==> Vendoring Kronos model package into $VENDOR_DIR/model ..."
 mkdir -p "$VENDOR_DIR"
@@ -66,3 +143,11 @@ fi
 
 echo "==> Done. Restart the backend, then GET /api/v1/plugins/kronos/status"
 echo "    Install every model later via: POST /api/v1/plugins/kronos/models/install-all"
+
+# Run the end-to-end self-test unless explicitly skipped.
+if [ "${1:-}" != "--no-test" ]; then
+  run_self_test || {
+    echo "!!  Self-test did not pass. Check network access / exchange reachability above."
+    exit 1
+  }
+fi

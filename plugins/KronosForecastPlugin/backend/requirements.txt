@@ -10,4 +10,8 @@ einops>=0.8.1
 huggingface_hub>=1.5.0
 safetensors>=0.6.2
 tqdm>=4.66.0
+# ccxt is normally provided by the core backend; listed here so the plugin's
+# keyless public-OHLCV fallback (forecast_service._fetch_public_ccxt_ohlcv)
+# still works if the plugin is installed against a trimmed backend.
+ccxt>=4.0.0
 # numpy + pandas are already provided by the core backend.

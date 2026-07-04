@@ -96,6 +96,54 @@ def _symbol_variants(symbol: str) -> List[str]:
     return variants
 
 
+# Keyless public exchanges tried as a last resort so a forecast always has
+# candles even when NO exchange is configured with API keys (the usual cause of
+# "No OHLCV data available"). ccxt public OHLCV endpoints need no credentials.
+_PUBLIC_CCXT_EXCHANGES = ("binance", "bybit", "okx", "kucoin", "gateio", "mexc")
+
+
+async def _fetch_public_ccxt_ohlcv(symbol: str, timeframe: str, limit: int) -> List[list]:
+    """Fetch OHLCV from a keyless public ccxt exchange (no API keys required).
+
+    Creates a short-lived async client per exchange, tries each symbol spelling,
+    and always closes the client to avoid leaking aiohttp sessions.
+    """
+    try:
+        import ccxt.async_support as ccxt_async  # ccxt is a core backend dep
+    except Exception as exc:
+        logger.warning(f"[Kronos] ccxt not available for public OHLCV fallback: {exc}")
+        return []
+
+    variants = [v for v in _symbol_variants(symbol) if "/" in v]  # ccxt needs BASE/QUOTE
+    if not variants:
+        return []
+
+    for ex_id in _PUBLIC_CCXT_EXCHANGES:
+        if not hasattr(ccxt_async, ex_id):
+            continue
+        client = None
+        try:
+            client = getattr(ccxt_async, ex_id)({"enableRateLimit": True, "timeout": 15000})
+            for sym in variants:
+                try:
+                    rows = await client.fetch_ohlcv(sym, timeframe=timeframe, limit=limit)
+                    if rows and len(rows) >= 5:
+                        logger.info(f"[Kronos] Public OHLCV resolved via {ex_id} for {sym} {timeframe}")
+                        return rows
+                except Exception as e:
+                    logger.debug(f"[Kronos] public {ex_id} {sym} {timeframe} failed: {e}")
+                    continue
+        except Exception as e:
+            logger.debug(f"[Kronos] could not init public ccxt {ex_id}: {e}")
+        finally:
+            if client is not None:
+                try:
+                    await client.close()
+                except Exception:
+                    pass
+    return []
+
+
 async def _fetch_ohlcv(exchange: str, symbol: str, timeframe: str, limit: int) -> List[list]:
     # Route forex / metals through the dedicated provider first.
     if _is_forex(symbol):
@@ -119,8 +167,8 @@ async def _fetch_ohlcv(exchange: str, symbol: str, timeframe: str, limit: int) -
         if ex is not None and ex not in candidates:
             candidates.append(ex)
     if not candidates:
-        logger.warning(f"[Kronos] No exchanges initialised — cannot fetch OHLCV for {symbol}")
-        return []
+        logger.warning(f"[Kronos] No exchanges initialised — trying keyless public OHLCV for {symbol}")
+        return await _fetch_public_ccxt_ohlcv(symbol, timeframe, limit)
 
     variants = _symbol_variants(symbol)
     last_err: Optional[Exception] = None
@@ -135,6 +183,10 @@ async def _fetch_ohlcv(exchange: str, symbol: str, timeframe: str, limit: int) -
                 last_err = e
                 logger.debug(f"[Kronos] OHLCV {ex_name} {sym} {timeframe} failed: {e}")
                 continue
+    # Last resort: keyless public ccxt fetch (no API keys / configured exchanges needed).
+    public_rows = await _fetch_public_ccxt_ohlcv(symbol, timeframe, limit)
+    if public_rows:
+        return public_rows
     if last_err:
         logger.warning(
             f"[Kronos] OHLCV unavailable for {symbol} {timeframe} on all "
