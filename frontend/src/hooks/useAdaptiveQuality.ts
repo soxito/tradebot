@@ -32,18 +32,26 @@ interface AdaptiveQuality {
   memGB: number | null
 }
 
-const DOWNGRADE_STREAK = 3 // seconds of low FPS before dropping a tier
-const UPGRADE_STREAK = 8   // seconds of headroom before climbing back
+const DOWNGRADE_STREAK = 1  // react on the very first bad second (never lag)
+const UPGRADE_STREAK = 6    // seconds of headroom before climbing back
+const HARD_FLOOR_FPS = 24   // below this, drop straight to the lowest tier
 
 export function useAdaptiveQuality(): AdaptiveQuality {
   const deviceRef = useRef(detectDevice())
   const ceilingIdxRef = useRef(PERF_TIERS.indexOf(detectStaticTier(deviceRef.current)))
 
-  const [tier, setTier] = useState<PerfTier>(PERF_TIERS[ceilingIdxRef.current])
+  // Start conservatively (never boot straight into a heavy tier — that is what
+  // froze weak machines) and let the FPS monitor earn its way up to the
+  // hardware ceiling. Cap the starting tier at 'medium'.
+  const startIdxRef = useRef(
+    Math.min(ceilingIdxRef.current, PERF_TIERS.indexOf('medium')),
+  )
+
+  const [tier, setTier] = useState<PerfTier>(PERF_TIERS[startIdxRef.current])
   const [fps, setFps] = useState(0)
 
-  const idxRef = useRef(ceilingIdxRef.current)
-  const profileRef = useRef<PerfProfile>(PERF_PROFILES[PERF_TIERS[ceilingIdxRef.current]])
+  const idxRef = useRef(startIdxRef.current)
+  const profileRef = useRef<PerfProfile>(PERF_PROFILES[PERF_TIERS[startIdxRef.current]])
 
   useEffect(() => {
     let raf = 0
@@ -76,13 +84,18 @@ export function useAdaptiveQuality(): AdaptiveQuality {
       const measured = (frames * 1000) / elapsed
       frames = 0
       windowStart = now
-      setFps(Math.round(measured))
+      setFps(prev => (Math.abs(prev - measured) >= 2 ? Math.round(measured) : prev))
 
       const target = profileRef.current.fpsTarget
       const idx = idxRef.current
 
-      if (measured < target * 0.8 && idx > 0) {
-        // Struggling — react quickly to prevent sustained lag.
+      if (measured < HARD_FLOOR_FPS && idx > 0) {
+        // Severe — the machine is choking. Drop straight to the lowest tier.
+        setIdx(0)
+        badStreak = 0
+        goodStreak = 0
+      } else if (measured < target * 0.8 && idx > 0) {
+        // Struggling — step down immediately.
         badStreak++
         goodStreak = 0
         if (badStreak >= DOWNGRADE_STREAK) { setIdx(idx - 1); badStreak = 0 }

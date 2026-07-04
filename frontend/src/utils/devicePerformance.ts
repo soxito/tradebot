@@ -125,16 +125,19 @@ export function detectStaticTier(info: DeviceInfo = detectDevice()): PerfTier {
   // Memory-constrained machines get capped hard.
   if (memGB != null && memGB <= 2) return 'low'
 
-  // Core-count driven tiering (matches Apple Silicon lineup):
-  //   ≤4 cores → low, ≤6 → medium, ≤8 → high (M2 base), ≥10 → ultra (M2 Pro+)
+  // Core-count driven tiering. Deliberately conservative because the room runs
+  // a particle canvas AND a Three.js robot at the same time — an 8-core /
+  // 8 GB laptop (e.g. Apple M2 2022) must stay on 'medium' to never freeze.
+  //   ≤4 cores → low, ≤8 → medium (M2 8GB), ≤10 → high (M2 Pro 10-core),
+  //   ≥12 → ultra (M2 Pro 12-core / M3 Pro-Max+)
   let tier: PerfTier
   if (cores <= 4) tier = 'low'
-  else if (cores <= 6) tier = 'medium'
-  else if (cores <= 8) tier = 'high'
+  else if (cores <= 8) tier = 'medium'
+  else if (cores <= 10) tier = 'high'
   else tier = 'ultra'
 
-  // A 4 GB machine shouldn't run the richest tier even with many cores.
-  if (memGB != null && memGB <= 4 && (tier === 'high' || tier === 'ultra')) {
+  // A 4 GB machine shouldn't run above low even with many cores.
+  if (memGB != null && memGB <= 4 && tier !== 'low') {
     tier = 'medium'
   }
   return tier
