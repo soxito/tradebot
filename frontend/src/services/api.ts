@@ -237,6 +237,8 @@ export const apiClient = {
     api.get('/exchanges/bitget/futures/contracts', { params: { product_type: productType } }),
   getBitgetFuturesAccountSummary: (productType: string = 'USDT-FUTURES') =>
     api.get('/exchanges/bitget/futures/account-summary', { params: { product_type: productType } }),
+  // Unified account overview + all linked Bitget accounts (main + sub-accounts)
+  getBitgetAccounts: () => api.get('/exchanges/bitget/accounts'),
   closeLivePosition: (data: {
     symbol: string;
     side: string;

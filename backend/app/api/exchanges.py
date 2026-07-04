@@ -420,11 +420,20 @@ async def get_bitget_open_orders(symbol: Optional[str] = Query(None)):
 
 @router.get("/bitget/futures/balance")
 async def get_bitget_futures_balance(
-    product_type: str = Query("USDT-FUTURES", description="USDT-FUTURES, COIN-FUTURES, USDC-FUTURES")
+    product_type: str = Query("USDT-FUTURES", description="USDT-FUTURES, COIN-FUTURES, USDC-FUTURES"),
+    all_products: bool = Query(False, description="Aggregate balances across all futures product types (unified account)"),
 ):
-    """Get Bitget futures account balances"""
+    """Get Bitget futures account balances.
+
+    With ``all_products=true`` the balances of every futures product type
+    (USDT/USDC/COIN) are returned together — required for a unified
+    (multi-assets) account that spreads margin across product types.
+    """
     connector = _get_bitget_connector()
     try:
+        if all_products:
+            balance = await connector.get_all_futures_balances()
+            return {"exchange": "bitget", "product_type": "ALL", "balance": balance}
         balance = await connector.get_futures_balance(product_type=product_type)
         return {"exchange": "bitget", "product_type": product_type, "balance": balance}
     except Exception as e:
@@ -436,10 +445,19 @@ async def get_bitget_futures_balance(
 async def get_bitget_futures_positions(
     product_type: str = Query("USDT-FUTURES", description="USDT-FUTURES, COIN-FUTURES, USDC-FUTURES"),
     margin_coin: Optional[str] = Query(None, description="Filter by margin coin (e.g., USDT)"),
+    all_products: bool = Query(False, description="Aggregate positions across all futures product types (unified account)"),
 ):
-    """Get all open futures positions"""
+    """Get all open futures positions.
+
+    With ``all_products=true`` positions from every futures product type are
+    returned, each tagged with its ``product_type`` — required to see USDC-
+    and COIN-margined positions on a unified account.
+    """
     connector = _get_bitget_connector()
     try:
+        if all_products:
+            positions = await connector.get_all_futures_positions()
+            return {"exchange": "bitget", "product_type": "ALL", "positions": positions}
         positions = await connector.get_futures_positions(
             product_type=product_type,
             margin_coin=margin_coin,
@@ -452,6 +470,32 @@ async def get_bitget_futures_positions(
     except Exception as e:
         logger.warning(f"Failed to get Bitget futures positions: {e}")
         return {"exchange": "bitget", "product_type": product_type, "positions": [], "error": str(e)}
+
+
+@router.get("/bitget/accounts")
+async def get_bitget_linked_accounts():
+    """Detect all linked Bitget accounts (main + sub-accounts) with balances.
+
+    Returns the unified account overview (per-account-type balances, asset
+    mode) plus each detected sub-account's futures equity. Degrades to
+    main-account-only when the API key lacks sub-account permission.
+    """
+    connector = _get_bitget_connector()
+    try:
+        return {"exchange": "bitget", **(await connector.get_linked_accounts())}
+    except Exception as e:
+        logger.warning(f"Failed to get Bitget linked accounts: {e}")
+        return {
+            "exchange": "bitget",
+            "accounts": [],
+            "account_count": 0,
+            "sub_accounts_supported": False,
+            "asset_mode": None,
+            "unified": False,
+            "account_type_balances": [],
+            "grand_total_usdt": 0,
+            "error": str(e),
+        }
 
 
 class FuturesOrderRequest(BaseModel):
@@ -940,8 +984,11 @@ async def get_bitget_futures_account_summary(
     """
     connector = _get_bitget_connector()
     try:
-        balance_data = await connector.get_futures_balance(product_type=product_type)
-        positions_data = await connector.get_futures_positions(product_type=product_type)
+        # Aggregate across ALL futures product types so a unified
+        # (multi-assets) account's USDC- and COIN-margined balances and
+        # positions are included, not just USDT-FUTURES.
+        balance_data = await connector.get_all_futures_balances()
+        positions_data = await connector.get_all_futures_positions()
     except Exception as e:
         # Return empty account on transient exchange errors instead of 500
         return {
@@ -950,21 +997,32 @@ async def get_bitget_futures_account_summary(
             "open_positions": [], "open_positions_count": 0,
             "total_pnl": 0, "total_pnl_pct": 0,
             "total_trades": 0, "winning_trades": 0, "losing_trades": 0, "win_rate": 0,
+            "asset_mode": None, "unified": False,
             "error": str(e),
         }
 
-    # Parse balance
+    # Detect asset mode (union = unified/multi-assets, single = classic).
+    asset_mode: Optional[str] = None
+    for b in (balance_data or []):
+        if b.get("assetMode"):
+            asset_mode = b.get("assetMode")
+            break
+
+    # Parse balance. Per-margin-coin fields (available, usdtEquity,
+    # unrealizedPL) are summed across rows/product types. Union account-wide
+    # fields (crossedRiskRate, unionMm) repeat on every row in multi-assets
+    # mode, so take the max instead of summing to avoid double-counting.
     available = 0.0
     equity = 0.0
     unrealized_pl = 0.0
     crossed_risk_rate = 0.0
     maintenance_margin = 0.0
     for b in (balance_data or []):
-        available += float(b.get("available", 0))
-        equity += float(b.get("equity") or b.get("usdtEquity", 0))
-        unrealized_pl += float(b.get("unrealizedPL", 0))
-        crossed_risk_rate = float(b.get("crossedRiskRate", 0))
-        maintenance_margin += float(b.get("unionMm", 0))
+        available += float(b.get("available", 0) or 0)
+        equity += float(b.get("usdtEquity") or b.get("equity") or b.get("accountEquity") or 0)
+        unrealized_pl += float(b.get("unrealizedPL", 0) or 0)
+        crossed_risk_rate = max(crossed_risk_rate, float(b.get("crossedRiskRate", 0) or 0))
+        maintenance_margin = max(maintenance_margin, float(b.get("unionMm", 0) or 0))
 
     # Parse positions
     open_positions = []
@@ -1014,6 +1072,8 @@ async def get_bitget_futures_account_summary(
             "margin_size": margin_size,
             "initial_margin": round(initial_margin, 2),
             "liquidation_price": float(p.get("liquidationPrice", 0)),
+            "product_type": p.get("product_type", "USDT-FUTURES"),
+            "margin_coin": p.get("marginCoin", ""),
         })
 
     # Cross-reference Trade DB for SL/TP on open positions
@@ -1200,6 +1260,8 @@ async def get_bitget_futures_account_summary(
         "losing_trades": losing_trades,
         "settings": settings_data,
         "product_type": product_type,
+        "asset_mode": asset_mode,
+        "unified": asset_mode == "union",
     }
 
 

@@ -248,6 +248,7 @@ export default function TradingPage() {
     open_positions_count: number; open_positions: LivePosition[];
     reserved_margin: number; mmr: number; maintenance_margin: number; total_pnl: number;
     total_trades: number; winning_trades: number; losing_trades: number;
+    asset_mode?: string | null; unified?: boolean;
     settings: {
       is_active?: boolean; auto_trade?: boolean; dry_run?: boolean;
       auto_trade_pairs?: string; auto_trade_timeframe?: string;
@@ -257,6 +258,17 @@ export default function TradingPage() {
     };
   } | null>(null)
   const [liveLoading, setLiveLoading] = useState(false)
+  interface BitgetLinkedAccount {
+    uid: string | null; name: string; type: 'main' | 'sub';
+    total_usdt: number; asset_mode?: string | null; unified?: boolean;
+    status?: string; permissions?: string[];
+  }
+  const [linkedAccounts, setLinkedAccounts] = useState<{
+    accounts: BitgetLinkedAccount[]; account_count: number;
+    sub_accounts_supported: boolean; asset_mode: string | null; unified: boolean;
+    account_type_balances: { account_type: string; usdt_balance: number }[];
+    grand_total_usdt: number; error?: string;
+  } | null>(null)
   interface LiveOrder {
     orderId: string
     symbol: string
@@ -657,6 +669,13 @@ export default function TradingPage() {
     finally { setLiveLoading(false) }
   }, [])
 
+  const fetchLinkedAccounts = useCallback(async () => {
+    try {
+      const res = await apiClient.getBitgetAccounts()
+      setLinkedAccounts(res.data)
+    } catch { setLinkedAccounts(null) }
+  }, [])
+
   const fetchLiveOpenOrders = useCallback(async () => {
     try {
       const res = await apiClient.getBitgetFuturesOpenOrders()
@@ -728,8 +747,8 @@ export default function TradingPage() {
   }
 
   const refreshLiveData = useCallback(async () => {
-    await Promise.all([fetchLiveAccount(), fetchLiveOpenOrders(), fetchLiveClosedTrades()])
-  }, [fetchLiveAccount, fetchLiveOpenOrders, fetchLiveClosedTrades])
+    await Promise.all([fetchLiveAccount(), fetchLiveOpenOrders(), fetchLiveClosedTrades(), fetchLinkedAccounts()])
+  }, [fetchLiveAccount, fetchLiveOpenOrders, fetchLiveClosedTrades, fetchLinkedAccounts])
 
   // Handle SL/TP changes from chart drag
   const handleChartSlTpChange = useCallback(async (
@@ -2069,6 +2088,64 @@ export default function TradingPage() {
                 </button>
               </div>
             </div>
+
+            {/* Unified Account & Linked Accounts */}
+            {linkedAccounts && (
+              <div className="mt-3 border-t border-green-500/20 pt-3">
+                <div className="flex flex-wrap items-center gap-2 mb-2">
+                  <h4 className="text-sm font-semibold text-white flex items-center gap-2">
+                    <Wallet className="w-4 h-4 text-blue-400" /> Unified Account
+                  </h4>
+                  <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium border ${
+                    linkedAccounts.unified
+                      ? 'bg-purple-500/15 border-purple-500/30 text-purple-300'
+                      : 'bg-gray-500/15 border-gray-500/30 text-gray-300'
+                  }`}>
+                    {linkedAccounts.unified ? 'UNIFIED (multi-assets)' : `CLASSIC${linkedAccounts.asset_mode ? ` (${linkedAccounts.asset_mode})` : ''}`}
+                  </span>
+                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-green-500/15 border border-green-500/30 text-green-300 font-medium font-mono">
+                    Total: ${linkedAccounts.grand_total_usdt.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                  </span>
+                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-blue-500/15 border border-blue-500/30 text-blue-300 font-medium">
+                    {linkedAccounts.account_count} account{linkedAccounts.account_count === 1 ? '' : 's'}
+                  </span>
+                </div>
+
+                {/* Per-account-type balance breakdown */}
+                {linkedAccounts.account_type_balances.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5 mb-2">
+                    {linkedAccounts.account_type_balances
+                      .filter(b => b.usdt_balance > 0)
+                      .map(b => (
+                        <span key={b.account_type} className="text-[10px] px-2 py-0.5 rounded bg-gray-800/60 border border-gray-700 text-gray-300 font-mono">
+                          {b.account_type}: ${b.usdt_balance.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                        </span>
+                      ))}
+                  </div>
+                )}
+
+                {/* Linked accounts (main + sub-accounts) */}
+                <div className="flex flex-wrap gap-2">
+                  {linkedAccounts.accounts.map((acc, i) => (
+                    <div key={acc.uid || `acc-${i}`} className="flex items-center gap-2 px-2.5 py-1 rounded bg-gray-900/50 border border-gray-700">
+                      <span className={`text-[9px] px-1.5 py-0.5 rounded font-semibold ${
+                        acc.type === 'main' ? 'bg-blue-600/30 text-blue-300' : 'bg-gray-600/30 text-gray-300'
+                      }`}>{acc.type === 'main' ? 'MAIN' : 'SUB'}</span>
+                      <span className="text-xs text-white font-medium">{acc.name}</span>
+                      <span className="text-xs font-mono text-green-400">${acc.total_usdt.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                      {acc.uid && <span className="text-[9px] text-gray-500 font-mono">#{acc.uid}</span>}
+                    </div>
+                  ))}
+                </div>
+
+                {!linkedAccounts.sub_accounts_supported && (
+                  <p className="text-[10px] text-yellow-400/80 mt-2 flex items-center gap-1">
+                    <AlertTriangle className="w-3 h-3" />
+                    Grant this API key the <span className="font-semibold">sub-account read</span> permission (and bind its IP) on Bitget to auto-detect linked sub-accounts.
+                  </p>
+                )}
+              </div>
+            )}
 
             {/* Live auto-trade settings */}
             {showLiveSettings && liveTradeSettings && (

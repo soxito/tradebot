@@ -301,6 +301,199 @@ class BitgetConnector(ExchangeConnector):
         )
         return result.get("data", [])
 
+    # All Bitget futures product types. A unified (multi-assets / assetMode
+    # "union") account can hold positions and margin across all three, so any
+    # "full account" view must query every one — querying only USDT-FUTURES
+    # silently hides USDC- and COIN-margined positions.
+    FUTURES_PRODUCT_TYPES: Tuple[str, ...] = ("USDT-FUTURES", "USDC-FUTURES", "COIN-FUTURES")
+
+    async def get_all_futures_balances(self) -> List[Dict[str, Any]]:
+        """Futures account balances across every product type.
+
+        Each returned row is tagged with its ``product_type`` and the
+        account's ``assetMode`` ("union" = unified/multi-assets, "single" =
+        single-asset). Missing product types are skipped gracefully.
+        """
+        if not self.native_client:
+            raise RuntimeError("Native client not initialized")
+        rows: List[Dict[str, Any]] = []
+        for pt in self.FUTURES_PRODUCT_TYPES:
+            try:
+                result = await self.native_client.get_futures_accounts(product_type=pt)
+            except Exception as e:
+                logger.debug(f"[{self.exchange_name}] futures balance {pt} skipped: {e}")
+                continue
+            for row in (result.get("data") or []):
+                row.setdefault("product_type", pt)
+                rows.append(row)
+        return rows
+
+    async def get_all_futures_positions(self) -> List[Dict[str, Any]]:
+        """Open futures positions across every product type.
+
+        Each position is tagged with the ``product_type`` it came from so the
+        caller can route close/modify orders correctly. Only positions with a
+        non-zero ``total`` are returned.
+        """
+        if not self.native_client:
+            raise RuntimeError("Native client not initialized")
+        positions: List[Dict[str, Any]] = []
+        for pt in self.FUTURES_PRODUCT_TYPES:
+            try:
+                result = await self.native_client.get_futures_positions(product_type=pt)
+            except Exception as e:
+                logger.debug(f"[{self.exchange_name}] positions {pt} skipped: {e}")
+                continue
+            for p in (result.get("data") or []):
+                try:
+                    total = float(p.get("total") or 0)
+                except (TypeError, ValueError):
+                    total = 0.0
+                if total == 0:
+                    continue
+                p.setdefault("product_type", pt)
+                positions.append(p)
+        return positions
+
+    async def get_account_overview(self) -> Dict[str, Any]:
+        """Unified account overview: per-account-type USDT balances plus the
+        futures asset mode (unified vs classic).
+
+        Returns::
+
+            {
+              "account_type_balances": [{accountType, usdtBalance}, ...],
+              "total_usdt": float,
+              "asset_mode": "union" | "single" | None,
+              "unified": bool,
+            }
+        """
+        if not self.native_client:
+            raise RuntimeError("Native client not initialized")
+
+        account_type_balances: List[Dict[str, Any]] = []
+        total_usdt = 0.0
+        try:
+            balance_result = await self.native_client.get_all_account_balance()
+            for row in (balance_result.get("data") or []):
+                usdt = float(row.get("usdtBalance") or 0)
+                total_usdt += usdt
+                account_type_balances.append(
+                    {"account_type": row.get("accountType", ""), "usdt_balance": usdt}
+                )
+        except Exception as e:
+            logger.warning(f"[{self.exchange_name}] all-account-balance failed: {e}")
+
+        # Detect asset mode from the futures account list (assetMode field).
+        asset_mode: Optional[str] = None
+        try:
+            acct = await self.native_client.get_futures_accounts(product_type="USDT-FUTURES")
+            for row in (acct.get("data") or []):
+                mode = row.get("assetMode")
+                if mode:
+                    asset_mode = mode
+                    break
+        except Exception as e:
+            logger.debug(f"[{self.exchange_name}] asset-mode probe failed: {e}")
+
+        return {
+            "account_type_balances": account_type_balances,
+            "total_usdt": round(total_usdt, 2),
+            "asset_mode": asset_mode,
+            "unified": asset_mode == "union",
+        }
+
+    async def get_linked_accounts(self) -> Dict[str, Any]:
+        """Detect all linked Bitget accounts (main + sub-accounts).
+
+        Aggregates the main account's cross-account-type balance and each
+        sub-account's futures equity. Degrades gracefully to main-account-only
+        when the API key lacks sub-account read permission or IP binding.
+        """
+        if not self.native_client:
+            raise RuntimeError("Native client not initialized")
+
+        overview = await self.get_account_overview()
+
+        main_uid: Optional[str] = None
+        try:
+            info = await self.native_client.get_account_info()
+            data = info.get("data") or {}
+            main_uid = str(data.get("userId") or data.get("userID") or "") or None
+        except Exception as e:
+            logger.debug(f"[{self.exchange_name}] account info failed: {e}")
+
+        accounts: List[Dict[str, Any]] = [
+            {
+                "uid": main_uid,
+                "name": "Main account",
+                "type": "main",
+                "total_usdt": overview["total_usdt"],
+                "asset_mode": overview["asset_mode"],
+                "unified": overview["unified"],
+            }
+        ]
+
+        # Map sub-account futures equity by uid (summed across product types).
+        sub_equity: Dict[str, float] = {}
+        for pt in self.FUTURES_PRODUCT_TYPES:
+            try:
+                subs = await self.native_client.get_sub_account_futures_assets(product_type=pt)
+            except Exception as e:
+                logger.debug(f"[{self.exchange_name}] sub-account assets {pt} skipped: {e}")
+                continue
+            for entry in (subs.get("data") or []):
+                uid = str(entry.get("userId") or "")
+                if not uid:
+                    continue
+                equity = 0.0
+                for asset in (entry.get("assetList") or []):
+                    equity += float(asset.get("usdtEquity") or asset.get("equity") or 0)
+                sub_equity[uid] = sub_equity.get(uid, 0.0) + equity
+
+        # Enrich with sub-account names/permissions where available.
+        sub_meta: Dict[str, Dict[str, Any]] = {}
+        subs_supported = True
+        try:
+            listing = await self.native_client.get_virtual_subaccount_list(limit=500)
+            for s in ((listing.get("data") or {}).get("subAccountList") or []):
+                uid = str(s.get("subAccountUid") or "")
+                if uid:
+                    sub_meta[uid] = {
+                        "name": s.get("subAccountName") or s.get("label") or uid,
+                        "status": s.get("status", ""),
+                        "permissions": s.get("permList") or [],
+                    }
+        except Exception as e:
+            subs_supported = False
+            logger.info(f"[{self.exchange_name}] sub-account list unavailable: {e}")
+
+        seen_uids = set(sub_equity) | set(sub_meta)
+        for uid in seen_uids:
+            meta = sub_meta.get(uid, {})
+            accounts.append(
+                {
+                    "uid": uid,
+                    "name": meta.get("name", uid),
+                    "type": "sub",
+                    "total_usdt": round(sub_equity.get(uid, 0.0), 2),
+                    "status": meta.get("status", ""),
+                    "permissions": meta.get("permissions", []),
+                }
+            )
+
+        return {
+            "accounts": accounts,
+            "account_count": len(accounts),
+            "sub_accounts_supported": subs_supported,
+            "asset_mode": overview["asset_mode"],
+            "unified": overview["unified"],
+            "account_type_balances": overview["account_type_balances"],
+            "grand_total_usdt": round(
+                overview["total_usdt"] + sum(sub_equity.values()), 2
+            ),
+        }
+
     async def detect_symbol_margin_mode(
         self,
         symbol: str,

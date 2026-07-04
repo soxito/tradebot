@@ -319,6 +319,48 @@ class BitgetClient:
         }
         return await self.get("/api/v2/mix/position/single-position", params)
 
+    # ─── Account Overview & Sub-Accounts ─────────────────────────
+    async def get_all_account_balance(self) -> Dict[str, Any]:
+        """
+        GET /api/v2/account/all-account-balance
+        Assets overview across every account type (spot, futures, funding,
+        earn, bots, margin) for the main account, expressed in USDT.
+        Useful for a unified account view of all linked balances.
+        """
+        return await self.get("/api/v2/account/all-account-balance")
+
+    async def get_sub_account_futures_assets(
+        self, product_type: str = "USDT-FUTURES"
+    ) -> Dict[str, Any]:
+        """
+        GET /api/v2/mix/account/sub-account-assets
+        Futures asset information for ALL sub-accounts under this main account
+        for the given product type. Requires the API key to have sub-account
+        read permission (ND Brokers are not allowed to call this).
+        """
+        return await self.get(
+            "/api/v2/mix/account/sub-account-assets", {"productType": product_type}
+        )
+
+    async def get_virtual_subaccount_list(
+        self,
+        limit: int = 100,
+        id_less_than: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        GET /api/v2/user/virtual-subaccount-list
+        List virtual sub-accounts (uid, name, permissions, status).
+        Requires the API key to be IP-bound.
+        status: normal | freeze
+        """
+        params: Dict[str, str] = {"limit": str(limit)}
+        if id_less_than:
+            params["idLessThan"] = id_less_than
+        if status:
+            params["status"] = status
+        return await self.get("/api/v2/user/virtual-subaccount-list", params)
+
     # ─── Futures Trading ─────────────────────────────────────────
     async def place_futures_order(
         self,
