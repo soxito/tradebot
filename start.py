@@ -1688,10 +1688,14 @@ def status() -> None:
 
 
 # ── Summary table ─────────────────────────────────────────────────────────────
-def print_sox_banner(mode: str, pg_port: int, redis_port: int) -> None:
-    """Branded SOX TRADE BOT status display shown after a successful start."""
-    r = get_resources()
-    CY, GN, B, RS, GD, DIM = C.CYAN, C.GREEN, C.BOLD, C.RESET, "\033[38;5;214m", "\033[2m"
+def print_sox_header() -> None:
+    """SOX ASCII logo with an animated JARVIS energy orb rendered beside it.
+
+    The orb is a pulsing core ringed by an orbiting spark, drawn to the right of
+    the logo. Animates in-place via ANSI cursor moves when stdout is a TTY;
+    falls back to a single static frame when piped/redirected (keeps logs clean).
+    """
+    CY, GD, DIM, RS, B = C.CYAN, "\033[38;5;214m", "\033[2m", C.RESET, C.BOLD
 
     logo = [
         "███████╗ ██████╗ ██╗  ██╗",
@@ -1701,12 +1705,68 @@ def print_sox_banner(mode: str, pg_port: int, redis_port: int) -> None:
         "███████║╚██████╔╝██╔╝ ██╗",
         "╚══════╝ ╚═════╝ ╚═╝  ╚═╝",
     ]
+
+    # Orb geometry: 8 rim slots (clockwise) around a pulsing core, on a 7x5 grid.
+    rim = [(0, 3), (1, 5), (2, 6), (3, 5), (4, 3), (3, 1), (2, 0), (1, 1)]
+    core_pulse = ['·', '•', '●', '◉', '●', '•']
+    OW, OH = 7, 5
+
+    def colorize(ch: str) -> str:
+        if ch == '✦':  return f"{B}{GD}✦{RS}"       # orbiting spark
+        if ch in '◉●': return f"{B}{CY}{ch}{RS}"     # bright core
+        if ch == '•':  return f"{CY}•{RS}"           # comet trail / soft core
+        if ch == '·':  return f"{DIM}{CY}·{RS}"      # dim rim
+        return ' '
+
+    def render(f: int) -> List[str]:
+        grid = [[' '] * OW for _ in range(OH)]
+        for (r, c) in rim:
+            grid[r][c] = '·'
+        tr, tc = rim[(f - 1) % len(rim)]             # trailing comet dot
+        if grid[tr][tc] == '·':
+            grid[tr][tc] = '•'
+        sr, sc = rim[f % len(rim)]                   # bright spark head
+        grid[sr][sc] = '✦'
+        grid[2][3] = core_pulse[f % len(core_pulse)] # pulsing core
+        lines = []
+        for r in range(6):
+            orow = r - 1  # vertically centre the 5-row orb against the 6-row logo
+            orb = ''.join(colorize(c) for c in grid[orow]) if 0 <= orow < OH else ' ' * OW
+            lines.append(f"    {B}{CY}{logo[r]}{RS}     {orb}")
+        return lines
+
     print()
-    for ln in logo:
-        print(f"    {B}{CY}{ln}{RS}")
+    try:
+        animate = sys.stdout.isatty()
+    except Exception:
+        animate = False
+
+    if animate:
+        FRAMES, DELAY = 24, 0.06
+        block = render(0)
+        print("\n".join(block))
+        for f in range(1, FRAMES):
+            time.sleep(DELAY)
+            sys.stdout.write(f"\033[{len(block)}A")   # move cursor up to redraw
+            for ln in render(f):
+                sys.stdout.write("\r\033[K" + ln + "\n")
+            sys.stdout.flush()
+    else:
+        for ln in render(3):
+            print(ln)
+
     print(f"    {B}{GD}S O X   T R A D E   B O T{RS}")
     print(f"    {DIM}{CY}Strategic Operations eXchange{RS}")
     print()
+
+
+def print_sox_banner(mode: str, pg_port: int, redis_port: int) -> None:
+    """Branded SOX TRADE BOT status display shown after a successful start."""
+    r = get_resources()
+    CY, GN, B, RS, GD, DIM = C.CYAN, C.GREEN, C.BOLD, C.RESET, "\033[38;5;214m", "\033[2m"
+
+    print_sox_header()
+
 
     W = 58  # visible width between the box borders
 
