@@ -69,7 +69,63 @@ docker-compose up --build
 - **PostgreSQL:** localhost:5433 (user: tradebot, db: tradebot)
 - **Redis:** localhost:6380
 
-## 🔒 Security
+## � Download & Update from GitHub
+
+Repository: **https://github.com/soxito/tradebot**
+
+### First-time download
+
+**Option A — Clone with Git (recommended)**
+```bash
+# HTTPS
+git clone https://github.com/soxito/tradebot.git
+cd tradebot
+
+# or SSH (if you have SSH keys set up on GitHub)
+git clone git@github.com:soxito/tradebot.git
+cd tradebot
+```
+
+**Option B — Download ZIP (no Git)**
+1. Open https://github.com/soxito/tradebot
+2. Click the green **Code** button → **Download ZIP**
+3. Unzip it and `cd` into the folder
+
+After downloading, create your local config (this file is **not** in the repo):
+```bash
+cp .env.example .env   # then edit .env with your own API keys
+```
+
+### Update your local files to the latest version
+
+Pull the newest changes from GitHub whenever the project is updated:
+```bash
+cd tradebot
+git pull origin main
+```
+
+If you have **local edits** that conflict with the pull, stash them first, update, then re-apply:
+```bash
+git stash            # temporarily shelve your local changes
+git pull origin main # get the latest code
+git stash pop        # re-apply your changes (resolve any conflicts)
+```
+
+> Your `.env` is git-ignored, so `git pull` never touches your API keys.
+> If `.env.example` changed, copy any new variables into your existing `.env`.
+
+### Rebuild after an update
+
+After pulling, rebuild so new dependencies and code take effect:
+```bash
+# Docker
+docker-compose up --build
+
+# or, running locally
+./run-local.sh
+```
+
+## �🔒 Security
 
 ### ⚠️ CRITICAL - Never commit secrets!
 
