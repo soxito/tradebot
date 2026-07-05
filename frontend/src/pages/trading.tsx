@@ -12,6 +12,8 @@ import {
   normalizeTradingViewStudyId,
 } from '@/utils/tradingviewStudies'
 import { useZarRate } from '@/hooks/useZarRate'
+import { useEventStream } from '@/hooks/useEventStream'
+import { useWakeLock } from '@/hooks/useWakeLock'
 import SignalFeed from '@/components/SignalFeed'
 import {
   TrendingUp,
@@ -891,21 +893,36 @@ export default function TradingPage() {
     return () => clearInterval(interval)
   }, [mounted, fetchTicker, fetchBalance, fetchSignals, fetchSimAccount])
 
-  // If sim is active, periodically refresh sim data (10s for real-time PnL)
+  // Realtime: react instantly to new signals + trade fills/closes over SSE.
+  useEventStream('signal.new', fetchSignals)
+  const { connected: streamLive } = useEventStream('trade.update', useCallback(() => {
+    if (simAccount?.is_active) refreshSimData()
+    if (tradingMode === 'live') refreshLiveData()
+  }, [simAccount?.is_active, tradingMode, refreshSimData, refreshLiveData]))
+
+  // Keep the screen awake during live trading when the user opted in (Settings).
+  const wakePref = mounted && typeof window !== 'undefined'
+    && localStorage.getItem('tradebot.wakelock.enabled') === '1'
+  useWakeLock(!!wakePref && tradingMode === 'live')
+
+  // If sim is active, periodically refresh sim data (10s for real-time PnL).
+  // Falls back to polling only while the realtime stream is down.
   useEffect(() => {
     if (!mounted || !simAccount?.is_active) return
     refreshSimData()
+    if (streamLive) return
     const interval = setInterval(refreshSimData, 10000)
     return () => clearInterval(interval)
-  }, [mounted, simAccount?.is_active, refreshSimData])
+  }, [mounted, simAccount?.is_active, refreshSimData, streamLive])
 
-  // If live mode, periodically refresh live futures data
+  // If live mode, periodically refresh live futures data (fallback when no SSE).
   useEffect(() => {
     if (!mounted || tradingMode !== 'live') return
     refreshLiveData()
+    if (streamLive) return
     const interval = setInterval(refreshLiveData, 10000)
     return () => clearInterval(interval)
-  }, [mounted, tradingMode, refreshLiveData])
+  }, [mounted, tradingMode, refreshLiveData, streamLive])
 
   // When ticker updates, sync limit price
   useEffect(() => {

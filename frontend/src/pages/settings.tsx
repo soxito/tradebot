@@ -1,7 +1,15 @@
 import Head from 'next/head'
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { apiClient } from '@/services/api'
-import { Settings, AlertTriangle, Shield, Target, Activity, Zap, Search, X, Plus } from 'lucide-react'
+import { Settings, AlertTriangle, Shield, Target, Activity, Zap, Search, X, Plus, Bell } from 'lucide-react'
+import { useStreamState } from '@/hooks/useEventStream'
+import {
+  notificationsSupported,
+  notificationsEnabled,
+  setNotificationsEnabled,
+  vibrationEnabled,
+  setVibrationEnabled,
+} from '@/services/notifications'
 
 const CONFIDENCE_OPTIONS = [
   { value: 0.50, label: '50%' },
@@ -260,6 +268,9 @@ export default function SettingsPage() {
             {saveMsg}
           </div>
         )}
+
+        {/* ─── Realtime & Alerts ─── */}
+        <RealtimeAlertsCard />
 
         {/* ─── Trading Configuration ─── */}
         <div className="bg-gray-800/30 border border-gray-700 rounded-lg p-5">
@@ -1152,6 +1163,106 @@ function PairSelector({
             })()}
           </div>
         )}
+      </div>
+    </div>
+  )
+}
+
+const WAKELOCK_PREF_KEY = 'tradebot.wakelock.enabled'
+
+function RealtimeAlertsCard() {
+  const streamState = useStreamState()
+  const [notifOn, setNotifOn] = useState(false)
+  const [vibrateOn, setVibrateOn] = useState(true)
+  const [wakeOn, setWakeOn] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const supported = notificationsSupported()
+
+  useEffect(() => {
+    setNotifOn(notificationsEnabled())
+    setVibrateOn(vibrationEnabled())
+    try { setWakeOn(localStorage.getItem(WAKELOCK_PREF_KEY) === '1') } catch { /* ignore */ }
+  }, [])
+
+  const toggleNotif = async () => {
+    setBusy(true)
+    const next = !notifOn
+    const ok = await setNotificationsEnabled(next)
+    setNotifOn(ok && next)
+    setBusy(false)
+  }
+
+  const toggleVibrate = () => {
+    const next = !vibrateOn
+    setVibrateOn(next)
+    setVibrationEnabled(next)
+  }
+
+  const toggleWake = () => {
+    const next = !wakeOn
+    setWakeOn(next)
+    try { localStorage.setItem(WAKELOCK_PREF_KEY, next ? '1' : '0') } catch { /* ignore */ }
+  }
+
+  const streamColor =
+    streamState === 'live' ? 'text-emerald-400'
+    : streamState === 'reconnecting' || streamState === 'connecting' ? 'text-yellow-400'
+    : 'text-gray-500'
+
+  const Row = ({ label, hint, checked, onClick, disabled }: {
+    label: string; hint: string; checked: boolean; onClick: () => void; disabled?: boolean
+  }) => (
+    <div className="flex items-center justify-between py-2.5">
+      <div>
+        <div className="text-sm text-gray-200">{label}</div>
+        <div className="text-xs text-gray-500">{hint}</div>
+      </div>
+      <button
+        onClick={onClick}
+        disabled={disabled}
+        role="switch"
+        aria-checked={checked}
+        aria-label={label}
+        className={`relative w-11 h-6 rounded-full transition ${checked ? 'bg-emerald-600' : 'bg-gray-600'} ${disabled ? 'opacity-40 cursor-not-allowed' : ''}`}
+      >
+        <span className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white transition-transform ${checked ? 'translate-x-5' : ''}`} />
+      </button>
+    </div>
+  )
+
+  return (
+    <div className="bg-gray-800/30 border border-gray-700 rounded-lg p-5">
+      <div className="flex items-center justify-between mb-4">
+        <h2 className="font-semibold flex items-center gap-2">
+          <Bell className="w-4 h-4 text-emerald-400" /> Realtime &amp; Alerts
+        </h2>
+        <span className={`text-xs flex items-center gap-1.5 ${streamColor}`}>
+          <span className={`w-2 h-2 rounded-full ${streamState === 'live' ? 'bg-emerald-500 animate-pulse' : streamState === 'closed' ? 'bg-gray-500' : 'bg-yellow-500 animate-pulse'}`} />
+          {streamState === 'live' ? 'Stream live' : streamState === 'closed' ? 'Polling (offline)' : 'Connecting…'}
+        </span>
+      </div>
+
+      <div className="divide-y divide-gray-700/50">
+        <Row
+          label="Desktop notifications"
+          hint={supported ? 'New signals, fills, and TP/SL hits (asks browser permission)' : 'Not supported in this browser'}
+          checked={notifOn}
+          onClick={toggleNotif}
+          disabled={!supported || busy}
+        />
+        <Row
+          label="Vibration on critical alerts"
+          hint="Buzz on TP/SL hits and new signals (mobile)"
+          checked={vibrateOn}
+          onClick={toggleVibrate}
+          disabled={!notifOn}
+        />
+        <Row
+          label="Keep screen awake during live trading"
+          hint="Holds a screen Wake Lock while the live trading tab is open"
+          checked={wakeOn}
+          onClick={toggleWake}
+        />
       </div>
     </div>
   )

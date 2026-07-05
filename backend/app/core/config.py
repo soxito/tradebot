@@ -128,6 +128,13 @@ class Settings(BaseSettings):
     PUMP_MONITOR_LOOP_INTERVAL_SECONDS: int = 120
     PUMP_MONITOR_PUMPED_RETENTION_HOURS: int = 24
 
+    # Realtime price-tick fan-out (SSE). Broadcasts live prices for symbols with
+    # open positions / active signals to all stream subscribers, replacing
+    # per-client price polling. Only runs while at least one client is connected.
+    AUTO_START_PRICE_TICK_LOOP: bool = True
+    PRICE_TICK_INTERVAL_SECONDS: int = 5
+    PRICE_TICK_MAX_SYMBOLS: int = 30
+
     # Plugin system
     PLUGIN_AUTO_MOUNT: bool = True
     PLUGIN_STRICT_MODE: bool = False

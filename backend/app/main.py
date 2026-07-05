@@ -66,10 +66,24 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Pair catalog sync loop failed to start: {e}")
 
+    # Realtime price-tick fan-out for SSE subscribers (idempotent; self-throttles
+    # to zero work when no client is connected).
+    if settings.AUTO_START_PRICE_TICK_LOOP:
+        try:
+            from app.core.scheduler import start_price_tick_loop
+            start_price_tick_loop()
+        except Exception as e:
+            logger.warning(f"Price tick loop failed to start: {e}")
+
     yield
     
     # Shutdown logic here
     stop_background_workers()
+    try:
+        from app.core.scheduler import stop_price_tick_loop
+        stop_price_tick_loop()
+    except Exception:
+        pass
     logger.info("🛑 TradeBot shutting down...")
 
 

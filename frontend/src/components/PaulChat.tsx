@@ -138,6 +138,43 @@ interface Message {
   sniperSetups?: SniperSetupAction[]  // ranked sniper setups → rendered as Execute cards
 }
 
+// ── Conversation persistence (survives page refresh) ──────────────────────
+// The streaming chat persists to the backend, but locally-added messages
+// (analyse cards, sniper setups, voice confirmations, errors) never reach the
+// server. Mirroring the full visible conversation to localStorage guarantees a
+// refresh restores the exact screen. Backend history stays the fallback for a
+// fresh browser that has no local copy yet.
+function chatStoreKey(): string {
+  let sk = 'default'
+  try { sk = localStorage.getItem('paul.session') || 'default' } catch { /* ignore */ }
+  return `paul.chat.${sk}`
+}
+
+function loadStoredMessages(): Message[] | null {
+  if (typeof window === 'undefined') return null
+  try {
+    const raw = localStorage.getItem(chatStoreKey())
+    if (!raw) return null
+    const arr = JSON.parse(raw)
+    if (!Array.isArray(arr) || arr.length === 0) return null
+    return arr as Message[]
+  } catch { return null }
+}
+
+function saveStoredMessages(msgs: Message[]): void {
+  if (typeof window === 'undefined') return
+  try {
+    const clean = msgs
+      // Drop the stock welcome and any empty "⚡ Thinking…" bubble so a refresh
+      // never restores a stuck placeholder.
+      .filter(m => m.id !== 'welcome' && !(m.pending && !m.content))
+      // Strip transient streaming state; flag restored msgs so TTS won't re-speak.
+      .map(({ pending: _pending, ...rest }) => ({ ...rest, fromHistory: true }))
+    if (clean.length === 0) { localStorage.removeItem(chatStoreKey()); return }
+    localStorage.setItem(chatStoreKey(), JSON.stringify(clean.slice(-300)))
+  } catch { /* quota exceeded — ignore */ }
+}
+
 interface Alert {
   id: string
   type: string
@@ -736,13 +773,19 @@ function hasWakeWord(transcript: string, requireGreeting = false): boolean {
 const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boolean } = {}) {
   const router = useRouter()
   const [open, setOpen] = useState(false)
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      id: 'welcome',
-      role: 'assistant',
-      content: "Good day, Sir. I'm PAUL — your personal trading assistant. How can I help you today? I can tell you about open positions, recent signals, live market news, or forecast any pair. Just say my name — \"Jarvis\", \"Paul\", or \"Sox\" — e.g. \"Jarvis, analyse Gold for sniper entries\".",
-    },
-  ])
+  const [messages, setMessages] = useState<Message[]>(() => {
+    // Restore the previous conversation immediately on mount so a page refresh
+    // never wipes the chat. Falls back to the welcome message on a fresh browser.
+    const stored = loadStoredMessages()
+    if (stored && stored.length) return stored
+    return [
+      {
+        id: 'welcome',
+        role: 'assistant',
+        content: "Good day, Sir. I'm PAUL — your personal trading assistant. How can I help you today? I can tell you about open positions, recent signals, live market news, or forecast any pair. Just say my name — \"Jarvis\", \"Paul\", or \"Sox\" — e.g. \"Jarvis, analyse Gold for sniper entries\".",
+      },
+    ]
+  })
   const [input, setInput] = useState('')
   const [streaming, setStreaming] = useState(false)
   const [alerts, setAlerts] = useState<Alert[]>([])
@@ -876,6 +919,13 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
   // the next user gesture so a one-off glitch can never leave JARVIS permanently
   // deaf (which used to happen by persisting the wake word OFF to localStorage).
   const wakeErrorPausedRef = useRef(false)
+  // Wake-recognizer liveness tracking. On heavy pages (charts, WebGL) the Web
+  // Speech recognizer can silently die — rec.start() throws and is swallowed, or
+  // onstart never fires — leaving JARVIS deaf until the next gesture. onstart
+  // sets started=true, onend sets it false; a periodic watchdog re-arms wake if
+  // it should be running but hasn't started within a few seconds.
+  const wakeStartedRef = useRef(false)
+  const wakeStartAtRef = useRef(0)
   // Re-arms the wake recognizer on the next user gesture (set up below).
   const rearmWakeOnGestureRef = useRef<() => void>(() => {})
   // Active Whisper capture (so it can be aborted the instant JARVIS starts to
@@ -982,6 +1032,13 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
   // Grace timer used before handing the mic back to the in-page recognizer when
   // the extension is connected but not actually listening (see syncExtVoiceReady).
   const extReleaseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Sticky flag: set true when we hand the mic to the in-page recognizer because
+  // the extension stalled ("Starting…") or reported its speech engine failed.
+  // While true, bare status/connected(listening:false) must NOT re-claim the mic
+  // — only real proof (listening:true, or a wake/command/interrupt) reclaims it.
+  // This is what stops the page↔extension mic-ownership flapping that left JARVIS
+  // deaf and the popup stuck on "Starting…".
+  const extMicReleasedRef = useRef(false)
 
   // ── Cost-aware Deepgram fallback (in-page) ────────────────────────────────
   // The free Web Speech API stays primary; only a *missed* utterance is sent to
@@ -1018,10 +1075,21 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     if (open) setTimeout(() => inputRef.current?.focus(), 100)
   }, [open])
 
+  // ── Mirror the conversation to localStorage (survives refresh) ────────────
+  // Debounced so streaming token updates coalesce into a single write.
+  useEffect(() => {
+    const t = setTimeout(() => saveStoredMessages(messages), 400)
+    return () => clearTimeout(t)
+  }, [messages])
+
   // ── Load persisted conversation history once on mount ─────────────────────
   useEffect(() => {
     let cancelled = false
     const load = async () => {
+      // A local mirror is the full-fidelity copy for THIS browser (it also
+      // captures analyse/command/sniper messages the backend never stores).
+      // When present, keep it and skip the server restore so nothing is lost.
+      if (loadStoredMessages()) { historyLoadedRef.current = true; return }
       try {
         const res = await apiClient.jarvis.getHistory(sessionKeyRef.current)
         const hist = res.data?.messages || []
@@ -1071,6 +1139,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
   // ── Start a brand-new conversation (archive the old one) ──────────────────
   const newChat = useCallback(async () => {
     try { await apiClient.jarvis.newChat(sessionKeyRef.current) } catch { /* ignore */ }
+    try { localStorage.removeItem(chatStoreKey()) } catch { /* ignore */ }
     setMessages([{
       id: 'welcome',
       role: 'assistant',
@@ -1174,7 +1243,9 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     // any orders.  This fires for both typed AND voice-transcribed commands.
     if (isBitgetCommand(text)) {
       const userMsg: Message = { id: nanoid(), role: 'user', content: text }
-      const loadingMsg: Message = { id: nanoid(), role: 'assistant', content: '⚡ Connecting to Bitget…', pending: true }
+      // Empty content → renders the animated "⚡ Thinking…" indicator while the
+      // backend fetches live data / runs the analysis.
+      const loadingMsg: Message = { id: nanoid(), role: 'assistant', content: '', pending: true }
       setMessages(prev => [...prev, userMsg, loadingMsg])
       try {
         const res = await apiClient.jarvis.executeCommand(text)
@@ -1183,17 +1254,53 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
         if (d.ok) {
           const o = d.order || {}
           if (d.action === 'analyze') {
-            // Clean analysis card
+            // Rich analysis card — prefer JARVIS's AI-composed human narrative,
+            // then layer in Kronos forecast, volume flow, news headlines and the
+            // proposed trade levels.
             const lines: string[] = []
-            lines.push(`**${o.symbol || 'Analysis'}** — Live Bitget Data`)
-            if (o.trend)  lines.push(`Trend: ${o.trend.toUpperCase()}`)
-            if (o.rsi)    lines.push(`RSI: ${Number(o.rsi).toFixed(0)}`)
-            if (o.ema50)  lines.push(`EMA 50: ${o.ema50}  |  EMA 200: ${o.ema200}`)
-            lines.push('')
-            if (o.proposed_entry) lines.push(`Entry:  ${o.proposed_entry}  (${o.side?.toUpperCase()})`)
-            if (o.sl)             lines.push(`SL:     ${o.sl}`)
-            if (o.tp1)            lines.push(`TP1:    ${o.tp1}`)
-            if (o.tp2)            lines.push(`TP2:    ${o.tp2}`)
+            if (o.narrative) {
+              lines.push(o.narrative)
+            } else {
+              lines.push(`**${o.symbol || 'Analysis'}** — Live Bitget Data`)
+              if (o.trend)  lines.push(`Trend: ${o.trend.toUpperCase()}`)
+              if (o.rsi)    lines.push(`RSI: ${Number(o.rsi).toFixed(0)}`)
+              if (o.ema50)  lines.push(`EMA 50: ${o.ema50}  |  EMA 200: ${o.ema200}`)
+            }
+            // Kronos ML forecast
+            if (o.kronos && o.kronos.direction) {
+              const pct = Number(o.kronos.pct_change)
+              lines.push('')
+              lines.push(`🔮 Kronos ML: ${String(o.kronos.direction).toUpperCase()} ${pct >= 0 ? '+' : ''}${pct.toFixed(2)}% → ${o.kronos.target_price} (${Math.round((o.kronos.confidence || 0) * 100)}% conf)`)
+            }
+            // Volume flow
+            if (o.volume && typeof o.volume.buy_pressure_pct === 'number') {
+              lines.push(`📊 Volume: ${o.volume.buy_pressure_pct.toFixed(0)}% buy / ${o.volume.sell_pressure_pct.toFixed(0)}% sell (${Number(o.volume.volume_spike_x).toFixed(1)}× avg)`)
+            }
+            // Your open position on this pair
+            if (o.position && o.position.side) {
+              const pnl = Number(o.position.pnl || 0)
+              const pnlPct = Number(o.position.pnl_pct || 0)
+              const arrow = pnl >= 0 ? '▲' : '▼'
+              lines.push(`📌 Your position: ${String(o.position.side).toUpperCase()} ${o.position.size} @ ${o.position.entry_price} · PnL ${arrow} ${Math.abs(pnl).toFixed(2)} USDT (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%)`)
+            }
+            // News headlines + sentiment
+            if (Array.isArray(o.news) && o.news.length) {
+              lines.push('')
+              lines.push(`📰 News (${o.news_count || o.news.length} · ${(o.sentiment_label || 'neutral').toUpperCase()})`)
+              o.news.slice(0, 4).forEach((n: any) => {
+                const sc = n.sentiment_score
+                const lbl = n.sentiment_label || (sc > 0.1 ? 'BULLISH' : sc < -0.1 ? 'BEARISH' : 'NEUTRAL')
+                lines.push(`• [${String(lbl).toUpperCase()}] ${n.title}${n.source ? ` — ${n.source}` : ''}`)
+              })
+            }
+            // Proposed trade levels
+            if (o.proposed_entry) {
+              lines.push('')
+              lines.push(`Entry:  ${o.proposed_entry}  (${o.side?.toUpperCase()})`)
+              if (o.sl)             lines.push(`SL:     ${o.sl}`)
+              if (o.tp1)            lines.push(`TP1:    ${o.tp1}`)
+              if (o.tp2)            lines.push(`TP2:    ${o.tp2}`)
+            }
             if (o.confirm_command) {
               lines.push('')
               lines.push(`To trade, type:`)
@@ -2767,16 +2874,36 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
   // "actually listening" confirmation arrives in time, we hand the mic back to
   // the in-page fallback so JARVIS still works. The extension's normal restart
   // gaps are far shorter than the watchdog, so healthy operation never flaps.
-  const syncExtVoiceReady = useCallback((confirmedListening: boolean) => {
+  const syncExtVoiceReady = useCallback((info: { listening: boolean; voiceReady?: boolean; proof?: boolean }) => {
+    const { listening: isListening, voiceReady, proof } = info
+    // 1) Extension explicitly reported its speech engine FAILED to start → the
+    //    page owns the mic. Sticky until the extension proves it is listening.
+    if (voiceReady === false) {
+      extMicReleasedRef.current = true
+      if (extReleaseTimerRef.current) { clearTimeout(extReleaseTimerRef.current); extReleaseTimerRef.current = null }
+      releaseMicToPage()
+      return
+    }
+    // 2) Positive proof the extension owns & uses the mic — a confirmed
+    //    listening:true, or a wake/command/interrupt event just arrived.
+    if (isListening || proof) {
+      extMicReleasedRef.current = false
+      if (extReleaseTimerRef.current) { clearTimeout(extReleaseTimerRef.current); extReleaseTimerRef.current = null }
+      claimMicForExt()
+      return
+    }
+    // 3) Connected/ready but not yet confirmed listening. If we already released
+    //    the mic to the page (a prior stall/failure), do NOT re-claim on bare
+    //    status(false) — that flapping is what left JARVIS deaf. Wait for proof.
+    if (extMicReleasedRef.current) return
+    // 4) First optimistic claim on connect: suppress the in-page recognizer and
+    //    arm a one-shot watchdog. If no "actually listening" confirmation lands,
+    //    hand the mic back to the page and latch released so we don't re-grab.
     claimMicForExt()
-    if (confirmedListening) {
-      if (extReleaseTimerRef.current) {
-        clearTimeout(extReleaseTimerRef.current)
-        extReleaseTimerRef.current = null
-      }
-    } else if (!extReleaseTimerRef.current) {
+    if (!extReleaseTimerRef.current) {
       extReleaseTimerRef.current = setTimeout(() => {
         extReleaseTimerRef.current = null
+        extMicReleasedRef.current = true
         releaseMicToPage()
       }, 6000)
     }
@@ -2935,11 +3062,15 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     const markExtConnected = (payload?: any) => {
       extConnectedRef.current = true
       setExtConnected(true)
-      // Reconcile mic ownership. `listening === true` means the extension has
-      // CONFIRMED its recognizer is running; anything else (connected/ready but
-      // not yet listening, e.g. stuck on "Starting…") arms the watchdog so the
-      // in-page fallback can reclaim the mic if no confirmation arrives.
-      syncExtVoiceReady(payload?.listening === true)
+      // Reconcile mic ownership from the extension's reported state:
+      //   • voiceReady === false → engine failed, the page takes the mic.
+      //   • listening === true or proof → the extension owns the mic.
+      //   • otherwise (connected/ready, unconfirmed) → optimistic claim + watchdog.
+      syncExtVoiceReady({
+        listening: payload?.listening === true,
+        voiceReady: payload?.voiceReady,
+        proof: payload?.proof === true,
+      })
     }
 
     // 1. Synchronous DOM-attribute check (set by the content script on load)
@@ -2968,8 +3099,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
           // User said the wake phrase while JARVIS was talking — stop instantly
           // so they can barge in (human-like interruptibility) via the extension.
           // Receiving this is proof the extension owns and is using the mic.
-          markExtConnected(d)
-          syncExtVoiceReady(true)
+          markExtConnected({ ...d, listening: true, proof: true })
           // Speaker gate: only the user's stored voice may interrupt JARVIS, so
           // its own TTS (or the TV) can never cut it off mid-sentence.
           if (voiceMatchEnabledRef.current && !voiceMatchRef.current) break
@@ -2978,8 +3108,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
         case 'wake':
           // Extension heard the wake phrase — open the chat and acknowledge.
           // Receiving this is proof the extension owns and is using the mic.
-          markExtConnected(d)
-          syncExtVoiceReady(true)
+          markExtConnected({ ...d, listening: true, proof: true })
           // Speaker gate: ignore wakes that aren't the user's stored voice.
           if (voiceMatchEnabledRef.current && !voiceMatchRef.current) break
           // Always cut off any in-progress speech first so JARVIS yields the
@@ -2991,8 +3120,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
         case 'command':
           // Extension captured a full command — execute it via the pipeline.
           // Receiving this is proof the extension owns and is using the mic.
-          markExtConnected(d)
-          syncExtVoiceReady(true)
+          markExtConnected({ ...d, listening: true, proof: true })
           if (typeof d.transcript === 'string') processExtCommand(d.transcript)
           break
         case 'voice-learning-restore':
@@ -3016,9 +3144,9 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
           break
         case 'status':
           // Mirror the extension's ACTUAL listening state onto mic ownership and
-          // the indicator — ownership follows listening, not mere readiness.
+          // the indicator — ownership follows listening + voiceReady, handled by
+          // markExtConnected (which reads d.listening and d.voiceReady).
           markExtConnected(d)
-          syncExtVoiceReady(!!d.listening)
           setListening(!!d.listening)
           break
       }
@@ -3433,6 +3561,8 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
       }
     }
     rec.onend = () => {
+      // Wake recognizer is no longer running — the watchdog may re-arm it.
+      wakeStartedRef.current = false
       // While JARVIS is speaking we normally keep the mic muted (speak()'s onend
       // resumes wake afterwards). BUT when speaker-ID barge-in is enabled we keep
       // the wake recognizer alive during speech so the user can interrupt — the
@@ -3445,7 +3575,10 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
         }, 400)
       }
     }
+    rec.onstart = () => { wakeStartedRef.current = true }
     wakeRef.current = rec
+    wakeStartedRef.current = false
+    wakeStartAtRef.current = Date.now()
     try { rec.start() } catch { /* noop */ }
   }, [speak, interruptSpeech, noteAndGetThreshold, canBargeIn, mouthGateOpen, faceFresh, cameraSeesUserTalking])
 
@@ -3461,6 +3594,32 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     }
     return () => { try { wakeRef.current?.stop() } catch { /* noop */ } }
   }, [wakeEnabled, startWake])
+
+  // ── In-page wake watchdog (heavy chart pages) ─────────────────────────────
+  // On chart / WebGL pages the Web Speech recognizer can silently die (start()
+  // throws and is swallowed, or onstart never fires) so JARVIS goes deaf until a
+  // gesture. This 3s backstop re-arms the wake recognizer whenever it SHOULD be
+  // running (page owns the mic, wake on, not in dictation / speaking / blackout /
+  // robot-lock) but hasn't reached onstart within a few seconds. It never fires
+  // while the extension owns the mic or during normal listening/speaking.
+  useEffect(() => {
+    if (!speechSupported) return
+    const id = setInterval(() => {
+      if (!wakeEnabledRef.current) return
+      if (extVoiceReadyRef.current) return          // extension owns the mic
+      if (listeningRef.current) return              // capturing a command
+      if (robotLockedRef.current) return            // robot-mode exclusive lock
+      if (wakeErrorPausedRef.current) return        // paused after mic denial (gesture re-arms)
+      if (micGatedRef.current) return               // post-speech echo blackout
+      if (isSpeakingRef.current && !canBargeIn()) return  // muted while JARVIS talks
+      // Healthy recognizer → nothing to do. Only re-arm when a start never
+      // succeeded within 3s (silent failure), avoiding restarts during silence.
+      if (wakeStartedRef.current) return
+      if (Date.now() - wakeStartAtRef.current < 3000) return
+      try { startWakeRef.current() } catch { /* noop */ }
+    }, 3000)
+    return () => clearInterval(id)
+  }, [speechSupported, canBargeIn])
 
   // ── Ensure wake listening starts after the first user gesture ─────────────
   // Browsers block mic access until the user interacts with the page, so the
@@ -4160,9 +4319,20 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
                   >
                     {msg.role === 'assistant' ? renderMarkdown(msg.content) : msg.content}
                     {msg.pending && !msg.content && (
-                      <span className="inline-flex gap-0.5">
+                      <span className="inline-flex items-center gap-1.5 text-cyan-300">
+                        <span className="animate-pulse text-sm leading-none">⚡</span>
+                        <span className="font-medium">Thinking</span>
+                        <span className="inline-flex gap-0.5">
+                          {[0,1,2].map(i => (
+                            <span key={i} className="w-1 h-1 bg-cyan-300 rounded-full animate-bounce" style={{ animationDelay: `${i * 0.15}s` }} />
+                          ))}
+                        </span>
+                      </span>
+                    )}
+                    {msg.pending && msg.content && (
+                      <span className="inline-flex gap-0.5 ml-1 align-middle">
                         {[0,1,2].map(i => (
-                          <span key={i} className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: `${i * 0.15}s` }} />
+                          <span key={i} className="w-1 h-1 bg-cyan-300 rounded-full animate-bounce" style={{ animationDelay: `${i * 0.15}s` }} />
                         ))}
                       </span>
                     )}

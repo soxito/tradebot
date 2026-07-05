@@ -11,6 +11,7 @@ from app.models.database import SentimentScore
 from app.sentiment.analyzer import sentiment_analyzer
 from app.sentiment.scrapers import NewsScraper
 from app.core.config import settings
+from app.core.events import event_bus, Topics
 from app.core.timezone import now_sast
 from loguru import logger
 
@@ -122,6 +123,16 @@ class SentimentService:
         await db.commit()
         
         logger.info(f"💾 Saved {len(scores)} sentiment scores to database")
+
+        if scores:
+            event_bus.emit(Topics.SENTIMENT_UPDATE, {
+                "count": len(scores),
+                "symbols": [
+                    {"symbol": s.symbol, "score": s.score, "magnitude": s.magnitude}
+                    for s in scores
+                ],
+            })
+
         return scores
     
     @staticmethod

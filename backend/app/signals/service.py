@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
 from app.models.database import Signal, SignalStatus, SignalSource, SignalAction
 from app.core.timezone import now_sast
+from app.core.events import event_bus, Topics
 from app.models.schemas import SignalCreate
 from loguru import logger
 
@@ -49,7 +50,20 @@ class SignalService:
             f"📊 New signal created: {signal.source.value} -> "
             f"{signal.action.value} {signal.symbol} @ {signal.price}"
         )
-        
+
+        # Push to realtime SSE subscribers (best-effort; never blocks the request).
+        event_bus.emit(Topics.SIGNAL_NEW, {
+            "id": signal.id,
+            "source": signal.source.value if signal.source else None,
+            "symbol": signal.symbol,
+            "action": signal.action.value if signal.action else None,
+            "price": signal.price,
+            "timeframe": signal.timeframe,
+            "strength": signal.strength,
+            "confidence": signal.confidence,
+            "status": signal.status.value if signal.status else None,
+        })
+
         return signal
     
     @staticmethod

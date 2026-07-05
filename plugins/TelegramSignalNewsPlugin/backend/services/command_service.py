@@ -301,7 +301,14 @@ async def _jarvis_command(cmd: str) -> tuple[str, str]:
         from app.api.jarvis import execute_command, CommandRequest
         result = await execute_command(CommandRequest(command=cmd))
         emoji = "✅" if result.ok else "❌"
-        return f"{emoji} {result.speech or result.detail}", "HTML"
+        # For rich analysis, prefer the full detail (AI narrative + news + levels)
+        # over the short spoken summary so Telegram users get the complete research.
+        if result.action in ("analyze", "news_position_analysis") and result.detail:
+            body = result.detail
+        else:
+            body = result.speech or result.detail
+        text = f"{emoji} {body}"
+        return text[:4000], "HTML"
     except Exception as exc:  # noqa: BLE001
         return f"❌ Jarvis error: {exc}", "HTML"
 

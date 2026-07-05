@@ -51,6 +51,15 @@ from plugins.TelegramSignalNewsPlugin.backend.services.telegram_provider import 
 from plugins.TelegramSignalNewsPlugin.backend.timezone_utils import now_utc_naive
 
 
+def _emit_event(topic: str, data: dict) -> None:
+    """Best-effort push to the core realtime EventBus (SSE). No-op without core."""
+    try:
+        from app.core.events import event_bus  # type: ignore
+        event_bus.emit(topic, data)
+    except Exception:
+        pass
+
+
 MONITOR_INTERVAL_SECONDS = 60          # base loop cadence (sniper trigger checks)
 POLL_INTERVAL_SECONDS = 300            # poll Telegram for new messages every 5 min
 POLL_LIMIT_PER_CHANNEL = 50
@@ -791,6 +800,19 @@ class TelegramSignalMonitor:
                             self._last_result.get("outcomes_applied"),
                             self._last_result.get("messages_saved"),
                         )
+                    # Push realtime status to SSE subscribers so the Telegram page
+                    # updates live instead of polling every 30s.
+                    _emit_event("monitor.status", {
+                        "last_run": self._last_run.isoformat() if self._last_run else None,
+                        "signals_created": self._last_result.get("signals_created"),
+                        "outcomes_applied": self._last_result.get("outcomes_applied"),
+                        "messages_saved": self._last_result.get("messages_saved"),
+                    })
+                    if (self._last_result.get("signals_created") or 0) > 0:
+                        _emit_event("signal.new", {
+                            "source": "telegram",
+                            "count": self._last_result.get("signals_created"),
+                        })
             except asyncio.CancelledError:
                 break
             except Exception as exc:  # noqa: BLE001 — never let the loop die

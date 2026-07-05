@@ -975,3 +975,165 @@ def get_pair_catalog_status() -> dict:
         "started_at": _pair_catalog_started_at,
         "last_run": _pair_catalog_last_run,
     }
+
+
+# ── Realtime Price-Tick Fan-Out Loop (SSE) ──────────────────
+_price_tick_task: asyncio.Task | None = None
+_price_tick_running = False
+_price_tick_last_run: dict | None = None
+_price_tick_started_at: str | None = None
+
+
+async def _collect_active_symbols() -> list[str]:
+    """Symbols worth streaming prices for: open sim positions + pending signals."""
+    from app.models.database import SimPosition, Signal, SignalStatus
+
+    symbols: set[str] = set()
+    async with AsyncSessionLocal() as db:
+        try:
+            sim = await db.execute(
+                select(SimPosition.symbol).where(SimPosition.status == "open").distinct()
+            )
+            symbols.update(s for s in sim.scalars().all() if s)
+        except Exception:
+            pass
+        try:
+            sig = await db.execute(
+                select(Signal.symbol)
+                .where(Signal.status == SignalStatus.PENDING)
+                .distinct()
+            )
+            symbols.update(s for s in sig.scalars().all() if s)
+        except Exception:
+            pass
+    return list(symbols)
+
+
+async def _fetch_one_price(symbol: str) -> tuple[str, float | None]:
+    """Best-effort live price: Bitget ticker first, sniper FX price fallback."""
+    from app.exchanges.manager import exchange_manager, SupportedExchange
+
+    try:
+        connector = exchange_manager.get_exchange(SupportedExchange.BITGET)
+        if connector:
+            ticker = await connector.get_ticker(symbol)
+            price = ticker.get("last") or ticker.get("close")
+            if price:
+                return symbol, float(price)
+    except Exception:
+        pass
+    try:
+        from plugins.TelegramSignalNewsPlugin.backend.services.sniper_service import _get_live_price
+        price = await _get_live_price(symbol)
+        if price:
+            return symbol, float(price)
+    except Exception:
+        pass
+    return symbol, None
+
+
+async def _price_tick_loop():
+    """
+    Broadcast live prices for actively-watched symbols to SSE subscribers.
+
+    Skips fetching entirely when no client is connected (subscriber_count == 0),
+    so the loop is effectively free while the dashboard is closed.
+    """
+    global _price_tick_running, _price_tick_last_run
+    from app.core.events import event_bus, Topics
+
+    interval = max(2, int(getattr(settings, "PRICE_TICK_INTERVAL_SECONDS", 5)))
+    max_symbols = max(1, int(getattr(settings, "PRICE_TICK_MAX_SYMBOLS", 30)))
+
+    _price_tick_running = True
+    logger.info(f"📈 [PRICE TICK] Started — every {interval}s (max {max_symbols} symbols)")
+
+    try:
+        await asyncio.sleep(10)  # let boot settle
+    except asyncio.CancelledError:
+        _price_tick_running = False
+        return
+
+    while _price_tick_running:
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            break
+        if not _price_tick_running:
+            break
+
+        # Only do work when someone is actually listening.
+        if event_bus.subscriber_count() <= 0:
+            continue
+
+        try:
+            symbols = (await _collect_active_symbols())[:max_symbols]
+            if not symbols:
+                continue
+
+            results = await asyncio.gather(
+                *(_fetch_one_price(s) for s in symbols), return_exceptions=True
+            )
+            prices = {
+                sym: px
+                for r in results
+                if isinstance(r, tuple)
+                for sym, px in [r]
+                if px is not None
+            }
+            if prices:
+                await event_bus.publish(Topics.PRICE_TICK, {"prices": prices})
+                _price_tick_last_run = {
+                    "at": now_sast().isoformat(),
+                    "status": "ok",
+                    "symbols": len(prices),
+                }
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            err_safe = str(e).replace("{", "{{").replace("}", "}}")
+            logger.error(f"📈 [PRICE TICK] Cycle error: {err_safe}")
+            _price_tick_last_run = {"at": now_sast().isoformat(), "status": "error", "error": str(e)}
+
+    _price_tick_running = False
+    logger.info("📈 [PRICE TICK] Stopped")
+
+
+def start_price_tick_loop():
+    """Start the realtime price-tick fan-out loop (idempotent)."""
+    global _price_tick_task, _price_tick_running, _price_tick_started_at
+
+    if _price_tick_task is not None and not _price_tick_task.done():
+        logger.warning("Price tick loop already running")
+        return False
+
+    _price_tick_running = True
+    _price_tick_started_at = now_sast().isoformat()
+    _price_tick_task = asyncio.create_task(_price_tick_loop())
+    logger.info("📈 Price tick loop started")
+    return True
+
+
+def stop_price_tick_loop():
+    """Stop the realtime price-tick fan-out loop."""
+    global _price_tick_running, _price_tick_task, _price_tick_started_at
+
+    if not _price_tick_running and (_price_tick_task is None or _price_tick_task.done()):
+        return False
+
+    _price_tick_running = False
+    if _price_tick_task:
+        _price_tick_task.cancel()
+        _price_tick_task = None
+    _price_tick_started_at = None
+    logger.info("📈 Price tick loop stopped")
+    return True
+
+
+def get_price_tick_status() -> dict:
+    """Return the current state of the price-tick loop."""
+    return {
+        "running": _price_tick_running,
+        "started_at": _price_tick_started_at,
+        "last_run": _price_tick_last_run,
+    }

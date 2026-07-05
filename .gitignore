@@ -65,6 +65,14 @@ pip-log.txt
 # Local run PID files
 .backend.pid
 .frontend.pid
+backend.pid
+frontend.pid
+*.pid
+
+# Telethon / Telegram session credentials (never commit!)
+*.session
+backend/tradebot_telegram.session
+tradebot_telegram.session
 
 # OS
 .DS_Store

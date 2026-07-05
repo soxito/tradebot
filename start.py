@@ -53,8 +53,16 @@ ROOT        = Path(__file__).parent.resolve()
 BACKEND_DIR = ROOT / "backend"
 FRONTEND_DIR = ROOT / "frontend"
 VENV        = BACKEND_DIR / ".venv"
-UVICORN_BIN = VENV / "bin" / "uvicorn"
-PY_BIN      = VENV / "bin" / "python"
+# Windows virtualenvs put executables in "Scripts" with a ".exe" suffix;
+# POSIX venvs use "bin" with no suffix. Compute both so every subprocess call
+# targets a file that actually exists (avoids WinError 2 on Windows).
+IS_WINDOWS  = os.name == "nt"
+_VENV_BIN   = "Scripts" if IS_WINDOWS else "bin"
+_EXE        = ".exe" if IS_WINDOWS else ""
+VENV_BIN    = VENV / _VENV_BIN
+UVICORN_BIN = VENV_BIN / f"uvicorn{_EXE}"
+PY_BIN      = VENV_BIN / f"python{_EXE}"
+PIP_BIN     = VENV_BIN / f"pip{_EXE}"
 PG_BIN      = Path("/opt/homebrew/opt/postgresql@16/bin")
 MODE_FILE   = ROOT / ".db-mode"
 HOME        = Path.home()
@@ -302,12 +310,31 @@ def run(cmd: List[str], cwd=None, env=None) -> subprocess.CompletedProcess:
 
 
 def pgrep(pattern: str) -> List[int]:
-    r = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True)
+    # pgrep is Unix-only; on Windows (or if absent) return no matches rather
+    # than crashing with FileNotFoundError / WinError 2.
+    try:
+        r = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True)
+    except (OSError, subprocess.SubprocessError):
+        return []
     return [int(p) for p in r.stdout.split() if p.strip().isdigit()]
 
 
 def pkill(pattern: str) -> None:
-    subprocess.run(["pkill", "-f", pattern], capture_output=True)
+    try:
+        subprocess.run(["pkill", "-f", pattern], capture_output=True)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _npm_cmd() -> str:
+    # On Windows npm/npx are ``npm.cmd``/``npx.cmd``; bare "npm" isn't found by
+    # subprocess (no PATHEXT resolution) → WinError 2. shutil.which resolves the
+    # real path (incl. the .cmd suffix), which subprocess can launch directly.
+    return shutil.which("npm") or ("npm.cmd" if IS_WINDOWS else "npm")
+
+
+def _npx_cmd() -> str:
+    return shutil.which("npx") or ("npx.cmd" if IS_WINDOWS else "npx")
 
 
 def http_ok(url: str, timeout: float = 5.0) -> bool:
@@ -555,6 +582,19 @@ def setup_integrations() -> bool:
     """
     header("0/7  Integrations (Headroom + Obsidian)")
 
+    # Headroom (macOS LaunchAgent + launchctl + os.getuid) and Obsidian
+    # (/Applications, `brew --cask`, `open -a`) bootstrapping are macOS-only.
+    # On Windows/Linux these are optional conveniences and must never block the
+    # core DB/backend/frontend from starting.
+    if not _on_macos():
+        if port_open("127.0.0.1", HEADROOM_PORT, 0.6) and \
+                http_json(f"{HEADROOM_URL}/health?include_config=1", timeout=3):
+            ok(f"Headroom already running on :{HEADROOM_PORT}")
+        else:
+            warn("Headroom auto-start is macOS-only — skipping (optional).")
+        warn("Obsidian auto-launch is macOS-only — skipping (optional).")
+        return True
+
     if not ensure_headroom_installed():
         return False
     if not start_headroom():
@@ -669,7 +709,7 @@ def _brew(formula: str, label: str = "") -> bool:
 
 def _npm_global(pkg: str) -> bool:
     """npm install -g pkg."""
-    npm = shutil.which("npm") or "npm"
+    npm = _npm_cmd()
     ok_inst, err = _spinner_run([npm, "install", "-g", pkg], f"npm install -g {pkg}")
     if not ok_inst:
         fail(f"  npm install -g {pkg} failed: {err[:200]}")
@@ -724,6 +764,9 @@ def preflight_check(mode: str) -> bool:
         unfixable.append("Python < 3.9 (current runner)")
 
     # ── Homebrew ─────────────────────────────────────────────────────────────
+    # Homebrew is only used to install/run the brew-mode postgres/redis and to
+    # auto-install node on macOS. It does not exist on Windows/Linux, so treat
+    # it as a hard requirement ONLY when the user is actually in brew mode.
     brew_ok = bool(shutil.which("brew") or Path("/opt/homebrew/bin/brew").exists())
     if not brew_ok:
         if sys.platform == "darwin":
@@ -731,11 +774,13 @@ def preflight_check(mode: str) -> bool:
             brew_ok = _install_homebrew()
             if brew_ok:
                 fixed_items.append("Homebrew")
-            else:
-                unfixable.append("Homebrew (required for all brew-mode deps)")
+            elif mode == "brew":
+                unfixable.append("Homebrew (required for brew-mode deps)")
+        elif mode == "brew":
+            _check("Homebrew (brew)", False, "", "only available on macOS — use --docker instead")
+            unfixable.append("Homebrew (brew mode requires macOS)")
         else:
-            _check("Homebrew (brew)", False, "", "only available on macOS")
-            unfixable.append("Homebrew (macOS only)")
+            _check("Homebrew (brew)", True, "not needed in docker mode")
     else:
         _check("Homebrew (brew)", True, shutil.which("brew") or "/opt/homebrew/bin/brew")
 
@@ -798,11 +843,11 @@ def preflight_check(mode: str) -> bool:
         if not pg_bin_ok:
             unfixable.append("postgresql@16 not installed")
 
-        redis_ok = bool(shutil.which("redis-cli"))
+        redis_ok = _redis_installed()
         if not redis_ok and brew_ok:
             warn("redis not found — auto-installing via Homebrew …")
             if _brew("redis", "Redis"):
-                redis_ok = bool(shutil.which("redis-cli"))
+                redis_ok = _redis_installed()
                 if redis_ok:
                     fixed_items.append("redis")
         _check("redis  (brew formula)", redis_ok, "", "brew install redis")
@@ -820,8 +865,23 @@ def preflight_check(mode: str) -> bool:
             r = subprocess.run(["docker", "info"], capture_output=True, timeout=5)
             daemon_ok = r.returncode == 0
             if not daemon_ok:
-                info("Docker daemon not running — attempting to open Docker Desktop …")
-                subprocess.run(["open", "-a", "Docker"], capture_output=True)
+                info("Docker daemon not running — attempting to start Docker Desktop …")
+                # Launching Docker Desktop is platform-specific; wrap each call
+                # so a missing launcher (e.g. `open` on Windows) can't crash the
+                # whole preflight with WinError 2 / FileNotFoundError.
+                try:
+                    if sys.platform == "darwin":
+                        subprocess.run(["open", "-a", "Docker"], capture_output=True)
+                    elif IS_WINDOWS:
+                        docker_desktop = Path(
+                            os.environ.get("ProgramFiles", r"C:\Program Files")
+                        ) / "Docker" / "Docker" / "Docker Desktop.exe"
+                        if docker_desktop.exists():
+                            subprocess.Popen([str(docker_desktop)])
+                    # On Linux the daemon is usually a systemd service; leave it
+                    # to the user to start (no reliable cross-distro launcher).
+                except (OSError, subprocess.SubprocessError):
+                    pass
                 for _ in range(30):
                     time.sleep(2)
                     if subprocess.run(["docker", "info"],
@@ -883,7 +943,7 @@ def preflight_check(mode: str) -> bool:
     print(f"  {C.BOLD}Python environment{C.RESET}")
     sep()
 
-    venv_exists = VENV.exists() and (VENV / "bin" / "python").exists()
+    venv_exists = VENV.exists() and PY_BIN.exists()
     if not venv_exists:
         info("Python venv not found — creating now …")
         py = _best_python()
@@ -912,7 +972,7 @@ def preflight_check(mode: str) -> bool:
         ]
         if missing_pkgs:
             info(f"Missing pip packages: {', '.join(missing_pkgs)} — installing …")
-            pip = VENV / "bin" / "pip"
+            pip = PIP_BIN
             reqs_file = BACKEND_DIR / "requirements.txt"
             lock_file = BACKEND_DIR / "requirements-lock.txt"
             # Upgrade pip itself first — old pip versions fail on binary wheels.
@@ -975,7 +1035,7 @@ def preflight_check(mode: str) -> bool:
     if not nm_ok and npm_ok:
         info("node_modules missing or incomplete — running npm install …")
         ok_nm, err_nm = _spinner_run(
-            ["npm", "install", "--legacy-peer-deps"],
+            [_npm_cmd(), "install", "--legacy-peer-deps"],
             "npm install", cwd=FRONTEND_DIR, timeout=300
         )
         if ok_nm:
@@ -1146,7 +1206,9 @@ def detect_mode(forced: Optional[str]) -> str:
         return "brew"
     if shutil.which("docker"):
         return "docker"
-    return "brew"  # will fail gracefully below
+    # Brew mode is macOS-only; on Windows/Linux default to docker so preflight
+    # gives actionable "install Docker Desktop" guidance instead of brew errors.
+    return "brew" if sys.platform == "darwin" else "docker"
 
 
 def save_mode(mode: str) -> None:
@@ -1320,24 +1382,101 @@ def start_postgres_docker() -> Tuple[bool, int]:
 
 
 # ── Redis ─────────────────────────────────────────────────────────────────────
+def _redis_installed() -> bool:
+    """True if a Redis server is installed (on PATH or as a Homebrew formula)."""
+    if shutil.which("redis-server") or shutil.which("redis-cli"):
+        return True
+    brew = _brew_path()
+    if brew:
+        # A brew keg that isn't linked onto PATH still counts as installed.
+        return run([brew, "list", "redis"]).returncode == 0
+    return False
+
+
+def _redis_ping(port: int) -> bool:
+    """True if Redis answers PING on the given port (real health, not just an open socket)."""
+    cli = shutil.which("redis-cli")
+    if not cli:
+        # Fall back to a raw RESP PING if the CLI isn't on PATH.
+        try:
+            with socket.create_connection(("localhost", port), timeout=1.0) as s:
+                s.sendall(b"PING\r\n")
+                return b"PONG" in s.recv(64).upper()
+        except OSError:
+            return False
+    try:
+        r = run([cli, "-p", str(port), "ping"])
+        return r.returncode == 0 and "PONG" in (r.stdout or "").upper()
+    except Exception:
+        return False
+
+
+def ensure_redis_installed() -> bool:
+    """Ensure a Redis server is installed; auto-install via Homebrew when missing."""
+    if _redis_installed():
+        return True
+    brew = _brew_path()
+    if not brew:
+        warn("Redis not installed and Homebrew unavailable — install it manually (brew install redis)")
+        return False
+    warn("Redis not found — installing via Homebrew …")
+    if _brew("redis", "Redis"):
+        ok("Redis installed")
+        return _redis_installed()
+    return False
+
+
 def start_redis_brew() -> Tuple[bool, int]:
     redis_port = 6379
     info("Starting Redis (Homebrew) …")
-    if port_open("localhost", redis_port, 0.5):
-        ok(f"Redis already running on :{redis_port}")
+
+    # Already up AND answering PING → nothing to do.
+    if _redis_ping(redis_port):
+        ok(f"Redis already running and healthy on :{redis_port}")
         return True, redis_port
-    run(["brew", "services", "start", "redis"])
-    return wait_for_port("localhost", redis_port, "Redis"), redis_port
+
+    # Install the server if it isn't present at all.
+    if not ensure_redis_installed():
+        warn("Redis could not be installed — backend falls back to in-memory SSE fan-out")
+        return False, redis_port
+
+    # Start (and register) the brew service so it persists across reboots.
+    brew = _brew_path() or "brew"
+    run([brew, "services", "start", "redis"])
+
+    if not wait_for_port("localhost", redis_port, "Redis"):
+        # A bare `redis-server` fallback for environments without brew services.
+        server = shutil.which("redis-server")
+        if server:
+            info("brew services unavailable — launching redis-server directly …")
+            subprocess.Popen(
+                [server, "--port", str(redis_port), "--daemonize", "yes"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            wait_for_port("localhost", redis_port, "Redis")
+
+    # Verify it truly answers PING, not just that the socket is open.
+    if _redis_ping(redis_port):
+        ok("Redis PING → PONG (configured & healthy)")
+        return True, redis_port
+    if port_open("localhost", redis_port, 0.5):
+        warn("Redis port open but not answering PING yet — continuing")
+        return True, redis_port
+    return False, redis_port
 
 
 def start_redis_docker() -> Tuple[bool, int]:
     redis_port = 6380
     info("Starting Redis (Docker) …")
-    if port_open("localhost", redis_port, 0.5):
-        ok(f"Redis already running on :{redis_port}")
+    if _redis_ping(redis_port):
+        ok(f"Redis already running and healthy on :{redis_port}")
         return True, redis_port
     run(["docker", "compose", "up", "-d", "redis"], cwd=ROOT)
-    return wait_for_port("localhost", redis_port, "Redis"), redis_port
+    if not wait_for_port("localhost", redis_port, "Redis"):
+        return False, redis_port
+    if _redis_ping(redis_port):
+        ok("Redis PING → PONG (configured & healthy)")
+    return True, redis_port
 
 
 # ── Python venv ───────────────────────────────────────────────────────────────
@@ -1355,12 +1494,19 @@ def _best_python() -> str:
         p = shutil.which(name)
         if p:
             return p
+    if IS_WINDOWS:
+        # Windows rarely exposes versioned "python3.x" commands. The interpreter
+        # already running this script is guaranteed to exist and be ≥3.9, so use
+        # it first, then fall back to whatever "python"/"python3" is on PATH.
+        # (Returned value must be a single token — subprocess treats it as the
+        # executable, so no "py -3.x" strings with embedded spaces.)
+        return sys.executable or shutil.which("python") or shutil.which("python3") or "python"
     for cand in ("/opt/homebrew/bin/python3.13",
                  "/opt/homebrew/bin/python3.12",
                  "/opt/homebrew/bin/python3.11"):
         if Path(cand).exists():
             return cand
-    return shutil.which("python3") or "/opt/homebrew/bin/python3"
+    return shutil.which("python3") or shutil.which("python") or sys.executable
 
 
 def ensure_venv() -> bool:
@@ -1398,7 +1544,7 @@ def ensure_pip_deps() -> bool:
         return True
 
     info(f"Installing Python dependencies: {', '.join(missing)} …")
-    pip = VENV / "bin" / "pip"
+    pip = PIP_BIN
 
     # Upgrade pip first — stale pip misses binary wheels for asyncpg, etc.
     run([str(pip), "install", "--quiet", "--upgrade", "pip"], cwd=BACKEND_DIR)
@@ -1432,7 +1578,7 @@ def ensure_pip_deps() -> bool:
     # Python>=3.12, so it can't be in requirements.txt.  Install the wheel
     # alone (--no-deps) — the conditional import in orchestrator.py works fine
     # without chainlit/langgraph being present.
-    pip = VENV / "bin" / "pip"
+    pip = PIP_BIN
     run([str(pip), "install", "--quiet", "--no-deps", "--upgrade",
          "tradingagents==0.6.0"], cwd=BACKEND_DIR)
 
@@ -1466,7 +1612,7 @@ def ensure_npm_deps() -> bool:
         ok("npm dependencies already installed")
         return True
     info("Installing npm dependencies (this may take a minute) …")
-    r = run(["npm", "install", "--legacy-peer-deps"], cwd=FRONTEND_DIR)
+    r = run([_npm_cmd(), "install", "--legacy-peer-deps"], cwd=FRONTEND_DIR)
     if r.returncode != 0:
         fail(f"npm install failed:\n{r.stderr[:400]}")
         return False
@@ -1622,7 +1768,7 @@ def start_frontend() -> bool:
 
     with open(log_file, "w") as lf:
         proc = subprocess.Popen(
-            ["npx", "next", "dev", "--port", str(FRONTEND_PORT)],
+            [_npx_cmd(), "next", "dev", "--port", str(FRONTEND_PORT)],
             cwd=FRONTEND_DIR,
             env=env,
             stdout=lf,

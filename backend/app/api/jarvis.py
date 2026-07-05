@@ -596,9 +596,12 @@ def _safe_float(val, default: float = 0.0) -> float:
 # Fallback version only — the real version is ALWAYS read live from
 # jarvis-extension/manifest.json (see _ext_version()). Keep this in sync so a
 # missing manifest never advertises a stale version.
-_EXT_VERSION = "3.6.4"
-_EXT_RELEASED = "2026-07-02"
+_EXT_VERSION = "3.6.7"
+_EXT_RELEASED = "2026-07-05"
 _EXT_CHANGELOG = [
+    "Fix mic hand-off: in-page JARVIS takes over when the extension speech engine stalls (no more stuck 'Starting…')",
+    "Stable mic ownership: stop page<->extension flapping that left voice deaf",
+    "Chart-page wake watchdog keeps voice listening alive on heavy WebGL pages",
     "Fix read-aloud silently dropped when pageSpeaking stuck true",
     "Fix accounts not shown in popup — lastUnifiedData now cached in background and used for instant account balance display on popup open and in 10s auto-refresh",
     "Fix accounts loading + trades not read aloud",
@@ -1373,13 +1376,15 @@ async def execute_command(req: CommandRequest):
     ex = req.exchange
     try:
         result = await _dispatch(cmd, ex)
-        # ── Dual-brain capture for every meaningful action ────────────────────
-        # Trades, TP/SL edits, analysis, and position reviews all feed BOTH
-        # system brains so JARVIS keeps learning and never misses anything.
+        # ── Brain capture for EVERY request ───────────────────────────────────
+        # Trades, TP/SL edits, analysis and position reviews get a rich capture;
+        # everything else (errors, queries, chit-chat, unknown commands) still
+        # gets logged so NOTHING JARVIS is ever asked is lost to the brains.
         _CAPTURE_ACTIONS = (
             "set_tp", "set_sl", "close", "execute",
             "analyze", "position_status", "list_positions",
         )
+        captured = False
         if result.ok and result.action in _CAPTURE_ACTIONS:
             try:
                 sym = result.order.get("symbol", "") if result.order else ""
@@ -1399,6 +1404,24 @@ async def execute_command(req: CommandRequest):
                     tags=["jarvis", result.action, sym],
                     order_id=result.order.get("id", "") if result.order else "",
                     importance=_imp,
+                )
+                captured = True
+            except Exception:
+                pass
+        # Catch-all: log every remaining request (failures, queries, unknown, …)
+        if not captured:
+            try:
+                import re as _re_sym2
+                _m2 = _re_sym2.search(r"\b([A-Z]{2,8}USDT?)\b", (cmd or "").upper())
+                _sym2 = _m2.group(1) if _m2 else ""
+                jarvis_learn_all_brains(
+                    action=result.action or "command",
+                    symbol=_sym2,
+                    summary=(cmd or "")[:200],
+                    detail=(result.speech or result.detail or "")[:600],
+                    tags=["jarvis", "request", result.action or "command",
+                          "ok" if result.ok else "error"],
+                    importance=0.3 if result.ok else 0.35,
                 )
             except Exception:
                 pass
@@ -1552,7 +1575,7 @@ async def _dispatch(cmd: str, ex: Optional[str]) -> CommandResult:  # noqa: C901
                 sym_candidate += "USDT"
 
         if sym_candidate:
-            return await _analyze_symbol(sym_candidate, cmd, ex)
+            return await _analyze_symbol(sym_candidate, cmd, ex, deep=_wants_deep_research(cmd))
         return CommandResult(
             ok=False, action="analyze",
             detail="Which symbol should I analyse? E.g. 'monitor SOLUSDT'",
@@ -1871,7 +1894,199 @@ def _rsi(closes: List[float], period: int = 14) -> float:
     return round(100 - (100 / (1 + rs)), 2)
 
 
-async def _analyze_symbol(symbol: str, original_cmd: str, ex_name: Optional[str]) -> CommandResult:
+# ── Deep-research helpers (volume · news · AI narrative) ─────────────────────
+# These power JARVIS's rich, human, multi-tool pair analysis.  Each is fully
+# self-contained and NEVER raises — a failure just omits that data section so
+# the core proposal is always returned.
+
+def _wants_deep_research(cmd: str) -> bool:
+    """True when the user asked JARVIS to go deep — search news, scrape, research."""
+    s = (cmd or "").lower()
+    return bool(re.search(
+        r"\b(news|headline|sentiment|research|deep|thorough|everything|"
+        r"in[\s-]?depth|full|scrape|search|internet|web|fundament)\w*",
+        s,
+    ))
+
+
+async def _crypto_volume_analysis(connector, ccxt_sym: str, ohlcv: list) -> Optional[Dict[str, Any]]:
+    """Compute buy/sell volume pressure from OHLCV plus 24h ticker volume.
+
+    Returns None on any failure (volume section simply omitted)."""
+    try:
+        vols   = [float(c[5]) for c in ohlcv if len(c) > 5]
+        closes = [float(c[4]) for c in ohlcv]
+        opens  = [float(c[1]) for c in ohlcv]
+        if len(vols) < 5:
+            return None
+        last_vol = vols[-1]
+        avg_vol  = sum(vols[-20:]) / min(len(vols), 20)
+        # Up-candle vs down-candle volume over the last 20 candles → pressure proxy.
+        buy_vol = sell_vol = 0.0
+        for o, c, v in zip(opens[-20:], closes[-20:], vols[-20:]):
+            if c >= o:
+                buy_vol += v
+            else:
+                sell_vol += v
+        tot = buy_vol + sell_vol
+        buy_pct  = round(buy_vol / tot * 100, 1) if tot else 50.0
+        sell_pct = round(100 - buy_pct, 1)
+
+        quote_vol_24h = None
+        try:
+            ticker = await connector.exchange.fetch_ticker(f"{ccxt_sym}:USDT")
+        except Exception:
+            try:
+                ticker = await connector.exchange.fetch_ticker(ccxt_sym)
+            except Exception:
+                ticker = None
+        if ticker:
+            quote_vol_24h = ticker.get("quoteVolume") or ticker.get("baseVolume")
+
+        spike = round(last_vol / avg_vol, 2) if avg_vol else 1.0
+        return {
+            "buy_pressure_pct": buy_pct,
+            "sell_pressure_pct": sell_pct,
+            "last_candle_volume": round(last_vol, 4),
+            "avg_volume_20": round(avg_vol, 4),
+            "volume_spike_x": spike,
+            "quote_volume_24h": quote_vol_24h,
+        }
+    except Exception as e:  # pragma: no cover
+        logger.debug(f"[JARVIS] volume analysis skipped: {e}")
+        return None
+
+
+async def _fetch_pair_news(base: str, coin_name: Optional[str], deep: bool) -> Dict[str, Any]:
+    """Fetch recent news for a token and (when deep) trigger a live internet scrape
+    that stores fresh articles in the DB so JARVIS learns from captured data.
+
+    Returns {articles, count, avg_sentiment, sentiment_label, scraped}."""
+    result: Dict[str, Any] = {
+        "articles": [], "count": 0, "avg_sentiment": 0.0,
+        "sentiment_label": "neutral", "scraped": False,
+    }
+    try:
+        from app.core.database import AsyncSessionLocal
+        from app.sentiment.enhanced_service import EnhancedSentimentService
+
+        async with AsyncSessionLocal() as db:
+            articles = await EnhancedSentimentService.get_articles(
+                db, symbol=base, hours=48, limit=15
+            )
+            # DEEP: if stored coverage is thin, scrape the live internet sources,
+            # store + score them (learning), then re-query for this token.
+            if deep and len(articles) < 4:
+                try:
+                    await asyncio.wait_for(
+                        EnhancedSentimentService.run_full_cycle(db, max_age_hours=48),
+                        timeout=30,
+                    )
+                    result["scraped"] = True
+                    articles = await EnhancedSentimentService.get_articles(
+                        db, symbol=base, hours=48, limit=15
+                    )
+                except Exception as e:
+                    logger.debug(f"[JARVIS] live news scrape skipped: {e}")
+
+            # Fallback: obscure tokens are rarely tagged by exact symbol, so do a
+            # broad text search on the coin name/base so the user still gets any
+            # relevant headlines they explicitly asked for.
+            if not articles:
+                term = (coin_name or base or "").strip()
+                if term:
+                    try:
+                        articles = await EnhancedSentimentService.get_articles(
+                            db, search=term, hours=48, limit=8
+                        )
+                    except Exception:
+                        articles = []
+
+        scores = [
+            a.get("sentiment_score") for a in articles
+            if isinstance(a.get("sentiment_score"), (int, float))
+        ]
+        avg = round(sum(scores) / len(scores), 3) if scores else 0.0
+        label = "bullish" if avg > 0.1 else "bearish" if avg < -0.1 else "neutral"
+        result.update({
+            "articles": articles, "count": len(articles),
+            "avg_sentiment": avg, "sentiment_label": label,
+        })
+    except Exception as e:  # pragma: no cover
+        logger.debug(f"[JARVIS] news fetch skipped: {e}")
+    return result
+
+
+async def _find_open_position(symbol: str) -> Optional[Dict[str, Any]]:
+    """Return the user's open position for `symbol` (any exchange) as a compact
+    dict, or None. Matches on the normalised base+quote so BTCUSDT ≡ BTC/USDT."""
+    try:
+        want = symbol.upper().replace("/", "").replace(":USDT", "")
+        want_base = want.replace("USDT", "").replace("USDC", "")
+        positions = await get_all_positions()
+        for p in positions:
+            have = (p.symbol or "").upper().replace("/", "")
+            have_base = have.replace("USDT", "").replace("USDC", "")
+            if have == want or have_base == want_base:
+                return {
+                    "exchange": p.exchange,
+                    "symbol": p.symbol,
+                    "side": p.side,
+                    "size": p.size,
+                    "entry_price": p.entry_price,
+                    "mark_price": p.mark_price,
+                    "pnl": p.pnl,
+                    "pnl_pct": p.pnl_pct,
+                    "leverage": p.leverage,
+                    "liquidation_price": p.liquidation_price,
+                }
+    except Exception as e:  # pragma: no cover
+        logger.debug(f"[JARVIS] open-position lookup skipped: {e}")
+    return None
+
+
+async def _compose_ai_narrative(brief: str) -> Optional[str]:
+    """Ask the multi-provider AI router (OpenAI-preferred failover) to turn the raw
+    research brief into a natural, human, decisive analysis.  Returns None if no
+    AI provider is available so the caller falls back to the template."""
+    try:
+        from app.core.database import AsyncSessionLocal
+        from plugins.AiMarketAnalyst.backend.services.ai_router import db_chat
+
+        async with AsyncSessionLocal() as db:
+            resp = await db_chat(
+                db,
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are JARVIS, an elite crypto trading analyst speaking to your "
+                            "principal (address him as 'Sir'). Write a natural, confident, human "
+                            "analysis — never robotic or list-only. Weave the technicals, volume "
+                            "flow, the Kronos ML forecast and the news/sentiment into one coherent "
+                            "read of the pair, then give a clear directional bias and the key risk. "
+                            "If the brief says the user ALREADY HOLDS AN OPEN POSITION on this pair, "
+                            "give a direct recommendation on that position — hold, add, reduce, close, "
+                            "or move the stop / take-profit — and say why, referencing his live PnL. "
+                            "Be specific with the numbers you were given. Do NOT invent data you "
+                            "were not given. Keep it to 4-8 tight sentences."
+                        ),
+                    },
+                    {"role": "user", "content": brief},
+                ],
+                temperature=0.4,
+                max_tokens=650,
+                agent_name="jarvis-deep-analysis",
+                source="jarvis",
+            )
+            if resp.get("ok") and resp.get("content"):
+                return str(resp["content"]).strip()
+    except Exception as e:  # pragma: no cover
+        logger.debug(f"[JARVIS] AI narrative skipped: {e}")
+    return None
+
+
+async def _analyze_symbol(symbol: str, original_cmd: str, ex_name: Optional[str], deep: bool = False) -> CommandResult:
     """
     Real-data market analysis for `symbol`.
 
@@ -2172,6 +2387,115 @@ async def _analyze_symbol(symbol: str, original_cmd: str, ex_name: Optional[str]
     except Exception as _ke:
         logger.debug(f"[JARVIS] Kronos forecast skipped: {_ke}")
 
+    # ── Volume flow + News/sentiment + AI narrative (deep research) ──────────
+    # Always add volume + stored news; only trigger a fresh internet scrape when
+    # the user explicitly asked for news/research (keyword-gated for speed).
+    volume_info = await _crypto_volume_analysis(connector, ccxt_sym, ohlcv)
+    news_info = await _fetch_pair_news(base, coin_name, deep)
+    position_info = await _find_open_position(symbol)
+
+    if volume_info:
+        detail += (
+            f"\n\nVOLUME FLOW — buy {volume_info['buy_pressure_pct']:.0f}% / "
+            f"sell {volume_info['sell_pressure_pct']:.0f}%"
+            f"  (last candle {volume_info['volume_spike_x']:.1f}× the 20-bar average"
+            + (f", 24h vol {volume_info['quote_volume_24h']:,.0f}"
+               if isinstance(volume_info.get('quote_volume_24h'), (int, float)) else "")
+            + ")"
+        )
+        speech += (
+            f" Volume is {volume_info['buy_pressure_pct']:.0f} percent buy-side."
+        )
+
+    news_lines: List[str] = []
+    for a in (news_info.get("articles") or [])[:4]:
+        sc = a.get("sentiment_score")
+        lbl = a.get("sentiment_label") or (
+            "BULLISH" if (sc or 0) > 0.1 else "BEARISH" if (sc or 0) < -0.1 else "NEUTRAL"
+        )
+        src = a.get("source") or ""
+        title = (a.get("title") or "")[:130]
+        if title:
+            news_lines.append(f"[{str(lbl).upper()}] {title}" + (f" — {src}" if src else ""))
+    if news_lines:
+        detail += (
+            f"\n\nNEWS & SENTIMENT ({news_info['count']} headlines, "
+            f"{news_info['sentiment_label'].upper()})\n" + "\n".join(f"• {l}" for l in news_lines)
+        )
+    elif deep:
+        detail += "\n\nNEWS & SENTIMENT — no fresh headlines found for this pair."
+
+    # ── Your open position on this pair (if any) ────────────────────────────
+    pos_brief = ""
+    if position_info:
+        _pdir = str(position_info.get("side", "")).upper()
+        _pnl = position_info.get("pnl") or 0
+        _pnl_pct = position_info.get("pnl_pct") or 0
+        _arrow = "▲" if _pnl >= 0 else "▼"
+        detail += (
+            f"\n\nYOUR OPEN POSITION — {_pdir} {position_info.get('size')} @ "
+            f"{position_info.get('entry_price')} (mark {position_info.get('mark_price')})\n"
+            f"PnL {_arrow} {abs(_pnl):.2f} USDT ({_pnl_pct:+.2f}%)"
+            + (f"  ·  liq {position_info.get('liquidation_price')}"
+               if position_info.get("liquidation_price") else "")
+        )
+        pos_brief = (
+            f"\nUSER ALREADY HOLDS AN OPEN POSITION on this pair: {_pdir} size "
+            f"{position_info.get('size')} entered at {position_info.get('entry_price')}, "
+            f"mark {position_info.get('mark_price')}, live PnL {_pnl:+.2f} USDT ({_pnl_pct:+.2f}%)"
+            + (f", leverage {position_info.get('leverage')}x" if position_info.get("leverage") else "")
+            + (f", liquidation {position_info.get('liquidation_price')}"
+               if position_info.get("liquidation_price") else "")
+            + ". Advise specifically what to do with THIS position."
+        )
+
+    # ── AI-composed human narrative (the natural JARVIS voice) ──────────────
+    _kronos_line = ""
+    if kronos_info:
+        _kronos_line = (
+            f"Kronos ML forecast: {kronos_info['direction']} "
+            f"{kronos_info['pct_change']:+.2f}% (target {kronos_info['target_price']:.6g}, "
+            f"{int(kronos_info['confidence'] * 100)}% confidence)."
+        )
+    brief = (
+        f"Pair: {display_name} ({symbol}) on {ex_list[0].value if ex_list else 'bitget'}, 4h chart.\n"
+        f"Price {current:.6g}. Trend {trend}. RSI {rsi:.0f} ({rsi_label}). "
+        f"EMA50 {ema50:.6g}, EMA200 {ema200:.6g}. "
+        f"Swing high {swing_high:.6g}, swing low {swing_low:.6g}.\n"
+        + (f"Volume: buy {volume_info['buy_pressure_pct']:.0f}% / sell {volume_info['sell_pressure_pct']:.0f}%, "
+           f"last candle {volume_info['volume_spike_x']:.1f}x avg.\n" if volume_info else "")
+        + (_kronos_line + "\n" if _kronos_line else "")
+        + (f"News sentiment: {news_info['sentiment_label']} across {news_info['count']} recent headlines.\n"
+           if news_info['count'] else "News: no fresh headlines for this pair.\n")
+        + (("Headlines:\n" + "\n".join(f"- {l}" for l in news_lines) + "\n") if news_lines else "")
+        + f"My proposed setup: {side_label} — entry {entry}, SL {sl}, TP1 {tp1} (R:R {rr1}x), "
+        f"TP2 {tp2} (R:R {rr2}x)."
+        + pos_brief
+    )
+    narrative = await _compose_ai_narrative(brief)
+
+    if narrative:
+        levels_block = (
+            f"PROPOSED {side_label} SETUP (real data — NOT executed)\n"
+            f"Entry {entry}  |  SL {sl}  |  TP1 {tp1} (R:R {rr1}x)  |  TP2 {tp2} (R:R {rr2}x)\n"
+            f"To execute say:  \"{confirm_cmd}\""
+        )
+        detail = f"{narrative}\n\n{levels_block}"
+        speech = narrative[:520].replace("\n", " ")
+
+    # ── Learn: persist this research + narrative to all three brains ────────
+    try:
+        jarvis_learn_all_brains(
+            action="deep_analysis" if deep else "analysis",
+            symbol=symbol,
+            summary=(narrative or speech or "")[:200],
+            detail=detail[:1200],
+            tags=["jarvis", "analysis", base, trend],
+            importance=0.6 if deep else 0.45,
+        )
+    except Exception:
+        pass
+
     return CommandResult(
         ok=True, action="analyze",
         detail=detail,
@@ -2182,6 +2506,23 @@ async def _analyze_symbol(symbol: str, original_cmd: str, ex_name: Optional[str]
             "rsi": rsi, "trend": trend, "ema50": round(ema50, 6),
             "ema200": round(ema200, 6), "confirm_command": confirm_cmd,
             "kronos": kronos_info,
+            "volume": volume_info,
+            "news": [
+                {
+                    "title": a.get("title"),
+                    "source": a.get("source"),
+                    "url": a.get("url"),
+                    "sentiment_score": a.get("sentiment_score"),
+                    "sentiment_label": a.get("sentiment_label"),
+                }
+                for a in (news_info.get("articles") or [])[:6]
+            ],
+            "news_count": news_info.get("count", 0),
+            "sentiment_label": news_info.get("sentiment_label"),
+            "sentiment_score": news_info.get("avg_sentiment"),
+            "position": position_info,
+            "narrative": narrative,
+            "deep": deep,
             "WARNING": "NOT EXECUTED — say the confirm_command to place the order",
         },
     )

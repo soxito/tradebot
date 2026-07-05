@@ -1,8 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { apiClient } from '@/services/api';
 import { formatPrice } from '@/utils/price';
 import { useTradeStore } from '@/store/useTradeStore';
 import { formatTimeZA } from '@/utils/datetime';
+import { useEventStream } from '@/hooks/useEventStream';
 
 interface Signal {
   id: number;
@@ -20,13 +21,7 @@ export default function SignalFeed() {
   const [signals, setSignals] = useState<Signal[]>([]);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    fetchSignals();
-    const interval = setInterval(fetchSignals, 10000); // Refresh every 10s
-    return () => clearInterval(interval);
-  }, []);
-
-  const fetchSignals = async () => {
+  const fetchSignals = useCallback(async () => {
     try {
       const response = await apiClient.getSignals({ limit: 20 });
       setSignals(response.data);
@@ -35,7 +30,18 @@ export default function SignalFeed() {
       console.error('Failed to fetch signals:', error);
       setLoading(false);
     }
-  };
+  }, []);
+
+  // Realtime: refetch the moment a new signal is pushed over SSE.
+  const { connected } = useEventStream('signal.new', fetchSignals);
+
+  useEffect(() => {
+    fetchSignals();
+    // Fallback polling only while the realtime stream is down (no regression).
+    if (connected) return;
+    const interval = setInterval(fetchSignals, 10000);
+    return () => clearInterval(interval);
+  }, [fetchSignals, connected]);
 
   const getActionColor = (action: string) => {
     switch (action.toLowerCase()) {

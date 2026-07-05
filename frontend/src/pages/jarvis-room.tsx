@@ -20,6 +20,7 @@ import { useRouter } from 'next/router'
 import { apiClient } from '@/services/api'
 import { useAdaptiveQuality } from '@/hooks/useAdaptiveQuality'
 import { PerfProfile, PerfTier, PERF_PROFILES } from '@/utils/devicePerformance'
+import { supportsOffscreenCanvas } from '@/utils/workerSupport'
 
 const PaulChat = dynamic(() => import('@/components/PaulChat'), { ssr: false })
 const TradingViewWidget = dynamic(() => import('@/components/TradingViewWidget'), { ssr: false })
@@ -133,6 +134,73 @@ function useSoxOrb(
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas) return
+
+    // ── Off-thread render path: OffscreenCanvas + Web Worker ──────────────────
+    // Moves the ~980-particle animation off the main thread so the room loads
+    // fast and stays responsive. Falls through to the main-thread loop below
+    // when the browser lacks OffscreenCanvas support (e.g. older Safari).
+    if (supportsOffscreenCanvas(canvas)) {
+      let worker: Worker | null = null
+      try {
+        worker = new Worker(new URL('../workers/soxOrb.worker.ts', import.meta.url))
+      } catch {
+        worker = null
+      }
+      if (worker) {
+        const w = worker
+        const readW = () => canvas.clientWidth || window.innerWidth
+        const readH = () => canvas.clientHeight || window.innerHeight
+        let offscreen: OffscreenCanvas | null = null
+        try {
+          offscreen = canvas.transferControlToOffscreen()
+        } catch {
+          offscreen = null
+        }
+        if (offscreen) {
+          w.postMessage({
+            type: 'init',
+            canvas: offscreen,
+            cssW: readW(),
+            cssH: readH(),
+            deviceDpr: window.devicePixelRatio || 1,
+            profile: qualityRef?.current ?? PERF_PROFILES.high,
+            state: stateRef.current,
+          }, [offscreen])
+
+          const onResize = () => w.postMessage({
+            type: 'resize', cssW: readW(), cssH: readH(), deviceDpr: window.devicePixelRatio || 1,
+          })
+          const onVisibility = () => w.postMessage({ type: 'visibility', hidden: document.hidden })
+          window.addEventListener('resize', onResize)
+          document.addEventListener('visibilitychange', onVisibility)
+
+          // Forward state + quality-tier changes to the worker. Both transition
+          // infrequently, so a light 150 ms poll (no main-thread rAF or canvas
+          // work) keeps the orb in sync at near-zero cost; the worker's own lerp
+          // smooths the visual transition.
+          let lastState = stateRef.current
+          let lastTier: PerfTier = (qualityRef?.current ?? PERF_PROFILES.high).tier
+          const sync = window.setInterval(() => {
+            const s = stateRef.current
+            if (s !== lastState) { lastState = s; w.postMessage({ type: 'state', state: s }) }
+            const prof = qualityRef?.current
+            if (prof && prof.tier !== lastTier) { lastTier = prof.tier; w.postMessage({ type: 'quality', profile: prof }) }
+          }, 150)
+
+          return () => {
+            clearInterval(sync)
+            window.removeEventListener('resize', onResize)
+            document.removeEventListener('visibilitychange', onVisibility)
+            try { w.postMessage({ type: 'stop' }) } catch { /* noop */ }
+            w.terminate()
+          }
+        }
+        // Transfer failed → drop the worker and use the main-thread path.
+        w.terminate()
+      }
+    }
+
+    // ── Main-thread fallback (no OffscreenCanvas) ─────────────────────────────
     const ctx = canvas.getContext('2d')
     if (!ctx) return
 
@@ -1247,7 +1315,12 @@ export default function SoxRoom() {
               {gfxTier.toUpperCase()} &middot; {gfxFps || '\u00B7\u00B7'} fps
             </span>
           </div>
-          <div style={{ fontSize: 8.5, color: '#64748b', marginTop: 2, fontFamily: 'monospace' }}>{gfxLabel} &middot; auto-tuned</div>
+          {/* gfxLabel embeds CPU cores / RAM read from `navigator`, which differ
+              between the server (fallback specs) and client (real hardware). Only
+              render it after mount so SSR and the first client render match. */}
+          <div style={{ fontSize: 8.5, color: '#64748b', marginTop: 2, fontFamily: 'monospace' }}>
+            {mounted ? `${gfxLabel} \u00B7 auto-tuned` : 'auto-tuned'}
+          </div>
           {sysStats?.available ? (
             <>
               <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 7, fontSize: 11 }}>

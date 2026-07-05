@@ -3,6 +3,7 @@ import Link from 'next/link';
 import dynamic from 'next/dynamic';
 import { useTradeStore } from '@/store/useTradeStore';
 import ConnectionStatus from '@/components/ConnectionStatus';
+import { useRealtimeNotifications } from '@/services/notifications';
 
 // PAUL JARVIS — lazy-loaded so it never blocks the main bundle, no SSR needed
 const PaulChat = dynamic(() => import('@/components/PaulChat'), { ssr: false })
@@ -80,6 +81,9 @@ const navItems = [
 export default function Layout({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const { sidebarOpen, toggleSidebar } = useTradeStore();
+
+  // Surface realtime SSE events as desktop notifications (no-op unless opted in).
+  useRealtimeNotifications();
 
   return (
     <div className="min-h-screen flex">

@@ -22,6 +22,7 @@ from app.models.database import (
     SimAccount, SimOrder, SimPosition,
     Signal, SignalAction, SignalStatus,
 )
+from app.core.events import event_bus, Topics
 from app.exchanges.manager import exchange_manager, SupportedExchange
 from app.exchanges.bitget import BitgetConnector
 from app.signals.generator import SignalGenerator
@@ -482,6 +483,15 @@ class SimulationEngine:
             await db.commit()
             await db.refresh(account)
             await db.refresh(order)
+            event_bus.emit(Topics.TRADE_UPDATE, {
+                "event": "closed_position",
+                "mode": "sim",
+                "order_id": order.id,
+                "symbol": symbol,
+                "side": side,
+                "pnl": round(pnl, 2),
+                "balance": round(account.balance, 2),
+            })
             return {
                 "success": True,
                 "action": "closed_position",
@@ -525,6 +535,20 @@ class SimulationEngine:
             f"📝 SIM order: {side.upper()} {amount} {symbol} @ ${price:.2f} "
             f"| SL: {stop_loss} | TP: {take_profit} | Balance: ${account.balance:.2f}"
         )
+
+        event_bus.emit(Topics.TRADE_UPDATE, {
+            "event": "opened_position",
+            "mode": "sim",
+            "order_id": order.id,
+            "position_id": position.id,
+            "symbol": symbol,
+            "side": pos_side,
+            "amount": amount,
+            "entry_price": price,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "balance": round(account.balance, 2),
+        })
 
         return {
             "success": True,
@@ -702,6 +726,16 @@ class SimulationEngine:
 
         await db.commit()
         await db.refresh(account)
+        event_bus.emit(Topics.TRADE_UPDATE, {
+            "event": "closed_position",
+            "mode": "sim",
+            "position_id": position_id,
+            "symbol": position.symbol,
+            "side": position.side,
+            "pnl": round(pnl, 2),
+            "refunded": round(refunded, 2),
+            "balance": round(account.balance, 2),
+        })
         return {
             "success": True,
             "position_id": position_id,
@@ -846,6 +880,8 @@ class SimulationEngine:
                 logger.info(f"🎯 SIM {hit}: {pos.symbol} {pos.side} PnL=${pnl:.2f}")
 
         await db.commit()
+        for c in closed:
+            event_bus.emit(Topics.TRADE_UPDATE, {"event": "sl_tp_hit", "mode": "sim", **c})
         return closed
 
     # ── Backfill SL/TP for existing positions ───────────────

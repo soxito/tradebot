@@ -57,6 +57,16 @@
   let restartTimer = null
   let manuallyStopped = false
   let restartDelay = 500  // exponential back-off starting value (ms)
+  // ── Speech-start health tracking (extension-side watchdog) ─────────────────
+  // Chrome sometimes accepts rec.start() but never fires onstart inside a content
+  // script (the popup then shows "Starting…" forever). We detect that, cap the
+  // retries, and when the engine is clearly dead we HAND THE MIC BACK to the page
+  // (voiceReady=false) so the in-page recognizer takes over instead of JARVIS
+  // going deaf. onstart resets all of this and reclaims voice cleanly.
+  let startWatchdog       = null   // timer: did onstart fire after start()?
+  let recStartedOk        = false  // set true by onstart; reset before each start()
+  let consecutiveFailures = 0      // starts that never reached onstart, in a row
+  let voiceFailed         = false  // gave up on the Chrome speech engine (page owns mic)
   let pageSpeaking = false
   let pageSpeakingSetAt = 0  // timestamp when pageSpeaking was last set true (deadman reset)
   let pageVoiceMatch = true  // updated by page's voiceMatch loop; gates dispatch when false
@@ -277,7 +287,9 @@
   function markPresence() {
     try {
       document.documentElement.setAttribute('data-jarvis-ext', '1')
-      document.documentElement.setAttribute('data-jarvis-ext-voice', VOICE_SUPPORTED ? '1' : '0')
+      // voiceReady is FALSE once the Chrome speech engine has failed to start so
+      // the page knows to take over the mic (never leaves JARVIS deaf).
+      document.documentElement.setAttribute('data-jarvis-ext-voice', (VOICE_SUPPORTED && !voiceFailed) ? '1' : '0')
       // Expose the installed version so the page can detect available updates.
       if (EXT_VERSION) document.documentElement.setAttribute('data-jarvis-ext-version', EXT_VERSION)
     } catch { /* noop */ }
@@ -288,7 +300,7 @@
       listening,
       enabled: !!settings.enabled,
       speechSupported: VOICE_SUPPORTED,
-      voiceReady: VOICE_SUPPORTED && !!settings.enabled,
+      voiceReady: VOICE_SUPPORTED && !!settings.enabled && !voiceFailed,
       ...extra,
     })
   }
@@ -299,12 +311,19 @@
       version: EXT_VERSION,
       enabled: !!settings.enabled,
       speechSupported: VOICE_SUPPORTED,
-      voiceReady: VOICE_SUPPORTED && !!settings.enabled,
+      voiceReady: VOICE_SUPPORTED && !!settings.enabled && !voiceFailed,
       // Report the ACTUAL listening state so the page only cedes the mic when
       // recognition is truly running — never while the extension is merely
       // connected/enabled but stuck before onstart ("Starting…").
       listening: !!listening,
     })
+  }
+  // Re-publish voice readiness to the page (DOM attr + status message). Called
+  // whenever voiceFailed flips so the page's mic-ownership watchdog reacts and
+  // the in-page recognizer takes over (or hands back) immediately.
+  function broadcastVoiceState() {
+    markPresence()
+    status()
   }
   function notify(title, body) {
     if (!settings.notifications) return
@@ -1021,6 +1040,37 @@
     }
   }
 
+  // Called when a recognition attempt ends/stalls WITHOUT ever reaching onstart.
+  // After a few in a row we conclude the Chrome speech engine won't start in this
+  // context and cede the mic to the page (voiceReady=false) so JARVIS still hears
+  // via the in-page recognizer. A slow background retry reclaims voice if the
+  // engine later recovers.
+  function handleStartFailure(reason) {
+    clearTimeout(startWatchdog); startWatchdog = null
+    consecutiveFailures++
+    console.warn(TAG, 'speech start failed —', reason, '(x' + consecutiveFailures + ')')
+    if (consecutiveFailures >= 3 && !voiceFailed) {
+      voiceFailed = true
+      listening = false
+      try { if (recognition) { recognition.onend = null; recognition.onerror = null; recognition.stop() } } catch { /* noop */ }
+      recognition = null
+      // Release the mic: drop our getUserMedia analyser so the page's recognizer
+      // isn't starved, and tell the page voice is NOT ready so it takes over.
+      stopFreqAnalyser()
+      broadcastVoiceState()   // posts voiceReady:false + data-jarvis-ext-voice='0'
+      badge('◌', '#64748b')
+      // Slow background retry: if the engine recovers we reclaim voice cleanly.
+      clearTimeout(restartTimer)
+      restartTimer = setTimeout(() => {
+        if (!settings.enabled || manuallyStopped) return
+        voiceFailed = false
+        consecutiveFailures = 0
+        startRecognition()
+        initFreqAnalyser()
+      }, 30000)
+    }
+  }
+
   // ── Speech recognition lifecycle ──────────────────────────────────────────
   function startRecognition() {
     if (!SR) {
@@ -1078,7 +1128,15 @@
     // ── onstart ──────────────────────────────────────────────────────────────
     rec.onstart = () => {
       listening    = true
+      recStartedOk = true
       restartDelay = 500  // reset back-off on clean start
+      clearTimeout(startWatchdog); startWatchdog = null
+      // Recovered: clear failure tracking and re-advertise voice as ready so the
+      // page cedes the mic back to the (now working) extension recognizer.
+      const wasFailed = voiceFailed
+      consecutiveFailures = 0
+      voiceFailed = false
+      if (wasFailed) broadcastVoiceState()
       status()
       badge('●', '#22c55e')
     }
@@ -1138,24 +1196,57 @@
     rec.onend = () => {
       try {
         clearTimeout(dispatchTimer)
+        clearTimeout(startWatchdog); startWatchdog = null
         listening = false
+        // Ended without ever reaching onstart → count it as a start failure so we
+        // can eventually cede the mic to the page instead of restart-looping.
+        if (!recStartedOk) handleStartFailure('onend-before-start')
         status()
-        if (settings.enabled && !manuallyStopped) {
+        if (settings.enabled && !manuallyStopped && !voiceFailed) {
           clearTimeout(restartTimer)
           restartTimer = setTimeout(() => { if (settings.enabled && !listening) startRecognition() }, restartDelay)
-        } else {
+        } else if (!voiceFailed) {
           badge('', '#64748b')
         }
       } catch { /* noop */ }
     }
 
     recognition = rec
-    try { rec.start() } catch (e) { console.warn(TAG, 'rec.start() failed', e); listening = false }
+    recStartedOk = false
+    // Watchdog: Chrome may accept start() yet never fire onstart inside a content
+    // script. If onstart hasn't arrived in 2.5s, tear the attempt down and count
+    // it as a failure so we can cede the mic to the page.
+    clearTimeout(startWatchdog)
+    startWatchdog = setTimeout(() => {
+      if (!recStartedOk && !listening) {
+        try { rec.onend = null; rec.onerror = null; rec.stop() } catch { /* noop */ }
+        listening = false
+        handleStartFailure('no-onstart')
+        if (!voiceFailed && settings.enabled && !manuallyStopped) {
+          clearTimeout(restartTimer)
+          restartTimer = setTimeout(() => { if (settings.enabled && !listening) startRecognition() }, restartDelay)
+        }
+      }
+    }, 2500)
+    try {
+      rec.start()
+    } catch (e) {
+      console.warn(TAG, 'rec.start() failed', e)
+      listening = false
+      clearTimeout(startWatchdog); startWatchdog = null
+      handleStartFailure('start-throw')
+      if (!voiceFailed && settings.enabled && !manuallyStopped) {
+        clearTimeout(restartTimer)
+        restartTimer = setTimeout(() => { if (settings.enabled && !listening) startRecognition() }, Math.max(restartDelay, 800))
+      }
+    }
   }
 
   function stopRecognition() {
     manuallyStopped = true
     clearTimeout(restartTimer)
+    clearTimeout(startWatchdog); startWatchdog = null
+    recStartedOk = false
     try { if (recognition) { recognition.onend = null; recognition.stop() } } catch { /* noop */ }
     recognition = null
     if (fxActive) stopFirefoxListen()  // also stop the Firefox Deepgram loop
