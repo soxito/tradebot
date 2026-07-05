@@ -487,3 +487,86 @@ class MT5BacktestDataRequest(BaseModel):
     daily_profit_target_pct: float = Field(default=0.0, ge=0.0, le=1000.0)
     use_ai: bool = Field(default=True)  # AI backtest analysis
     candles: List[MT5CandleInput] = Field(default_factory=list)
+
+
+# ── Scalp Bot Schemas ──────────────────────────────────────────────
+
+class ScalpStartRequest(BaseModel):
+    """Activate the autonomous scalp bot for one account + symbol."""
+    account_id: int
+    symbol: str = Field(..., max_length=30)
+    lot_size: float = Field(default=0.01, gt=0, le=100.0)
+    auto_lot: bool = Field(default=False)
+    risk_per_trade_pct: float = Field(default=1.0, ge=0.05, le=20.0)
+    max_daily_loss_pct: float = Field(default=3.0, ge=0.5, le=50.0)
+    target_profit_pct: float = Field(default=1.5, ge=0.1, le=20.0)
+    recovery_enabled: bool = Field(default=True)
+    use_ai: bool = Field(default=True)
+    use_kronos: bool = Field(default=True)
+    timeframe: str = Field(default="M5", pattern=r"^(M1|M5|M15|M30|H1)$")
+
+
+class ScalpStopRequest(BaseModel):
+    account_id: int
+    symbol: str = Field(..., max_length=30)
+
+
+class ScalpTradeInfo(BaseModel):
+    ticket: Optional[int] = None
+    side: str
+    lot: float
+    entry_price: float
+    sl: Optional[float] = None
+    tp: Optional[float] = None
+    pnl: float = 0.0
+    is_recovery: bool = False
+    status: str = "open"
+    confidence: float = 0.0
+    opened_at: Optional[datetime] = None
+
+
+class ScalpStatusResponse(BaseModel):
+    session_id: int
+    account_id: int
+    symbol: str
+    status: str
+    phase: str
+    lot_size: float
+    recovery_enabled: bool
+    use_ai: bool
+    use_kronos: bool
+    timeframe: str
+    bias_direction: Optional[str] = None
+    bias_confidence: float = 0.0
+    session_pnl: float = 0.0
+    total_trades: int = 0
+    wins: int = 0
+    losses: int = 0
+    combined_pnl: float = 0.0
+    open_trades: List[ScalpTradeInfo] = Field(default_factory=list)
+    last_cycle_at: Optional[datetime] = None
+    ai_note: Optional[str] = None
+    error_msg: Optional[str] = None
+    started_at: Optional[datetime] = None
+
+
+class ScalpSymbolResult(BaseModel):
+    symbol: str
+    description: Optional[str] = None
+    price: Optional[float] = None
+
+
+class ScalpTradeRow(BaseModel):
+    id: int
+    symbol: str
+    side: str
+    lot: float
+    entry_price: float
+    close_price: Optional[float] = None
+    pnl: float = 0.0
+    is_recovery: bool = False
+    status: str
+    confidence: float = 0.0
+    reason: Optional[str] = None
+    opened_at: Optional[datetime] = None
+    closed_at: Optional[datetime] = None

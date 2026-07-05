@@ -31,6 +31,8 @@ from plugins.MT5TradingPlugin.backend.schemas import (
     MT5SymbolInfo, MT5EquityPoint,
     MT5SmcAnalyzeResponse, MT5BacktestRequest, MT5BacktestResponse,
     MT5SmcPlaceRequest, MT5SmcAnalyzeDataRequest, MT5BacktestDataRequest,
+    ScalpStartRequest, ScalpStopRequest, ScalpStatusResponse, ScalpTradeInfo,
+    ScalpSymbolResult, ScalpTradeRow,
 )
 from plugins.MT5TradingPlugin.backend.services.mt5_client import mt5_client
 from plugins.MT5TradingPlugin.backend.services.sync_service import MT5SyncService
@@ -1478,3 +1480,240 @@ async def apply_position_suggestions_endpoint(data: PositionSuggestionsApplyRequ
     applied = sum(1 for r in results if r.get("success"))
     failed = len(results) - applied
     return {"applied": applied, "failed": failed, "results": results}
+
+
+# ── Autonomous Scalp Bot ──────────────────────────────────────────
+#
+# Search a broker symbol, activate the scalp bot with a lot size + risk
+# settings, and it autonomously analyses the market across all timeframes
+# (M5 primary) using SMC + Kronos + AI, places market orders with SL/TP,
+# closes on profit, and adds an SMC-guided recovery leg when a trade goes
+# against it so a retracement pushes the combined PnL back to profit.
+
+from plugins.MT5TradingPlugin.backend.models import (
+    MT5ScalpSession, MT5ScalpTrade, MT5ScalpSessionStatus,
+)
+from plugins.MT5TradingPlugin.backend.services.scalp_bot_service import (
+    scalp_bot_manager,
+)
+
+
+async def _scalp_status_payload(db, session: MT5ScalpSession) -> ScalpStatusResponse:
+    """Build a live status response for one scalp session."""
+    open_rows = await db.execute(
+        select(MT5ScalpTrade).where(
+            MT5ScalpTrade.session_id == session.id,
+            MT5ScalpTrade.status == "open",
+        )
+    )
+    open_trades = open_rows.scalars().all()
+
+    # Pull live PnL for the open tickets from MT5 (best-effort).
+    live_pnl: dict[int, float] = {}
+    account = await db.get(MT5Account, session.account_id)
+    if account and open_trades:
+        try:
+            positions = await mt5_client.get_positions(
+                account.login, account.server, account.password_encrypted
+            )
+            live_pnl = {
+                int(p.get("ticket", 0)): float(p.get("profit", 0.0) or 0.0)
+                for p in positions if p.get("ticket")
+            }
+        except Exception:  # noqa: BLE001
+            live_pnl = {}
+
+    infos: List[ScalpTradeInfo] = []
+    combined = 0.0
+    for t in open_trades:
+        pnl = live_pnl.get(int(t.ticket or 0), 0.0)
+        combined += pnl
+        infos.append(ScalpTradeInfo(
+            ticket=t.ticket, side=t.side, lot=t.lot, entry_price=t.entry_price,
+            sl=t.sl, tp=t.tp, pnl=round(pnl, 2), is_recovery=t.is_recovery,
+            status=t.status, confidence=t.confidence, opened_at=t.opened_at,
+        ))
+
+    return ScalpStatusResponse(
+        session_id=session.id, account_id=session.account_id, symbol=session.symbol,
+        status=session.status.value if hasattr(session.status, "value") else str(session.status),
+        phase=session.phase or "analyzing",
+        lot_size=session.lot_size, recovery_enabled=session.recovery_enabled,
+        use_ai=session.use_ai, use_kronos=session.use_kronos,
+        timeframe=session.timeframe or "M5",
+        bias_direction=session.bias_direction, bias_confidence=session.bias_confidence or 0.0,
+        session_pnl=round(session.session_pnl or 0.0, 2),
+        total_trades=session.total_trades or 0, wins=session.wins or 0,
+        losses=session.losses or 0, combined_pnl=round(combined, 2),
+        open_trades=infos, last_cycle_at=session.last_cycle_at,
+        ai_note=session.ai_note, error_msg=session.error_msg, started_at=session.started_at,
+    )
+
+
+@router.post("/scalp/start", response_model=ScalpStatusResponse)
+async def scalp_start(data: ScalpStartRequest):
+    """Activate the autonomous scalp bot for one account + symbol."""
+    async with AsyncSessionLocal() as db:
+        account = await db.get(MT5Account, data.account_id)
+        if not account:
+            raise HTTPException(404, "Account not found")
+
+        # Reuse or replace an existing session for this account+symbol.
+        existing = (await db.execute(
+            select(MT5ScalpSession).where(
+                MT5ScalpSession.account_id == data.account_id,
+                MT5ScalpSession.symbol == data.symbol,
+                MT5ScalpSession.status.in_([
+                    MT5ScalpSessionStatus.ACTIVE, MT5ScalpSessionStatus.PAUSED,
+                ]),
+            ).limit(1)
+        )).scalar_one_or_none()
+
+        if existing:
+            session = existing
+            session.status = MT5ScalpSessionStatus.ACTIVE
+            session.phase = "analyzing"
+            session.error_msg = None
+        else:
+            session = MT5ScalpSession(
+                user_id=DEFAULT_USER_ID, account_id=data.account_id, symbol=data.symbol,
+                status=MT5ScalpSessionStatus.ACTIVE, phase="analyzing",
+            )
+            db.add(session)
+
+        session.lot_size = data.lot_size
+        session.auto_lot = data.auto_lot
+        session.risk_per_trade_pct = data.risk_per_trade_pct
+        session.max_daily_loss_pct = data.max_daily_loss_pct
+        session.target_profit_pct = data.target_profit_pct
+        session.recovery_enabled = data.recovery_enabled
+        session.use_ai = data.use_ai
+        session.use_kronos = data.use_kronos
+        session.timeframe = data.timeframe
+        session.raw_settings = data.model_dump()
+        await db.commit()
+        await db.refresh(session)
+        session_id = session.id
+
+    scalp_bot_manager.start(session_id)
+
+    async with AsyncSessionLocal() as db:
+        session = await db.get(MT5ScalpSession, session_id)
+        return await _scalp_status_payload(db, session)
+
+
+@router.post("/scalp/stop")
+async def scalp_stop(data: ScalpStopRequest):
+    """Stop the scalp bot for one account + symbol and close open trades."""
+    async with AsyncSessionLocal() as db:
+        rows = await db.execute(
+            select(MT5ScalpSession).where(
+                MT5ScalpSession.account_id == data.account_id,
+                MT5ScalpSession.symbol == data.symbol,
+                MT5ScalpSession.status.in_([
+                    MT5ScalpSessionStatus.ACTIVE, MT5ScalpSessionStatus.PAUSED,
+                ]),
+            )
+        )
+        sessions = rows.scalars().all()
+    if not sessions:
+        raise HTTPException(404, "No active scalp session for this symbol")
+    for s in sessions:
+        await scalp_bot_manager.stop(s.id)
+    return {"stopped": [s.id for s in sessions]}
+
+
+@router.get("/scalp/status/{account_id}", response_model=List[ScalpStatusResponse])
+async def scalp_status(account_id: int):
+    """List all non-stopped scalp sessions for an account with live PnL."""
+    async with AsyncSessionLocal() as db:
+        rows = await db.execute(
+            select(MT5ScalpSession).where(
+                MT5ScalpSession.account_id == account_id,
+                MT5ScalpSession.status.in_([
+                    MT5ScalpSessionStatus.ACTIVE, MT5ScalpSessionStatus.PAUSED,
+                ]),
+            ).order_by(MT5ScalpSession.started_at.desc())
+        )
+        sessions = rows.scalars().all()
+        return [await _scalp_status_payload(db, s) for s in sessions]
+
+
+@router.post("/scalp/close-all/{account_id}")
+async def scalp_close_all(account_id: int):
+    """Emergency stop: close every open scalp trade and stop all sessions."""
+    async with AsyncSessionLocal() as db:
+        rows = await db.execute(
+            select(MT5ScalpSession).where(
+                MT5ScalpSession.account_id == account_id,
+                MT5ScalpSession.status.in_([
+                    MT5ScalpSessionStatus.ACTIVE, MT5ScalpSessionStatus.PAUSED,
+                ]),
+            )
+        )
+        sessions = rows.scalars().all()
+    for s in sessions:
+        await scalp_bot_manager.stop(s.id)
+    return {"stopped": [s.id for s in sessions]}
+
+
+@router.get("/scalp/symbols/search", response_model=List[ScalpSymbolResult])
+async def scalp_symbol_search(
+    account_id: int,
+    q: str = Query(default="", max_length=30),
+    limit: int = Query(default=30, ge=1, le=100),
+):
+    """Fuzzy-search the broker's tradeable symbols (FX, metals, indices, crypto, stocks)."""
+    async with AsyncSessionLocal() as db:
+        account = await db.get(MT5Account, account_id)
+        if not account:
+            raise HTTPException(404, "Account not found")
+        try:
+            symbols = await mt5_client.get_symbols(
+                account.login, account.server, account.password_encrypted
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[MT5/scalp] symbol search failed: {e}")
+            symbols = []
+
+    needle = (q or "").upper().replace("/", "")
+    matched = [s for s in symbols if not needle or needle in (s or "").upper().replace("/", "")]
+    # Exact / prefix matches first, then contains.
+    matched.sort(key=lambda s: (
+        0 if (s or "").upper().replace("/", "").startswith(needle) else 1,
+        len(s or ""),
+    ))
+    return [ScalpSymbolResult(symbol=s, description=None) for s in matched[:limit]]
+
+
+@router.get("/scalp/sessions/{account_id}", response_model=List[ScalpStatusResponse])
+async def scalp_sessions_history(account_id: int, limit: int = Query(default=20, le=100)):
+    """Recent scalp sessions (any status) for an account."""
+    async with AsyncSessionLocal() as db:
+        rows = await db.execute(
+            select(MT5ScalpSession)
+            .where(MT5ScalpSession.account_id == account_id)
+            .order_by(MT5ScalpSession.started_at.desc())
+            .limit(limit)
+        )
+        sessions = rows.scalars().all()
+        return [await _scalp_status_payload(db, s) for s in sessions]
+
+
+@router.get("/scalp/trades/{session_id}", response_model=List[ScalpTradeRow])
+async def scalp_trades(session_id: int, limit: int = Query(default=50, le=200)):
+    """Trade log for a scalp session."""
+    async with AsyncSessionLocal() as db:
+        rows = await db.execute(
+            select(MT5ScalpTrade)
+            .where(MT5ScalpTrade.session_id == session_id)
+            .order_by(MT5ScalpTrade.opened_at.desc())
+            .limit(limit)
+        )
+        trades = rows.scalars().all()
+        return [ScalpTradeRow(
+            id=t.id, symbol=t.symbol, side=t.side, lot=t.lot,
+            entry_price=t.entry_price, close_price=t.close_price, pnl=round(t.pnl or 0.0, 2),
+            is_recovery=t.is_recovery, status=t.status, confidence=t.confidence,
+            reason=t.reason, opened_at=t.opened_at, closed_at=t.closed_at,
+        ) for t in trades]

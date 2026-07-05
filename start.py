@@ -1699,44 +1699,106 @@ def start_postgres_docker() -> Tuple[bool, int]:
 
 # ── Redis ─────────────────────────────────────────────────────────────────────
 def _redis_installed() -> bool:
-    """True if a Redis server binary is available (PATH, Homebrew keg, or Scoop)."""
+    """True if a Redis server binary is available (PATH, Homebrew keg, known paths, or service)."""
     if shutil.which("redis-server") or shutil.which("redis-cli"):
         return True
     if IS_WINDOWS:
-        # Scoop installs to %USERPROFILE%\scoop\shims (usually on PATH).
-        # Chocolatey installs to C:\ProgramData\chocolatey\bin (usually on PATH).
-        # Redis for Windows via Memurai or official MSI also lands on PATH.
-        # If shutil.which found nothing, do a last-resort MSI-service check.
-        try:
-            r = subprocess.run(
-                ["sc", "query", "redis"],
-                capture_output=True, text=True, timeout=5,
-            )
-            return "RUNNING" in r.stdout.upper()
-        except Exception:
-            return False
+        # Check well-known install locations (winget/choco/Scoop/Memurai/tporadowski).
+        for candidate in _windows_redis_candidates():
+            if Path(candidate).exists():
+                return True
+        # An installed (but stopped) Windows service also counts.
+        for svc in ("redis", "Memurai", "memurai-developer", "Memurai-Developer"):
+            try:
+                r = subprocess.run(["sc", "query", svc],
+                                   capture_output=True, text=True, timeout=5)
+                if r.returncode == 0 and "SERVICE_NAME" in r.stdout:
+                    return True
+            except Exception:
+                pass
+        return False
     brew = _brew_path()
     if brew:
         return run([brew, "list", "redis"]).returncode == 0
     return False
 
 
+def _windows_redis_candidates() -> list:
+    """Return a list of candidate redis-server.exe paths on Windows."""
+    user = os.environ.get("USERPROFILE", "C:\\Users\\User")
+    pf   = os.environ.get("ProgramFiles", "C:\\Program Files")
+    pfd  = os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")
+    choco_lib = os.environ.get("ChocolateyInstall",
+                               "C:\\ProgramData\\chocolatey")
+    return [
+        # tporadowski Redis for Windows (winget / direct MSI)
+        rf"{pf}\Redis\redis-server.exe",
+        rf"{pfd}\Redis\redis-server.exe",
+        # Memurai (native Windows Redis-compatible — winget)
+        rf"{pf}\Memurai\memurai.exe",
+        rf"{pf}\Memurai Developer\memurai.exe",
+        # Chocolatey redis-64
+        rf"{choco_lib}\lib\redis-64\tools\redis-server.exe",
+        rf"{choco_lib}\bin\redis-server.exe",
+        # Scoop
+        rf"{user}\scoop\apps\redis\current\redis-server.exe",
+        rf"{user}\scoop\shims\redis-server.exe",
+    ]
+
+
+def _refresh_windows_path() -> None:
+    """Re-read the user + machine PATH from the Windows registry and prepend new dirs.
+
+    winget/choco/Scoop update the registry PATH but don't update the running
+    process environment, so binaries installed in this session won't be found
+    by shutil.which() unless we refresh PATH ourselves.
+    """
+    if not IS_WINDOWS:
+        return
+    try:
+        import winreg
+        new_dirs: list = []
+        for hive, sub in [
+            (winreg.HKEY_LOCAL_MACHINE,
+             r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+            (winreg.HKEY_CURRENT_USER,
+             r"Environment"),
+        ]:
+            try:
+                key = winreg.OpenKey(hive, sub)
+                val, _ = winreg.QueryValueEx(key, "Path")
+                winreg.CloseKey(key)
+                new_dirs.extend(val.split(os.pathsep))
+            except Exception:
+                pass
+        current = os.environ.get("PATH", "").split(os.pathsep)
+        to_add = [d for d in new_dirs if d and d not in current]
+        if to_add:
+            os.environ["PATH"] = os.pathsep.join(to_add + current)
+    except ImportError:
+        pass  # winreg only exists on Windows — this is fine
+
+
 def _redis_ping(port: int) -> bool:
     """True if Redis answers PING on the given port (real health, not just an open socket)."""
-    cli = shutil.which("redis-cli")
-    if not cli and IS_WINDOWS:
-        cli = shutil.which("redis-cli.exe")
-    if cli:
-        try:
-            r = run([cli, "-p", str(port), "ping"])
-            return r.returncode == 0 and "PONG" in (r.stdout or "").upper()
-        except Exception:
-            pass
-    # Raw RESP PING fallback (works everywhere, no redis-cli required).
+    # Try redis-cli first (fast, clear PONG response).
+    for cli_name in ("redis-cli", "redis-cli.exe", "memurai-cli", "memurai-cli.exe"):
+        cli = shutil.which(cli_name)
+        if cli:
+            try:
+                r = run([cli, "-p", str(port), "ping"])
+                if r.returncode == 0 and "PONG" in (r.stdout or "").upper():
+                    return True
+            except Exception:
+                pass
+            break  # stop after first cli found even if it failed
+
+    # Raw RESP PING fallback — works everywhere, no binary required.
     try:
-        with socket.create_connection(("localhost", port), timeout=1.0) as s:
+        with socket.create_connection(("localhost", port), timeout=1.5) as s:
             s.sendall(b"PING\r\n")
-            return b"PONG" in s.recv(64).upper()
+            data = s.recv(128)
+            return b"PONG" in data.upper()
     except OSError:
         return False
 
@@ -1745,65 +1807,80 @@ def _ensure_redis_windows() -> bool:
     """Install Redis on Windows using the best available package manager.
 
     Strategy (first one that works wins):
-      1. winget  — ships with Windows 10 1709+ / Windows 11
+      1. winget  — ships with Windows 10 1709+/11 (tporadowski.redis is the
+                   official Windows port; Memurai as a second option)
       2. choco   — Chocolatey (popular dev-machine tool)
-      3. Scoop   — alternative; installs redis from the 'main' bucket
+      3. Scoop   — lightweight CLI package manager
 
-    Memurai (https://www.memurai.com) is a production-quality Redis-compatible
-    server for Windows, also installable via winget.  We try the official Redis
-    package first (Tencent/redis-windows or Memurai, depending on what winget
-    resolves) and fall through to Choco/Scoop on failure.
+    After each attempt we refresh the process PATH from the registry so the
+    newly installed binaries are visible to shutil.which().
     """
-    # 1. winget (Windows Package Manager — built-in since Win 10 21H1)
-    winget = shutil.which("winget")
+    def _post_install_ok() -> bool:
+        _refresh_windows_path()
+        return _redis_installed()
+
+    # 1. winget
+    winget = shutil.which("winget") or shutil.which("winget.exe")
     if winget:
-        warn("Redis not found — installing via winget (Memurai, Redis-compatible) …")
-        # Prefer Memurai (native Windows, production-quality, free tier).
-        ok_w, err = _spinner_run(
-            [winget, "install", "--id", "Memurai.Memurai-Developer", "-e",
-             "--accept-source-agreements", "--accept-package-agreements"],
-            "winget install Memurai",
-            timeout=600,
-        )
-        if ok_w and _redis_installed():
-            return True
-        # Fall back to the Tencent-maintained official Redis for Windows.
+        info("Installing Redis via winget (tporadowski.redis) …")
         ok_w, err = _spinner_run(
             [winget, "install", "--id", "tporadowski.redis", "-e",
-             "--accept-source-agreements", "--accept-package-agreements"],
-            "winget install Redis (tporadowski)",
+             "--accept-source-agreements", "--accept-package-agreements",
+             "--scope", "machine"],
+            "winget install tporadowski.redis",
             timeout=600,
         )
-        if ok_w and _redis_installed():
+        if _post_install_ok():
             return True
-        warn(f"winget Redis install did not succeed: {err[:200]}")
+        if ok_w:
+            warn("winget reported success but redis-server not found — refreshing PATH")
+            _refresh_windows_path()
+            if _redis_installed():
+                return True
+
+        # Fallback within winget: Memurai (Redis-compatible, native Windows)
+        info("Trying Memurai (Redis-compatible) via winget …")
+        ok_w2, err2 = _spinner_run(
+            [winget, "install", "--id", "Memurai.Memurai-Developer", "-e",
+             "--accept-source-agreements", "--accept-package-agreements"],
+            "winget install Memurai.Memurai-Developer",
+            timeout=600,
+        )
+        if _post_install_ok():
+            return True
+        warn(f"winget installs did not result in a usable Redis: {(err2 or err)[:200]}")
 
     # 2. Chocolatey
     choco = shutil.which("choco") or shutil.which("choco.exe")
     if choco:
-        warn("Redis not found — trying chocolatey …")
+        info("Installing Redis via Chocolatey (redis-64) …")
         ok_c, err = _spinner_run(
             [choco, "install", "redis-64", "-y", "--no-progress"],
             "choco install redis-64",
             timeout=600,
         )
-        if ok_c and _redis_installed():
+        if _post_install_ok():
             return True
-        warn(f"choco Redis install did not succeed: {err[:200]}")
+        warn(f"choco install did not result in a usable Redis: {err[:200]}")
 
-    # 3. Scoop
-    scoop = shutil.which("scoop") or shutil.which("scoop.ps1")
-    if scoop:
-        warn("Redis not found — trying Scoop …")
-        ok_s, err = _spinner_run(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-             "-Command", "scoop install redis"],
-            "scoop install redis",
-            timeout=600,
-        )
-        if ok_s and _redis_installed():
-            return True
-        warn(f"Scoop Redis install did not succeed: {err[:200]}")
+    # 3. Scoop — scoop may be a .cmd shim or a .ps1 function
+    for scoop_cmd in (
+        shutil.which("scoop"),
+        shutil.which("scoop.cmd"),
+        os.path.join(os.environ.get("USERPROFILE", ""), "scoop", "shims", "scoop.cmd"),
+        os.path.join(os.environ.get("USERPROFILE", ""), "scoop", "shims", "scoop"),
+    ):
+        if scoop_cmd and Path(scoop_cmd).exists():
+            info("Installing Redis via Scoop …")
+            ok_s, err = _spinner_run(
+                [scoop_cmd, "install", "redis"],
+                "scoop install redis",
+                timeout=600,
+            )
+            if _post_install_ok():
+                return True
+            warn(f"Scoop install did not result in a usable Redis: {err[:200]}")
+            break  # only try the first scoop found
 
     return False
 
@@ -1811,24 +1888,26 @@ def _ensure_redis_windows() -> bool:
 def ensure_redis_installed() -> bool:
     """Ensure a Redis server is installed; auto-install via the best available tool.
 
-    macOS  → Homebrew (brew install redis)
-    Linux  → apt / yum / pacman (first one found)
+    macOS   → Homebrew (brew install redis)
+    Linux   → apt-get / dnf / yum / pacman / zypper (first one found)
     Windows → winget → choco → Scoop (first one that succeeds)
     """
     if _redis_installed():
         return True
 
     if IS_WINDOWS:
+        info("Redis not detected — attempting automatic installation …")
         if _ensure_redis_windows():
             ok("Redis installed on Windows")
             return True
         fail(
-            "Could not auto-install Redis on Windows.\n"
-            "  Option A: install Memurai  →  https://www.memurai.com/get-memurai\n"
-            "  Option B: winget install tporadowski.redis\n"
-            "  Option C: choco install redis-64\n"
-            "  Option D: scoop install redis\n"
-            "  After installing, re-run start.py."
+            "Could not auto-install Redis on Windows.  Install it manually:\n"
+            "  A) winget install tporadowski.redis\n"
+            "  B) winget install Memurai.Memurai-Developer\n"
+            "  C) choco install redis-64\n"
+            "  D) scoop install redis\n"
+            "  E) Download from https://github.com/tporadowski/redis/releases\n"
+            "  Then re-run:  python start.py"
         )
         return False
 
@@ -1847,11 +1926,16 @@ def ensure_redis_installed() -> bool:
 
     # Linux — try common package managers
     for mgr, cmd, label in [
-        ("apt-get", ["sudo", "apt-get", "install", "-y", "redis-server"], "apt-get install redis-server"),
-        ("dnf",     ["sudo", "dnf",     "install", "-y", "redis"],        "dnf install redis"),
-        ("yum",     ["sudo", "yum",     "install", "-y", "redis"],        "yum install redis"),
-        ("pacman",  ["sudo", "pacman",  "-S",  "--noconfirm", "redis"],   "pacman -S redis"),
-        ("zypper",  ["sudo", "zypper",  "install", "-y", "redis"],        "zypper install redis"),
+        ("apt-get", ["sudo", "apt-get", "install", "-y", "redis-server"],
+         "apt-get install redis-server"),
+        ("dnf",     ["sudo", "dnf",     "install", "-y", "redis"],
+         "dnf install redis"),
+        ("yum",     ["sudo", "yum",     "install", "-y", "redis"],
+         "yum install redis"),
+        ("pacman",  ["sudo", "pacman",  "-S",  "--noconfirm", "redis"],
+         "pacman -S redis"),
+        ("zypper",  ["sudo", "zypper",  "install", "-y", "redis"],
+         "zypper install redis"),
     ]:
         if shutil.which(mgr):
             warn(f"Redis not found — installing via {mgr} …")
@@ -1867,58 +1951,112 @@ def ensure_redis_installed() -> bool:
 
 
 def _start_redis_service_windows(port: int) -> bool:
-    """Attempt to start the Redis / Memurai Windows service, then fall back to direct launch."""
-    for service in ("memurai", "memurai-developer", "redis"):
-        r = subprocess.run(["net", "start", service],
-                           capture_output=True, text=True, timeout=15)
-        if r.returncode == 0 or "already been started" in r.stdout.lower():
-            info(f"Windows service '{service}' started")
+    """Start the Redis / Memurai Windows service, or launch the binary directly.
+
+    Tries (in order):
+      1. sc start  <service>    — works without elevation for pre-registered services
+      2. net start <service>    — alternative start command
+      3. Direct redis-server.exe launch from all known install paths
+    """
+    # Try all known service names (tporadowski installs as "Redis"; Memurai
+    # as "Memurai" or "Memurai-Developer").
+    for svc in ("Redis", "redis", "Memurai", "Memurai-Developer", "memurai-developer"):
+        # First query whether the service exists at all.
+        qr = subprocess.run(["sc", "query", svc],
+                            capture_output=True, text=True, timeout=5)
+        if qr.returncode != 0:
+            continue  # service not registered, try next name
+
+        state = qr.stdout.upper()
+        if "RUNNING" in state:
+            ok(f"Windows Redis service '{svc}' already running")
             return True
 
-    # Direct redis-server.exe launch (Scoop / tporadowski layout)
-    for candidate in (
-        shutil.which("redis-server"),
-        shutil.which("redis-server.exe"),
-        r"C:\Program Files\Redis\redis-server.exe",
-        r"C:\ProgramData\chocolatey\lib\redis-64\tools\redis-server.exe",
-    ):
+        # Service exists but is stopped — start it.
+        info(f"Starting Windows service '{svc}' …")
+        sr = subprocess.run(["sc", "start", svc],
+                            capture_output=True, text=True, timeout=20)
+        if sr.returncode == 0 or "RUNNING" in sr.stdout.upper():
+            ok(f"Windows service '{svc}' started")
+            return True
+
+        # sc start may need elevation; fall back to net start.
+        nr = subprocess.run(["net", "start", svc],
+                            capture_output=True, text=True, timeout=20)
+        if nr.returncode == 0 or "started successfully" in nr.stdout.lower() \
+                or "already been started" in nr.stdout.lower():
+            ok(f"Windows service '{svc}' started (net start)")
+            return True
+
+        warn(f"Could not start service '{svc}': {(sr.stderr or nr.stderr or '').strip()[:160]}")
+
+    # No registered service → try launching redis-server.exe directly.
+    for candidate in _windows_redis_candidates():
         if candidate and Path(candidate).exists():
             info(f"Launching redis-server directly: {candidate}")
-            subprocess.Popen(
-                [candidate, "--port", str(port)],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                creationflags=subprocess.DETACHED_PROCESS
-                    if hasattr(subprocess, "DETACHED_PROCESS") else 0,
-            )
-            return True
+            try:
+                subprocess.Popen(
+                    [candidate, "--port", str(port)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "DETACHED_PROCESS", 0)
+                        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+                )
+                return True
+            except Exception as e:
+                warn(f"Could not launch {candidate}: {e}")
+
+    # Refresh PATH (install may have just run) and try once more from PATH.
+    _refresh_windows_path()
+    server = shutil.which("redis-server") or shutil.which("redis-server.exe") \
+             or shutil.which("memurai")    or shutil.which("memurai.exe")
+    if server:
+        info(f"Launching from PATH: {server}")
+        subprocess.Popen(
+            [server, "--port", str(port)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "DETACHED_PROCESS", 0),
+        )
+        return True
+
     return False
 
 
 def start_redis_brew() -> Tuple[bool, int]:
-    redis_port = 6379
-    info("Starting Redis (Homebrew) …")
+    """Start Redis — brew/native depending on platform.
 
-    # Already up AND answering PING → nothing to do.
+    On Windows this is the 'native' path (brew is not available); it auto-installs
+    via winget/choco/Scoop if Redis isn't present, then starts the service or
+    the binary directly.
+    """
+    redis_port = 6379
+    _label = "Redis (native)" if IS_WINDOWS else "Redis (Homebrew)"
+    info(f"Starting {_label} …")
+
+    # Already answering PING → nothing to do.
     if _redis_ping(redis_port):
         ok(f"Redis already running and healthy on :{redis_port}")
         return True, redis_port
 
-    # Install the server if it isn't present at all.
+    # Install if not present.
     if not ensure_redis_installed():
         warn("Redis could not be installed — backend falls back to in-memory SSE fan-out")
         return False, redis_port
 
+    # ── Start ──────────────────────────────────────────────────────────────
     if IS_WINDOWS:
-        # On Windows the "brew" path is not relevant — start via service/direct.
         _start_redis_service_windows(redis_port)
+        # Give Windows services a moment to finish initialising.
+        for _ in range(12):
+            if _redis_ping(redis_port):
+                break
+            time.sleep(1)
     else:
-        # Start (and register) the brew service so it persists across reboots.
+        # macOS/Linux: start via brew services, fall back to direct daemon.
         brew = _brew_path() or "brew"
         run([brew, "services", "start", "redis"])
 
-    if not wait_for_port("localhost", redis_port, "Redis"):
-        if not IS_WINDOWS:
-            # Bare redis-server fallback for environments without brew services.
+        if not wait_for_port("localhost", redis_port, "Redis"):
             server = shutil.which("redis-server")
             if server:
                 info("brew services unavailable — launching redis-server directly …")
@@ -1928,13 +2066,22 @@ def start_redis_brew() -> Tuple[bool, int]:
                 )
                 wait_for_port("localhost", redis_port, "Redis")
 
-    # Verify it truly answers PING, not just that the socket is open.
+    # Final health check.
     if _redis_ping(redis_port):
         ok("Redis PING → PONG (configured & healthy)")
         return True, redis_port
     if port_open("localhost", redis_port, 0.5):
         warn("Redis port open but not answering PING yet — continuing")
         return True, redis_port
+
+    if IS_WINDOWS:
+        fail(
+            "Redis did not start on Windows.  Troubleshooting steps:\n"
+            "  1. Open Services (services.msc) and check if 'Redis' or 'Memurai' is there.\n"
+            "  2. Start it manually, then re-run start.py.\n"
+            "  3. Or run in a separate terminal: redis-server --port 6379\n"
+            "  4. Download Redis: https://github.com/tporadowski/redis/releases"
+        )
     return False, redis_port
 
 

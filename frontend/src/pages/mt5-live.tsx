@@ -14,6 +14,7 @@ import { apiClient } from '@/services/api'
 import MT5Chart, { MT5PositionForChart, MT5DealForChart } from '@/components/MT5Chart'
 import MT5AdvancedChart from '@/components/MT5AdvancedChart'
 import MT5SniperChart from '@/components/MT5SniperChart'
+import MT5ScalpBotPanel from '@/components/MT5ScalpBotPanel'
 import ChartErrorBoundary from '@/components/ChartErrorBoundary'
 import MT5AccountBadge from '@/components/MT5AccountBadge'
 import { formatDateTimeCompactZA, formatTimeZA } from '@/utils/datetime'
@@ -1588,6 +1589,14 @@ export default function MT5LivePage() {
                     preferForexSymbols={isMT5ForexServer(selected.server)}
                   />
                 )}
+
+                {/* Autonomous Scalp Bot — analyses all timeframes, auto-trades with SL/TP + recovery */}
+                <div className="mt-4">
+                  <MT5ScalpBotPanel
+                    accountId={selected.id}
+                    serverSymbolDefault={getDefaultSymbol(selected.server)}
+                  />
+                </div>
               </div>
 
               {/* Side panel */}

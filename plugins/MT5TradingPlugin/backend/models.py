@@ -65,6 +65,13 @@ class CopySimStatus(str, enum.Enum):
     CLOSED = "closed"
     CANCELLED = "cancelled"
 
+class MT5ScalpSessionStatus(str, enum.Enum):
+    ACTIVE = "active"
+    PAUSED = "paused"
+    STOPPED = "stopped"
+    COMPLETED = "completed"
+    ERROR = "error"
+
 
 # ── Core MT5 Models ────────────────────────────────────────
 
@@ -310,6 +317,82 @@ class MT5CopySimTrade(MT5Base):
 
     __table_args__ = (
         Index("ix_mt5_copy_sim_profile_status", "copy_profile_id", "status"),
+    )
+
+
+# ── Autonomous Scalping ────────────────────────────────────
+
+class MT5ScalpSession(MT5Base):
+    """An autonomous scalp-bot session for a single account + symbol."""
+    __tablename__ = "mt5_scalp_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    account_id = Column(Integer, nullable=False, index=True)
+    symbol = Column(String(30), nullable=False, index=True)
+    lot_size = Column(Float, default=0.01)
+    auto_lot = Column(Boolean, default=False)
+    risk_per_trade_pct = Column(Float, default=1.0)
+    max_daily_loss_pct = Column(Float, default=3.0)
+    target_profit_pct = Column(Float, default=1.5)      # per-trade take-profit ceiling
+    recovery_enabled = Column(Boolean, default=True)
+    use_ai = Column(Boolean, default=True)
+    use_kronos = Column(Boolean, default=True)
+    timeframe = Column(String(10), default="M5")        # primary scalp timeframe
+    status = Column(
+        SQLEnum(MT5ScalpSessionStatus, name="mt5_scalp_session_status"),
+        default=MT5ScalpSessionStatus.ACTIVE,
+        index=True,
+    )
+    # Live phase for the UI: analyzing | waiting | in_trade | recovery
+    phase = Column(String(20), default="analyzing")
+    bias_direction = Column(String(10), nullable=True)  # buy | sell | neutral
+    bias_confidence = Column(Float, default=0.0)
+    trade1_ticket = Column(BigInteger, nullable=True)
+    trade2_ticket = Column(BigInteger, nullable=True)   # recovery leg
+    total_trades = Column(Integer, default=0)
+    wins = Column(Integer, default=0)
+    losses = Column(Integer, default=0)
+    session_pnl = Column(Float, default=0.0)
+    start_equity = Column(Float, default=0.0)
+    last_cycle_at = Column(DateTime, nullable=True)
+    ai_note = Column(Text, nullable=True)
+    error_msg = Column(Text, nullable=True)
+    raw_settings = Column(JSON, nullable=True)
+    started_at = Column(DateTime, default=datetime.utcnow)
+    stopped_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_mt5_scalp_sessions_acct_symbol", "account_id", "symbol"),
+    )
+
+
+class MT5ScalpTrade(MT5Base):
+    """A single scalp trade opened by a scalp-bot session."""
+    __tablename__ = "mt5_scalp_trades"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(Integer, nullable=False, index=True)
+    account_id = Column(Integer, nullable=False, index=True)
+    symbol = Column(String(30), nullable=False, index=True)
+    side = Column(String(10), nullable=False)           # buy | sell
+    lot = Column(Float, nullable=False)
+    entry_price = Column(Float, nullable=False)
+    sl = Column(Float, nullable=True)
+    tp = Column(Float, nullable=True)
+    close_price = Column(Float, nullable=True)
+    pnl = Column(Float, default=0.0)
+    is_recovery = Column(Boolean, default=False)
+    ticket = Column(BigInteger, nullable=True, index=True)
+    confidence = Column(Float, default=0.0)
+    reason = Column(Text, nullable=True)
+    status = Column(String(20), default="open")         # open | closed
+    opened_at = Column(DateTime, default=datetime.utcnow)
+    closed_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("ix_mt5_scalp_trades_session_status", "session_id", "status"),
     )
 
 

@@ -676,6 +676,22 @@ export const apiClient = {
       api.post('/plugins/mt5/auto-manage/analyze-positions', {}, { params: { account_id: accountId }, timeout: 120000 }),
     applySuggestions: (suggestions: { ticket: number; account_id: number; sl?: number | null; tp?: number | null }[]) =>
       api.post('/plugins/mt5/auto-manage/apply-suggestions', { suggestions }, { timeout: 60000 }),
+    // ── Autonomous Scalp Bot ──
+    scalp: {
+      start: (data: {
+        account_id: number; symbol: string; lot_size?: number; auto_lot?: boolean;
+        risk_per_trade_pct?: number; max_daily_loss_pct?: number; target_profit_pct?: number;
+        recovery_enabled?: boolean; use_ai?: boolean; use_kronos?: boolean; timeframe?: string;
+      }) => api.post('/plugins/mt5/scalp/start', data),
+      stop: (accountId: number, symbol: string) =>
+        api.post('/plugins/mt5/scalp/stop', { account_id: accountId, symbol }),
+      status: (accountId: number) => api.get(`/plugins/mt5/scalp/status/${accountId}`),
+      closeAll: (accountId: number) => api.post(`/plugins/mt5/scalp/close-all/${accountId}`),
+      searchSymbols: (accountId: number, q: string) =>
+        api.get('/plugins/mt5/scalp/symbols/search', { params: { account_id: accountId, q } }),
+      sessions: (accountId: number) => api.get(`/plugins/mt5/scalp/sessions/${accountId}`),
+      trades: (sessionId: number) => api.get(`/plugins/mt5/scalp/trades/${sessionId}`),
+    },
   },
 
   // ── AI Analyst Plugin ─────────────────────────────────
