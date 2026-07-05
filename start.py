@@ -742,6 +742,53 @@ def _fixed(label: str) -> None:
     print(f"  {C.GREEN}✔{C.RESET}  {C.GREEN}{label} (auto-installed){C.RESET}")
 
 
+def _ensure_vc_redist() -> Tuple[bool, bool]:
+    """
+    Ensure the Microsoft Visual C++ Redistributable (2015-2022, x64) is present.
+
+    Compiled Python wheels (pydantic-core, asyncpg, numpy, torch, ccxt deps …)
+    link against vcruntime140.dll / vcruntime140_1.dll, which ship with this
+    redistributable. The 'pythoncore' nuget/embeddable Python build does NOT
+    bundle it (unlike the python.org installer), so a fresh Windows box fails
+    with "VCRUNTIME140.dll was not found" the moment the backend imports one of
+    those packages.
+
+    Returns (available, auto_installed).
+    """
+    if not IS_WINDOWS:
+        return True, False
+
+    import ctypes
+
+    def _loaded() -> bool:
+        # System32 is always on the DLL search path, so a successful load here
+        # means the redistributable is installed for every child process too.
+        for dll in ("vcruntime140.dll", "vcruntime140_1.dll"):
+            try:
+                ctypes.WinDLL(dll)
+            except OSError:
+                return False
+        return True
+
+    if _loaded():
+        return True, False
+
+    # winget ships with Windows 10 1709+/11 — use it for a silent install.
+    winget = shutil.which("winget")
+    if winget:
+        warn("Visual C++ Redistributable missing — installing via winget …")
+        _spinner_run(
+            [winget, "install", "--id", "Microsoft.VCRedist.2015+.x64", "-e",
+             "--accept-source-agreements", "--accept-package-agreements"],
+            "winget install Microsoft Visual C++ Redistributable (x64)",
+            timeout=300,
+        )
+        if _loaded():
+            return True, True
+
+    return False, False
+
+
 def preflight_check(mode: str) -> bool:
     """
     Detect every requirement, auto-install anything that's missing and
@@ -762,6 +809,23 @@ def preflight_check(mode: str) -> bool:
         fail("  Python 3.9+ is required to run this script.")
         fail("  Install: brew install python@3.11  then re-run with python3.11 start.py")
         unfixable.append("Python < 3.9 (current runner)")
+
+    # ── Visual C++ runtime (Windows only) ────────────────────────────────────
+    # Compiled wheels (pydantic-core, asyncpg, numpy …) need vcruntime140.dll.
+    # The nuget/embeddable Python build doesn't ship it, so detect + auto-install
+    # the redistributable BEFORE the backend subprocess tries to import them.
+    if IS_WINDOWS:
+        vc_ok, vc_fixed = _ensure_vc_redist()
+        if vc_fixed:
+            fixed_items.append("Microsoft Visual C++ Redistributable")
+        _check("Visual C++ runtime (vcruntime140.dll)", vc_ok,
+               "installed" if vc_ok else "",
+               "install https://aka.ms/vs/17/release/vc_redist.x64.exe then re-run")
+        if not vc_ok:
+            unfixable.append(
+                "Microsoft Visual C++ Redistributable missing (vcruntime140.dll) — "
+                "install https://aka.ms/vs/17/release/vc_redist.x64.exe"
+            )
 
     # ── Homebrew ─────────────────────────────────────────────────────────────
     # Homebrew is only used to install/run the brew-mode postgres/redis and to
