@@ -12,6 +12,7 @@ and the engine-only result is shown without breaking the analysis flow.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
@@ -153,6 +154,14 @@ async def ai_review(
         }
 
     # Compact, numbers-only context so the model cannot wander off-data.
+    # Enrich with upcoming economic events for this symbol so the AI can
+    # flag imminent high-impact news (CPI, FOMC, NFP, interest rates, etc.)
+    eco_events: List[Dict[str, Any]] = []
+    try:
+        eco_events = await fetch_economic_events(symbol)
+    except Exception:
+        pass
+
     context = {
         "symbol": symbol,
         "timeframe": timeframe,
@@ -168,6 +177,7 @@ async def ai_review(
         "range": analysis.get("range"),
         "liquidity": analysis.get("liquidity"),
         "structure_events": (analysis.get("structure_events") or [])[-6:],
+        "economic_events": eco_events[:6],
         "candidate_signals": [
             {
                 "side": s["side"],
@@ -318,3 +328,95 @@ async def ai_backtest_review(
         "provider": result.get("provider"),
         "model": result.get("model"),
     }
+
+
+# ── Economic Calendar helper ──────────────────────────────────────────────────
+# Fetches upcoming high-impact economic events (CPI, interest rates, NFP, GDP,
+# PMI, etc.) that are relevant for the instrument being analysed.
+# Used by the AI review + scalp gate so models can factor in scheduled risk.
+
+_ECO_CURRENCY_MAP: Dict[str, List[str]] = {
+    "XAUUSD": ["USD", "XAU"],
+    "XAGUSD": ["USD", "XAG"],
+    "EURUSD": ["EUR", "USD"],
+    "GBPUSD": ["GBP", "USD"],
+    "USDJPY": ["USD", "JPY"],
+    "USDCHF": ["USD", "CHF"],
+    "AUDUSD": ["AUD", "USD"],
+    "NZDUSD": ["NZD", "USD"],
+    "USDCAD": ["USD", "CAD"],
+    "US30":   ["USD"],
+    "NAS100": ["USD"],
+    "SP500":  ["USD"],
+    "USOIL":  ["USD"],
+    "UKOIL":  ["USD"],
+}
+
+_HIGH_IMPACT_KEYWORDS = (
+    "interest rate", "cpi", "inflation", "gdp", "nfp", "non-farm",
+    "unemployment", "fomc", "federal reserve", "ecb", "boe", "rba",
+    "pmi", "retail sales", "trade balance", "pce", "core cpi",
+)
+
+
+async def fetch_economic_events(symbol: str, lookback_hours: int = 48,
+                                lookahead_hours: int = 72) -> List[Dict[str, Any]]:
+    """
+    Return upcoming and recent high-impact economic events for the currencies in
+    ``symbol``.  Uses the ForexFactory public JSON calendar (no API key required).
+
+    Results are sorted nearest-first and limited to 10 to stay token-efficient
+    for the AI context window.  Always fails gracefully — never raises.
+    """
+    currencies = _ECO_CURRENCY_MAP.get(
+        (symbol or "").upper().replace("/", ""),
+        [(symbol or "").upper()[:3], (symbol or "").upper()[3:6]],
+    )
+    try:
+        import httpx  # type: ignore
+        now = datetime.now(timezone.utc)
+        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(url, headers={"User-Agent": "TradeBot/1.0"})
+            resp.raise_for_status()
+            events: List[Dict[str, Any]] = resp.json()
+    except Exception as e:
+        logger.debug(f"[economic_events] fetch failed: {e}")
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for ev in events:
+        try:
+            currency = str(ev.get("country", ev.get("currency", ""))).upper()
+            if currency not in currencies:
+                continue
+            impact = str(ev.get("impact", ev.get("type", ""))).lower()
+            if "high" not in impact:
+                continue
+            title = str(ev.get("title", ev.get("name", ""))).lower()
+            if not any(kw in title for kw in _HIGH_IMPACT_KEYWORDS):
+                continue
+            # Parse event time
+            date_str = str(ev.get("date", ev.get("time", "")))
+            try:
+                ev_time = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                continue
+            delta_h = (ev_time - now).total_seconds() / 3600.0
+            if delta_h < -lookback_hours or delta_h > lookahead_hours:
+                continue
+            out.append({
+                "title":    ev.get("title") or ev.get("name", ""),
+                "currency": currency,
+                "impact":   "high",
+                "time_utc": ev_time.strftime("%Y-%m-%d %H:%M"),
+                "hours_away": round(delta_h, 1),
+                "forecast": ev.get("forecast"),
+                "previous": ev.get("previous"),
+                "actual":   ev.get("actual"),
+            })
+        except Exception:
+            continue
+
+    out.sort(key=lambda x: abs(x["hours_away"]))
+    return out[:10]

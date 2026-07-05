@@ -165,21 +165,49 @@ async def _kronos_direction(candles: List[Candle], symbol: str, timeframe: str) 
 async def _ai_gate(symbol: str, side: str, bias_reason: str, confidence: float) -> Dict[str, Any]:
     """
     Optional AI confirmation via the shared AiMarketAnalyst router.
+    Also fetches economic calendar events (CPI, rates, NFP, etc.) and includes
+    them in the prompt so the AI can flag imminent high-impact news risk.
 
     Returns ``{"decision": "take"|"skip", "note": str}``. Fails open (``take``)
-    if no AI provider is configured so scalping is never blocked by AI outage.
+    if no AI provider is configured.
     """
     try:
         from plugins.AiMarketAnalyst.backend.services.ai_router import db_chat  # type: ignore
     except Exception:
         return {"decision": "take", "note": "ai_unavailable"}
 
+    # Fetch economic calendar for this symbol (non-blocking, best-effort)
+    eco_events: List[Dict[str, Any]] = []
+    try:
+        from plugins.MT5TradingPlugin.backend.services.smc_ai import fetch_economic_events  # type: ignore
+        eco_events = await fetch_economic_events(symbol)
+    except Exception:
+        pass
+
+    eco_context = ""
+    if eco_events:
+        upcoming = [e for e in eco_events if -2 <= e.get("hours_away", 99) <= 24]
+        if upcoming:
+            eco_context = (
+                "\nUpcoming high-impact economic events: "
+                + ", ".join(
+                    f"{e['title']} ({e['currency']}) in {e['hours_away']:.1f}h"
+                    + (f" [prev={e['previous']}, fcst={e['forecast']}]"
+                       if e.get("previous") or e.get("forecast") else "")
+                    for e in upcoming[:4]
+                )
+                + "."
+            )
+
     prompt = (
         f"You are a scalping risk filter. Instrument {symbol}. The engine wants a "
-        f"{side.upper()} market scalp (confidence {confidence:.2f}). Multi-timeframe "
-        f"read: {bias_reason}. Reply STRICT JSON only: "
-        '{"decision":"take"|"skip","note":str}. Skip only if this is clearly a bad '
-        "scalp (e.g. fighting a strong opposing higher-timeframe trend)."
+        f"{side.upper()} pending limit scalp (confidence {confidence:.2f}). "
+        f"Multi-timeframe read: {bias_reason}.{eco_context} "
+        "Reply STRICT JSON only: "
+        '{"decision":"take"|"skip","note":str}. Skip only if there is a STRONG '
+        "reason (e.g. imminent high-impact news within 2h, confirmed opposing "
+        "higher-timeframe trend, extreme overbought/oversold). "
+        "Otherwise default to take — the engine already filters most bad setups."
     )
     try:
         async with AsyncSessionLocal() as db:
@@ -485,11 +513,15 @@ class ScalpBotManager:
                           entry: ScalpEntry, note: str, recovery: bool = False) -> None:
         comment = f"{COMMENT_TAG}{'-R' if recovery else ''}#{session_id}"
         symbol = await self._session_symbol(session_id)
+        # Use the SMC-derived order type (buy_limit, sell_limit, buy_stop, sell_stop)
+        # and the zone entry price so the order rests at the institutional level.
+        order_type = getattr(entry, "order_type", entry.side)
+        limit_price = entry.entry  # non-zero → pending order placed at this price
         try:
             result = await mt5_client.place_order(
                 login=login, server=server, password=password,
-                symbol=symbol, order_type=entry.side,
-                volume=entry.lot, price=0, sl=entry.stop_loss, tp=entry.take_profit,
+                symbol=symbol, order_type=order_type,
+                volume=entry.lot, price=limit_price, sl=entry.stop_loss, tp=entry.take_profit,
                 comment=comment,
             )
         except Exception as e:  # noqa: BLE001

@@ -532,6 +532,10 @@ class ScalpStatusResponse(BaseModel):
     status: str
     phase: str
     lot_size: float
+    auto_lot: bool = False
+    risk_per_trade_pct: float = 1.0
+    max_daily_loss_pct: float = 3.0
+    target_profit_pct: float = 1.5
     recovery_enabled: bool
     use_ai: bool
     use_kronos: bool
@@ -548,6 +552,18 @@ class ScalpStatusResponse(BaseModel):
     ai_note: Optional[str] = None
     error_msg: Optional[str] = None
     started_at: Optional[datetime] = None
+
+
+class ScalpUpdateRequest(BaseModel):
+    """Patch settings on a running scalp session — takes effect on the next 10s cycle."""
+    lot_size: Optional[float] = Field(default=None, gt=0, le=100.0)
+    auto_lot: Optional[bool] = None
+    risk_per_trade_pct: Optional[float] = Field(default=None, ge=0.05, le=20.0)
+    max_daily_loss_pct: Optional[float] = Field(default=None, ge=0.5, le=50.0)
+    target_profit_pct: Optional[float] = Field(default=None, ge=0.1, le=20.0)
+    recovery_enabled: Optional[bool] = None
+    use_ai: Optional[bool] = None
+    use_kronos: Optional[bool] = None
 
 
 class ScalpSymbolResult(BaseModel):

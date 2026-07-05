@@ -26,7 +26,7 @@ import { ZoneBoxPrimitive, ZoneBox } from './MT5ZonePrimitive'
 import {
   Crosshair, RefreshCw, Target, TrendingUp, TrendingDown, Activity,
   Zap, FlaskConical, ChevronRight, AlertTriangle, Brain, CheckCircle, X,
-  Calculator, Maximize2, Minimize2, Settings, Wifi, Volume2, VolumeX,
+  Calculator, Maximize2, Minimize2, Settings, Wifi, Volume2, VolumeX, Loader2,
 } from 'lucide-react'
 import { formatTimeZA } from '@/utils/datetime'
 import { getPriceSource, setPriceSource as savePriceSource, PRICE_SOURCE_OPTIONS } from '@/utils/priceSource'
@@ -394,6 +394,11 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
   const [symbol, setSymbol] = useState(defaultSymbol)
   const [symbolInput, setSymbolInput] = useState(defaultSymbol)
   const cfg0 = useRef<SniperCfg>(loadSniperCfg()).current  // read persisted config once
+  // ── Broker symbol search ──────────────────────────────────────────────────
+  const [symbolResults, setSymbolResults] = useState<{ symbol: string }[]>([])
+  const [showSymbolResults, setShowSymbolResults] = useState(false)
+  const [searchingSymbol, setSearchingSymbol] = useState(false)
+  const symbolSearchTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [timeframe, setTimeframe] = useState(cfg0.timeframe ?? 'H1')
   const [minRR, setMinRR] = useState(cfg0.minRR ?? 2)
   const [maxLoss, setMaxLoss] = useState(cfg0.maxLoss ?? 15)        // hard max $ loss the user will accept
@@ -1224,8 +1229,30 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
     if (!clean) return
     setSymbol(clean)
     setSymbolInput(clean)
+    setShowSymbolResults(false)
     onSymbolChange?.(clean)
   }
+
+  // Debounced broker symbol search (300ms) — fires when symbolInput changes
+  useEffect(() => {
+    if (symbolSearchTimer.current) clearTimeout(symbolSearchTimer.current)
+    const q = symbolInput.trim()
+    if (!q || q === symbol) { setSymbolResults([]); return }
+    symbolSearchTimer.current = setTimeout(async () => {
+      setSearchingSymbol(true)
+      try {
+        const res = await apiClient.mt5.scalp.searchSymbols(accountId, q)
+        setSymbolResults(res.data || [])
+        setShowSymbolResults(true)
+      } catch {
+        setSymbolResults([])
+      } finally {
+        setSearchingSymbol(false)
+      }
+    }, 300)
+    return () => { if (symbolSearchTimer.current) clearTimeout(symbolSearchTimer.current) }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [symbolInput, accountId])
 
   const biasColor = analysis?.bias === 'bullish' ? 'text-green-400' : analysis?.bias === 'bearish' ? 'text-red-400' : 'text-gray-400'
   const ai = analysis?.ai
@@ -1238,17 +1265,33 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
         <div className="flex items-center gap-1.5 text-tradebot-accent font-semibold text-sm">
           <Crosshair className="w-4 h-4" /> SMC Sniper
         </div>
-        <div className="flex items-center bg-gray-800 border border-gray-600 rounded-lg overflow-hidden">
+        {/* ── Symbol search with broker dropdown ─────────────────────────── */}
+        <div className="relative flex items-center bg-gray-800 border border-gray-600 rounded-lg overflow-visible">
           <input
             value={symbolInput}
-            onChange={e => setSymbolInput(e.target.value.toUpperCase())}
-            onKeyDown={e => e.key === 'Enter' && applySymbol(symbolInput)}
-            className="bg-transparent text-white text-sm px-2 py-1 w-24 focus:outline-none font-semibold"
+            onChange={e => { setSymbolInput(e.target.value.toUpperCase()); setShowSymbolResults(true) }}
+            onFocus={() => symbolInput && symbolResults.length > 0 && setShowSymbolResults(true)}
+            onKeyDown={e => {
+              if (e.key === 'Enter') { applySymbol(symbolInput); setShowSymbolResults(false) }
+              if (e.key === 'Escape') setShowSymbolResults(false)
+            }}
+            className="bg-transparent text-white text-sm px-2 py-1 w-28 focus:outline-none font-semibold"
             placeholder="Symbol"
           />
-          <button onClick={() => applySymbol(symbolInput)} className="px-2 py-1 text-xs text-gray-400 hover:text-white">
+          {searchingSymbol && <Loader2 className="w-3 h-3 text-gray-400 animate-spin mr-1 shrink-0" />}
+          <button onClick={() => { applySymbol(symbolInput); setShowSymbolResults(false) }} className="px-2 py-1 text-xs text-gray-400 hover:text-white">
             <ChevronRight className="w-3 h-3" />
           </button>
+          {showSymbolResults && symbolResults.length > 0 && (
+            <div className="absolute top-full left-0 z-50 mt-1 w-52 max-h-56 overflow-y-auto rounded-lg bg-gray-900 border border-gray-700 shadow-xl">
+              {symbolResults.map(r => (
+                <button key={r.symbol} onMouseDown={e => { e.preventDefault(); applySymbol(r.symbol) }}
+                  className="w-full text-left px-3 py-2 text-sm text-gray-200 hover:bg-gray-800 font-medium">
+                  {r.symbol}
+                </button>
+              ))}
+            </div>
+          )}
         </div>
         <div className="flex gap-0.5 bg-gray-800/70 rounded-lg p-0.5">
           {TIMEFRAMES.map(tf => (

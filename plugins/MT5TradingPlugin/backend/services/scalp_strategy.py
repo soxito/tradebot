@@ -80,14 +80,16 @@ class ScalpBias:
 
 @dataclass
 class ScalpEntry:
-    """A ready-to-execute market scalp order."""
+    """A ready-to-execute pending-limit scalp order."""
     side: str                 # "buy" | "sell"
-    entry: float              # reference price (current bid/ask)
+    entry: float              # limit/stop price for the pending order
     stop_loss: float
     take_profit: float
     lot: float
     confidence: float         # 0..1
     reason: str
+    # MT5 order type: buy_limit | sell_limit | buy_stop | sell_stop
+    order_type: str = "buy_limit"
     is_recovery: bool = False
     confluence: List[str] = field(default_factory=list)
     sl_pips: float = 0.0
@@ -275,27 +277,64 @@ class ScalpStrategyEngine:
 
         side = bias.direction
         atr = bias.atr_m5
-        sl_dist = atr * self.sl_atr_mult
-        tp_dist = atr * self.tp_atr_mult
-
-        if side == "buy":
-            stop_loss = current_price - sl_dist
-            take_profit = current_price + tp_dist
-        else:
-            stop_loss = current_price + sl_dist
-            take_profit = current_price - tp_dist
-
-        lot, risk_amount = self._resolve_lot(balance, sl_dist)
         pip = self.pip_size or 1.0
+
+        # ── Prefer SMC zone entry from M5 signals (limit order at OB/FVG) ──────
+        # When the M5 SMC engine has a same-direction pending setup, use its
+        # zone price (buy_limit/sell_limit/buy_stop/sell_stop) so we enter at
+        # institutional levels rather than at market.
+        best_signal: Optional[Dict[str, Any]] = None
+        for sig in m5_signals:
+            if sig.get("side") == side and sig.get("entry") and sig.get("stop_loss"):
+                best_signal = sig
+                break
+
+        if best_signal:
+            raw_entry   = float(best_signal.get("entry", current_price))
+            raw_sl      = float(best_signal.get("stop_loss", 0) or 0)
+            raw_tp1     = float(best_signal.get("tp1", 0) or 0)
+            raw_tp      = float(best_signal.get("take_profit", 0) or raw_tp1 or 0)
+            otype       = best_signal.get("order_type", f"{side}_limit")
+            # Fall back to ATR geometry when zone values are degenerate
+            if raw_sl <= 0 or raw_tp <= 0 or raw_entry <= 0:
+                raw_entry = current_price
+                raw_sl    = current_price - atr * self.sl_atr_mult if side == "buy" else current_price + atr * self.sl_atr_mult
+                raw_tp    = current_price + atr * self.tp_atr_mult if side == "buy" else current_price - atr * self.tp_atr_mult
+                otype     = f"{side}_limit"
+            entry_price = round(raw_entry, 6)
+            stop_loss   = round(raw_sl, 6)
+            take_profit = round(raw_tp, 6)
+            extra       = [f"zone:{best_signal.get('zone_kind','ob')}", f"rr:{best_signal.get('rr',0):.1f}"]
+            confluence  = confluence + extra
+        else:
+            # Fallback: ATR-based limit entry (slight pullback/push vs current price)
+            sl_dist  = atr * self.sl_atr_mult
+            tp_dist  = atr * self.tp_atr_mult
+            pullback = atr * 0.3  # wait for 30% ATR retracement before fill
+            if side == "buy":
+                entry_price = round(current_price - pullback, 6)
+                stop_loss   = round(current_price - sl_dist, 6)
+                take_profit = round(current_price + tp_dist, 6)
+                otype       = "buy_limit"
+            else:
+                entry_price = round(current_price + pullback, 6)
+                stop_loss   = round(current_price + sl_dist, 6)
+                take_profit = round(current_price - tp_dist, 6)
+                otype       = "sell_limit"
+
+        sl_dist = abs(entry_price - stop_loss)
+        tp_dist = abs(take_profit - entry_price)
+        lot, risk_amount = self._resolve_lot(balance, sl_dist)
 
         entry = ScalpEntry(
             side=side,
-            entry=round(current_price, 6),
-            stop_loss=round(stop_loss, 6),
-            take_profit=round(take_profit, 6),
+            entry=entry_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
             lot=lot,
             confidence=round(bias.confidence, 3),
             reason=bias.reason,
+            order_type=otype,
             confluence=confluence,
             sl_pips=round(sl_dist / pip, 1),
             tp_pips=round(tp_dist / pip, 1),
@@ -333,12 +372,17 @@ class ScalpStrategyEngine:
         atr = bias.atr_m5
         sl_dist = atr * self.sl_atr_mult
         tp_dist = atr * self.tp_atr_mult
+        pullback = sl_dist * 0.3
         if recovery_side == "buy":
-            stop_loss = current_price - sl_dist
-            take_profit = current_price + tp_dist
+            entry_price = round(current_price - pullback, 6)
+            stop_loss   = round(current_price - sl_dist, 6)
+            take_profit = round(current_price + tp_dist, 6)
+            otype       = "buy_limit"
         else:
-            stop_loss = current_price + sl_dist
-            take_profit = current_price - tp_dist
+            entry_price = round(current_price + pullback, 6)
+            stop_loss   = round(current_price + sl_dist, 6)
+            take_profit = round(current_price - tp_dist, 6)
+            otype       = "sell_limit"
 
         lot = max(0.01, round(original_lot * RECOVERY_LOT_MULTIPLIER, 2))
         _, risk_amount = self._resolve_lot(balance, sl_dist)
@@ -346,12 +390,13 @@ class ScalpStrategyEngine:
 
         return ScalpEntry(
             side=recovery_side,
-            entry=round(current_price, 6),
-            stop_loss=round(stop_loss, 6),
-            take_profit=round(take_profit, 6),
+            entry=entry_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
             lot=lot,
             confidence=round(bias.confidence, 3),
             reason=f"Recovery leg — market turned {recovery_side}: {bias.reason}",
+            order_type=otype,
             is_recovery=True,
             confluence=[f"{tf}:{b}" for tf, b in bias.tf_bias.items()] + ["recovery"],
             sl_pips=round(sl_dist / pip, 1),

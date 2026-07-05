@@ -1,17 +1,21 @@
 /**
  * MT5ScalpBotPanel — Autonomous scalp-bot control surface for /mt5-live.
  *
- * Search a broker symbol, set lot size + risk, and click Activate. The backend
- * scalp loop analyses the market across all timeframes (M5 primary) using SMC +
- * Kronos + Jarvis AI, places market orders with SL/TP, closes on profit, and adds
- * an SMC-guided recovery leg when a trade goes against it. Polls /scalp/status
- * every 5s for a live view (phase, bias, open legs, combined PnL, trade log).
+ * Per-account: rendered with key={accountId} in mt5-live.tsx so each account
+ * gets its own independent state, poll loop, and session binding.
+ *
+ * Settings editable while active: lot size, loss limit, targets, and toggles
+ * can all be changed on a running session via the "Apply" button (takes effect
+ * on the next ~10s cycle — no restart required).
+ *
+ * Settings sync: when switching back to an account that already has an active
+ * session the inputs are pre-filled with the session's current live settings.
  */
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { apiClient } from '@/services/api'
 import {
   Zap, Square, Search, Loader2, TrendingUp, TrendingDown, Activity,
-  ShieldCheck, Brain, Sparkles, ChevronDown, ChevronUp, AlertTriangle,
+  ShieldCheck, Brain, Sparkles, ChevronDown, ChevronUp, AlertTriangle, Check,
 } from 'lucide-react'
 
 interface ScalpTradeInfo {
@@ -35,6 +39,10 @@ interface ScalpStatus {
   status: string
   phase: string
   lot_size: number
+  auto_lot: boolean
+  risk_per_trade_pct: number
+  max_daily_loss_pct: number
+  target_profit_pct: number
   recovery_enabled: boolean
   use_ai: boolean
   use_kronos: boolean
@@ -72,6 +80,10 @@ interface ScalpTradeRow {
 interface Props {
   accountId: number
   serverSymbolDefault?: string
+  /** Current chart symbol — when this changes the panel syncs (if not active). */
+  chartSymbol?: string
+  /** Fired when user picks a symbol so the chart can sync. */
+  onSymbolChange?: (symbol: string) => void
 }
 
 const PHASE_LABEL: Record<string, string> = {
@@ -98,8 +110,8 @@ function pnlColor(v: number): string {
   return 'text-gray-300'
 }
 
-export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault }: Props) {
-  const [symbol, setSymbol] = useState(serverSymbolDefault || 'XAUUSD')
+export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault, chartSymbol, onSymbolChange }: Props) {
+  const [symbol, setSymbol] = useState(chartSymbol || serverSymbolDefault || 'XAUUSD')
   const [query, setQuery] = useState('')
   const [results, setResults] = useState<{ symbol: string; description: string | null }[]>([])
   const [searching, setSearching] = useState(false)
@@ -118,17 +130,33 @@ export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault }: Pro
   const [session, setSession] = useState<ScalpStatus | null>(null)
   const [trades, setTrades] = useState<ScalpTradeRow[]>([])
   const [busy, setBusy] = useState(false)
+  const [applying, setApplying] = useState(false)
+  const [applySuccess, setApplySuccess] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Tracks which session id we last synced settings from so we don't
+  // overwrite user edits on every 5s poll, only on first load per session.
+  const syncedSessionId = useRef<number | null>(null)
 
-  // ── Poll live status for the selected symbol ──────────────────────────────
+  // ── Sync symbol from chart (when not running a live session) ──────────────
+  useEffect(() => {
+    if (!active && chartSymbol && chartSymbol !== symbol) {
+      setSymbol(chartSymbol.toUpperCase())
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chartSymbol])
+
+  // ── Poll live status for this account ────────────────────────────────────
   const refreshStatus = useCallback(async () => {
     try {
       const res = await apiClient.mt5.scalp.status(accountId)
       const list: ScalpStatus[] = res.data || []
       const match = list.find(s => s.symbol.toUpperCase() === symbol.toUpperCase()) || null
-      setSession(match)
+      setSession(prev => {
+        if (!match) syncedSessionId.current = null
+        return match
+      })
       if (match) {
         const tr = await apiClient.mt5.scalp.trades(match.session_id)
         setTrades(tr.data || [])
@@ -145,6 +173,28 @@ export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault }: Pro
     const id = setInterval(refreshStatus, 5000)
     return () => clearInterval(id)
   }, [refreshStatus])
+
+  // ── Sync settings from live session (once per session load) ──────────────
+  // When you switch to an account that already has a running session, the
+  // inputs are pre-filled with the session's current settings.
+  useEffect(() => {
+    if (session && session.session_id !== syncedSessionId.current) {
+      syncedSessionId.current = session.session_id
+      setLotSize(session.lot_size)
+      setAutoLot(session.auto_lot ?? false)
+      setMaxDailyLoss(session.max_daily_loss_pct ?? 3)
+      setTargetProfit(session.target_profit_pct ?? 1.5)
+      setRecovery(session.recovery_enabled)
+      setUseAi(session.use_ai)
+      setUseKronos(session.use_kronos)
+      setSymbol(session.symbol)
+      // also tell chart to sync
+      if (session.symbol && session.symbol !== symbol) {
+        onSymbolChange?.(session.symbol)
+      }
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session])
 
   // ── Symbol search (debounced) ─────────────────────────────────────────────
   useEffect(() => {
@@ -215,7 +265,30 @@ export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault }: Pro
     }
   }
 
-  const autoLotPreview = autoLot ? '(risk-based)' : ''
+  // Push updated settings to the running session (takes effect next cycle ~10s)
+  const handleApply = async () => {
+    if (!session) return
+    setApplying(true); setError(null)
+    try {
+      await (apiClient.mt5.scalp as any).update(session.session_id, {
+        lot_size: lotSize,
+        auto_lot: autoLot,
+        max_daily_loss_pct: maxDailyLoss,
+        target_profit_pct: targetProfit,
+        recovery_enabled: recovery,
+        use_ai: useAi,
+        use_kronos: useKronos,
+      })
+      setApplySuccess(true)
+      setTimeout(() => setApplySuccess(false), 2000)
+      await refreshStatus()
+    } catch (e: any) {
+      setError(e?.response?.data?.detail || e?.message || 'Failed to apply settings')
+    } finally {
+      setApplying(false)
+    }
+  }
+
   const phase = session?.phase || 'analyzing'
   const combined = session?.combined_pnl ?? 0
 
@@ -257,7 +330,13 @@ export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault }: Pro
                 {results.map(r => (
                   <button
                     key={r.symbol}
-                    onClick={() => { setSymbol(r.symbol); setQuery(''); setShowResults(false) }}
+                    onClick={() => {
+                      setSymbol(r.symbol)
+                      setQuery('')
+                      setShowResults(false)
+                      // sync to chart
+                      onSymbolChange?.(r.symbol)
+                    }}
                     className="w-full text-left px-3 py-2 text-sm text-gray-200 hover:bg-gray-800 flex items-center justify-between"
                   >
                     <span className="font-medium">{r.symbol}</span>
@@ -288,6 +367,44 @@ export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault }: Pro
           )}
         </div>
 
+        {/* Always-visible Lot size row */}
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-gray-400 shrink-0">Lot:</span>
+          <button
+            onClick={() => setLotSize(v => Math.max(0.01, +(v - 0.01).toFixed(2)))}
+            disabled={autoLot}
+            className="px-2 py-1 rounded bg-gray-900 border border-gray-700 text-gray-300 text-xs disabled:opacity-40 hover:bg-gray-700"
+          >−</button>
+          <input
+            type="number" step="0.01" min="0.01"
+            value={lotSize}
+            onChange={e => setLotSize(Math.max(0.01, +e.target.value || 0.01))}
+            disabled={autoLot}
+            className="w-20 text-center py-1 rounded bg-gray-900 border border-gray-700 text-white text-sm disabled:opacity-40"
+          />
+          <button
+            onClick={() => setLotSize(v => +(v + 0.01).toFixed(2))}
+            disabled={autoLot}
+            className="px-2 py-1 rounded bg-gray-900 border border-gray-700 text-gray-300 text-xs disabled:opacity-40 hover:bg-gray-700"
+          >+</button>
+          <label className="flex items-center gap-1.5 text-[11px] text-gray-400 cursor-pointer ml-1">
+            <input type="checkbox" checked={autoLot} onChange={e => setAutoLot(e.target.checked)} />
+            Auto
+          </label>
+          {active && (
+            <button
+              onClick={handleApply}
+              disabled={applying}
+              className={`ml-auto flex items-center gap-1 px-2.5 py-1 rounded text-[11px] font-semibold transition ${
+                applySuccess ? 'bg-green-500/20 text-green-300' : 'bg-tradebot-accent/20 text-tradebot-accent hover:bg-tradebot-accent/30'
+              } disabled:opacity-50`}
+            >
+              {applying ? <Loader2 className="w-3 h-3 animate-spin" /> : applySuccess ? <Check className="w-3 h-3" /> : <Zap className="w-3 h-3" />}
+              {applySuccess ? 'Saved!' : 'Apply'}
+            </button>
+          )}
+        </div>
+
         {error && (
           <div className="flex items-start gap-2 text-xs text-red-300 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">
             <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
@@ -295,35 +412,62 @@ export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault }: Pro
           </div>
         )}
 
-        {/* ── Settings (collapsible) ── */}
+        {/* ── Settings (collapsible, always editable even when active) ── */}
         <div>
-          <button
-            onClick={() => setShowSettings(s => !s)}
-            className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-white transition"
-          >
-            {showSettings ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
-            Settings
-          </button>
+          <div className="flex items-center justify-between">
+            <button
+              onClick={() => setShowSettings(s => !s)}
+              className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-white transition"
+            >
+              {showSettings ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+              Settings
+              {active && <span className="ml-1 text-[10px] text-tradebot-accent/70">(editable while running)</span>}
+            </button>
+            {/* Apply button — visible when session is active and settings panel is open */}
+            {active && showSettings && (
+              <button
+                onClick={handleApply}
+                disabled={applying}
+                className={`flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-semibold transition ${
+                  applySuccess
+                    ? 'bg-green-500/20 text-green-300'
+                    : 'bg-tradebot-accent/20 text-tradebot-accent hover:bg-tradebot-accent/30'
+                } disabled:opacity-50`}
+              >
+                {applying ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : applySuccess ? (
+                  <Check className="w-3.5 h-3.5" />
+                ) : (
+                  <Zap className="w-3.5 h-3.5" />
+                )}
+                {applySuccess ? 'Applied!' : 'Apply changes'}
+              </button>
+            )}
+          </div>
           {showSettings && (
             <div className="mt-3 grid grid-cols-2 md:grid-cols-3 gap-3 text-xs">
-              {/* Lot size */}
+              {/* Lot size — always editable */}
               <div className="col-span-1">
-                <label className="block text-gray-400 mb-1">Lot size {autoLotPreview}</label>
+                <label className="block text-gray-400 mb-1">
+                  Lot size {autoLot ? '(risk-based)' : ''}
+                  {active && <span className="text-tradebot-accent/70 ml-1">✎</span>}
+                </label>
                 <div className="flex items-center gap-1">
                   <button
                     onClick={() => setLotSize(v => Math.max(0.01, +(v - 0.01).toFixed(2)))}
-                    disabled={!!active || autoLot}
+                    disabled={autoLot}
                     className="px-2 py-1 rounded bg-gray-900 border border-gray-700 text-gray-300 disabled:opacity-40"
                   >−</button>
                   <input
                     type="number" step="0.01" min="0.01" value={lotSize}
                     onChange={e => setLotSize(Math.max(0.01, +e.target.value || 0.01))}
-                    disabled={!!active || autoLot}
+                    disabled={autoLot}
                     className="w-full text-center py-1 rounded bg-gray-900 border border-gray-700 text-white disabled:opacity-40"
                   />
                   <button
                     onClick={() => setLotSize(v => +(v + 0.01).toFixed(2))}
-                    disabled={!!active || autoLot}
+                    disabled={autoLot}
                     className="px-2 py-1 rounded bg-gray-900 border border-gray-700 text-gray-300 disabled:opacity-40"
                   >+</button>
                 </div>
@@ -331,7 +475,7 @@ export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault }: Pro
               {/* Auto lot */}
               <div className="col-span-1 flex items-end">
                 <label className="flex items-center gap-2 text-gray-300 cursor-pointer">
-                  <input type="checkbox" checked={autoLot} onChange={e => setAutoLot(e.target.checked)} disabled={!!active} />
+                  <input type="checkbox" checked={autoLot} onChange={e => setAutoLot(e.target.checked)} />
                   Auto lot (risk-based)
                 </label>
               </div>
@@ -339,31 +483,36 @@ export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault }: Pro
               <div className="col-span-1">
                 <label className="block text-gray-400 mb-1">Max daily loss: {maxDailyLoss}%</label>
                 <input type="range" min={1} max={10} step={0.5} value={maxDailyLoss}
-                  onChange={e => setMaxDailyLoss(+e.target.value)} disabled={!!active}
-                  className="w-full accent-tradebot-accent disabled:opacity-40" />
+                  onChange={e => setMaxDailyLoss(+e.target.value)}
+                  className="w-full accent-tradebot-accent" />
               </div>
               {/* Target profit */}
               <div className="col-span-1">
                 <label className="block text-gray-400 mb-1">Target/trade: {targetProfit}%</label>
                 <input type="range" min={0.5} max={5} step={0.1} value={targetProfit}
-                  onChange={e => setTargetProfit(+e.target.value)} disabled={!!active}
-                  className="w-full accent-tradebot-accent disabled:opacity-40" />
+                  onChange={e => setTargetProfit(+e.target.value)}
+                  className="w-full accent-tradebot-accent" />
               </div>
               {/* Toggles */}
               <div className="col-span-2 md:col-span-3 flex flex-wrap gap-4 pt-1">
                 <label className="flex items-center gap-2 text-gray-300 cursor-pointer">
-                  <input type="checkbox" checked={recovery} onChange={e => setRecovery(e.target.checked)} disabled={!!active} />
+                  <input type="checkbox" checked={recovery} onChange={e => setRecovery(e.target.checked)} />
                   <ShieldCheck className="w-3.5 h-3.5 text-orange-400" /> Recovery order
                 </label>
                 <label className="flex items-center gap-2 text-gray-300 cursor-pointer">
-                  <input type="checkbox" checked={useAi} onChange={e => setUseAi(e.target.checked)} disabled={!!active} />
+                  <input type="checkbox" checked={useAi} onChange={e => setUseAi(e.target.checked)} />
                   <Brain className="w-3.5 h-3.5 text-purple-400" /> AI analysis
                 </label>
                 <label className="flex items-center gap-2 text-gray-300 cursor-pointer">
-                  <input type="checkbox" checked={useKronos} onChange={e => setUseKronos(e.target.checked)} disabled={!!active} />
+                  <input type="checkbox" checked={useKronos} onChange={e => setUseKronos(e.target.checked)} />
                   <Sparkles className="w-3.5 h-3.5 text-cyan-400" /> Kronos forecast
                 </label>
               </div>
+              {active && (
+                <p className="col-span-2 md:col-span-3 text-[10px] text-gray-500 italic">
+                  Changes take effect on the next cycle (~10s). Click &quot;Apply changes&quot; to push now.
+                </p>
+              )}
             </div>
           )}
         </div>

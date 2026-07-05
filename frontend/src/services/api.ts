@@ -691,6 +691,11 @@ export const apiClient = {
         api.get('/plugins/mt5/scalp/symbols/search', { params: { account_id: accountId, q } }),
       sessions: (accountId: number) => api.get(`/plugins/mt5/scalp/sessions/${accountId}`),
       trades: (sessionId: number) => api.get(`/plugins/mt5/scalp/trades/${sessionId}`),
+      update: (sessionId: number, data: {
+        lot_size?: number; auto_lot?: boolean; risk_per_trade_pct?: number;
+        max_daily_loss_pct?: number; target_profit_pct?: number;
+        recovery_enabled?: boolean; use_ai?: boolean; use_kronos?: boolean;
+      }) => api.patch(`/plugins/mt5/scalp/update/${sessionId}`, data),
     },
   },
 

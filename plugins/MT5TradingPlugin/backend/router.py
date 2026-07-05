@@ -32,7 +32,7 @@ from plugins.MT5TradingPlugin.backend.schemas import (
     MT5SmcAnalyzeResponse, MT5BacktestRequest, MT5BacktestResponse,
     MT5SmcPlaceRequest, MT5SmcAnalyzeDataRequest, MT5BacktestDataRequest,
     ScalpStartRequest, ScalpStopRequest, ScalpStatusResponse, ScalpTradeInfo,
-    ScalpSymbolResult, ScalpTradeRow,
+    ScalpSymbolResult, ScalpTradeRow, ScalpUpdateRequest,
 )
 from plugins.MT5TradingPlugin.backend.services.mt5_client import mt5_client
 from plugins.MT5TradingPlugin.backend.services.sync_service import MT5SyncService
@@ -1538,7 +1538,12 @@ async def _scalp_status_payload(db, session: MT5ScalpSession) -> ScalpStatusResp
         session_id=session.id, account_id=session.account_id, symbol=session.symbol,
         status=session.status.value if hasattr(session.status, "value") else str(session.status),
         phase=session.phase or "analyzing",
-        lot_size=session.lot_size, recovery_enabled=session.recovery_enabled,
+        lot_size=session.lot_size,
+        auto_lot=bool(session.auto_lot),
+        risk_per_trade_pct=session.risk_per_trade_pct or 1.0,
+        max_daily_loss_pct=session.max_daily_loss_pct or 3.0,
+        target_profit_pct=session.target_profit_pct or 1.5,
+        recovery_enabled=session.recovery_enabled,
         use_ai=session.use_ai, use_kronos=session.use_kronos,
         timeframe=session.timeframe or "M5",
         bias_direction=session.bias_direction, bias_confidence=session.bias_confidence or 0.0,
@@ -1717,3 +1722,34 @@ async def scalp_trades(session_id: int, limit: int = Query(default=50, le=200)):
             is_recovery=t.is_recovery, status=t.status, confidence=t.confidence,
             reason=t.reason, opened_at=t.opened_at, closed_at=t.closed_at,
         ) for t in trades]
+
+
+@router.patch("/scalp/update/{session_id}", response_model=ScalpStatusResponse)
+async def scalp_update_settings(session_id: int, data: ScalpUpdateRequest):
+    """
+    Patch lot size / risk / toggle settings on a running scalp session.
+    Changes take effect on the next automatic cycle (~10s) — no restart required.
+    """
+    async with AsyncSessionLocal() as db:
+        session = await db.get(MT5ScalpSession, session_id)
+        if not session:
+            raise HTTPException(404, "Scalp session not found")
+        if data.lot_size is not None:
+            session.lot_size = data.lot_size
+        if data.auto_lot is not None:
+            session.auto_lot = data.auto_lot
+        if data.risk_per_trade_pct is not None:
+            session.risk_per_trade_pct = data.risk_per_trade_pct
+        if data.max_daily_loss_pct is not None:
+            session.max_daily_loss_pct = data.max_daily_loss_pct
+        if data.target_profit_pct is not None:
+            session.target_profit_pct = data.target_profit_pct
+        if data.recovery_enabled is not None:
+            session.recovery_enabled = data.recovery_enabled
+        if data.use_ai is not None:
+            session.use_ai = data.use_ai
+        if data.use_kronos is not None:
+            session.use_kronos = data.use_kronos
+        await db.commit()
+        await db.refresh(session)
+        return await _scalp_status_payload(db, session)

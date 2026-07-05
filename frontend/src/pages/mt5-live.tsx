@@ -1593,8 +1593,14 @@ export default function MT5LivePage() {
                 {/* Autonomous Scalp Bot — analyses all timeframes, auto-trades with SL/TP + recovery */}
                 <div className="mt-4">
                   <MT5ScalpBotPanel
+                    key={selected.id}
                     accountId={selected.id}
                     serverSymbolDefault={getDefaultSymbol(selected.server)}
+                    chartSymbol={chartSymbol}
+                    onSymbolChange={s => {
+                      setChartSymbol(s)
+                      setTradeForm(p => ({ ...p, symbol: s }))
+                    }}
                   />
                 </div>
               </div>
