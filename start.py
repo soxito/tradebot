@@ -116,6 +116,29 @@ def _total_ram_bytes() -> int:
             for ln in Path("/proc/meminfo").read_text().splitlines():
                 if ln.startswith("MemTotal:"):
                     return int(ln.split()[1]) * 1024  # kB → bytes
+        elif system == "windows":
+            # POSIX os.sysconf doesn't exist on Windows, so query the kernel
+            # directly via GlobalMemoryStatusEx (stdlib ctypes, no deps). Without
+            # this a 16 GB Windows box falls through to the 8 GB assumption below.
+            import ctypes
+
+            class _MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = _MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return int(stat.ullTotalPhys)
     except Exception:
         pass
     # Portable fallback (POSIX)
@@ -138,6 +161,34 @@ def _physical_cores(logical: int) -> int:
             ids = set(re.findall(r"core id\s*:\s*(\d+)", Path("/proc/cpuinfo").read_text()))
             if ids:
                 return len(ids)
+        elif system == "windows":
+            # os.cpu_count() reports logical CPUs (4 on a 2-core/4-thread
+            # i5-4300U), which would over-provision ML/BLAS threads. Query the
+            # real physical core count via CIM (PowerShell), then legacy wmic.
+            import re
+            for cmd in (
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-CimInstance Win32_Processor | "
+                 "Measure-Object -Property NumberOfCores -Sum).Sum"],
+                ["wmic", "cpu", "get", "NumberOfCores"],
+            ):
+                try:
+                    r = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+                except (OSError, subprocess.SubprocessError):
+                    continue
+                if r.returncode == 0:
+                    nums = [int(x) for x in re.findall(r"\d+", r.stdout)]
+                    total = sum(nums)
+                    if total > 0:
+                        return total
+    except Exception:
+        pass
+    # Cross-platform last resort: psutil if it happens to be importable.
+    try:
+        import psutil  # type: ignore
+        pc = psutil.cpu_count(logical=False)
+        if pc:
+            return int(pc)
     except Exception:
         pass
     return logical
@@ -160,7 +211,13 @@ def detect_resources() -> Dict[str, object]:
 
     # ML/BLAS thread cap — leave 2 cores for the event loop + OS so torch/numpy
     # can't saturate the CPU and stall the API on smaller machines.
-    ml_threads = max(2, physical - 2) if physical > 4 else max(1, physical)
+    if physical > 4:
+        ml_threads = max(2, physical - 2)
+    else:
+        # Low-core machines (≤4 physical, e.g. a dual-core i5-4300U reporting
+        # 2 physical / 4 logical): keep ML work from starving the async event
+        # loop + OS by leaving ~2 logical cores free (but always ≥1 thread).
+        ml_threads = max(1, min(physical, logical - 2))
 
     # UI quality-tier hint for the frontend (mirrors devicePerformance.ts).
     lc = logical
@@ -182,6 +239,11 @@ def detect_resources() -> Dict[str, object]:
         "node_heap_mb": node_heap,
         "ml_threads": ml_threads,
         "ui_tier": ui_tier,
+        # Hard 3D/WebGL kill-switch for very weak GPUs (e.g. the Intel HD 4400
+        # in an i5-4300U): on the 'low' tier we tell the browser to skip the
+        # Three.js robot / SOX orb / force-graph-3d entirely instead of relying
+        # only on the adaptive FPS downgrade.
+        "disable_3d": ui_tier == "low",
     }
 
 
@@ -198,6 +260,8 @@ def print_resources() -> None:
     ok(f"CPU: {r['physical']} physical / {r['logical']} logical cores")
     ok(f"RAM: {r['ram_gb']} GB")
     info(f"Frontend Node heap: {r['node_heap_mb']} MB  ·  backend ML threads: {r['ml_threads']}  ·  UI tier: {str(r['ui_tier']).upper()}")
+    if r.get("disable_3d"):
+        info("Low-power GPU profile: 3D/WebGL effects disabled (robot · orb · 3D graph)")
 
 MT5_API_URL   = _DOTENV.get("MT5_API_URL", os.environ.get("MT5_API_URL", "http://localhost:8092"))
 MT5_IMAGE     = "timurila/mt5rest"     # Docker image for mtapi-io REST bridge
@@ -324,6 +388,36 @@ def pkill(pattern: str) -> None:
         subprocess.run(["pkill", "-f", pattern], capture_output=True)
     except (OSError, subprocess.SubprocessError):
         pass
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if a process with `pid` is currently running (cross-platform)."""
+    if IS_WINDOWS:
+        try:
+            r = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"],
+                               capture_output=True, text=True)
+            return r.returncode == 0 and str(pid) in r.stdout
+        except (OSError, subprocess.SubprocessError):
+            return False
+    try:
+        os.kill(pid, 0)  # signal 0 = existence check, doesn't kill
+        return True
+    except OSError:
+        return False
+
+
+def _kill_pid_tree(pid: int) -> bool:
+    """Terminate a process and its children (cross-platform)."""
+    try:
+        if IS_WINDOWS:
+            # taskkill /T also kills the child processes (next dev spawns them).
+            r = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                               capture_output=True, text=True)
+            return r.returncode == 0
+        os.kill(pid, 15)  # SIGTERM
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def _npm_cmd() -> str:
@@ -1955,12 +2049,28 @@ def start_backend(pg_port: int, redis_port: int, mode: str) -> bool:
         env.setdefault(_k, _ml)
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+    # On low-core machines (≤2 physical cores, e.g. the dual-core i5-4300U)
+    # uvicorn's --reload is a needless tax: it spawns a second supervisor
+    # process AND a constant filesystem watcher that steals CPU from the API.
+    # Skip it there and run a single lean process. Override with TRADEBOT_RELOAD.
+    _reload_override = os.environ.get("TRADEBOT_RELOAD")
+    if _reload_override is not None:
+        use_reload = _reload_override.strip().lower() in ("1", "true", "yes", "on")
+    else:
+        use_reload = int(_res["physical"]) > 2
+    uvicorn_cmd = [str(UVICORN_BIN), "app.main:app",
+                   "--host", "0.0.0.0", "--port", str(BACKEND_PORT)]
+    if use_reload:
+        uvicorn_cmd += ["--reload",
+                        "--reload-dir", str(BACKEND_DIR / "app"),
+                        "--reload-dir", str(ROOT / "plugins")]
+    else:
+        info("Low-core machine — starting backend without --reload (set "
+             "TRADEBOT_RELOAD=1 to force auto-reload)")
+
     with open(log_file, "w") as lf:
         proc = subprocess.Popen(
-            [str(UVICORN_BIN), "app.main:app",
-             "--host", "0.0.0.0", "--port", str(BACKEND_PORT), "--reload",
-             "--reload-dir", str(BACKEND_DIR / "app"),
-             "--reload-dir", str(ROOT / "plugins")],
+            uvicorn_cmd,
             cwd=BACKEND_DIR,
             env=env,
             stdout=lf,
@@ -2013,6 +2123,8 @@ def start_frontend() -> bool:
         "PORT": str(FRONTEND_PORT),
         "NODE_OPTIONS": _node_opts,
         "NEXT_PUBLIC_PERF_TIER": str(_res["ui_tier"]),
+        # Hard-disable WebGL on weak GPUs (low tier) — see detect_resources().
+        "NEXT_PUBLIC_DISABLE_3D": "1" if _res.get("disable_3d") else "0",
     }
 
     with open(log_file, "w") as lf:
@@ -2049,6 +2161,22 @@ def stop_all() -> None:
             info(f"Stopped: {pattern} (pids {pids})")
         else:
             warn(f"Not running: {pattern}")
+
+    # PID-file fallback — REQUIRED on Windows where pgrep/pkill are no-ops, and
+    # a safety net elsewhere. start_backend/start_frontend write these files.
+    for label, pidfile in (("backend", ROOT / "backend.pid"),
+                           ("frontend", ROOT / "frontend.pid")):
+        if not pidfile.exists():
+            continue
+        try:
+            pid = int(pidfile.read_text().strip())
+        except (ValueError, OSError):
+            pidfile.unlink(missing_ok=True)
+            continue
+        if _pid_alive(pid) and _kill_pid_tree(pid):
+            info(f"Stopped {label} via PID file (pid {pid})")
+        pidfile.unlink(missing_ok=True)
+
     # MT5 REST container
     if _docker_available() and _container_running(MT5_CONTAINER):
         subprocess.run(["docker", "stop", MT5_CONTAINER], capture_output=True, timeout=15)
@@ -2076,7 +2204,7 @@ def status() -> None:
         symbol = f"{C.GREEN}●{C.RESET}" if running else f"{C.RED}○{C.RESET}"
         state = "running" if running else "stopped"
         print(f"  {symbol}  {label:<26}  :{port}  {state}")
-    obsidian_open = subprocess.run(["pgrep", "-f", "Obsidian"], capture_output=True).returncode == 0
+    obsidian_open = bool(pgrep("Obsidian"))
     obs_symbol = f"{C.GREEN}●{C.RESET}" if obsidian_open else f"{C.YELLOW}○{C.RESET}"
     obs_state = "running" if obsidian_open else "not running"
     print(f"  {obs_symbol}  {'Obsidian app':<26}  {'-':>5}  {obs_state}")

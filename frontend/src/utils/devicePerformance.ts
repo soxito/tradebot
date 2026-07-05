@@ -160,6 +160,27 @@ export function detectStaticProfile(info: DeviceInfo = detectDevice()): PerfProf
   return PERF_PROFILES[detectStaticTier(info)]
 }
 
+/**
+ * Hard 3D/WebGL kill-switch. start.py sets NEXT_PUBLIC_DISABLE_3D='1' on the
+ * 'low' UI tier (weak GPUs such as the Intel HD 4400 in an i5-4300U) so the app
+ * SKIPS WebGL work — the Three.js JARVIS robot and the 3D force-graph — instead
+ * of merely downscaling it. Per-browser override via localStorage
+ * 'tradebot.disable3d' ('1' forces off, '0' forces on).
+ */
+export function threeDisabled(): boolean {
+  if (typeof window !== 'undefined') {
+    try {
+      const o = window.localStorage.getItem('tradebot.disable3d')
+      if (o === '1') return true
+      if (o === '0') return false
+    } catch {
+      /* localStorage blocked — fall back to the env hint */
+    }
+  }
+  const env = typeof process !== 'undefined' ? process.env.NEXT_PUBLIC_DISABLE_3D : undefined
+  return env === '1' || env === 'true'
+}
+
 /** Human-readable label e.g. "ULTRA · 12-core · 16GB". */
 export function describeTier(tier: PerfTier, info: DeviceInfo = detectDevice()): string {
   const parts = [tier.toUpperCase(), `${info.cores}-core`]

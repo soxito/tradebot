@@ -11,6 +11,7 @@ import Head from 'next/head'
 import Link from 'next/link'
 import { useCallback, useEffect, useRef, useState, useMemo } from 'react'
 import { apiClient } from '@/services/api'
+import { threeDisabled } from '@/utils/devicePerformance'
 import {
   Network, Sparkles, Search, Brain, Trash2, RefreshCw, Gauge,
   Layers, X, Save, Check, Maximize2, Minimize2, PanelRightClose, PanelRightOpen,
@@ -689,12 +690,17 @@ export default function IntelligencePage() {
   // attaches to the real ForceGraph instance (next/dynamic swallows the ref).
   const [FG2D, setFG2D] = useState<any>(null)
   const [FG3D, setFG3D] = useState<any>(null)
+  // Skip the heavy Three.js 3D graph on weak GPUs (start.py sets
+  // NEXT_PUBLIC_DISABLE_3D on the 'low' tier). 2D stays fully functional.
+  const [disable3D] = useState(() => threeDisabled())
   useEffect(() => {
     let alive = true
     import('react-force-graph-2d').then(m => { if (alive) setFG2D(() => m.default) }).catch(() => {})
-    import('react-force-graph-3d').then(m => { if (alive) setFG3D(() => m.default) }).catch(() => {})
+    if (!disable3D) {
+      import('react-force-graph-3d').then(m => { if (alive) setFG3D(() => m.default) }).catch(() => {})
+    }
     return () => { alive = false }
-  }, [])
+  }, [disable3D])
 
   // ── Load full graph ─────────────────────────────────────────────────────────
   const loadGraph = useCallback(async () => {
@@ -1258,9 +1264,9 @@ export default function IntelligencePage() {
             {nodeCount.toLocaleString()} nodes · {linkCount.toLocaleString()} links
           </div>
 
-          {/* 2D/3D toggle */}
+          {/* 2D/3D toggle (3D hidden on weak-GPU / disable-3D profile) */}
           <div className="flex bg-gray-800 rounded p-0.5 gap-0.5">
-            {(['2d', '3d'] as const).map(m => (
+            {(disable3D ? (['2d'] as const) : (['2d', '3d'] as const)).map(m => (
               <button key={m} onClick={() => setMode(m)}
                 className={`px-3 py-1 rounded text-xs font-semibold transition ${mode === m ? 'bg-cyan-600 text-white' : 'text-gray-400 hover:text-white'}`}>
                 {m.toUpperCase()}

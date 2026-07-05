@@ -17,7 +17,7 @@ import {
   Mic, MicOff, Volume2, VolumeX, Ear, Settings, Play,
 } from 'lucide-react'
 import type { RobotState, AvatarStyle } from './JarvisRobot'
-import { detectStaticTier } from '@/utils/devicePerformance'
+import { detectStaticTier, threeDisabled } from '@/utils/devicePerformance'
 
 // 3D robot avatar — loaded client-side only (Three.js needs the DOM/WebGL).
 const JarvisRobotAvatar = dynamic(() => import('./JarvisRobotAvatar'), { ssr: false })
