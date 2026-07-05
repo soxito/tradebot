@@ -828,11 +828,18 @@ def preflight_check(mode: str) -> bool:
 
     # ── Python (this process) ────────────────────────────────────────────────
     py_ver = sys.version.split()[0]
-    py_ok = tuple(int(x) for x in py_ver.split(".")[:2]) >= (3, 9)
+    py_tuple = tuple(int(x) for x in py_ver.split(".")[:2])
+    py_ok = py_tuple >= (3, 9)
     if not _check("Python ≥ 3.9", py_ok, f"python {py_ver}"):
         fail("  Python 3.9+ is required to run this script.")
         fail("  Install: brew install python@3.11  then re-run with python3.11 start.py")
         unfixable.append("Python < 3.9 (current runner)")
+    elif py_tuple >= (3, 14):
+        # The dependency lockfile is frozen against 3.13; some exact pins have no
+        # 3.14 wheel yet. The installer falls back to resolved versions, but 3.13
+        # is the smoothest path if pip still fails.
+        warn(f"Python {py_ver} is very new — some pinned wheels may be missing. "
+             "If pip fails below, install Python 3.13 and re-run.")
 
     # ── Visual C++ runtime (Windows only) ────────────────────────────────────
     # Compiled wheels (pydantic-core, asyncpg, numpy …) need vcruntime140.dll.
@@ -1082,7 +1089,12 @@ def preflight_check(mode: str) -> bool:
             _spinner_run([str(pip), "install", "--quiet", "--upgrade", "pip"],
                          "Upgrading pip", timeout=60)
             # Prefer the fully-pinned lockfile: --no-deps skips resolution entirely,
-            # avoiding the "dependency graph too complex" error from ccxt/openai trees.
+            # avoiding the "dependency graph too complex" error from ccxt/openai
+            # trees. The lockfile is frozen against Python 3.13, though — on newer
+            # runtimes (e.g. 3.14) some exact pins have no wheel (e.g.
+            # litellm==1.89.3), so fall back to resolving requirements.txt, which
+            # lets pip choose versions compatible with the current interpreter.
+            ok_p, err_p = False, ""
             if lock_file.exists():
                 ok_p, err_p = _spinner_run(
                     [str(pip), "install", "--prefer-binary", "--no-deps",
@@ -1090,12 +1102,15 @@ def preflight_check(mode: str) -> bool:
                     "pip install -r requirements-lock.txt",
                     cwd=BACKEND_DIR, timeout=360
                 )
-            else:
+                if not ok_p:
+                    warn("Lockfile install failed (often a newer-Python wheel gap) "
+                         "— retrying with resolved requirements.txt …")
+            if not ok_p:
                 ok_p, err_p = _spinner_run(
                     [str(pip), "install", "--prefer-binary", "--upgrade",
                      "-r", str(reqs_file)],
                     "pip install -r requirements.txt",
-                    cwd=BACKEND_DIR, timeout=360
+                    cwd=BACKEND_DIR, timeout=600
                 )
             if ok_p:
                 # Re-check every package individually
@@ -1663,12 +1678,18 @@ def ensure_pip_deps() -> bool:
 
     # Use the fully-pinned lockfile when available — it lets pip skip dependency
     # resolution entirely (--no-deps) which avoids the "graph too complex" error
-    # caused by ccxt + openai + headroom-ai having very deep transitive trees.
+    # caused by ccxt + openai having very deep transitive trees. The lockfile is
+    # frozen against Python 3.13; on newer runtimes (e.g. 3.14) some exact pins
+    # have no wheel, so fall back to resolving requirements.txt in that case.
     lock = BACKEND_DIR / "requirements-lock.txt"
+    r = None
     if lock.exists():
         r = run([str(pip), "install", "--prefer-binary", "--no-deps",
                  "-r", str(lock)], cwd=BACKEND_DIR)
-    else:
+        if r.returncode != 0:
+            warn("Lockfile install failed (often a newer-Python wheel gap) — "
+                 "retrying with resolved requirements.txt …")
+    if r is None or r.returncode != 0:
         r = run([str(pip), "install", "--prefer-binary", "--upgrade",
                  "-r", str(reqs)], cwd=BACKEND_DIR)
     if r.returncode != 0:
