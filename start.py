@@ -1053,10 +1053,34 @@ def preflight_check(mode: str) -> bool:
     print(f"  {C.BOLD}Python environment{C.RESET}")
     sep()
 
+    # Compiled wheels only cover CPython 3.11–3.13, so make sure we build the
+    # venv with a supported interpreter (auto-installing Python 3.13 on Windows
+    # if the box only has 3.14+). If a previous run already created a 3.14 venv,
+    # recreate it — otherwise pandas/numpy/pydantic-core fail to build.
+    supported_py = _ensure_supported_python()
+
     venv_exists = VENV.exists() and PY_BIN.exists()
+    if venv_exists and supported_py:
+        venv_ver = _python_version(str(PY_BIN))
+        if venv_ver and venv_ver > _MAX_SUPPORTED_PY:
+            warn(f"Existing venv uses Python {venv_ver[0]}.{venv_ver[1]} — "
+                 "unsupported for prebuilt wheels; recreating with a supported "
+                 "interpreter …")
+            try:
+                shutil.rmtree(VENV)
+            except OSError as e:
+                warn(f"  could not remove old venv: {e}")
+            venv_exists = VENV.exists() and PY_BIN.exists()
+
     if not venv_exists:
         info("Python venv not found — creating now …")
-        py = _best_python()
+        py = supported_py or _best_python()
+        if not supported_py:
+            pv = _python_version(py)
+            if pv and pv > _MAX_SUPPORTED_PY:
+                warn(f"No Python 3.11–3.13 available — creating venv with "
+                     f"{pv[0]}.{pv[1]}; some dependencies may fail to build. "
+                     "Install Python 3.13 for a clean setup.")
         ok_v, err_v = _spinner_run([py, "-m", "venv", str(VENV)],
                                    "Creating Python venv")
         if ok_v:
@@ -1607,32 +1631,114 @@ def start_redis_docker() -> Tuple[bool, int]:
 
 
 # ── Python venv ───────────────────────────────────────────────────────────────
-def _best_python() -> str:
-    """
-    Return the newest Python ≥3.11 available.
+# Compiled dependency wheels (pandas, numpy, pydantic-core, asyncpg …) are only
+# published for CPython 3.11–3.13. On Python 3.14+ pip can't find wheels and
+# falls back to source builds that fail ("metadata-generation-failed"). The venv
+# must therefore be built with an interpreter in this supported window.
+_MIN_SUPPORTED_PY = (3, 11)
+_MAX_SUPPORTED_PY = (3, 13)
 
-    The dependency lockfile is frozen against modern CPython, and several core
-    packages (pydantic-core, etc.) only ship pre-built wheels for 3.11–3.13.
-    If the venv is created with an old interpreter (e.g. macOS system Python
-    3.9), pip falls back to building those wheels from Rust/C source and fails.
-    Prefer 3.13 → 3.12 → 3.11, then any python3 as a last resort.
+
+def _python_version(exe: str) -> Optional[Tuple[int, int]]:
+    """Return (major, minor) for a python executable, or None if it won't run."""
+    try:
+        r = subprocess.run(
+            [exe, "-c", "import sys;print('%d.%d' % sys.version_info[:2])"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            major, minor = r.stdout.strip().split(".")[:2]
+            return (int(major), int(minor))
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    return None
+
+
+def _is_supported_py(ver: Optional[Tuple[int, int]]) -> bool:
+    return bool(ver) and _MIN_SUPPORTED_PY <= ver <= _MAX_SUPPORTED_PY
+
+
+def _find_supported_python() -> Optional[str]:
     """
+    Locate an installed interpreter in [3.11, 3.13], best-first (3.13 → 3.11).
+    Returns the executable path, or None if none is installed.
+    """
+    # 1) Versioned commands on PATH (POSIX, and some Windows installs).
     for name in ("python3.13", "python3.12", "python3.11"):
         p = shutil.which(name)
-        if p:
+        if p and _is_supported_py(_python_version(p)):
             return p
+    # 2) The interpreter running this script, if it's already supported.
+    if _is_supported_py(_python_version(sys.executable)):
+        return sys.executable
     if IS_WINDOWS:
-        # Windows rarely exposes versioned "python3.x" commands. The interpreter
-        # already running this script is guaranteed to exist and be ≥3.9, so use
-        # it first, then fall back to whatever "python"/"python3" is on PATH.
-        # (Returned value must be a single token — subprocess treats it as the
-        # executable, so no "py -3.x" strings with embedded spaces.)
+        # 3) The `py` launcher — resolve the REAL exe path so the returned value
+        #    stays a single token (no "py -3.13" string with an embedded space).
+        launcher = shutil.which("py")
+        if launcher:
+            for flag in ("-3.13", "-3.12", "-3.11"):
+                try:
+                    r = subprocess.run(
+                        [launcher, flag, "-c", "import sys;print(sys.executable)"],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    exe = r.stdout.strip()
+                    if r.returncode == 0 and exe and Path(exe).exists():
+                        return exe
+                except (OSError, subprocess.SubprocessError):
+                    pass
+        # 4) Standard per-user / system install locations.
+        bases = [
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Python",
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")),
+            Path("C:/"),
+        ]
+        for base in bases:
+            for ver in ("313", "312", "311"):
+                cand = base / f"Python{ver}" / "python.exe"
+                if cand.exists():
+                    return str(cand)
+    else:
+        for cand in ("/opt/homebrew/bin/python3.13", "/opt/homebrew/bin/python3.12",
+                     "/opt/homebrew/bin/python3.11", "/usr/local/bin/python3.13",
+                     "/usr/local/bin/python3.12", "/usr/local/bin/python3.11"):
+            if Path(cand).exists():
+                return cand
+    return None
+
+
+def _ensure_supported_python() -> Optional[str]:
+    """
+    Return a path to a supported interpreter (3.11–3.13), auto-installing
+    Python 3.13 via winget on Windows if none is present. Returns None when no
+    supported interpreter is available and one couldn't be installed.
+    """
+    found = _find_supported_python()
+    if found:
+        return found
+    if IS_WINDOWS:
+        warn("No Python 3.11–3.13 found (compiled wheels don't cover 3.14+) — "
+             "installing Python 3.13 via winget …")
+        if _winget_install("Python.Python.3.13", "Python 3.13"):
+            found = _find_supported_python()
+            if found:
+                return found
+    return None
+
+
+def _best_python() -> str:
+    """
+    Return the best interpreter for creating the venv.
+
+    Compiled dependency wheels only cover CPython 3.11–3.13, so prefer a
+    supported interpreter (3.13 → 3.11). Fall back to the running interpreter
+    only when nothing better is available.
+    """
+    supported = _find_supported_python()
+    if supported:
+        return supported
+    if IS_WINDOWS:
         return sys.executable or shutil.which("python") or shutil.which("python3") or "python"
-    for cand in ("/opt/homebrew/bin/python3.13",
-                 "/opt/homebrew/bin/python3.12",
-                 "/opt/homebrew/bin/python3.11"):
-        if Path(cand).exists():
-            return cand
     return shutil.which("python3") or shutil.which("python") or sys.executable
 
 
