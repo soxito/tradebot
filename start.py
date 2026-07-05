@@ -720,8 +720,11 @@ def _npm_global(pkg: str) -> bool:
 
 def _cmd_version(cmd: str) -> str:
     """Return first line of `cmd --version`, or empty string on failure."""
+    # Resolve via shutil.which so Windows .cmd/.bat shims (npm, npx) are found —
+    # subprocess only auto-appends ".exe", so bare ["npm", ...] would fail there.
+    exe = shutil.which(cmd) or cmd
     try:
-        r = subprocess.run([cmd, "--version"], capture_output=True, text=True, timeout=5)
+        r = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=5)
         return (r.stdout or r.stderr).splitlines()[0].strip() if r.returncode == 0 else ""
     except Exception:
         return ""
@@ -787,6 +790,27 @@ def _ensure_vc_redist() -> Tuple[bool, bool]:
             return True, True
 
     return False, False
+
+
+def _winget_install(package_id: str, label: str) -> bool:
+    """
+    Silently install a package via winget (Windows 10 1709+/11). Returns True
+    on success. Adds nothing and never raises on platforms without winget.
+    """
+    if not IS_WINDOWS:
+        return False
+    winget = shutil.which("winget")
+    if not winget:
+        return False
+    ok_inst, err = _spinner_run(
+        [winget, "install", "--id", package_id, "-e",
+         "--accept-source-agreements", "--accept-package-agreements"],
+        f"winget install {label}",
+        timeout=600,
+    )
+    if not ok_inst:
+        warn(f"  winget install {package_id} failed: {err[:160]}")
+    return ok_inst
 
 
 def preflight_check(mode: str) -> bool:
@@ -858,8 +882,21 @@ def preflight_check(mode: str) -> bool:
             node_ok  = bool(node_ver)
             if node_ok:
                 fixed_items.append("Node.js")
+    if not node_ok and IS_WINDOWS:
+        warn("Node.js not found — auto-installing via winget …")
+        if _winget_install("OpenJS.NodeJS.LTS", "Node.js LTS"):
+            # winget won't refresh this process's PATH — add the default install
+            # dir so node/npm/npx are visible without a shell restart.
+            node_dir = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "nodejs"
+            if node_dir.is_dir():
+                os.environ["PATH"] = str(node_dir) + os.pathsep + os.environ.get("PATH", "")
+            node_ver = _cmd_version("node")
+            node_ok  = bool(node_ver)
+            if node_ok:
+                fixed_items.append("Node.js")
     _check("Node.js", node_ok, node_ver,
-           "brew install node  (or nvm install --lts)")
+           "install https://nodejs.org/en/download (or: winget install OpenJS.NodeJS.LTS)"
+           if IS_WINDOWS else "brew install node  (or nvm install --lts)")
     if not node_ok:
         unfixable.append("Node.js not found")
 
@@ -870,13 +907,13 @@ def preflight_check(mode: str) -> bool:
         unfixable.append("npm not found")
 
     npx_ok = bool(shutil.which("npx"))
-    if not npx_ok and npm_ok:
+    if not npx_ok and npm_ok and not IS_WINDOWS:
         warn("npx not found — installing globally …")
         if _npm_global("npx"):
             npx_ok = bool(shutil.which("npx"))
             if npx_ok:
                 fixed_items.append("npx")
-    _check("npx", npx_ok, "", "npm install -g npx")
+    _check("npx", npx_ok, "", "npx ships with npm — reinstall Node.js")
     if not npx_ok:
         unfixable.append("npx not found")
 
@@ -921,9 +958,11 @@ def preflight_check(mode: str) -> bool:
     else:  # docker mode
         docker_cli_ok = bool(shutil.which("docker"))
         _check("Docker CLI", docker_cli_ok, _cmd_version("docker"),
+               "install Docker Desktop: winget install Docker.DockerDesktop"
+               if IS_WINDOWS else
                "https://www.docker.com/products/docker-desktop  (manual install)")
         if not docker_cli_ok:
-            unfixable.append("Docker CLI not found (install Docker Desktop manually)")
+            unfixable.append("Docker CLI not found (install Docker Desktop)")
 
         if docker_cli_ok:
             r = subprocess.run(["docker", "info"], capture_output=True, timeout=5)
@@ -1259,12 +1298,21 @@ def start_mt5rest() -> bool:
 
 # ── DB mode ───────────────────────────────────────────────────────────────────
 def detect_mode(forced: Optional[str]) -> str:
+    # Brew mode (Homebrew postgres/redis) only works on macOS. On Windows/Linux
+    # coerce any brew request — forced flag, saved .db-mode, or auto-detect — to
+    # docker so a stale/committed "brew" mode can't wedge the whole preflight.
+    def _coerce(m: str) -> str:
+        if m == "brew" and sys.platform != "darwin":
+            warn("Brew mode is macOS-only — switching to Docker mode.")
+            return "docker"
+        return m
+
     if forced:
-        return forced
+        return _coerce(forced)
     if MODE_FILE.exists():
         saved = MODE_FILE.read_text().strip()
         warn(f"Using last saved DB mode: {C.BOLD}{saved}{C.RESET}")
-        return saved
+        return _coerce(saved)
     # Auto-detect: prefer brew if pg_isready binary exists
     if (PG_BIN / "pg_isready").exists():
         return "brew"
@@ -1645,6 +1693,16 @@ def ensure_pip_deps() -> bool:
     pip = PIP_BIN
     run([str(pip), "install", "--quiet", "--no-deps", "--upgrade",
          "tradingagents==0.6.0"], cwd=BACKEND_DIR)
+
+    # headroom-ai (context compression) is OPTIONAL — imported conditionally and
+    # falls back silently if absent (backend/app/utils/headroom_compress.py). It
+    # can fail to build on newer/unsupported Python (e.g. 3.14) or Windows, so
+    # install it best-effort with prebuilt wheels only and never fail the run.
+    r_hr = run([str(pip), "install", "--quiet", "--no-deps", "--only-binary=:all:",
+                "--upgrade", "headroom-ai==0.27.0"], cwd=BACKEND_DIR)
+    if r_hr.returncode != 0:
+        warn("headroom-ai unavailable for this Python — context compression "
+             "disabled (optional, app runs normally).")
 
     return True
 

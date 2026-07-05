@@ -47,7 +47,6 @@ googleapis-common-protos==1.75.0
 greenlet==3.4.0
 h11==0.16.0
 h2==4.3.0
-headroom-ai==0.27.0
 hf-xet==1.5.1
 hnswlib==0.8.0
 hpack==4.2.0

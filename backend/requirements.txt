@@ -61,7 +61,10 @@ openai==1.82.0
 # tradingagents is installed separately with --no-deps (see start.py) because its
 # published deps require chainlit>=2.11.1 (unreleased) and Python>=3.12.
 # The package itself works fine without those deps when imported conditionally.
-headroom-ai==0.27.0  # context compression — 60-95% token reduction
+# headroom-ai (context compression) is OPTIONAL and installed best-effort in
+# start.py — it is imported conditionally (backend/app/utils/headroom_compress.py)
+# and can fail to build on some Python versions (e.g. 3.14), so it must not be a
+# hard dependency that blocks the core install.
 
 # Face Vision (GPU-accelerated)
 # Install:  bash scripts/setup-face-vision.sh
