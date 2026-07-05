@@ -4,72 +4,97 @@
 
 ## 🏗️ Architecture
 
-- **Backend:** Python 3.12, FastAPI, ccxt, SQLAlchemy, Redis
-- **Frontend:** TypeScript, React/Next.js, TradingView Lightweight Charts
-- **Exchanges:** Binance, Bitget, Bybit, OKX, KuCoin, Coinbase
-- **Sentiment:** CoinGecko, CoinMarketCap, CryptoPanic, Reddit, RSS feeds
-- **Infrastructure:** Docker, PostgreSQL, Redis
+- **Backend:** Python 3.13, FastAPI, `ccxt` + native Bitget v2 SDK, SQLAlchemy (async) + asyncpg, Redis
+- **Frontend:** Next.js 16, React 19, TypeScript, Tailwind, TradingView Lightweight Charts, Three.js, react-force-graph-3d
+- **Exchanges:** Binance, Bitget (spot + futures), Bybit, OKX, KuCoin, Coinbase
+- **Sentiment & news:** CryptoPanic, RSS feeds, Reddit → VADER + TextBlob scoring
+- **Realtime:** Server-Sent Events over a Redis pub/sub `EventBus` (in-memory fallback)
+- **Assistant:** JARVIS / Paul — global voice + chat widget with a WebGL S.O.X room
+- **Infrastructure:** PostgreSQL, Redis (Homebrew or Docker), Docker Compose
 
 ## 📋 Features
 
-### ✅ Completed (Phases 1-6)
-✅ Project scaffold with Docker infrastructure  
-✅ FastAPI backend with CORS & health checks  
-✅ Next.js frontend with Tailwind CSS  
-✅ PostgreSQL & Redis integration  
-✅ Environment variable management  
-✅ Security (API key validation, webhook signatures)  
-✅ **Multi-exchange connector** (Binance, Bitget, Bybit, OKX, KuCoin, Coinbase via ccxt)  
-✅ **TradingView webhook receiver** with signal validation  
-✅ **News scraping & sentiment analysis** (RSS feeds + CryptoPanic + VADER + TextBlob)  
-✅ **Signal & decision engine** with risk management (position sizing, stop-loss, take-profit)  
-✅ **Real-time dashboard** with TradingView Lightweight Charts  
-✅ **Trade history tracking** with P&L calculations  
+### Core platform
+- ✅ Multi-exchange connectors (Binance, Bitget, Bybit, OKX, KuCoin, Coinbase) with a native Bitget v2 SDK for spot + futures
+- ✅ TradingView webhook receiver with signature validation
+- ✅ News + sentiment pipeline (RSS + CryptoPanic → VADER + TextBlob)
+- ✅ Signal & decision engine with risk management (position sizing, stop-loss, take-profit, exposure limits)
+- ✅ Realtime dashboard: TradingView charts, wallet balances, trade history, live SSE stream (Live/Poll fallback)
+- ✅ Multi-account + unified-account Bitget balances/positions (USDT/USDC/COIN futures)
 
-### 🔄 Coming Soon (Phases 7-8)
-- 🤖 Auto-trading execution with background scheduler
-- 🔔 Alert system (Telegram, Discord, email)
-- 📊 Advanced monitoring and metrics
+### JARVIS / Paul assistant
+- 🎙️ Hands-free voice control (free Web Speech primary, cost-aware Deepgram STT fallback)
+- 🧠 Position-aware deep analysis (volume pressure + news + forecast + your open PnL)
+- 🤖 3D robot avatar + ~980-particle S.O.X orb rendered off-thread via Web Workers / OffscreenCanvas
+- 🎚️ Adaptive graphics that auto-scale quality (low → ultra) to the device and live FPS
+
+### Plugins (standalone — never modify core code, see `plugins/`)
+- `MT5TradingPlugin` — MetaTrader 5 REST bridge
+- `AiMarketAnalyst` — multi-provider LLM router (Groq, OpenRouter, Gemini, Mistral, Cerebras, DeepSeek, Together, OpenAI, custom) with failover
+- `KronosForecastPlugin` — Kronos ML candle forecasting (mini/small/base) with heuristic fallback
+- `TelegramSignalNewsPlugin` — Telegram signal ingestion, news→sentiment, and sniper auto-trade
+- `ObsidianKnowledgePlugin` — knowledge-base integration
+- `AgentPaulPlugin` — background "subconscious" agent
+
+### Platform support
+- 🖥️ Cross-platform launcher (`start.py`) for macOS, Linux and Windows
+- 🪟 Windows + low-end hardware auto-tuning (RAM/core detection, ML-thread caps, optional 3D kill-switch)
 
 ## 🚀 Quick Start
 
+The recommended way to run TradeBot locally is the cross-platform launcher
+`start.py`. It provisions PostgreSQL and Redis (Homebrew or Docker), builds the
+Python virtual environment, installs dependencies, and starts the backend and
+frontend with resource-aware tuning.
+
 ### Prerequisites
-- Docker & Docker Compose
-- Git
+- **Python 3.11+** and **Node.js 18+**
+- **PostgreSQL** and **Redis** — provisioned automatically via Homebrew or Docker, or bring your own
+- **Git**
 
-### Installation
-
-1. **Clone the repository**
+### 1. Get the code and configure
 ```bash
-git clone <your-repo-url> tradebot
+git clone https://github.com/soxito/tradebot.git
 cd tradebot
+cp .env.example .env   # then edit .env with your own API keys
 ```
 
-2. **Create environment file**
+### 2. Start everything (recommended)
+
+**macOS / Linux**
 ```bash
-cp .env.example .env
+python start.py         # or: ./run-local.sh
 ```
 
-3. **Configure API keys** (edit `.env`)
-```bash
-# Add your exchange API keys (testnet keys for development!)
-# Add news/sentiment API keys (most have free tiers)
-# Generate a secure SECRET_KEY and TRADINGVIEW_WEBHOOK_SECRET
+**Windows**
+```bat
+start.bat
 ```
 
-4. **Start the services**
+`start.py` also accepts `--status` (show running services) and `--stop` (stop
+them). It auto-detects your hardware and, on low-end machines, reduces ML thread
+usage and disables 3D/WebGL rendering. Override behaviours with env vars:
+`NEXT_PUBLIC_DISABLE_3D=1` (hard-disable 3D), `TRADEBOT_RELOAD=1` (force backend
+hot-reload on low-core CPUs).
+
+### 3. Or run with Docker
 ```bash
 docker-compose up --build
 ```
 
-5. **Access the application**
-- **Frontend Dashboard:** http://localhost:3001
-- **Backend API Docs:** http://localhost:8080/docs
-- **Health Check:** http://localhost:8080/health
-- **PostgreSQL:** localhost:5433 (user: tradebot, db: tradebot)
-- **Redis:** localhost:6380
+### Access the application
 
-## � Download & Update from GitHub
+| Service | Local (`start.py`) | Docker |
+| --- | --- | --- |
+| Frontend dashboard | http://localhost:3000 | http://localhost:3001 |
+| Backend API docs | http://localhost:1448/docs | http://localhost:8080/docs |
+| Health check | http://localhost:1448/health | http://localhost:8080/health |
+| PostgreSQL | localhost:5434 | localhost:5433 |
+| Redis | localhost:6379 | localhost:6380 |
+
+> Default DB credentials: user `tradebot`, database `tradebot`.
+
+## 📥 Download & Update from GitHub
 
 Repository: **https://github.com/soxito/tradebot**
 
@@ -125,7 +150,7 @@ docker-compose up --build
 ./run-local.sh
 ```
 
-## �🔒 Security
+## 🔒 Security
 
 ### ⚠️ CRITICAL - Never commit secrets!
 
@@ -153,26 +178,41 @@ Risk limits (configured in `.env`):
 
 ```
 tradebot/
+├── start.py                 # ⭐ Cross-platform launcher (macOS/Linux/Windows)
+├── start.bat                # Windows one-click wrapper for start.py
+├── run-local.sh             # Bash launcher (macOS/Linux)
 ├── backend/                 # Python FastAPI
 │   ├── app/
-│   │   ├── api/            # API routes & webhooks
-│   │   ├── core/           # Config, security
-│   │   ├── exchanges/      # Exchange connectors
+│   │   ├── agents/         # Background agents
+│   │   ├── api/            # API routes, webhooks, SSE stream
+│   │   ├── core/           # Config, security, EventBus
+│   │   ├── exchanges/      # Exchange connectors (ccxt + Bitget v2)
 │   │   ├── sentiment/      # News & sentiment analysis
 │   │   ├── signals/        # Signal processing
 │   │   ├── trading/        # Order execution
 │   │   └── models/         # Database models
 │   ├── requirements.txt
 │   └── Dockerfile
-├── frontend/               # Next.js/React
+├── frontend/               # Next.js 16 / React 19
 │   ├── src/
-│   │   ├── components/    # UI components
+│   │   ├── components/    # UI components (JARVIS, charts, orb)
 │   │   ├── pages/         # Next.js pages
-│   │   └── styles/        # CSS/Tailwind
+│   │   ├── utils/         # Device performance / adaptive quality
+│   │   └── styles/        # CSS / Tailwind
 │   ├── package.json
 │   └── Dockerfile
+├── plugins/                # Standalone plugins (never modify core)
+│   ├── MT5TradingPlugin/
+│   ├── AiMarketAnalyst/
+│   ├── KronosForecastPlugin/
+│   ├── TelegramSignalNewsPlugin/
+│   ├── ObsidianKnowledgePlugin/
+│   └── AgentPaulPlugin/
+├── jarvis-extension/       # Browser extension for JARVIS voice
+├── scripts/                # Setup & diagnostic scripts
 ├── docker-compose.yml
 ├── .env.example           # Template (copy to .env)
+├── CHANGELOG.md
 └── README.md
 ```
 
@@ -207,12 +247,16 @@ docker exec -it tradebot-redis redis-cli
 - `GET /health` - System health check
 - `GET /api/v1/status` - API module status
 
-### Coming Soon
+### Trading & data
 - `POST /api/v1/webhooks/tradingview` - TradingView alerts
 - `GET /api/v1/signals` - Recent trading signals
 - `GET /api/v1/sentiment/{symbol}` - Asset sentiment score
 - `GET /api/v1/trades` - Trade history
 - `POST /api/v1/orders` - Manual order execution
+- `GET /api/v1/stream/events` - Realtime SSE stream (signals, trades, sniper, ticks, alerts)
+
+> The interactive OpenAPI docs at `/docs` list the full, live endpoint set
+> (including plugin routes for MT5, Kronos, Telegram signals and the AI analyst).
 
 ## 🧪 Testing & Verification
 
@@ -364,14 +408,19 @@ the JARVIS settings panel (and on the Voice Agent tab as a cost warning).
 
 ## 📈 Roadmap
 
-- [x] Phase 1: Infrastructure & scaffold
-- [x] Phase 2: Multi-exchange connector
-- [x] Phase 3: TradingView integration
-- [x] Phase 4: Sentiment analysis pipeline
-- [x] Phase 5: Signal & decision engine
-- [x] Phase 6: Dashboard with charts
-- [ ] Phase 7: Auto-trading execution
-- [ ] Phase 8: Monitoring & alerts
+- [x] Core platform: infrastructure, multi-exchange connectors, TradingView webhooks
+- [x] News & sentiment pipeline
+- [x] Signal & decision engine with risk management
+- [x] Realtime dashboard (SSE) with charts, balances and trade history
+- [x] JARVIS voice assistant + adaptive 3D graphics
+- [x] Plugin ecosystem (MT5, AI analyst, Kronos, Telegram, Obsidian, Agent Paul)
+- [x] Cross-platform + low-end hardware support (Windows, `start.py` auto-tuning)
+- [x] Auto-trading execution with background scheduler (simulation + live loops)
+- [x] Alerting (Telegram, Discord, email) + Prometheus monitoring & metrics
+- [ ] Fully automated trade execution across all plugins
+- [ ] Backtesting engine
+
+See [CHANGELOG.md](CHANGELOG.md) for a detailed history of changes.
 
 ## ⚠️ Disclaimer
 

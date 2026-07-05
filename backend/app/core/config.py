@@ -83,6 +83,15 @@ class Settings(BaseSettings):
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
     DISCORD_WEBHOOK_URL: str = ""
+    # Email (SMTP) alerts (optional)
+    EMAIL_ALERTS_ENABLED: bool = False
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM: str = ""            # falls back to SMTP_USERNAME when blank
+    SMTP_TO: str = ""             # comma-separated recipient list
+    SMTP_USE_TLS: bool = True     # STARTTLS on 587; set False + port 465 for SSL
     PROMETHEUS_ENABLED: bool = True
     LOG_LEVEL: str = "INFO"
     LOG_JSON: bool = False

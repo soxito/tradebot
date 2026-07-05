@@ -23,6 +23,11 @@ async def monitoring_status():
         "prometheus_enabled": settings.PROMETHEUS_ENABLED,
         "telegram_configured": bool(settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID),
         "discord_configured": bool(settings.DISCORD_WEBHOOK_URL),
+        "email_configured": bool(
+            settings.EMAIL_ALERTS_ENABLED
+            and settings.SMTP_HOST
+            and settings.SMTP_TO
+        ),
         "log_level": settings.LOG_LEVEL,
         "log_json": settings.LOG_JSON,
         "log_file_path": settings.LOG_FILE_PATH,
