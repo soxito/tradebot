@@ -1066,7 +1066,11 @@ def preflight_check(mode: str) -> bool:
             unfixable.append("Docker CLI not found (install Docker Desktop)")
 
         if docker_cli_ok:
-            r = subprocess.run(["docker", "info"], capture_output=True, timeout=5)
+            # Docker Desktop on Windows uses WSL2/HyperV which can take
+            # 20-30 s to respond on first call; use a longer timeout there.
+            _docker_info_timeout = 30 if IS_WINDOWS else 5
+            r = subprocess.run(["docker", "info"], capture_output=True,
+                               timeout=_docker_info_timeout)
             daemon_ok = r.returncode == 0
             if not daemon_ok:
                 info("Docker daemon not running — attempting to start Docker Desktop …")
@@ -1089,7 +1093,8 @@ def preflight_check(mode: str) -> bool:
                 for _ in range(30):
                     time.sleep(2)
                     if subprocess.run(["docker", "info"],
-                                      capture_output=True, timeout=3).returncode == 0:
+                                      capture_output=True,
+                                      timeout=10 if IS_WINDOWS else 3).returncode == 0:
                         daemon_ok = True
                         fixed_items.append("Docker daemon")
                         break
@@ -1101,7 +1106,8 @@ def preflight_check(mode: str) -> bool:
                 unfixable.append("Docker daemon not running")
 
             r2 = subprocess.run(["docker", "compose", "version"],
-                                capture_output=True, text=True, timeout=5)
+                                capture_output=True, text=True,
+                                timeout=30 if IS_WINDOWS else 5)
             compose_ok = r2.returncode == 0
             ver2 = r2.stdout.strip().splitlines()[0] if compose_ok else ""
             _check("docker compose (v2 plugin)", compose_ok, ver2,
