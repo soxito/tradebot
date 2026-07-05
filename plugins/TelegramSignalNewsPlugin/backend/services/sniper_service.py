@@ -287,7 +287,7 @@ async def _ai_entry_opinion(
         '{"decision":"enter|wait|skip","entry":<number>,"confidence":<0-1>,'
         '"direction_confirmed":<true|false>,"info":"<1-sentence pair read>",'
         '"note":"<short reason>"}. '
-        "Also weigh kronos_ml_forecast when present (an ML K-line forecast with "
+        "Also weigh sox_ml_forecast when present (an ML K-line forecast with "
         "direction/pct_change/confidence over the next candles): if it strongly "
         "opposes the signal direction with decent confidence, prefer 'wait' or 'skip'."
     )
@@ -320,7 +320,7 @@ async def _ai_entry_opinion(
             "resistance": resistance,
             "high_opposite_volume": opposite_volume,
             "volume_ratio": volume_ratio,
-            "kronos_ml_forecast": kronos_fc,
+            "sox_ml_forecast": kronos_fc,
         },
         default=str,
     )

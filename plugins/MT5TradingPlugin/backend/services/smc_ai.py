@@ -131,7 +131,7 @@ async def ai_review(
     telegram-signals and /agents). Always returns a dict with `available` so
     the frontend degrades gracefully when no provider is configured.
 
-    ``kronos_forecast`` is the Kronos ML K-line forecast computed by the router
+    ``kronos_forecast`` is the Sox ML K-line forecast computed by the router
     from the SAME candles the SMC engine analysed (so it works for any symbol,
     including XAUUSD). It is folded into the model's context as a secondary
     confirmation signal.
@@ -142,7 +142,7 @@ async def ai_review(
     if not signals:
         return {"available": False, "reason": "No setups to review"}
 
-    # Kronos ML K-line forecast (supplied by the router from the chart's candles).
+    # Sox ML K-line forecast (supplied by the router from the chart's candles).
     kronos_fc = None
     if isinstance(kronos_forecast, dict) and kronos_forecast.get("direction"):
         kronos_fc = {
@@ -163,7 +163,7 @@ async def ai_review(
         "rsi": analysis.get("rsi"),
         "volume_z": analysis.get("volume_z"),
         "momentum": analysis.get("momentum"),
-        "kronos_ml_forecast": kronos_fc,
+        "sox_ml_forecast": kronos_fc,
         "equilibrium": analysis.get("equilibrium"),
         "range": analysis.get("range"),
         "liquidity": analysis.get("liquidity"),

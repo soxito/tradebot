@@ -2063,7 +2063,7 @@ async def _compose_ai_narrative(brief: str) -> Optional[str]:
                             "You are JARVIS, an elite crypto trading analyst speaking to your "
                             "principal (address him as 'Sir'). Write a natural, confident, human "
                             "analysis — never robotic or list-only. Weave the technicals, volume "
-                            "flow, the Kronos ML forecast and the news/sentiment into one coherent "
+                            "flow, the Sox ML forecast and the news/sentiment into one coherent "
                             "read of the pair, then give a clear directional bias and the key risk. "
                             "If the brief says the user ALREADY HOLDS AN OPEN POSITION on this pair, "
                             "give a direct recommendation on that position — hold, add, reduce, close, "
@@ -2376,12 +2376,12 @@ async def _analyze_symbol(symbol: str, original_cmd: str, ex_name: Optional[str]
                 "engine": _fc.engine,
             }
             detail += (
-                f"\n\nKRONOS ML FORECAST ({_fc.engine}) — next 12×4h\n"
+                f"\n\nSOX ML FORECAST ({_fc.engine}) — next 12×4h\n"
                 f"Direction: {s.direction.upper()}  |  {s.pct_change:+.2f}%  "
                 f"|  Target {s.target_price:.4g}  |  {int(s.confidence*100)}% confidence"
             )
             speech += (
-                f" Kronos forecasts {s.direction} {s.pct_change:+.1f} percent "
+                f" Sox forecasts {s.direction} {s.pct_change:+.1f} percent "
                 f"over the next two days at {int(s.confidence*100)} percent confidence."
             )
     except Exception as _ke:
@@ -2453,7 +2453,7 @@ async def _analyze_symbol(symbol: str, original_cmd: str, ex_name: Optional[str]
     _kronos_line = ""
     if kronos_info:
         _kronos_line = (
-            f"Kronos ML forecast: {kronos_info['direction']} "
+            f"Sox ML forecast: {kronos_info['direction']} "
             f"{kronos_info['pct_change']:+.2f}% (target {kronos_info['target_price']:.6g}, "
             f"{int(kronos_info['confidence'] * 100)}% confidence)."
         )

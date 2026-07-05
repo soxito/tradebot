@@ -24,7 +24,7 @@ from plugins.KronosForecastPlugin.backend.schemas import (
 
 _SYSTEM_PROMPT = (
     "You are JARVIS, a precise crypto/markets forecasting analyst. You are given "
-    "a Kronos foundation-model price forecast plus live market context. Explain "
+    "a Sox foundation-model price forecast plus live market context. Explain "
     "the forecast in clear, structured prose a trader can act on. Cover: "
     "(1) predicted direction and magnitude, (2) confidence and what the p10-p90 "
     "band implies about uncertainty, (3) the target vs current price, (4) for "

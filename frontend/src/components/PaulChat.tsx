@@ -1266,11 +1266,11 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
               if (o.rsi)    lines.push(`RSI: ${Number(o.rsi).toFixed(0)}`)
               if (o.ema50)  lines.push(`EMA 50: ${o.ema50}  |  EMA 200: ${o.ema200}`)
             }
-            // Kronos ML forecast
+            // Sox ML forecast
             if (o.kronos && o.kronos.direction) {
               const pct = Number(o.kronos.pct_change)
               lines.push('')
-              lines.push(`🔮 Kronos ML: ${String(o.kronos.direction).toUpperCase()} ${pct >= 0 ? '+' : ''}${pct.toFixed(2)}% → ${o.kronos.target_price} (${Math.round((o.kronos.confidence || 0) * 100)}% conf)`)
+              lines.push(`🔮 Sox ML: ${String(o.kronos.direction).toUpperCase()} ${pct >= 0 ? '+' : ''}${pct.toFixed(2)}% → ${o.kronos.target_price} (${Math.round((o.kronos.confidence || 0) * 100)}% conf)`)
             }
             // Volume flow
             if (o.volume && typeof o.volume.buy_pressure_pct === 'number') {
