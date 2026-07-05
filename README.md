@@ -216,7 +216,111 @@ tradebot/
 └── README.md
 ```
 
-## 🛠️ Development
+## � Obsidian Knowledge Base
+
+TradeBot ships an `ObsidianKnowledgePlugin` that syncs signals, agent decisions,
+strategy notes and code-community graphs into a local Obsidian vault, and can
+optionally enrich agent prompts with vault context.
+
+### 1. Install Obsidian
+
+Download the free desktop app from **https://obsidian.md** and install it.
+
+### 2. Open the vault
+
+In Obsidian, choose **"Open folder as vault"** and select:
+```
+<tradebot-root>/obsidian-vault/tradebot
+```
+
+### 3. Install community plugins
+
+Go to **Settings → Community plugins → Browse** and install:
+
+| Plugin | Purpose |
+| --- | --- |
+| **Dataview** | Query notes like a database (signals, decisions, communities) |
+| **Templater** | Auto-fill daily-journal and trade note templates |
+| **Local REST API** | Exposes a local HTTP API so TradeBot can push/pull notes |
+| **Obsidian Git** | Auto-commit vault changes to Git |
+
+### 4. Configure Local REST API
+
+1. Enable the **Local REST API** plugin and open its settings.
+2. Copy the generated **API token**.
+3. Add the following to your `.env`:
+
+```env
+OBSIDIAN_VAULT_PATH=~/obsidian-vault/tradebot
+OBSIDIAN_REST_URL=https://localhost:27124
+OBSIDIAN_REST_TOKEN=<paste token here>
+OBSIDIAN_AUTO_SYNC_MINUTES=15
+OBSIDIAN_EXPORT_DECISIONS=true
+OBSIDIAN_EXPORT_SIGNALS=true
+OBSIDIAN_EXPORT_COMMUNITIES=true
+OBSIDIAN_INJECT_CONTEXT=false   # set true to enrich agent prompts with vault notes
+```
+
+> The Local REST API plugin uses a self-signed TLS certificate on port 27124.
+> TradeBot's backend accepts it; you can override the URL if you change the port.
+
+### 5. First sync
+
+Trigger the initial sync from the TradeBot UI (**Intelligence → Vault**) or via
+the API:
+```bash
+curl -X POST http://localhost:1448/api/v1/plugins/obsidian-knowledge/sync
+```
+
+### 6. Vault structure
+
+```
+obsidian-vault/tradebot/
+├─ _index.md           ← Dashboard (Dataview queries for today's signals, decisions)
+├─ _daily/             ← Auto daily journals (one per day)
+├─ signals/            ← One note per trading signal
+├─ decisions/          ← One note per agent decision
+├─ strategies/         ← Strategy reference notes
+├─ communities/        ← Graphify code communities (~176 notes)
+└─ trades/             ← Closed trade outcome notes
+```
+
+### 7. Explore in Obsidian
+
+- Press **Ctrl+G** (macOS: **Cmd+G**) to open the **Graph View** — see notes linked by symbol, strategy or community.
+- Use the **Intelligence → Vault** tab in the TradeBot UI for full-text search, manual sync and clicking nodes in the Brain graph to open linked vault notes.
+
+### Dataview query examples
+
+**Today's signals:**
+```dataview
+TABLE symbol, action, confidence
+FROM "signals"
+WHERE contains(file.name, date(today))
+SORT confidence DESC
+```
+
+**Agent performance by symbol:**
+```dataview
+TABLE symbol, count(rows) AS decisions, round(average(confidence), 2) AS avg_confidence
+FROM "decisions"
+GROUP BY symbol
+SORT count(rows) DESC
+```
+
+**Community map:**
+```dataview
+TABLE node_count
+FROM "communities"
+SORT node_count DESC
+LIMIT 20
+```
+
+> Full setup details are also in [`obsidian-vault/SETUP.md`](obsidian-vault/SETUP.md).
+
+---
+
+## �🛠️ Development
 
 ### Backend Development
 ```bash

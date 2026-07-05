@@ -508,9 +508,65 @@ def ensure_obsidian() -> bool:
     return False
 
 
+def ensure_env_obsidian() -> None:
+    """Inject missing Obsidian env vars into the root .env file.
+
+    Only adds keys that are not already present — never overwrites existing
+    values (e.g. a user-supplied REST token).  The OBSIDIAN_REST_TOKEN line is
+    added as a placeholder comment so the user knows exactly where to paste the
+    token they copy from the Local REST API plugin.
+    """
+    dotenv_path = ROOT / ".env"
+    if not dotenv_path.exists():
+        return  # .env hasn't been created yet — nothing to patch
+
+    existing_text = dotenv_path.read_text()
+    existing_keys = {
+        line.partition("=")[0].strip()
+        for line in existing_text.splitlines()
+        if line.strip() and not line.strip().startswith("#") and "=" in line
+    }
+
+    # Defaults keyed on env-var name.  Order matters for the appended block.
+    defaults = [
+        ("OBSIDIAN_VAULT_PATH", str(OBSIDIAN_VAULT_DIR)),
+        ("OBSIDIAN_REST_URL",   "https://localhost:27124"),
+        # Token intentionally left blank — user must paste it from the plugin.
+        ("OBSIDIAN_REST_TOKEN", ""),
+        ("OBSIDIAN_AUTO_SYNC_MINUTES", "15"),
+        ("OBSIDIAN_EXPORT_DECISIONS",  "true"),
+        ("OBSIDIAN_EXPORT_SIGNALS",    "true"),
+        ("OBSIDIAN_EXPORT_COMMUNITIES","true"),
+        ("OBSIDIAN_INJECT_CONTEXT",    "false"),
+    ]
+
+    missing = [(k, v) for k, v in defaults if k not in existing_keys]
+    if not missing:
+        return  # all keys already present
+
+    lines = [
+        "\n# ── Obsidian Knowledge Plugin ──────────────────────────────────────",
+        "# Copy the API token from Obsidian → Settings → Local REST API,",
+        "# then set OBSIDIAN_REST_TOKEN below.",
+    ]
+    for k, v in missing:
+        lines.append(f"{k}={v}")
+
+    with dotenv_path.open("a") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+    added = [k for k, _ in missing]
+    ok(f".env ← added Obsidian keys: {', '.join(added)}")
+    if "OBSIDIAN_REST_TOKEN" in added:
+        warn("OBSIDIAN_REST_TOKEN is blank — paste the token from the Obsidian Local REST API plugin settings")
+
+
 def start_obsidian() -> bool:
     if not ensure_dir(OBSIDIAN_VAULT_DIR):
         return False
+
+    # Inject missing Obsidian env vars before anything else.
+    ensure_env_obsidian()
 
     # Never delete vault data. Only ensure setup scaffold exists.
     if not OBSIDIAN_SETUP_FILE.exists():
@@ -2014,25 +2070,28 @@ def start_backend(pg_port: int, redis_port: int, mode: str) -> bool:
     info(f"Starting FastAPI backend on :{BACKEND_PORT} …")
 
     log_file = ROOT / "backend.log"
-    env = {
-        **os.environ,
-        "PYTHONPATH": f"{BACKEND_DIR}:{ROOT}",
-        "DATABASE_URL": (
-            f"postgresql+asyncpg://tradebot:tradebot_password@localhost:{pg_port}/tradebot"
-            if mode == "docker"
-            else f"postgresql+asyncpg://tradebot:tradebot_password@localhost:{pg_port}/tradebot"
-        ),
-        "REDIS_URL": f"redis://localhost:{redis_port}/0",
-    }
 
-    # Load .env from root if present
+    # Start with a copy of the current shell environment.
+    env = {**os.environ, "PYTHONPATH": f"{BACKEND_DIR}:{ROOT}"}
+
+    # Load .env — user-set values WIN over shell environment (so keys like
+    # DATABASE_URL, REDIS_URL, and all API keys are taken verbatim from the
+    # file the user edited, not silently overridden by computed defaults).
     dotenv = ROOT / ".env"
     if dotenv.exists():
         for line in dotenv.read_text().splitlines():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 k, _, v = line.partition("=")
-                env.setdefault(k.strip(), v.strip())
+                env[k.strip()] = v.strip()
+
+    # Computed fallbacks — only used when .env (and shell) haven't set the key.
+    _db_url = (
+        f"postgresql+asyncpg://tradebot:tradebot_password@localhost:{pg_port}/tradebot"
+    )
+    env.setdefault("DATABASE_URL", _db_url)
+    env.setdefault("REDIS_URL", f"redis://localhost:{redis_port}/0")
+
     # Always inject MT5_API_URL so backend can reach the REST bridge
     env.setdefault("MT5_API_URL", MT5_API_URL)
 
@@ -2400,11 +2459,34 @@ def main() -> None:
 
     # ── 2. Redis ──────────────────────────────────────────────────────────────
     header("2/6  Redis")
-    if mode == "brew":
+    # Honour a custom REDIS_URL in .env — if the user already points at a
+    # managed/remote Redis we skip local provisioning and just verify it.
+    _dotenv_redis = _DOTENV.get("REDIS_URL", "")
+    _using_custom_redis = bool(
+        _dotenv_redis and not _dotenv_redis.startswith("redis://localhost")
+    )
+    if _using_custom_redis:
+        info(f"Using custom REDIS_URL from .env: {_dotenv_redis}")
+        # Parse the port from the URL for health-check purposes
+        try:
+            import urllib.parse as _up
+            _parsed = _up.urlparse(_dotenv_redis)
+            redis_port = _parsed.port or 6379
+            redis_ok = _redis_ping(redis_port)
+        except Exception:
+            redis_port = 6379
+            redis_ok = False
+        if redis_ok:
+            ok("Custom Redis is reachable (PING → PONG)")
+        else:
+            warn("Custom Redis did not answer PING — backend may start degraded")
+        results["Redis"] = redis_ok
+    elif mode == "brew":
         redis_ok, redis_port = start_redis_brew()
+        results["Redis"] = redis_ok
     else:
         redis_ok, redis_port = start_redis_docker()
-    results["Redis"] = redis_ok
+        results["Redis"] = redis_ok
     if not redis_ok:
         warn("Redis not available — backend may still start in degraded mode")
 
