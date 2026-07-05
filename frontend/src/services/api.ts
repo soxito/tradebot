@@ -1,10 +1,14 @@
 import axios from 'axios';
 import type { AxiosRequestConfig } from 'axios';
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:1448/api/v1';
+const DEFAULT_API_BASE_URL = 'http://localhost:1448/api/v1';
+
+export const getApiBaseUrl = () => process.env.NEXT_PUBLIC_API_URL || DEFAULT_API_BASE_URL;
+
+const getApiRootUrl = () => getApiBaseUrl().replace(/\/api\/v1\/?$/, '');
 
 export const api = axios.create({
-  baseURL: API_BASE_URL,
+  baseURL: getApiBaseUrl(),
   headers: {
     'Content-Type': 'application/json',
   },
@@ -29,7 +33,7 @@ api.interceptors.response.use(
 // API Endpoints
 export const apiClient = {
   // Health & Status
- health: () => axios.get(`${API_BASE_URL.replace('/api/v1', '')}/health`),
+  health: () => axios.get(`${getApiRootUrl()}/health`),
   status: (config?: AxiosRequestConfig) => api.get('/status', config),
   
   // Exchanges

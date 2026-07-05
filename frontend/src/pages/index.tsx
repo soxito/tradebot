@@ -5,6 +5,7 @@ import WalletBalance from '@/components/WalletBalance'
 import SignalFeed from '@/components/SignalFeed'
 import TradeHistory from '@/components/TradeHistory'
 import { useTradeStore } from '@/store/useTradeStore'
+import { apiClient } from '@/services/api'
 import { SMART_MONEY_CONCEPTS_STUDY_ID } from '@/utils/tradingviewStudies'
 
 const TradingViewChart = dynamic(() => import('@/components/TradingViewChart'), {
@@ -15,9 +16,16 @@ const TradingViewWidget = dynamic(() => import('@/components/TradingViewWidget')
 })
 
 export default function Dashboard() {
-  const [apiStatus, setApiStatus] = useState<any>(null)
+  const [apiStatus, setApiStatus] = useState<{
+    modules?: {
+      trading?: string
+      signals?: string
+    }
+  } | null>(null)
   const [loading, setLoading] = useState(true)
-  const [exchangeStatus, setExchangeStatus] = useState<any>(null)
+  const [exchangeStatus, setExchangeStatus] = useState<{
+    initialized_count?: number
+  } | null>(null)
   const { selectedSymbol, selectedExchange, selectedTimeframe } = useTradeStore()
   const [dashChartMode, setDashChartMode] = useState<'tradingview' | 'custom'>('tradingview')
 
@@ -28,11 +36,11 @@ export default function Dashboard() {
   const fetchStatus = async () => {
     try {
       const [apiRes, exchangeRes] = await Promise.all([
-        fetch(`${process.env.NEXT_PUBLIC_API_URL}/status`),
-        fetch(`${process.env.NEXT_PUBLIC_API_URL}/exchanges/status`),
+        apiClient.status(),
+        apiClient.getExchangesStatus(),
       ])
-      setApiStatus(await apiRes.json())
-      setExchangeStatus(await exchangeRes.json())
+      setApiStatus(apiRes.data)
+      setExchangeStatus(exchangeRes.data)
     } catch (err) {
       console.error('Failed to fetch status:', err)
     } finally {

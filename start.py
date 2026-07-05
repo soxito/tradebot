@@ -2314,12 +2314,11 @@ def ensure_frontend_env() -> None:
     default; the real backend runs on :1448) — causing HTTP 500 / ECONNREFUSED
     on every page load.
     """
+    desired = f"NEXT_PUBLIC_API_URL=http://localhost:{BACKEND_PORT}/api/v1\n"
     env_local = FRONTEND_DIR / ".env.local"
-    if env_local.exists():
+    if env_local.exists() and env_local.read_text() == desired:
         return
-    env_local.write_text(
-        f"NEXT_PUBLIC_API_URL=http://localhost:{BACKEND_PORT}/api/v1\n"
-    )
+    env_local.write_text(desired)
     ok(f"Created frontend/.env.local (NEXT_PUBLIC_API_URL=http://localhost:{BACKEND_PORT}/api/v1)")
 
 
