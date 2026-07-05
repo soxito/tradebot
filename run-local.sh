@@ -95,6 +95,15 @@ save_mode() {
 ensure_db_brew() {
   echo -e "${CYAN}▶ Starting Postgres + Redis (Homebrew)...${NC}"
   brew services start postgresql@16 2>/dev/null || true
+
+  # Ensure Redis is installed before trying to start it.
+  if ! command -v redis-server &>/dev/null && ! brew list redis &>/dev/null 2>&1; then
+    echo -e "${YELLOW}  Redis not found — installing via Homebrew...${NC}"
+    brew install redis || {
+      echo -e "${RED}  ✗ brew install redis failed — install it manually then re-run.${NC}"
+      exit 1
+    }
+  fi
   brew services start redis 2>/dev/null || true
 
   # Wait for PG
@@ -244,6 +253,21 @@ setup() {
   pip install --upgrade pip
   pip install -r "$ROOT/backend/requirements.txt"
   python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab'); nltk.download('stopwords'); nltk.download('vader_lexicon')" 2>/dev/null || true
+
+  # Kronos ML forecaster — vendor the model + install torch (one-time).
+  # Idempotent + best-effort: the plugin falls back to a heuristic forecast if
+  # this is skipped or fails. Opt out with TRADEBOT_SKIP_KRONOS_SETUP=1.
+  local kronos_setup="$ROOT/plugins/KronosForecastPlugin/scripts/setup_kronos.sh"
+  local kronos_model="$ROOT/plugins/KronosForecastPlugin/backend/vendor/model"
+  if [[ "${TRADEBOT_SKIP_KRONOS_SETUP:-}" =~ ^(1|true|yes|on)$ ]]; then
+    echo -e "${YELLOW}  ⏭ Kronos setup skipped (TRADEBOT_SKIP_KRONOS_SETUP set)${NC}"
+  elif [[ -d "$kronos_model" && -n "$(ls -A "$kronos_model" 2>/dev/null)" ]]; then
+    echo -e "${GREEN}  ✓ Kronos model already set up (vendored)${NC}"
+  elif [[ -f "$kronos_setup" ]]; then
+    echo -e "${CYAN}  ▶ Setting up Kronos ML forecaster (torch + vendored model)...${NC}"
+    bash "$kronos_setup" --no-test || \
+      echo -e "${YELLOW}  ! Kronos setup did not complete — heuristic fallback stays active${NC}"
+  fi
 
   cd "$ROOT/frontend"
   npm install

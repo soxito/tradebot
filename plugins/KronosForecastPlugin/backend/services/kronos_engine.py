@@ -15,6 +15,7 @@ and JARVIS keep working.
 """
 from __future__ import annotations
 
+import os
 import sys
 import json
 import threading
@@ -25,6 +26,16 @@ import pandas as pd
 from loguru import logger
 
 from plugins.KronosForecastPlugin.backend.config import kronos_config, KRONOS_MODELS
+
+
+def kronos_setup_command() -> str:
+    """OS-appropriate command to run the Kronos setup script."""
+    if os.name == "nt":
+        return (
+            "powershell -ExecutionPolicy Bypass -File "
+            "plugins\\KronosForecastPlugin\\scripts\\setup_kronos.ps1"
+        )
+    return "bash plugins/KronosForecastPlugin/scripts/setup_kronos.sh"
 
 # Where the last-selected model is persisted so a hot-swap survives a backend
 # reload/restart (otherwise every restart reverts to the config default).
@@ -74,7 +85,7 @@ class KronosEngine:
         if not model_pkg.exists():
             self._load_error = (
                 f"Kronos model package not found at {model_pkg}. "
-                f"Run: bash plugins/KronosForecastPlugin/scripts/setup_kronos.sh"
+                f"Run: {kronos_setup_command()}"
             )
             return False
         vendor_str = str(vendor)

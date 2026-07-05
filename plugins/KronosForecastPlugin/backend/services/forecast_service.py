@@ -336,7 +336,8 @@ def _heuristic_note(reason: Optional[str] = None) -> str:
     base = "Heuristic forecast — Kronos model weights not installed."
     if err:
         base = f"Heuristic forecast — Kronos unavailable ({err})."
-    return base + " Run: bash plugins/KronosForecastPlugin/scripts/setup_kronos.sh"
+    from plugins.KronosForecastPlugin.backend.services.kronos_engine import kronos_setup_command
+    return base + f" Run: {kronos_setup_command()}"
 
 
 def _build_overlays(

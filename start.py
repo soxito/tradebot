@@ -79,6 +79,15 @@ OBSIDIAN_APP_PATH = Path("/Applications/Obsidian.app")
 OBSIDIAN_VAULT_DIR = (ROOT / "obsidian-vault").resolve()
 OBSIDIAN_SETUP_FILE = OBSIDIAN_VAULT_DIR / "SETUP.md"
 
+# ── Kronos ML forecaster setup ────────────────────────────────────────────────
+KRONOS_PLUGIN_DIR = (ROOT / "plugins" / "KronosForecastPlugin").resolve()
+KRONOS_SCRIPTS_DIR = KRONOS_PLUGIN_DIR / "scripts"
+KRONOS_SETUP_SH = KRONOS_SCRIPTS_DIR / "setup_kronos.sh"
+KRONOS_SETUP_PS1 = KRONOS_SCRIPTS_DIR / "setup_kronos.ps1"
+KRONOS_VENDOR_MODEL = KRONOS_PLUGIN_DIR / "backend" / "vendor" / "model"
+# Opt-out with TRADEBOT_SKIP_KRONOS_SETUP=1 (keeps the heuristic fallback).
+KRONOS_SETUP_ENABLED = os.environ.get("TRADEBOT_SKIP_KRONOS_SETUP", "").strip().lower() not in ("1", "true", "yes", "on")
+
 # ── Ports ─────────────────────────────────────────────────────────────────────
 BACKEND_PORT  = int(os.environ.get("BACKEND_PORT", "1448"))
 FRONTEND_PORT = int(os.environ.get("FRONTEND_PORT", "3000"))
@@ -1690,12 +1699,24 @@ def start_postgres_docker() -> Tuple[bool, int]:
 
 # ── Redis ─────────────────────────────────────────────────────────────────────
 def _redis_installed() -> bool:
-    """True if a Redis server is installed (on PATH or as a Homebrew formula)."""
+    """True if a Redis server binary is available (PATH, Homebrew keg, or Scoop)."""
     if shutil.which("redis-server") or shutil.which("redis-cli"):
         return True
+    if IS_WINDOWS:
+        # Scoop installs to %USERPROFILE%\scoop\shims (usually on PATH).
+        # Chocolatey installs to C:\ProgramData\chocolatey\bin (usually on PATH).
+        # Redis for Windows via Memurai or official MSI also lands on PATH.
+        # If shutil.which found nothing, do a last-resort MSI-service check.
+        try:
+            r = subprocess.run(
+                ["sc", "query", "redis"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return "RUNNING" in r.stdout.upper()
+        except Exception:
+            return False
     brew = _brew_path()
     if brew:
-        # A brew keg that isn't linked onto PATH still counts as installed.
         return run([brew, "list", "redis"]).returncode == 0
     return False
 
@@ -1703,33 +1724,173 @@ def _redis_installed() -> bool:
 def _redis_ping(port: int) -> bool:
     """True if Redis answers PING on the given port (real health, not just an open socket)."""
     cli = shutil.which("redis-cli")
-    if not cli:
-        # Fall back to a raw RESP PING if the CLI isn't on PATH.
+    if not cli and IS_WINDOWS:
+        cli = shutil.which("redis-cli.exe")
+    if cli:
         try:
-            with socket.create_connection(("localhost", port), timeout=1.0) as s:
-                s.sendall(b"PING\r\n")
-                return b"PONG" in s.recv(64).upper()
-        except OSError:
-            return False
+            r = run([cli, "-p", str(port), "ping"])
+            return r.returncode == 0 and "PONG" in (r.stdout or "").upper()
+        except Exception:
+            pass
+    # Raw RESP PING fallback (works everywhere, no redis-cli required).
     try:
-        r = run([cli, "-p", str(port), "ping"])
-        return r.returncode == 0 and "PONG" in (r.stdout or "").upper()
-    except Exception:
+        with socket.create_connection(("localhost", port), timeout=1.0) as s:
+            s.sendall(b"PING\r\n")
+            return b"PONG" in s.recv(64).upper()
+    except OSError:
         return False
+
+
+def _ensure_redis_windows() -> bool:
+    """Install Redis on Windows using the best available package manager.
+
+    Strategy (first one that works wins):
+      1. winget  — ships with Windows 10 1709+ / Windows 11
+      2. choco   — Chocolatey (popular dev-machine tool)
+      3. Scoop   — alternative; installs redis from the 'main' bucket
+
+    Memurai (https://www.memurai.com) is a production-quality Redis-compatible
+    server for Windows, also installable via winget.  We try the official Redis
+    package first (Tencent/redis-windows or Memurai, depending on what winget
+    resolves) and fall through to Choco/Scoop on failure.
+    """
+    # 1. winget (Windows Package Manager — built-in since Win 10 21H1)
+    winget = shutil.which("winget")
+    if winget:
+        warn("Redis not found — installing via winget (Memurai, Redis-compatible) …")
+        # Prefer Memurai (native Windows, production-quality, free tier).
+        ok_w, err = _spinner_run(
+            [winget, "install", "--id", "Memurai.Memurai-Developer", "-e",
+             "--accept-source-agreements", "--accept-package-agreements"],
+            "winget install Memurai",
+            timeout=600,
+        )
+        if ok_w and _redis_installed():
+            return True
+        # Fall back to the Tencent-maintained official Redis for Windows.
+        ok_w, err = _spinner_run(
+            [winget, "install", "--id", "tporadowski.redis", "-e",
+             "--accept-source-agreements", "--accept-package-agreements"],
+            "winget install Redis (tporadowski)",
+            timeout=600,
+        )
+        if ok_w and _redis_installed():
+            return True
+        warn(f"winget Redis install did not succeed: {err[:200]}")
+
+    # 2. Chocolatey
+    choco = shutil.which("choco") or shutil.which("choco.exe")
+    if choco:
+        warn("Redis not found — trying chocolatey …")
+        ok_c, err = _spinner_run(
+            [choco, "install", "redis-64", "-y", "--no-progress"],
+            "choco install redis-64",
+            timeout=600,
+        )
+        if ok_c and _redis_installed():
+            return True
+        warn(f"choco Redis install did not succeed: {err[:200]}")
+
+    # 3. Scoop
+    scoop = shutil.which("scoop") or shutil.which("scoop.ps1")
+    if scoop:
+        warn("Redis not found — trying Scoop …")
+        ok_s, err = _spinner_run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-Command", "scoop install redis"],
+            "scoop install redis",
+            timeout=600,
+        )
+        if ok_s and _redis_installed():
+            return True
+        warn(f"Scoop Redis install did not succeed: {err[:200]}")
+
+    return False
 
 
 def ensure_redis_installed() -> bool:
-    """Ensure a Redis server is installed; auto-install via Homebrew when missing."""
+    """Ensure a Redis server is installed; auto-install via the best available tool.
+
+    macOS  → Homebrew (brew install redis)
+    Linux  → apt / yum / pacman (first one found)
+    Windows → winget → choco → Scoop (first one that succeeds)
+    """
     if _redis_installed():
         return True
-    brew = _brew_path()
-    if not brew:
-        warn("Redis not installed and Homebrew unavailable — install it manually (brew install redis)")
+
+    if IS_WINDOWS:
+        if _ensure_redis_windows():
+            ok("Redis installed on Windows")
+            return True
+        fail(
+            "Could not auto-install Redis on Windows.\n"
+            "  Option A: install Memurai  →  https://www.memurai.com/get-memurai\n"
+            "  Option B: winget install tporadowski.redis\n"
+            "  Option C: choco install redis-64\n"
+            "  Option D: scoop install redis\n"
+            "  After installing, re-run start.py."
+        )
         return False
-    warn("Redis not found — installing via Homebrew …")
-    if _brew("redis", "Redis"):
-        ok("Redis installed")
-        return _redis_installed()
+
+    # macOS — Homebrew
+    if _on_macos():
+        brew = _brew_path()
+        if not brew:
+            warn("Redis not installed and Homebrew unavailable — install Redis manually")
+            return False
+        warn("Redis not found — installing via Homebrew …")
+        if _brew("redis", "Redis"):
+            ok("Redis installed via Homebrew")
+            return _redis_installed()
+        fail("brew install redis failed — install Redis manually then re-run start.py")
+        return False
+
+    # Linux — try common package managers
+    for mgr, cmd, label in [
+        ("apt-get", ["sudo", "apt-get", "install", "-y", "redis-server"], "apt-get install redis-server"),
+        ("dnf",     ["sudo", "dnf",     "install", "-y", "redis"],        "dnf install redis"),
+        ("yum",     ["sudo", "yum",     "install", "-y", "redis"],        "yum install redis"),
+        ("pacman",  ["sudo", "pacman",  "-S",  "--noconfirm", "redis"],   "pacman -S redis"),
+        ("zypper",  ["sudo", "zypper",  "install", "-y", "redis"],        "zypper install redis"),
+    ]:
+        if shutil.which(mgr):
+            warn(f"Redis not found — installing via {mgr} …")
+            ok_i, err = _spinner_run(cmd, label, timeout=600)
+            if ok_i and _redis_installed():
+                ok(f"Redis installed via {mgr}")
+                return True
+            warn(f"{mgr} install did not succeed: {err[:160]}")
+            break
+
+    fail("Could not auto-install Redis — install it manually then re-run start.py")
+    return False
+
+
+def _start_redis_service_windows(port: int) -> bool:
+    """Attempt to start the Redis / Memurai Windows service, then fall back to direct launch."""
+    for service in ("memurai", "memurai-developer", "redis"):
+        r = subprocess.run(["net", "start", service],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode == 0 or "already been started" in r.stdout.lower():
+            info(f"Windows service '{service}' started")
+            return True
+
+    # Direct redis-server.exe launch (Scoop / tporadowski layout)
+    for candidate in (
+        shutil.which("redis-server"),
+        shutil.which("redis-server.exe"),
+        r"C:\Program Files\Redis\redis-server.exe",
+        r"C:\ProgramData\chocolatey\lib\redis-64\tools\redis-server.exe",
+    ):
+        if candidate and Path(candidate).exists():
+            info(f"Launching redis-server directly: {candidate}")
+            subprocess.Popen(
+                [candidate, "--port", str(port)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=subprocess.DETACHED_PROCESS
+                    if hasattr(subprocess, "DETACHED_PROCESS") else 0,
+            )
+            return True
     return False
 
 
@@ -1747,20 +1908,25 @@ def start_redis_brew() -> Tuple[bool, int]:
         warn("Redis could not be installed — backend falls back to in-memory SSE fan-out")
         return False, redis_port
 
-    # Start (and register) the brew service so it persists across reboots.
-    brew = _brew_path() or "brew"
-    run([brew, "services", "start", "redis"])
+    if IS_WINDOWS:
+        # On Windows the "brew" path is not relevant — start via service/direct.
+        _start_redis_service_windows(redis_port)
+    else:
+        # Start (and register) the brew service so it persists across reboots.
+        brew = _brew_path() or "brew"
+        run([brew, "services", "start", "redis"])
 
     if not wait_for_port("localhost", redis_port, "Redis"):
-        # A bare `redis-server` fallback for environments without brew services.
-        server = shutil.which("redis-server")
-        if server:
-            info("brew services unavailable — launching redis-server directly …")
-            subprocess.Popen(
-                [server, "--port", str(redis_port), "--daemonize", "yes"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            wait_for_port("localhost", redis_port, "Redis")
+        if not IS_WINDOWS:
+            # Bare redis-server fallback for environments without brew services.
+            server = shutil.which("redis-server")
+            if server:
+                info("brew services unavailable — launching redis-server directly …")
+                subprocess.Popen(
+                    [server, "--port", str(redis_port), "--daemonize", "yes"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                wait_for_port("localhost", redis_port, "Redis")
 
     # Verify it truly answers PING, not just that the socket is open.
     if _redis_ping(redis_port):
@@ -2026,6 +2192,66 @@ def ensure_npm_deps() -> bool:
 
 
 # ── Backend ───────────────────────────────────────────────────────────────────
+def ensure_kronos_model() -> bool:
+    """Run the Kronos plugin's model setup once (cross-platform: macOS/Linux + Windows).
+
+    Idempotent: if the Kronos `model/` package is already vendored we skip — so
+    this only does real work on the first run. Best-effort: the plugin falls
+    back to a heuristic forecast when the model is absent, so a failure here
+    never blocks startup. Opt out with TRADEBOT_SKIP_KRONOS_SETUP=1.
+
+    Windows runs the PowerShell port (setup_kronos.ps1); POSIX runs the bash
+    script (setup_kronos.sh). The self-test is skipped (--no-test / -NoTest) to
+    avoid a network dependency during startup.
+    """
+    if not KRONOS_SETUP_ENABLED:
+        warn("Kronos setup skipped (TRADEBOT_SKIP_KRONOS_SETUP set) — heuristic fallback stays active")
+        return True
+
+    # Already vendored → nothing to do (cheap check every run).
+    if KRONOS_VENDOR_MODEL.exists() and any(KRONOS_VENDOR_MODEL.iterdir()):
+        ok("Kronos model already set up (vendored) — skipping")
+        return True
+
+    if not KRONOS_SCRIPTS_DIR.exists():
+        warn("KronosForecastPlugin scripts not found — skipping Kronos setup")
+        return True
+
+    # Git is required to vendor the upstream model package.
+    if not shutil.which("git"):
+        warn("Git not found — cannot vendor Kronos model. Install Git, then run "
+             "the Kronos setup script manually. Heuristic fallback stays active.")
+        return True
+
+    info("Setting up Kronos ML forecaster (one-time: installs torch + vendors model) …")
+
+    if IS_WINDOWS:
+        if not KRONOS_SETUP_PS1.exists():
+            warn("setup_kronos.ps1 not found — skipping Kronos setup")
+            return True
+        pwsh = shutil.which("pwsh") or shutil.which("powershell")
+        if not pwsh:
+            warn("PowerShell not found — run setup_kronos.ps1 manually to enable Kronos")
+            return True
+        cmd = [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass",
+               "-File", str(KRONOS_SETUP_PS1), "-NoTest"]
+    else:
+        if not KRONOS_SETUP_SH.exists():
+            warn("setup_kronos.sh not found — skipping Kronos setup")
+            return True
+        bash = shutil.which("bash") or "/bin/bash"
+        cmd = [bash, str(KRONOS_SETUP_SH), "--no-test"]
+
+    ok_run, err = _spinner_run(cmd, "Kronos model setup", cwd=str(ROOT), timeout=1800)
+    if ok_run and KRONOS_VENDOR_MODEL.exists():
+        ok("Kronos model installed — real ML forecasts enabled after backend start")
+        return True
+
+    warn(f"Kronos setup did not complete ({(err or 'see output above')[:160]}). "
+         "Heuristic fallback stays active; you can re-run the setup script later.")
+    return True
+
+
 def warmup_kronos_and_openhuman() -> None:
     """Confirm the Kronos forecaster is loaded and kick the OpenHuman subconscious.
 
@@ -2045,7 +2271,8 @@ def warmup_kronos_and_openhuman() -> None:
         if ks.get("available"):
             ok(f"Kronos forecaster ready — {model} on {device} ({engine})")
         else:
-            warn(f"Kronos in heuristic fallback ({model}) — run setup_kronos.sh to load weights")
+            _setup_hint = ("setup_kronos.ps1" if IS_WINDOWS else "setup_kronos.sh")
+            warn(f"Kronos in heuristic fallback ({model}) — run {_setup_hint} to load weights")
     else:
         warn("Kronos status not ready yet (model may still be warm-loading)")
 
@@ -2481,11 +2708,14 @@ def main() -> None:
         else:
             warn("Custom Redis did not answer PING — backend may start degraded")
         results["Redis"] = redis_ok
-    elif mode == "brew":
-        redis_ok, redis_port = start_redis_brew()
+    elif mode == "docker":
+        redis_ok, redis_port = start_redis_docker()
         results["Redis"] = redis_ok
     else:
-        redis_ok, redis_port = start_redis_docker()
+        # brew mode on macOS/Linux, or native install on Windows.
+        # start_redis_brew() auto-detects the platform and uses the right
+        # package manager (brew/apt/dnf/… on POSIX; winget/choco/scoop on Windows).
+        redis_ok, redis_port = start_redis_brew()
         results["Redis"] = redis_ok
     if not redis_ok:
         warn("Redis not available — backend may still start in degraded mode")
@@ -2501,6 +2731,10 @@ def main() -> None:
     if not deps_ok:
         fail("Cannot start backend without Python deps.")
         sys.exit(1)
+
+    # Kronos ML forecaster — one-time model setup (macOS/Linux + Windows).
+    # Best-effort: never blocks startup (heuristic fallback covers failures).
+    ensure_kronos_model()
 
     # ── 4. Backend ────────────────────────────────────────────────────────────
     header("4/6  FastAPI backend")

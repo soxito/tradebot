@@ -22,11 +22,23 @@ candles, giving a forward-looking price path with probabilistic confidence bands
 
 ## Setup (enable the real model)
 
+**macOS / Linux**
 ```bash
 bash plugins/KronosForecastPlugin/scripts/setup_kronos.sh
 # optional: pre-download weights so the first forecast is instant
 bash plugins/KronosForecastPlugin/scripts/setup_kronos.sh --predownload
 ```
+
+**Windows (PowerShell)**
+```powershell
+powershell -ExecutionPolicy Bypass -File plugins\KronosForecastPlugin\scripts\setup_kronos.ps1
+# optional: pre-download weights so the first forecast is instant
+powershell -ExecutionPolicy Bypass -File plugins\KronosForecastPlugin\scripts\setup_kronos.ps1 -Predownload
+```
+
+> `setup_kronos.sh` is a bash script and will not run in PowerShell — use the
+> `.ps1` version on Windows. Flags map as `--predownload` → `-Predownload`,
+> `--all` → `-All`, `--test` → `-Test`, `--no-test` → `-NoTest`.
 
 This installs `torch` + friends into `backend/.venv`, vendors the MIT-licensed
 Kronos `model/` package into `backend/vendor/model`, then you restart the backend:
