@@ -2313,13 +2313,18 @@ def ensure_frontend_env() -> None:
     the wrong port (the code had localhost:8000 as a stale hardcoded
     default; the real backend runs on :1448) — causing HTTP 500 / ECONNREFUSED
     on every page load.
+
+    Uses the IPv4 loopback (127.0.0.1) rather than `localhost`: on Windows
+    `localhost` resolves to IPv6 (::1) first, but uvicorn binds IPv4 (0.0.0.0)
+    only, so a `localhost` API URL causes ECONNREFUSED and a spurious
+    "network issue" on the MT5 Live page.
     """
-    desired = f"NEXT_PUBLIC_API_URL=http://localhost:{BACKEND_PORT}/api/v1\n"
+    desired = f"NEXT_PUBLIC_API_URL=http://127.0.0.1:{BACKEND_PORT}/api/v1\n"
     env_local = FRONTEND_DIR / ".env.local"
     if env_local.exists() and env_local.read_text() == desired:
         return
     env_local.write_text(desired)
-    ok(f"Created frontend/.env.local (NEXT_PUBLIC_API_URL=http://localhost:{BACKEND_PORT}/api/v1)")
+    ok(f"Created frontend/.env.local (NEXT_PUBLIC_API_URL=http://127.0.0.1:{BACKEND_PORT}/api/v1)")
 
 
 def ensure_npm_deps() -> bool:
@@ -2459,11 +2464,14 @@ def start_backend(pg_port: int, redis_port: int, mode: str) -> bool:
                 env[k.strip()] = v.strip()
 
     # Computed fallbacks — only used when .env (and shell) haven't set the key.
+    # Use 127.0.0.1 instead of localhost: on Windows, asyncpg resolves
+    # "localhost" to ::1 (IPv6) but PostgreSQL only listens on 127.0.0.1,
+    # causing [Errno 11001] getaddrinfo failed.
     _db_url = (
-        f"postgresql+asyncpg://tradebot:tradebot_password@localhost:{pg_port}/tradebot"
+        f"postgresql+asyncpg://tradebot:tradebot_password@127.0.0.1:{pg_port}/tradebot"
     )
     env.setdefault("DATABASE_URL", _db_url)
-    env.setdefault("REDIS_URL", f"redis://localhost:{redis_port}/0")
+    env.setdefault("REDIS_URL", f"redis://127.0.0.1:{redis_port}/0")
 
     # Always inject MT5_API_URL so backend can reach the REST bridge
     env.setdefault("MT5_API_URL", MT5_API_URL)

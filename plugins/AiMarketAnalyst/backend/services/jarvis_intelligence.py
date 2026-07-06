@@ -36,7 +36,10 @@ from plugins.AiMarketAnalyst.backend.models import AIAgentKnowledge
 from plugins.AiMarketAnalyst.backend.services import knowledge_service
 
 # ── Internal base URL (same process — connect to self) ────────────────────────
-_BASE = "http://localhost:8000/api/v1"
+# Read BACKEND_PORT so the harvester hits the correct port (default 1448, not 8000).
+# Using 127.0.0.1 avoids Windows getaddrinfo failures caused by localhost → ::1.
+import os as _os
+_BASE = "http://127.0.0.1:{}/api/v1".format(_os.environ.get("BACKEND_PORT", "1448"))
 
 # ── How often to re-harvest the same source (seconds) ─────────────────────────
 _HARVEST_TTL = 300   # 5 min — don't spam knowledge store

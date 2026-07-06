@@ -485,6 +485,15 @@ function pnlColor(n: number) {
 /** Safely extract a human-readable error string from an axios error.
  *  FastAPI validation errors return detail as an array of {type,loc,msg,...} objects — we join them. */
 function apiErr(e: any): string {
+  // Connection failures (no response) — most common on Windows when the browser
+  // resolves `localhost` to IPv6 while the backend binds IPv4, or when the
+  // backend isn't running. Give an actionable message instead of "Network Error".
+  if (e?.code === 'ERR_NETWORK' || (e && !e.response && e.request)) {
+    return 'Cannot reach the backend API — check that the backend is running on this machine (port 1448).'
+  }
+  if (e?.code === 'ECONNABORTED') {
+    return 'Request timed out — the backend is slow or unreachable.'
+  }
   const detail = e?.response?.data?.detail
   if (!detail) return e?.message ?? 'Unknown error'
   if (typeof detail === 'string') return detail

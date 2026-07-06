@@ -1,9 +1,35 @@
 import axios from 'axios';
 import type { AxiosRequestConfig } from 'axios';
 
-const DEFAULT_API_BASE_URL = 'http://localhost:1448/api/v1';
+const DEFAULT_API_BASE_URL = 'http://127.0.0.1:1448/api/v1';
 
-export const getApiBaseUrl = () => process.env.NEXT_PUBLIC_API_URL || DEFAULT_API_BASE_URL;
+/**
+ * Normalise an API base URL for use inside the browser.
+ *
+ * Windows resolves `localhost` to the IPv6 loopback (`::1`) first, but the
+ * backend (uvicorn) binds IPv4 only (`0.0.0.0`). A `localhost` API URL therefore
+ * yields `ECONNREFUSED` on Windows and the UI shows a spurious "network issue".
+ * Rewriting to the IPv4 loopback makes same-machine access reliable on every
+ * platform without affecting LAN / remote hostnames.
+ */
+const normalizeBrowserHost = (url: string): string => {
+  if (typeof window === 'undefined' || !url) return url;
+  return url.replace('://localhost:', '://127.0.0.1:').replace('://localhost/', '://127.0.0.1/');
+};
+
+export const getApiBaseUrl = () => {
+  const envUrl = process.env.NEXT_PUBLIC_API_URL;
+  if (envUrl) return normalizeBrowserHost(envUrl);
+  // No explicit env: in the browser follow the current host so localhost,
+  // 127.0.0.1, and LAN IPs all target the matching backend.
+  if (typeof window !== 'undefined') {
+    const { protocol, hostname } = window.location;
+    const host = hostname === 'localhost' ? '127.0.0.1' : hostname;
+    const port = process.env.NEXT_PUBLIC_API_PORT || '1448';
+    return `${protocol}//${host}:${port}/api/v1`;
+  }
+  return DEFAULT_API_BASE_URL;
+};
 
 const getApiRootUrl = () => getApiBaseUrl().replace(/\/api\/v1\/?$/, '');
 
@@ -766,7 +792,7 @@ export const apiClient = {
   jarvis: {
     /** Stream JARVIS SSE response; caller handles the ReadableStream */
     chatStream: (messages: {role: string; content: string}[], pathname?: string, sessionKey?: string): Promise<Response> =>
-      fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:1448/api/v1'}/plugins/agent-paul/chat`, {
+      fetch(`${getApiBaseUrl()}/plugins/agent-paul/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messages, pathname: pathname || '/', session_key: sessionKey || 'default' }),

@@ -34,7 +34,7 @@ from plugins.MT5TradingPlugin.backend.schemas import (
     ScalpStartRequest, ScalpStopRequest, ScalpStatusResponse, ScalpTradeInfo,
     ScalpSymbolResult, ScalpTradeRow, ScalpUpdateRequest,
 )
-from plugins.MT5TradingPlugin.backend.services.mt5_client import mt5_client
+from plugins.MT5TradingPlugin.backend.services.mt5_client import mt5_client, is_pending_order
 from plugins.MT5TradingPlugin.backend.services.sync_service import MT5SyncService
 from plugins.MT5TradingPlugin.backend.services.aggregation_service import MT5AggregationService
 from plugins.MT5TradingPlugin.backend.services.risk_metrics import MT5RiskMetricsService
@@ -1503,35 +1503,53 @@ async def _scalp_status_payload(db, session: MT5ScalpSession) -> ScalpStatusResp
     open_rows = await db.execute(
         select(MT5ScalpTrade).where(
             MT5ScalpTrade.session_id == session.id,
-            MT5ScalpTrade.status == "open",
+            MT5ScalpTrade.status.in_(["open", "pending"]),
         )
     )
     open_trades = open_rows.scalars().all()
 
-    # Pull live PnL for the open tickets from MT5 (best-effort).
+    # Pull live PnL for FILLED tickets and detect which tracked tickets are still
+    # resting as pending orders (unrealised 0) — scalp entries are pending
+    # limit/stop orders, so positions-only status would hide them.
     live_pnl: dict[int, float] = {}
+    pending_tickets: set = set()
     account = await db.get(MT5Account, session.account_id)
     if account and open_trades:
         try:
-            positions = await mt5_client.get_positions(
+            all_orders = await mt5_client.get_orders(
                 account.login, account.server, account.password_encrypted
             )
-            live_pnl = {
-                int(p.get("ticket", 0)): float(p.get("profit", 0.0) or 0.0)
-                for p in positions if p.get("ticket")
-            }
+            for o in all_orders:
+                tk = 0
+                for k in ("ticket", "order", "Ticket", "Order"):
+                    v = o.get(k)
+                    if v:
+                        try:
+                            tk = int(v)
+                            break
+                        except (TypeError, ValueError):
+                            continue
+                if not tk:
+                    continue
+                if is_pending_order(o):
+                    pending_tickets.add(tk)
+                else:
+                    live_pnl[tk] = float(o.get("profit", 0.0) or 0.0)
         except Exception:  # noqa: BLE001
             live_pnl = {}
 
     infos: List[ScalpTradeInfo] = []
     combined = 0.0
     for t in open_trades:
-        pnl = live_pnl.get(int(t.ticket or 0), 0.0)
+        tk = int(t.ticket or 0)
+        is_pending = tk in pending_tickets or t.status == "pending"
+        pnl = 0.0 if is_pending else live_pnl.get(tk, 0.0)
         combined += pnl
         infos.append(ScalpTradeInfo(
             ticket=t.ticket, side=t.side, lot=t.lot, entry_price=t.entry_price,
             sl=t.sl, tp=t.tp, pnl=round(pnl, 2), is_recovery=t.is_recovery,
-            status=t.status, confidence=t.confidence, opened_at=t.opened_at,
+            status="pending" if is_pending else "open",
+            confidence=t.confidence, opened_at=t.opened_at,
         ))
 
     return ScalpStatusResponse(
@@ -1631,6 +1649,8 @@ async def scalp_stop(data: ScalpStopRequest):
 @router.get("/scalp/status/{account_id}", response_model=List[ScalpStatusResponse])
 async def scalp_status(account_id: int):
     """List all non-stopped scalp sessions for an account with live PnL."""
+    # Idempotently resume ACTIVE sessions whose loops died on a backend restart.
+    await scalp_bot_manager.ensure_resumed()
     async with AsyncSessionLocal() as db:
         rows = await db.execute(
             select(MT5ScalpSession).where(

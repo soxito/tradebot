@@ -21,10 +21,13 @@ class Settings(BaseSettings):
     CORS_ORIGINS: str = "http://localhost:3000,http://localhost:3001,http://localhost:8000,http://localhost:8080"
     
     # Database
-    DATABASE_URL: str = "postgresql+asyncpg://tradebot:tradebot_password@localhost:5434/tradebot"
+    # Use 127.0.0.1 instead of localhost: on Windows, asyncpg resolves
+    # "localhost" to ::1 (IPv6) while PostgreSQL only listens on 127.0.0.1,
+    # producing [Errno 11001] getaddrinfo failed.
+    DATABASE_URL: str = "postgresql+asyncpg://tradebot:tradebot_password@127.0.0.1:5434/tradebot"
     
     # Redis
-    REDIS_URL: str = "redis://localhost:6379/0"
+    REDIS_URL: str = "redis://127.0.0.1:6379/0"
     
     # Exchange API Keys (NEVER commit real keys!)
     BINANCE_API_KEY: str = ""
@@ -160,6 +163,37 @@ class Settings(BaseSettings):
     OBSIDIAN_INJECT_CONTEXT: bool = False
     OBSIDIAN_CONTEXT_NOTES_LIMIT: int = 5
     OBSIDIAN_CONTEXT_TOKEN_BUDGET: int = 800
+
+    @field_validator("DATABASE_URL", mode="before")
+    @classmethod
+    def normalize_database_url(cls, v: str) -> str:
+        """On Windows, replace 'localhost' with '127.0.0.1' in DATABASE_URL.
+
+        asyncpg on Windows resolves 'localhost' to ::1 (IPv6) but PostgreSQL
+        typically only listens on 127.0.0.1 (IPv4), causing errno 11001
+        (WSAHOST_NOT_FOUND / getaddrinfo failed).
+        """
+        import os
+        if os.name == "nt" and "localhost" in v:
+            v = v.replace("localhost", "127.0.0.1")
+        return v
+
+    @field_validator("REDIS_URL", mode="before")
+    @classmethod
+    def normalize_redis_url(cls, v: str) -> str:
+        """Ensure REDIS_URL always carries a valid scheme.
+
+        A bare 'host:port' or 'host:port/db' in .env causes redis-py to raise
+        'Redis URL must specify one of the following schemes (redis://, ...)'.  
+        Prepend 'redis://' when the scheme is missing.
+        """
+        if v and "://" not in v:
+            v = f"redis://{v}"
+        # Also replace localhost with 127.0.0.1 on Windows
+        import os
+        if os.name == "nt" and "localhost" in v:
+            v = v.replace("localhost", "127.0.0.1")
+        return v
 
     @property
     def cors_origins_list(self) -> List[str]:
