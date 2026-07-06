@@ -70,9 +70,15 @@ HOME        = Path.home()
 # ── Integration paths/config ──────────────────────────────────────────────────
 HEADROOM_PORT = int(os.environ.get("HEADROOM_PORT", "8787"))
 HEADROOM_URL = f"http://127.0.0.1:{HEADROOM_PORT}"
-HEADROOM_LOG = HOME / "Library" / "Logs" / "headroom.log"
-HEADROOM_PLIST = HOME / "Library" / "LaunchAgents" / "ai.headroomlabs.headroom.plist"
 HEADROOM_DATA_DIR = HOME / ".headroom"
+# macOS keeps logs under ~/Library/Logs; Windows/Linux have no such convention,
+# so the proxy log lives alongside the Headroom data dir on those platforms.
+HEADROOM_LOG = (
+    HOME / "Library" / "Logs" / "headroom.log"
+    if platform.system().lower() == "darwin"
+    else HEADROOM_DATA_DIR / "headroom.log"
+)
+HEADROOM_PLIST = HOME / "Library" / "LaunchAgents" / "ai.headroomlabs.headroom.plist"
 HEADROOM_PROXY_KEY = os.environ.get("HEADROOM_PROXY_KEY", "tradebot-local-headroom")
 
 OBSIDIAN_APP_PATH = Path("/Applications/Obsidian.app")
@@ -472,6 +478,7 @@ def _on_macos() -> bool:
 def _headroom_bin() -> Optional[str]:
     candidates = [
         shutil.which("headroom"),
+        str(HOME / ".local" / "bin" / f"headroom{_EXE}"),
         str(HOME / ".local" / "bin" / "headroom"),
         "/opt/homebrew/bin/headroom",
         "/usr/local/bin/headroom",
@@ -483,10 +490,66 @@ def _headroom_bin() -> Optional[str]:
 
 
 def _obsidian_installed() -> bool:
-    if OBSIDIAN_APP_PATH.exists():
-        return True
-    r = subprocess.run(["open", "-Ra", "Obsidian"], capture_output=True)
-    return r.returncode == 0
+    system = platform.system().lower()
+    if system == "darwin":
+        if OBSIDIAN_APP_PATH.exists():
+            return True
+        try:
+            r = subprocess.run(["open", "-Ra", "Obsidian"], capture_output=True)
+            return r.returncode == 0
+        except Exception:
+            return False
+    if IS_WINDOWS:
+        local = os.environ.get("LOCALAPPDATA", "")
+        cands = []
+        if local:
+            cands += [
+                Path(local) / "Programs" / "Obsidian" / "Obsidian.exe",
+                Path(local) / "Obsidian" / "Obsidian.exe",
+            ]
+        return any(p.exists() for p in cands) or bool(shutil.which("Obsidian"))
+    # Linux (native package or Flatpak)
+    return bool(shutil.which("obsidian")) or \
+        Path("/var/lib/flatpak/exports/bin/md.obsidian.Obsidian").exists()
+
+
+def _launch_obsidian() -> bool:
+    """Best-effort launch of the Obsidian desktop app with the TradeBot vault.
+
+    Cross-platform and non-fatal: the Local REST API integration only needs
+    Obsidian running with its plugin + token, so a launch failure never blocks
+    startup.
+    """
+    system = platform.system().lower()
+    try:
+        if system == "darwin":
+            r = subprocess.run(
+                ["open", "-a", "Obsidian", str(OBSIDIAN_VAULT_DIR)],
+                capture_output=True, text=True,
+            )
+            return r.returncode == 0
+        if IS_WINDOWS:
+            local = os.environ.get("LOCALAPPDATA", "")
+            for cand in (
+                Path(local) / "Programs" / "Obsidian" / "Obsidian.exe",
+                Path(local) / "Obsidian" / "Obsidian.exe",
+            ):
+                if local and cand.exists():
+                    subprocess.Popen(
+                        [str(cand)],
+                        creationflags=getattr(subprocess, "DETACHED_PROCESS", 0),
+                    )
+                    return True
+            os.startfile(str(OBSIDIAN_VAULT_DIR))  # type: ignore[attr-defined]  # noqa: SLF001
+            return True
+        # Linux
+        launcher = shutil.which("obsidian") or shutil.which("xdg-open")
+        if launcher:
+            subprocess.Popen([launcher, str(OBSIDIAN_VAULT_DIR)], start_new_session=True)
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def ensure_obsidian() -> bool:
@@ -632,26 +695,111 @@ def ensure_headroom_installed() -> bool:
     return False
 
 
+def _headroom_env_pairs() -> List[Tuple[str, str]]:
+    """Environment variables that configure the Headroom compression proxy.
+
+    Shared by the macOS LaunchAgent command string and the Windows/Linux
+    detached-process launcher so both platforms run an identically-configured
+    proxy.
+    """
+    return [
+        ("OPENAI_TARGET_API_URL", f"http://127.0.0.1:{BACKEND_PORT}/api/v1/provider-relay"),
+        ("HEADROOM_COMPRESS_SYSTEM_MESSAGES", "1"),
+        ("HEADROOM_COMPRESS_USER_MESSAGES", "1"),
+        ("HEADROOM_MIN_TOKENS", "1"),
+        ("HEADROOM_TARGET_RATIO", "0.4"),
+        ("HEADROOM_FORCE_KOMPRESS", "1"),
+        ("HEADROOM_COMPRESSION_STABLE_AFTER_TURN", "0"),
+        ("HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS", "0"),
+        ("HEADROOM_PROTECT_RECENT", "0"),
+        ("HEADROOM_PROTECT_ANALYSIS_CONTEXT", "0"),
+        ("HEADROOM_INTERCEPT_TOOL_RESULTS", "1"),
+        ("HEADROOM_DATA_DIR", str(HEADROOM_DATA_DIR)),
+        ("ANTHROPIC_API_KEY", HEADROOM_PROXY_KEY),
+    ]
+
+
+def _headroom_child_env() -> Dict[str, str]:
+    """Full environment for a detached Headroom proxy process (Windows/Linux)."""
+    env = dict(os.environ)
+    # Deployment vars force a hosted profile that breaks the local proxy.
+    for k in ("HEADROOM_DEPLOYMENT_PROFILE", "HEADROOM_DEPLOYMENT_NAME",
+              "HEADROOM_DEPLOYMENT_ID", "HEADROOM_DEPLOYMENT_MODE"):
+        env.pop(k, None)
+    for k, v in _headroom_env_pairs():
+        env[k] = v
+    return env
+
+
 def _headroom_launch_command() -> str:
     headroom_bin = _headroom_bin() or "headroom"
+    exports = "; ".join(f'export {k}="{v}"' for k, v in _headroom_env_pairs())
     return (
         'export PATH="/Users/sakhilematsimela/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"; '
         "unset HEADROOM_DEPLOYMENT_PROFILE HEADROOM_DEPLOYMENT_NAME HEADROOM_DEPLOYMENT_ID HEADROOM_DEPLOYMENT_MODE; "
-        f'export OPENAI_TARGET_API_URL="http://127.0.0.1:{BACKEND_PORT}/api/v1/provider-relay"; '
-        "export HEADROOM_COMPRESS_SYSTEM_MESSAGES=1; "
-        "export HEADROOM_COMPRESS_USER_MESSAGES=1; "
-        "export HEADROOM_MIN_TOKENS=1; "
-        "export HEADROOM_TARGET_RATIO=0.4; "
-        "export HEADROOM_FORCE_KOMPRESS=1; "
-        "export HEADROOM_COMPRESSION_STABLE_AFTER_TURN=0; "
-        "export HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS=0; "
-        "export HEADROOM_PROTECT_RECENT=0; "
-        "export HEADROOM_PROTECT_ANALYSIS_CONTEXT=0; "
-        "export HEADROOM_INTERCEPT_TOOL_RESULTS=1; "
-        f'export HEADROOM_DATA_DIR="{HEADROOM_DATA_DIR}"; '
-        f'export ANTHROPIC_API_KEY="{HEADROOM_PROXY_KEY}"; '
+        f"{exports}; "
         f"exec {headroom_bin} proxy --port {HEADROOM_PORT}"
     )
+
+
+def start_headroom_process() -> bool:
+    """Start the Headroom proxy as a detached background process.
+
+    Cross-platform alternative to the macOS LaunchAgent — used on Windows and
+    Linux where launchd/launchctl are unavailable. The process is fully
+    detached so it survives after start.py exits, and its output is captured to
+    the Headroom log file.
+    """
+    if port_open("127.0.0.1", HEADROOM_PORT, 0.6):
+        health = http_json(f"{HEADROOM_URL}/health?include_config=1", timeout=3)
+        if health:
+            ok(f"Headroom already running on :{HEADROOM_PORT}")
+            return True
+
+    headroom_bin = _headroom_bin()
+    if not headroom_bin:
+        warn("Headroom binary not found on PATH — skipping proxy start")
+        return False
+    if not ensure_dir(HEADROOM_DATA_DIR) or not ensure_dir(HEADROOM_LOG.parent):
+        return False
+
+    try:
+        logf = open(HEADROOM_LOG, "ab")
+    except Exception:
+        logf = subprocess.DEVNULL  # type: ignore[assignment]
+
+    popen_kwargs: Dict[str, object] = {
+        "stdout": logf, "stderr": logf, "env": _headroom_child_env(),
+        "cwd": str(ROOT),
+    }
+    if IS_WINDOWS:
+        # Detach so the proxy keeps running independently of this launcher.
+        popen_kwargs["creationflags"] = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0)
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    try:
+        subprocess.Popen([headroom_bin, "proxy", "--port", str(HEADROOM_PORT)], **popen_kwargs)
+    except Exception as ex:
+        fail(f"Failed to launch Headroom proxy: {ex}")
+        return False
+
+    if not wait_for_port("127.0.0.1", HEADROOM_PORT, "Headroom proxy", max_wait=40):
+        return False
+
+    health = http_json(f"{HEADROOM_URL}/health?include_config=1", timeout=5)
+    if not health:
+        warn("Headroom is listening but its health endpoint did not respond yet")
+        return True
+    config = health.get("config", {})
+    if config.get("compress_user_messages") and config.get("compress_system_messages"):
+        ok("Headroom healthy with compression enabled")
+    else:
+        ok(f"Headroom running on :{HEADROOM_PORT}")
+    return True
 
 
 def ensure_headroom_launchagent() -> bool:
@@ -741,17 +889,43 @@ def setup_integrations() -> bool:
     """
     header("0/7  Integrations (Headroom + Obsidian)")
 
-    # Headroom (macOS LaunchAgent + launchctl + os.getuid) and Obsidian
-    # (/Applications, `brew --cask`, `open -a`) bootstrapping are macOS-only.
-    # On Windows/Linux these are optional conveniences and must never block the
-    # core DB/backend/frontend from starting.
+    # Headroom + Obsidian bootstrapping differs per OS:
+    #   • macOS  — LaunchAgent + launchctl (Headroom), `open`/brew (Obsidian).
+    #   • Windows/Linux — detached background process (Headroom), direct-exe /
+    #     xdg-open launch (Obsidian).
+    # In every case these are optional conveniences that must NEVER block the
+    # core DB/backend/frontend from starting, so non-macOS failures only warn.
     if not _on_macos():
-        if port_open("127.0.0.1", HEADROOM_PORT, 0.6) and \
-                http_json(f"{HEADROOM_URL}/health?include_config=1", timeout=3):
-            ok(f"Headroom already running on :{HEADROOM_PORT}")
+        # ── Headroom compression proxy (detached process) ─────────────────────
+        if ensure_headroom_installed():
+            try:
+                start_headroom_process()
+            except Exception as ex:  # noqa: BLE001 — never block startup
+                warn(f"Headroom start skipped: {ex}")
         else:
-            warn("Headroom auto-start is macOS-only — skipping (optional).")
-        warn("Obsidian auto-launch is macOS-only — skipping (optional).")
+            warn("Headroom not installed — skipping proxy (optional).")
+
+        # ── Obsidian knowledge vault (env + best-effort launch) ───────────────
+        # localhost:27124 is reachable natively on Windows/Linux, so we only
+        # need the .env keys present and the app running with its REST plugin.
+        ensure_env_obsidian()
+        ensure_dir(OBSIDIAN_VAULT_DIR)
+        if not OBSIDIAN_SETUP_FILE.exists():
+            try:
+                OBSIDIAN_SETUP_FILE.write_text(
+                    "# Obsidian Vault\n\n"
+                    "This vault is managed by TradeBot start.py bootstrap.\n"
+                    "Data is persistent and never deleted by startup automation.\n"
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        if _obsidian_installed():
+            if _launch_obsidian():
+                ok("Obsidian launched with TradeBot vault")
+            else:
+                warn("Could not auto-launch Obsidian — open it manually (optional).")
+        else:
+            warn("Obsidian not installed — get it from https://obsidian.md (optional).")
         return True
 
     if not ensure_headroom_installed():

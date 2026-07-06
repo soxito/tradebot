@@ -27,6 +27,7 @@ import {
   Crosshair, RefreshCw, Target, TrendingUp, TrendingDown, Activity,
   Zap, FlaskConical, ChevronRight, AlertTriangle, Brain, CheckCircle, X,
   Calculator, Maximize2, Minimize2, Settings, Wifi, Volume2, VolumeX, Loader2,
+  Eye, EyeOff, Layers,
 } from 'lucide-react'
 import { formatTimeZA } from '@/utils/datetime'
 import { getPriceSource, setPriceSource as savePriceSource, PRICE_SOURCE_OPTIONS } from '@/utils/priceSource'
@@ -204,6 +205,37 @@ interface PendingChartOrder {
 }
 
 const TIMEFRAMES = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1'] as const
+
+// ── Chart layer visibility ───────────────────────────────────────────────────
+const LAYER_KEYS = ['zones', 'range', 'liquidity', 'setup', 'structure', 'position', 'kronos'] as const
+type LayerKey = typeof LAYER_KEYS[number]
+const LAYER_LABELS: Record<LayerKey, string> = {
+  zones:     'OB/FVG',
+  range:     'Range',
+  liquidity: 'Liquidity',
+  setup:     'Setup',
+  structure: 'CHoCH/BOS',
+  position:  'Position',
+  kronos:    'Kronos',
+}
+const LAYER_COLORS: Record<LayerKey, string> = {
+  zones:     '#3b82f6',
+  range:     '#eab308',
+  liquidity: '#8b5cf6',
+  setup:     '#22c55e',
+  structure: '#10b981',
+  position:  '#f97316',
+  kronos:    '#a78bfa',
+}
+const LAYERS_CFG_KEY = 'mt5_sniper_layers'
+function loadLayerCfg(): Record<LayerKey, boolean> {
+  if (typeof window === 'undefined') return Object.fromEntries(LAYER_KEYS.map(k => [k, true])) as Record<LayerKey, boolean>
+  try {
+    const raw = window.localStorage.getItem(LAYERS_CFG_KEY)
+    const saved = raw ? JSON.parse(raw) as Partial<Record<LayerKey, boolean>> : {}
+    return Object.fromEntries(LAYER_KEYS.map(k => [k, saved[k] !== false])) as Record<LayerKey, boolean>
+  } catch { return Object.fromEntries(LAYER_KEYS.map(k => [k, true])) as Record<LayerKey, boolean> }
+}
 const TF_MINUTES: Record<string, number> = { M1: 1, M5: 5, M15: 15, M30: 30, H1: 60, H4: 240, D1: 1440, W1: 10080 }
 const MT5_TF_TO_EXCHANGE: Record<string, string> = { M1: '1m', M5: '5m', M15: '15m', M30: '30m', H1: '1h', H4: '4h', D1: '1d', W1: '1w' }
 /** Optimal candle count per timeframe — enough SMC structure without hitting backend 1000-bar limit. */
@@ -435,6 +467,17 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
   const [applying, setApplying] = useState<'sl' | 'tp' | 'both' | null>(null)
   const [applyMsg, setApplyMsg] = useState<{ ok: boolean; text: string } | null>(null)
 
+  // Layer visibility toggles (persisted to localStorage)
+  const [visibleLayers, setVisibleLayers] = useState<Record<LayerKey, boolean>>(loadLayerCfg)
+  const [showLayerPanel, setShowLayerPanel] = useState(false)
+  const toggleLayer = (k: LayerKey) => {
+    setVisibleLayers(prev => {
+      const next = { ...prev, [k]: !prev[k] }
+      try { window.localStorage.setItem(LAYERS_CFG_KEY, JSON.stringify(next)) } catch {}
+      return next
+    })
+  }
+
   // JARVIS speech — triggered after analysis completes to narrate the results
   const speakAsJarvis = useJarvisSpeak()
 
@@ -626,13 +669,29 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
       layout: { background: { type: ColorType.Solid, color: THEME.bg }, textColor: THEME.text, fontSize: 11 },
       grid: { vertLines: { color: THEME.grid }, horzLines: { color: THEME.grid } },
       crosshair: { mode: CrosshairMode.Normal },
-      rightPriceScale: { borderColor: THEME.border, scaleMargins: { top: 0.08, bottom: 0.08 } },
-      timeScale: { borderColor: THEME.border, timeVisible: true, secondsVisible: false },
+      rightPriceScale: {
+        borderColor: THEME.border,
+        scaleMargins: { top: 0.10, bottom: 0.10 },
+      },
+      timeScale: {
+        borderColor: THEME.border,
+        timeVisible: true,
+        secondsVisible: false,
+        barSpacing: 8,           // start wider so candles aren’t crammed
+        minBarSpacing: 2,        // prevents bars becoming hairlines when zoomed out
+        rightOffset: 8,          // breathing room after the last candle
+        fixLeftEdge: false,
+        fixRightEdge: false,
+      },
     })
     const cs = c.addCandlestickSeries({
-      upColor: THEME.up, downColor: THEME.down,
-      borderUpColor: THEME.up, borderDownColor: THEME.down,
-      wickUpColor: THEME.up, wickDownColor: THEME.down,
+      upColor:        '#26a69a',
+      downColor:      '#ef5350',
+      borderUpColor:  '#26a69a',
+      borderDownColor:'#ef5350',
+      wickUpColor:    '#4dd0c4',  // slightly lighter wick so body stands out
+      wickDownColor:  '#f47373',
+      borderVisible:  true,       // always draw body border for clarity
     })
     chart.current = c
     candleSeries.current = cs
@@ -956,10 +1015,6 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
     const add = (opts: any) => { try { overlayLines.current.push(cs.createPriceLine(opts)) } catch {} }
 
     // ── Order blocks and Fair Value Gaps (shaded boxes via primitive) ────────
-    // Each zone is a translucent rectangle that extends from its formation bar
-    // to the right edge of the chart — TradingView supply/demand-box style.
-    //   OB  — blue (bullish demand) / orange (bearish supply)
-    //   FVG — teal (bullish)       / red (bearish)
     const zoneBoxes: ZoneBox[] = (analysis.zones ?? []).slice(-12).map(z => {
       const isBull = z.kind.startsWith('bullish')
       const isOB   = z.kind.includes('ob')
@@ -976,25 +1031,30 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
         labelColor: `rgba(${rgb},0.95)`,
       }
     })
-    try { zonePrimitive.current?.setBoxes(zoneBoxes) } catch {}
+    try { zonePrimitive.current?.setBoxes(visibleLayers.zones ? zoneBoxes : []) } catch {}
 
     // Equilibrium (premium/discount divider)
-    if (analysis.equilibrium) {
-      add({ price: analysis.equilibrium, color: THEME.eq, lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'EQ 50%' })
+    if (visibleLayers.range) {
+      if (analysis.equilibrium) {
+        add({ price: analysis.equilibrium, color: THEME.eq, lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'EQ 50%' })
+      }
+      // Dealing range extremes
+      if (analysis.range) {
+        add({ price: analysis.range.high, color: 'rgba(239,83,80,0.55)', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'Strong High' })
+        add({ price: analysis.range.low, color: 'rgba(96,165,250,0.55)', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'Weak Low' })
+      }
     }
-    // Dealing range extremes — labelled Strong High / Weak Low (reference style)
-    if (analysis.range) {
-      add({ price: analysis.range.high, color: 'rgba(239,83,80,0.55)', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'Strong High' })
-      add({ price: analysis.range.low, color: 'rgba(96,165,250,0.55)', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'Weak Low' })
-    }
-    // Liquidity pools — equal highs (EQH) / equal lows (EQL)
-    ;(analysis.liquidity?.buyside ?? []).slice(-2).forEach(p =>
-      add({ price: p, color: 'rgba(139,92,246,0.45)', lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: true, title: 'EQH' }))
-    ;(analysis.liquidity?.sellside ?? []).slice(-2).forEach(p =>
-      add({ price: p, color: 'rgba(139,92,246,0.45)', lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: true, title: 'EQL' }))
 
-    // Selected setup: entry / SL / TP1 / TP2 / TP3 (scale-out ladder)
-    if (selected) {
+    // Liquidity pools — equal highs (EQH) / equal lows (EQL)
+    if (visibleLayers.liquidity) {
+      ;(analysis.liquidity?.buyside ?? []).slice(-2).forEach(p =>
+        add({ price: p, color: 'rgba(139,92,246,0.45)', lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: true, title: 'EQH' }))
+      ;(analysis.liquidity?.sellside ?? []).slice(-2).forEach(p =>
+        add({ price: p, color: 'rgba(139,92,246,0.45)', lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: true, title: 'EQL' }))
+    }
+
+    // Selected setup: entry / SL / TP1 / TP2 / TP3
+    if (visibleLayers.setup && selected) {
       const isBuy = selected.side === 'buy'
       add({ price: selected.entry, color: isBuy ? THEME.buy : THEME.sell, lineWidth: 2, lineStyle: LineStyle.Solid, axisLabelVisible: true, title: `${isBuy ? 'BUY' : 'SELL'} LIMIT` })
       add({ price: selected.stop_loss, color: THEME.sl, lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'SL' })
@@ -1006,13 +1066,13 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
       })
     }
 
-    // US (New York) session open — reference candle the day's entries build from.
-    if (analysis.us_session?.enabled && analysis.us_session.open_price) {
+    // US (New York) session open
+    if (visibleLayers.range && analysis.us_session?.enabled && analysis.us_session.open_price) {
       add({ price: analysis.us_session.open_price, color: 'rgba(250,204,21,0.6)', lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: true, title: 'US open' })
     }
 
-    // Active trade (open position) — entry / SL / TP lines, drawn boldly.
-    if (activeTrade) {
+    // Active trade (open position) — entry / SL / TP lines
+    if (visibleLayers.position && activeTrade) {
       const ap = activeTrade.pos
       add({ price: ap.price_open, color: activeTrade.isBuy ? THEME.buy : THEME.sell, lineWidth: 2, lineStyle: LineStyle.Solid, axisLabelVisible: true, title: `OPEN ${ap.volume}L` })
       if (ap.sl != null) add({ price: ap.sl, color: THEME.sl, lineWidth: 2, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'Pos SL' })
@@ -1020,43 +1080,42 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
     }
 
     // ── Markers: CHoCH / BOS labels + signal setup arrows ───────────────────
-    // CHoCH = square marker, larger — signals a shift in market character.
-    // BOS   = circle marker, smaller — confirms continuation of existing bias.
-    const structureMarkers: SeriesMarker<Time>[] = (analysis.structure_events ?? []).map(e => {
-      const isBull  = e.direction === 'bullish'
-      const isChoCH = e.type === 'CHoCH'
-      return {
-        time:     e.time as Time,
-        position: isBull ? 'belowBar' : 'aboveBar',
-        color:    isChoCH
-          ? (isBull ? '#10b981' : '#f43f5e')
-          : (isBull ? '#60a5fa' : '#fb923c'),
-        shape:    isChoCH ? 'square' : 'circle',
-        text:     e.type,
-        size:     isChoCH ? 2 : 1,
-      }
-    })
+    const structureMarkers: SeriesMarker<Time>[] = visibleLayers.structure
+      ? (analysis.structure_events ?? []).map(e => {
+          const isBull  = e.direction === 'bullish'
+          const isChoCH = e.type === 'CHoCH'
+          return {
+            time:     e.time as Time,
+            position: isBull ? 'belowBar' : 'aboveBar',
+            color:    isChoCH
+              ? (isBull ? '#10b981' : '#f43f5e')
+              : (isBull ? '#60a5fa' : '#fb923c'),
+            shape:    isChoCH ? 'square' : 'circle',
+            text:     e.type,
+            size:     isChoCH ? 2 : 1,
+          } as SeriesMarker<Time>
+        })
+      : []
 
-    const signalMarkers: SeriesMarker<Time>[] = signals.map(s => ({
-      time:     s.formed_time as Time,
-      position: s.side === 'buy' ? 'belowBar' : 'aboveBar',
-      color:    s.side === 'buy' ? THEME.buy : THEME.sell,
-      shape:    s.side === 'buy' ? 'arrowUp' : 'arrowDown',
-      text:     `${s.side === 'buy' ? 'BUY' : 'SELL'} ${(s.confidence * 100).toFixed(0)}%`,
-      size:     1,
-    }))
+    const signalMarkers: SeriesMarker<Time>[] = visibleLayers.structure
+      ? signals.map(s => ({
+          time:     s.formed_time as Time,
+          position: s.side === 'buy' ? 'belowBar' : 'aboveBar',
+          color:    s.side === 'buy' ? THEME.buy : THEME.sell,
+          shape:    s.side === 'buy' ? 'arrowUp' : 'arrowDown',
+          text:     `${s.side === 'buy' ? 'BUY' : 'SELL'} ${(s.confidence * 100).toFixed(0)}%`,
+          size:     1,
+        } as SeriesMarker<Time>))
+      : []
 
     const allMarkers = [...structureMarkers, ...signalMarkers]
       .sort((a, b) => (a.time as number) - (b.time as number))
     try { cs.setMarkers(allMarkers) } catch {}
 
-    // ── Kronos ML forecast overlay (purple forward line + p10/p90 band) ──────
-    // Drawn as dedicated line series so it projects into future timestamps,
-    // right off the last real candle. Works for any symbol (XAUUSD, FX, crypto)
-    // because the backend forecasts the exact candles shown here.
+    // ── Kronos ML forecast overlay ──────────────────────────────────────────
     try {
       const k = analysis.kronos
-      if (k?.overlays?.length && chart.current) {
+      if (visibleLayers.kronos && k?.overlays?.length && chart.current) {
         k.overlays.forEach((ov, i) => {
           const s = chart.current!.addLineSeries({
             color: ov.color,
@@ -1087,7 +1146,7 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
         })
       }
     } catch {}
-  }, [analysis, selected, signals, activeTrade])
+  }, [analysis, selected, signals, activeTrade, visibleLayers])
 
   // Resize the chart when toggling fullscreen so it fills the new container.
   useEffect(() => {
@@ -1414,6 +1473,40 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
           {isFullscreen ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
           {isFullscreen ? 'Exit' : 'Full screen'}
         </button>
+      </div>
+
+      {/* ── Layer visibility toggle bar ─────────────────────────────────────── */}
+      <div className="flex items-center gap-1.5 px-3 py-1.5 border-b border-gray-700/40 bg-[#0d1119] flex-wrap">
+        <button
+          onClick={() => setShowLayerPanel(v => !v)}
+          className={`flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium border transition-colors ${
+            showLayerPanel ? 'bg-tradebot-accent/20 text-tradebot-accent border-tradebot-accent/40' : 'bg-gray-800 text-gray-400 border-gray-600 hover:text-gray-200'
+          }`}
+          title="Toggle drawing layers"
+        >
+          <Layers className="w-3 h-3" /> Layers
+        </button>
+        {LAYER_KEYS.map(k => {
+          const on = visibleLayers[k]
+          return (
+            <button
+              key={k}
+              onClick={() => toggleLayer(k)}
+              title={`${on ? 'Hide' : 'Show'} ${LAYER_LABELS[k]}`}
+              className={`flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium border transition-all ${
+                on
+                  ? 'bg-gray-800/80 border-gray-600 text-gray-200 hover:opacity-80'
+                  : 'bg-transparent border-gray-700/40 text-gray-600 hover:text-gray-400'
+              }`}
+              style={on ? { borderColor: LAYER_COLORS[k] + '60', color: LAYER_COLORS[k] } : {}}
+            >
+              {on
+                ? <Eye className="w-3 h-3" />
+                : <EyeOff className="w-3 h-3" />}
+              {LAYER_LABELS[k]}
+            </button>
+          )
+        })}
       </div>
 
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-0">

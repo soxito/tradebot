@@ -17,6 +17,7 @@ Docker: docker run --rm -p 8090:80 mtapiio/mt5rest
 Docs:   https://mt5.mtapi.io/index.html
 """
 import asyncio
+import re
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timedelta
 import httpx
@@ -81,6 +82,37 @@ TF_MAP: Dict[str, int] = {
     "1m":  1,   "5m":  5,   "15m": 15,  "30m": 30,
     "1h":  60,  "4h":  240, "1d":  1440,"1w":  10080,
 }
+
+
+# ── Server-name normalisation ─────────────────────────────────────────────────
+# The mtapi bridge resolves the broker by its EXACT server name. A tiny typo
+# (e.g. "MetaQoutes-Demo" — the 'uo' transposed to 'ou') yields a hard
+# ``Server not found`` error at ConnectEx. These corrections run before every
+# connect so a mistyped server resolves instead of failing. Case-insensitive
+# substring fixes; the suffix ("-Demo", "-Live01", …) is preserved. Unknown
+# names pass through unchanged.
+_SERVER_TYPO_FIXES: Dict[str, str] = {
+    "metaqoutes": "MetaQuotes",   # transposed 'uo' → 'ou' (most common)
+    "meta-quotes": "MetaQuotes",
+    "meta quotes": "MetaQuotes",
+}
+
+
+def normalize_server_name(server: str) -> str:
+    """Correct well-known broker server-name typos before connecting.
+
+    Fixes the most common transpositions (e.g. "MetaQoutes" → "MetaQuotes")
+    while preserving the broker suffix. Returns the input unchanged when no
+    known correction applies.
+    """
+    if not server:
+        return server
+    s = server.strip()
+    for typo, correct in _SERVER_TYPO_FIXES.items():
+        s = re.sub(re.escape(typo), correct, s, flags=re.IGNORECASE)
+    # General 'Qoutes' → 'Quotes' transposition safety net (any *Qoutes* server).
+    s = re.sub(r"qoutes", "Quotes", s, flags=re.IGNORECASE)
+    return s
 
 
 # ── Exceptions ────────────────────────────────────────────────────────────────
@@ -203,6 +235,10 @@ class MT5Client:
           the server name, pick the closest demo/real match, and retry once with
           the corrected server string.
         """
+        # Correct well-known broker-name typos (e.g. MetaQoutes → MetaQuotes)
+        # before any network call so a trivial misspelling never hard-fails.
+        server = normalize_server_name(server)
+
         async def _do_connect(srv: str) -> str:
             data = await self._get("/ConnectEx", params={
                 "user": login, "password": password, "server": srv,
@@ -263,14 +299,28 @@ class MT5Client:
                 except Exception:
                     candidates = []
 
+                # If the raw company term found nothing (often a typo), retry the
+                # search with a typo-corrected term so misspelled names resolve.
+                if not candidates:
+                    fixed_guess = normalize_server_name(company_guess)
+                    if fixed_guess.lower() != company_guess.lower():
+                        logger.info(f"[MT5] Retrying broker search with corrected term '{fixed_guess}'")
+                        try:
+                            candidates = await self.search_broker(fixed_guess)
+                        except Exception:
+                            candidates = []
+
                 # Pick the best matching server name:
                 #   prefer an exact case-insensitive match, then a demo match
                 #   if the supplied name contained 'demo', else any real server.
                 want_demo = "demo" in server.lower()
                 best: Optional[str] = None
+                all_names: List[str] = []
                 for broker_group in candidates:
                     for entry in (broker_group.get("results") or []):
                         srv_name = entry.get("name", "")
+                        if srv_name:
+                            all_names.append(srv_name)
                         if srv_name.lower() == bad_srv.lower():
                             best = srv_name   # exact match wins immediately
                             break
@@ -281,6 +331,14 @@ class MT5Client:
                                 best = srv_name
                     if best and best.lower() == bad_srv.lower():
                         break  # exact match found, stop searching
+
+                # Fuzzy fallback: no category match yet → closest name by edit
+                # distance (handles typos the category rules miss).
+                if best is None and all_names:
+                    import difflib as _difflib
+                    close = _difflib.get_close_matches(bad_srv, all_names, n=1, cutoff=0.6)
+                    if close:
+                        best = close[0]
 
                 if best and best.lower() != server.lower():
                     logger.info(f"[MT5] Resolved server '{server}' → '{best}' — retrying")
@@ -300,6 +358,7 @@ class MT5Client:
 
     async def get_token(self, login: str, server: str, password: str) -> str:
         """Return a valid token, reconnecting if expired."""
+        server = normalize_server_name(server)
         token = self._tokens.get(login, server)
         if token and not self._tokens.needs_check(login, server):
             return token
@@ -321,6 +380,7 @@ class MT5Client:
             return False
 
     async def disconnect(self, login: str, server: str, _password: str = ""):
+        server = normalize_server_name(server)
         token = self._tokens.get(login, server)
         if token:
             try:

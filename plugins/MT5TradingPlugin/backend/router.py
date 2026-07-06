@@ -5,7 +5,7 @@ All routes under /api/v1/plugins/mt5/
 Mounts as a standalone FastAPI router — discovered by plugin loader.
 """
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import select, delete
@@ -1002,6 +1002,50 @@ async def _kronos_from_candles(candles, symbol: str, timeframe: str):
         return None
 
 
+def _apply_kronos_to_signals(analysis: dict, kronos_block: Optional[dict]) -> None:
+    """Fuse the Kronos ML forecast into the SMC sniper signals (in place).
+
+    For each signal we tag ``kronos_aligned`` (does the forecast agree with the
+    trade side?) and compute a ``fusion_score`` (0..1) blending the SMC
+    confidence with Kronos agreement. Signals are then re-ordered so
+    Kronos-aligned, high-conviction setups rank first — turning Kronos into an
+    active input for *selecting* sniper setups, not just a chart overlay.
+
+    Fully additive and graceful: when no forecast is available the signals keep
+    their original order and the new fields stay ``None``.
+    """
+    signals = analysis.get("signals") if isinstance(analysis, dict) else None
+    if not signals:
+        return
+
+    direction = (kronos_block or {}).get("direction")  # up | down | flat | None
+    kconf = float((kronos_block or {}).get("confidence", 0.0) or 0.0)
+    have_dir = direction in ("up", "down")
+
+    for sig in signals:
+        conf = float(sig.get("confidence", 0.0) or 0.0)
+        if not have_dir:
+            # No usable forecast — fusion score == SMC confidence, no alignment.
+            sig["kronos_aligned"] = None
+            sig["fusion_score"] = round(conf, 3)
+            continue
+        side = sig.get("side")
+        aligned = (side == "buy" and direction == "up") or (side == "sell" and direction == "down")
+        sig["kronos_aligned"] = bool(aligned)
+        # Agreement contributes up to +0.25, opposition subtracts up to −0.25,
+        # scaled by the forecast confidence. SMC confidence remains the anchor.
+        adj = (kconf * 0.25) if aligned else -(kconf * 0.25)
+        sig["fusion_score"] = round(max(0.0, min(1.0, conf + adj)), 3)
+
+    # Re-rank: aligned first, then by fusion score (opposed setups sink).
+    signals.sort(
+        key=lambda s: (
+            0 if s.get("kronos_aligned") else (2 if s.get("kronos_aligned") is False else 1),
+            -float(s.get("fusion_score") or 0.0),
+        )
+    )
+
+
 @router.get("/strategy/analyze", response_model=MT5SmcAnalyzeResponse)
 async def smc_analyze(
     account_id: int,
@@ -1029,6 +1073,8 @@ async def smc_analyze(
     analysis = engine.analyze(candles)
 
     kronos_block = await _kronos_from_candles(candles, symbol, timeframe)
+    # Fuse Kronos into signal selection (tags alignment, re-ranks setups).
+    _apply_kronos_to_signals(analysis, kronos_block)
 
     ai_block = None
     if use_ai and not analysis.get("error") and analysis.get("signals"):
@@ -1085,6 +1131,8 @@ async def smc_analyze_data(data: MT5SmcAnalyzeDataRequest):
     analysis = engine.analyze(candles)
 
     kronos_block = await _kronos_from_candles(candles, data.symbol, data.timeframe)
+    # Fuse Kronos into signal selection (tags alignment, re-ranks setups).
+    _apply_kronos_to_signals(analysis, kronos_block)
 
     ai_block = None
     if data.use_ai and not analysis.get("error") and analysis.get("signals"):
@@ -1701,6 +1749,10 @@ async def _scalp_status_payload(db, session: MT5ScalpSession) -> ScalpStatusResp
         recovery_enabled=session.recovery_enabled,
         use_ai=session.use_ai, use_kronos=session.use_kronos,
         timeframe=session.timeframe or "M5",
+        strictness=(
+            (session.raw_settings or {}).get("strictness", "balanced")
+            if isinstance(session.raw_settings, dict) else "balanced"
+        ),
         bias_direction=session.bias_direction, bias_confidence=session.bias_confidence or 0.0,
         session_pnl=round(session.session_pnl or 0.0, 2),
         total_trades=session.total_trades or 0, wins=session.wins or 0,
@@ -1864,8 +1916,18 @@ async def scalp_sessions_history(account_id: int, limit: int = Query(default=20,
 
 @router.get("/scalp/trades/{session_id}", response_model=List[ScalpTradeRow])
 async def scalp_trades(session_id: int, limit: int = Query(default=50, le=200)):
-    """Trade log for a scalp session."""
+    """Trade log for a scalp session.
+
+    Automatically backfills P&L for closed trades that still have pnl=0 by
+    querying the broker’s order history.  This recovers real SL/TP-closed P&L
+    for trades that were reconciled before the deal-history lookup was added,
+    and updates session wins / losses / session_pnl in the same pass.
+    """
     async with AsyncSessionLocal() as db:
+        session = await db.get(MT5ScalpSession, session_id)
+        if not session:
+            return []
+
         rows = await db.execute(
             select(MT5ScalpTrade)
             .where(MT5ScalpTrade.session_id == session_id)
@@ -1873,12 +1935,64 @@ async def scalp_trades(session_id: int, limit: int = Query(default=50, le=200)):
             .limit(limit)
         )
         trades = rows.scalars().all()
-        return [ScalpTradeRow(
-            id=t.id, symbol=t.symbol, side=t.side, lot=t.lot,
-            entry_price=t.entry_price, close_price=t.close_price, pnl=round(t.pnl or 0.0, 2),
-            is_recovery=t.is_recovery, status=t.status, confidence=t.confidence,
-            reason=t.reason, opened_at=t.opened_at, closed_at=t.closed_at,
-        ) for t in trades]
+
+        # ── Overlay real P&L from MT5Deal for closed trades showing 0.00 ────────
+        # Build an in-memory pnl/price overlay from the already-synced MT5Deal
+        # table (MT5Deal.mt5_ticket == MT5ScalpTrade.ticket for this broker).
+        # No DB writes here — avoids ORM-expiry issues; _reconcile_gone handles
+        # future writes; the overlay just enriches the API response on the fly.
+        pnl_overlay: dict = {}
+        price_overlay: dict = {}
+        zero_tickets = [
+            int(t.ticket) for t in trades
+            if t.status == "closed" and (t.pnl or 0.0) == 0.0 and t.ticket
+        ]
+        if zero_tickets:
+            try:
+                account_id_val = int(session.account_id)  # cache before any expiry
+                deal_rows = await db.execute(
+                    select(MT5Deal).where(
+                        MT5Deal.account_id == account_id_val,
+                        MT5Deal.mt5_ticket.in_(zero_tickets),
+                    )
+                )
+                for deal in deal_rows.scalars().all():
+                    tk = deal.mt5_ticket
+                    pnl_overlay[tk] = pnl_overlay.get(tk, 0.0) + float(deal.profit or 0.0)
+                    if deal.price:
+                        price_overlay[tk] = float(deal.price)
+                # Fallback: some brokers link via mt5_position_ticket
+                if not pnl_overlay:
+                    deal_rows2 = await db.execute(
+                        select(MT5Deal).where(
+                            MT5Deal.account_id == account_id_val,
+                            MT5Deal.mt5_position_ticket.in_(zero_tickets),
+                        )
+                    )
+                    for deal in deal_rows2.scalars().all():
+                        pk = deal.mt5_position_ticket
+                        pnl_overlay[pk] = pnl_overlay.get(pk, 0.0) + float(deal.profit or 0.0)
+                        if deal.price:
+                            price_overlay[pk] = float(deal.price)
+            except Exception as _e:
+                logger.debug(f"[ScalpTrades] pnl overlay session={session_id}: {_e}")
+
+        result = []
+        for t in trades:
+            pnl = float(t.pnl or 0.0)
+            cp  = t.close_price
+            if t.ticket and t.ticket in pnl_overlay:
+                pnl = pnl_overlay[t.ticket]
+                cp  = price_overlay.get(t.ticket, cp)
+            result.append(ScalpTradeRow(
+                id=t.id, symbol=t.symbol, side=t.side, lot=t.lot,
+                entry_price=t.entry_price, close_price=cp,
+                pnl=round(pnl, 2),
+                is_recovery=t.is_recovery, status=t.status, confidence=t.confidence,
+                reason=t.reason, opened_at=t.opened_at, closed_at=t.closed_at,
+            ))
+        return result
+
 
 
 @router.patch("/scalp/update/{session_id}", response_model=ScalpStatusResponse)
@@ -1907,6 +2021,12 @@ async def scalp_update_settings(session_id: int, data: ScalpUpdateRequest):
             session.use_ai = data.use_ai
         if data.use_kronos is not None:
             session.use_kronos = data.use_kronos
+        if data.strictness is not None:
+            # Strictness lives in raw_settings (no dedicated column). Merge so
+            # the running loop picks up the new preset on its next cycle.
+            rs = dict(session.raw_settings) if isinstance(session.raw_settings, dict) else {}
+            rs["strictness"] = data.strictness
+            session.raw_settings = rs
         await db.commit()
         await db.refresh(session)
         return await _scalp_status_payload(db, session)

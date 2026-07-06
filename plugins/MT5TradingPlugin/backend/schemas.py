@@ -376,6 +376,9 @@ class MT5SmcSignal(BaseModel):
     sl_pips: float = 0.0
     tp_pips: float = 0.0
     pip_value: float = 0.0
+    # ── Kronos ML fusion (optional; populated when a forecast is available) ──
+    kronos_aligned: Optional[bool] = None   # True=agrees, False=opposes, None=n/a
+    fusion_score: Optional[float] = None     # 0..1 blended SMC + Kronos quality
 
 
 class MT5SmcZone(BaseModel):
@@ -504,6 +507,9 @@ class ScalpStartRequest(BaseModel):
     use_ai: bool = Field(default=True)
     use_kronos: bool = Field(default=True)
     timeframe: str = Field(default="M5", pattern=r"^(M1|M5|M15|M30|H1)$")
+    # Entry selectivity — stricter presets trade less but demand stronger
+    # confluence + reward:risk, minimising losing trades.
+    strictness: str = Field(default="balanced", pattern=r"^(conservative|balanced|aggressive)$")
 
 
 class ScalpStopRequest(BaseModel):
@@ -540,6 +546,7 @@ class ScalpStatusResponse(BaseModel):
     use_ai: bool
     use_kronos: bool
     timeframe: str
+    strictness: str = "balanced"
     bias_direction: Optional[str] = None
     bias_confidence: float = 0.0
     session_pnl: float = 0.0
@@ -564,6 +571,7 @@ class ScalpUpdateRequest(BaseModel):
     recovery_enabled: Optional[bool] = None
     use_ai: Optional[bool] = None
     use_kronos: Optional[bool] = None
+    strictness: Optional[str] = Field(default=None, pattern=r"^(conservative|balanced|aggressive)$")
 
 
 class ScalpSymbolResult(BaseModel):

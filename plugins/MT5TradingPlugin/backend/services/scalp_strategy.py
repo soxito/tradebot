@@ -59,6 +59,17 @@ RECOVERY_DRAWDOWN_ATR = 1.0
 # Recovery size relative to the original lot (kept < 2× to bound exposure).
 RECOVERY_LOT_MULTIPLIER = 1.5
 
+# ── Auto-lot safety ────────────────────────────────────────────────
+# When auto_lot is active the formula is: lot = risk / (sl_dist × contract_size).
+# If sl_dist is near-zero (stale/synthetic candle ATR), the lot explodes.
+# Two mandatory caps prevent catastrophic over-sizing:
+#   1. SL_MIN_PIPS  — minimum SL distance expressed in pip multiples so the
+#      denominator is never allowed to collapse to near-zero.
+#   2. MAX_AUTO_LOT_MULT — auto-lot must never exceed this multiple of the
+#      user’s configured lot_size regardless of balance/SL/risk settings.
+SL_MIN_PIPS: float = 5.0          # floor: at least 5 pips between entry and SL
+MAX_AUTO_LOT_MULT: float = 10.0   # cap: auto-lot ≤ 10× base lot size
+
 # ── Real-time scalp entry tuning ─────────────────────────────────────────────
 # The scalp must engage the *current* candle movement, so the resting entry has
 # to sit close to live price rather than at a distant institutional zone.
@@ -77,6 +88,53 @@ MOMENTUM_MIN_STANDALONE = 0.5
 # Tight scalp geometry off the M1 micro-ATR (real-time entry timeframe).
 RT_SL_ATR_M1 = 1.1
 RT_TP_ATR_M1 = 1.7
+
+
+# ── Strictness presets ───────────────────────────────────────────────────────
+# Each preset tunes how selective the scalper is. "conservative" trades the
+# least but demands the strongest confluence + reward:risk (fewest losses).
+# "balanced" is the default (backward-safe). "aggressive" trades more often.
+#
+#   min_confidence          — bias/entry confidence floor
+#   momentum_min_standalone — live-momentum strength needed to scalp when the
+#                             higher-timeframe (HTF) bias is flat
+#   min_rr                  — hard reward:risk floor; TP is widened to meet it
+#   require_htf_alignment   — when True, momentum-only (flat-HTF) scalps are
+#                             disallowed — every entry must ride the HTF trend
+#   min_fusion_score        — quality-score floor the bot-level fusion gate uses
+#   kronos_veto             — reject an entry when the Kronos ML score opposes
+#                             the trade side by more than this magnitude
+#   kronos_align_bonus      — confidence bonus when Kronos agrees with the side
+STRICTNESS_PRESETS: Dict[str, Dict[str, float]] = {
+    "conservative": {
+        "min_confidence": 0.68,
+        "momentum_min_standalone": 0.75,
+        "min_rr": 1.8,
+        "require_htf_alignment": 1.0,
+        "min_fusion_score": 0.66,
+        "kronos_veto": 0.25,
+        "kronos_align_bonus": 0.12,
+    },
+    "balanced": {
+        "min_confidence": 0.58,
+        "momentum_min_standalone": 0.55,
+        "min_rr": 1.5,
+        "require_htf_alignment": 0.0,
+        "min_fusion_score": 0.55,
+        "kronos_veto": 0.40,
+        "kronos_align_bonus": 0.10,
+    },
+    "aggressive": {
+        "min_confidence": 0.50,
+        "momentum_min_standalone": 0.45,
+        "min_rr": 1.3,
+        "require_htf_alignment": 0.0,
+        "min_fusion_score": 0.45,
+        "kronos_veto": 0.55,
+        "kronos_align_bonus": 0.08,
+    },
+}
+DEFAULT_STRICTNESS = "balanced"
 
 
 # ── Data structures ──────────────────────────────────────────────────────────────
@@ -115,6 +173,11 @@ class ScalpEntry:
     tp_pips: float = 0.0
     risk_amount: float = 0.0
     kronos_score: float = 0.0  # optional ML agreement (-1..1); 0 = unused
+    # ── Fusion diagnostics (SMC + Kronos + momentum quality) ─────────────────
+    rr: float = 0.0            # realised reward:risk after min-RR enforcement
+    quality_score: float = 0.0  # 0..1 blended entry quality used by the gate
+    gate_results: Dict[str, Any] = field(default_factory=dict)
+    veto_reason: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -168,15 +231,29 @@ class ScalpStrategyEngine:
         lot_size: float = 0.01,
         auto_lot: bool = False,
         risk_per_trade_pct: float = 1.0,
-        min_confidence: float = 0.55,
+        min_confidence: Optional[float] = None,
         sl_atr_mult: float = SL_ATR_MULT,
         tp_atr_mult: float = TP_ATR_MULT,
+        strictness: str = DEFAULT_STRICTNESS,
     ) -> None:
         self.symbol = symbol
         self.lot_size = max(0.01, round(lot_size, 2))
         self.auto_lot = auto_lot
         self.risk_per_trade_pct = risk_per_trade_pct
-        self.min_confidence = min_confidence
+        # Strictness preset drives how selective the scalper is. An explicit
+        # ``min_confidence`` still overrides the preset's confidence floor.
+        self.strictness = strictness if strictness in STRICTNESS_PRESETS else DEFAULT_STRICTNESS
+        preset = STRICTNESS_PRESETS[self.strictness]
+        self.min_confidence = (
+            float(min_confidence) if min_confidence is not None
+            else float(preset["min_confidence"])
+        )
+        self.min_rr = float(preset["min_rr"])
+        self.momentum_min_standalone = float(preset["momentum_min_standalone"])
+        self.require_htf_alignment = bool(preset["require_htf_alignment"])
+        self.min_fusion_score = float(preset["min_fusion_score"])
+        self.kronos_veto = float(preset["kronos_veto"])
+        self.kronos_align_bonus = float(preset["kronos_align_bonus"])
         self.sl_atr_mult = sl_atr_mult
         self.tp_atr_mult = tp_atr_mult
         self.point_size = point_size_for_symbol(symbol)
@@ -248,16 +325,93 @@ class ScalpStrategyEngine:
 
     def _resolve_lot(self, balance: float, sl_distance: float,
                      multiplier: float = 1.0) -> tuple[float, float]:
-        """Return (lot, risk_amount). Fixed lot unless auto_lot is enabled."""
-        if not self.auto_lot or balance <= 0 or sl_distance <= 0 or self.contract_size <= 0:
-            lot = max(0.01, round(self.lot_size * multiplier, 2))
-            risk = round(lot * sl_distance * self.contract_size, 2) if sl_distance > 0 else 0.0
-            return lot, risk
+        """Return (lot, risk_amount). Fixed lot unless auto_lot is enabled.
+
+        Safety constraints (always enforced, even in auto-lot mode):
+
+        1. *SL distance floor* — the denominator of the auto-lot formula is
+           clamped to at least ``SL_MIN_PIPS × pip_size`` so that near-zero ATR
+           values (from stale or synthetic candles) cannot inflate the lot to
+           thousands of times the intended size.
+
+        2. *Lot cap* — the computed lot is limited to
+           ``lot_size × MAX_AUTO_LOT_MULT`` so a user who sets 0.01 lot will
+           never receive more than 0.10 lot from the auto-sizing logic,
+           regardless of balance, SL tightness, or risk percentage.
+        """
+        base_lot = max(0.01, round(self.lot_size * multiplier, 2))
+
+        if not self.auto_lot or balance <= 0 or self.contract_size <= 0:
+            risk = round(base_lot * sl_distance * self.contract_size, 2) if sl_distance > 0 else 0.0
+            return base_lot, risk
+
+        if sl_distance <= 0:
+            return base_lot, 0.0
+
+        # 1. Floor: prevent near-zero SL from causing lot explosion.
+        # Use the wider of 5 pips and 10 points (handles both FX & metals).
+        pip = self.pip_size or (self.point_size * 10.0) if self.point_size else 0.0001
+        min_sl = max(pip * SL_MIN_PIPS, self.point_size * 10.0) if self.point_size > 0 else pip * SL_MIN_PIPS
+        sl_safe = max(sl_distance, min_sl)
+
         risk_amount = balance * (self.risk_per_trade_pct / 100.0) * multiplier
-        lot = risk_amount / (sl_distance * self.contract_size)
+        raw_lot = risk_amount / (sl_safe * self.contract_size)
+
+        # 2. Cap: auto-lot ≤ MAX_AUTO_LOT_MULT × configured lot size.
+        max_auto = max(base_lot, round(self.lot_size * MAX_AUTO_LOT_MULT * multiplier, 2))
+        lot = min(raw_lot, max_auto)
         lot = max(0.01, round(lot, 2))
         actual_risk = round(lot * sl_distance * self.contract_size, 2)
         return lot, actual_risk
+
+    # -- quality / reward-risk enforcement -------------------------------------
+
+    def _enforce_min_rr(
+        self, side: str, entry: float, stop_loss: float, take_profit: float,
+    ) -> tuple[float, float]:
+        """Guarantee reward:risk ≥ ``self.min_rr`` by widening TP if needed.
+
+        Keeping reward comfortably above risk is the single biggest lever for
+        "hardly loses" behaviour: even a sub-50 % win rate stays net-positive
+        when winners pay more than losers. Returns ``(take_profit, rr)``.
+        """
+        risk = abs(entry - stop_loss)
+        if risk <= 0:
+            return take_profit, 0.0
+        reward = abs(take_profit - entry)
+        min_reward = risk * self.min_rr
+        if reward < min_reward:
+            take_profit = round(
+                entry + min_reward if side == "buy" else entry - min_reward, 6
+            )
+            reward = min_reward
+        return take_profit, round(reward / risk, 2)
+
+    def _quality_score(
+        self, confidence: float, rr: float, kronos_score: float,
+        side: str, momentum_aligned: bool,
+    ) -> tuple[float, bool]:
+        """Blend the decision inputs into a 0..1 quality score.
+
+        Weights: confidence 45 %, reward:risk 25 %, Kronos agreement 20 %,
+        live-momentum alignment 10 %. Returns ``(score, kronos_aligned)`` where
+        an unavailable Kronos score (0.0) contributes a neutral 0.5.
+        """
+        conf_c = max(0.0, min(1.0, confidence))
+        # RR 1.0 → 0.0, RR 3.0 → 1.0 (clamped).
+        rr_c = max(0.0, min(1.0, (rr - 1.0) / 2.0))
+        kronos_aligned = False
+        if kronos_score:
+            kronos_aligned = (
+                (kronos_score > 0 and side == "buy")
+                or (kronos_score < 0 and side == "sell")
+            )
+            k_c = min(1.0, abs(kronos_score)) if kronos_aligned else 0.0
+        else:
+            k_c = 0.5  # unavailable → neutral, never penalise the SMC decision
+        mom_c = 1.0 if momentum_aligned else 0.5
+        score = 0.45 * conf_c + 0.25 * rr_c + 0.20 * k_c + 0.10 * mom_c
+        return round(max(0.0, min(1.0, score)), 3), kronos_aligned
 
     # -- real-time movement ----------------------------------------------------
 
@@ -307,6 +461,7 @@ class ScalpStrategyEngine:
         self, side: str, current_price: float, m1: List[Candle], m5: List[Candle],
         balance: float, confidence: float, momentum_strength: float,
         bid: float, ask: float, bias: ScalpBias, confluence: List[str],
+        kronos_score: float = 0.0, momentum_aligned: bool = True,
     ) -> ScalpEntry:
         """Build a market-adjacent scalp entry that engages the current move.
 
@@ -355,7 +510,14 @@ class ScalpStrategyEngine:
         entry = round(entry, 6)
         stop_loss = round(stop_loss, 6)
         take_profit = round(take_profit, 6)
+        # Guarantee reward:risk ≥ the strictness floor before sizing.
+        take_profit, rr = self._enforce_min_rr(side, entry, stop_loss, take_profit)
+        sl_dist = abs(entry - stop_loss)
+        tp_dist = abs(take_profit - entry)
         lot, risk_amount = self._resolve_lot(balance, sl_dist)
+        quality, kronos_aligned = self._quality_score(
+            confidence, rr, kronos_score, side, momentum_aligned,
+        )
 
         mode = "momentum-stop" if strong else "pullback-limit"
         return ScalpEntry(
@@ -363,9 +525,16 @@ class ScalpStrategyEngine:
             lot=lot, confidence=round(confidence, 3),
             reason=f"Real-time {mode} scalp — {bias.reason}",
             order_type=otype,
-            confluence=confluence + [f"rt:{mode}", f"mom:{momentum_strength:.2f}"],
+            confluence=confluence + [f"rt:{mode}", f"mom:{momentum_strength:.2f}"]
+                       + (["kronos_aligned"] if kronos_aligned else []),
             sl_pips=round(sl_dist / pip, 1), tp_pips=round(tp_dist / pip, 1),
-            risk_amount=risk_amount,
+            risk_amount=risk_amount, kronos_score=round(kronos_score, 3),
+            rr=rr, quality_score=quality,
+            gate_results={
+                "confidence": round(confidence, 3), "rr": rr,
+                "kronos": round(kronos_score, 3), "kronos_aligned": kronos_aligned,
+                "momentum": round(momentum_strength, 3), "source": "realtime",
+            },
         )
 
     # -- entry -----------------------------------------------------------------
@@ -377,6 +546,7 @@ class ScalpStrategyEngine:
         balance: float = 0.0,
         bid: float = 0.0,
         ask: float = 0.0,
+        kronos_score: float = 0.0,
     ) -> tuple[Optional[ScalpEntry], ScalpBias]:
         """
         Produce a scalp entry that engages the *current* candle movement.
@@ -388,6 +558,9 @@ class ScalpStrategyEngine:
         The resting order is kept within scalp range of live price (an in-range
         SMC zone when available, else a market-adjacent momentum entry), so it
         fills on the current move instead of waiting at a distant level.
+
+        ``kronos_score`` (−1..1) is an optional ML directional read: a strongly
+        opposing score vetoes the entry, an agreeing score raises conviction.
 
         Returns ``(entry_or_None, bias)`` so callers can surface the live bias
         even when no trade is taken.
@@ -406,12 +579,14 @@ class ScalpStrategyEngine:
         side: Optional[str] = None
         confidence = bias.confidence
         confluence = [f"{tf}:{b}" for tf, b in bias.tf_bias.items()]
+        momentum_aligned = False
 
         if bias.direction in ("buy", "sell"):
             if mom_dir == bias.direction:
                 side = bias.direction
                 confidence = min(1.0, bias.confidence + 0.15 + mom_strength * 0.2)
                 confluence.append("HTF+live-aligned")
+                momentum_aligned = True
             elif mom_dir == "neutral":
                 if bias.confidence >= self.min_confidence:
                     side = bias.direction
@@ -419,13 +594,34 @@ class ScalpStrategyEngine:
             else:
                 # Live move opposes the higher-timeframe trend — stand aside.
                 return None, bias
-        elif mom_dir in ("buy", "sell") and mom_strength >= MOMENTUM_MIN_STANDALONE:
+        elif (mom_dir in ("buy", "sell")
+              and mom_strength >= self.momentum_min_standalone
+              and not self.require_htf_alignment):
             # No dominant HTF trend, but a clear live move — scalp it in real time.
             side = mom_dir
             confidence = max(self.min_confidence, min(0.9, 0.5 + mom_strength * 0.4))
             confluence.append("live-momentum")
+            momentum_aligned = True
 
-        if side is None or confidence < self.min_confidence:
+        if side is None:
+            return None, bias
+
+        # ── Kronos ML directional fusion (optional) ──────────────────────────
+        # A strongly opposing forecast vetoes the trade; agreement lifts
+        # conviction. Unavailable (0.0) leaves the SMC decision untouched.
+        if kronos_score:
+            opposes = (
+                (side == "buy" and kronos_score < 0)
+                or (side == "sell" and kronos_score > 0)
+            )
+            if opposes and abs(kronos_score) >= self.kronos_veto:
+                bias.reason += f" | Kronos veto ({kronos_score:+.2f})"
+                return None, bias
+            if not opposes:
+                confidence = min(1.0, confidence + self.kronos_align_bonus * abs(kronos_score))
+                confluence.append("kronos_aligned")
+
+        if confidence < self.min_confidence:
             return None, bias
 
         atr = bias.atr_m5
@@ -455,14 +651,20 @@ class ScalpStrategyEngine:
                 return self._build_realtime_entry(
                     side, current_price, m1, m5, balance, confidence,
                     mom_strength, bid, ask, bias, confluence,
+                    kronos_score=kronos_score, momentum_aligned=momentum_aligned,
                 ), bias
             entry_price = round(raw_entry, 6)
             stop_loss   = round(raw_sl, 6)
             take_profit = round(raw_tp, 6)
+            # Enforce the reward:risk floor (widen TP if the zone target is tight).
+            take_profit, rr = self._enforce_min_rr(side, entry_price, stop_loss, take_profit)
+            quality, kronos_aligned = self._quality_score(
+                confidence, rr, kronos_score, side, momentum_aligned,
+            )
             confluence  = confluence + [
                 f"zone:{best_signal.get('zone_kind','ob')}",
-                f"rr:{best_signal.get('rr',0):.1f}", "in-range",
-            ]
+                f"rr:{rr:.1f}", "in-range",
+            ] + (["kronos_aligned"] if kronos_aligned else [])
             sl_dist = abs(entry_price - stop_loss)
             tp_dist = abs(take_profit - entry_price)
             lot, risk_amount = self._resolve_lot(balance, sl_dist)
@@ -473,7 +675,13 @@ class ScalpStrategyEngine:
                 reason=f"SMC zone scalp — {bias.reason}",
                 order_type=otype, confluence=confluence,
                 sl_pips=round(sl_dist / pip, 1), tp_pips=round(tp_dist / pip, 1),
-                risk_amount=risk_amount,
+                risk_amount=risk_amount, kronos_score=round(kronos_score, 3),
+                rr=rr, quality_score=quality,
+                gate_results={
+                    "confidence": round(confidence, 3), "rr": rr,
+                    "kronos": round(kronos_score, 3), "kronos_aligned": kronos_aligned,
+                    "momentum": round(mom_strength, 3), "source": "smc_zone",
+                },
             )
             return entry, bias
 
@@ -481,6 +689,7 @@ class ScalpStrategyEngine:
         entry = self._build_realtime_entry(
             side, current_price, m1, m5, balance, confidence,
             mom_strength, bid, ask, bias, confluence,
+            kronos_score=kronos_score, momentum_aligned=momentum_aligned,
         )
         return entry, bias
 
@@ -530,6 +739,10 @@ class ScalpStrategyEngine:
         _, risk_amount = self._resolve_lot(balance, sl_dist)
         pip = self.pip_size or 1.0
 
+        # Enforce the reward:risk floor on the recovery leg too.
+        take_profit, rr = self._enforce_min_rr(recovery_side, entry_price, stop_loss, take_profit)
+        quality, _ = self._quality_score(bias.confidence, rr, 0.0, recovery_side, True)
+
         return ScalpEntry(
             side=recovery_side,
             entry=entry_price,
@@ -544,4 +757,7 @@ class ScalpStrategyEngine:
             sl_pips=round(sl_dist / pip, 1),
             tp_pips=round(tp_dist / pip, 1),
             risk_amount=risk_amount,
+            rr=rr, quality_score=quality,
+            gate_results={"confidence": round(bias.confidence, 3), "rr": rr,
+                          "source": "recovery"},
         )

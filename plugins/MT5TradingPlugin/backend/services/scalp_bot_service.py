@@ -19,7 +19,7 @@ Standalone plugin service — never imports or mutates core trading logic.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
@@ -43,6 +43,7 @@ from plugins.MT5TradingPlugin.backend.services.scalp_strategy import (
     ALL_SCALP_TFS,
     PRIMARY_SCALP_TF,
     RECOVERY_DRAWDOWN_ATR,
+    DEFAULT_STRICTNESS,
 )
 from plugins.MT5TradingPlugin.backend.services.smc_strategy import (
     Candle,
@@ -400,6 +401,11 @@ class ScalpBotManager:
                 "trade1_ticket": session.trade1_ticket,
                 "trade2_ticket": session.trade2_ticket,
                 "start_equity": session.start_equity,
+                # Strictness preset lives in raw_settings (no dedicated column).
+                "strictness": (
+                    (session.raw_settings or {}).get("strictness", DEFAULT_STRICTNESS)
+                    if isinstance(session.raw_settings, dict) else DEFAULT_STRICTNESS
+                ),
             }
             login, server, password = account.login, account.server, account.password_encrypted
 
@@ -469,6 +475,7 @@ class ScalpBotManager:
             lot_size=cfg["lot_size"],
             auto_lot=cfg["auto_lot"],
             risk_per_trade_pct=cfg["risk_per_trade_pct"],
+            strictness=cfg["strictness"],
         )
 
         # ── Live orders belonging to this session (positions + pending) ──────
@@ -521,7 +528,7 @@ class ScalpBotManager:
         if cfg["trade2_ticket"] and t2_state == "gone":
             gone.append(int(cfg["trade2_ticket"]))
         if gone:
-            await self._reconcile_gone(session_id, gone)
+            await self._reconcile_gone(session_id, gone, login, server, password)
             async with AsyncSessionLocal() as db:
                 session = await db.get(MT5ScalpSession, session_id)
                 cfg["trade1_ticket"] = session.trade1_ticket
@@ -545,37 +552,70 @@ class ScalpBotManager:
         # ── State machine ────────────────────────────────────────────────────
         if not cfg["trade1_ticket"]:
             # Flat → look for a fresh entry.
-            entry, bias = engine.analyse(candles_by_tf, mid, balance, bid=bid, ask=ask)
+            # Run the Kronos ML forecast FIRST so it is fused into the entry
+            # decision (agreement lifts conviction, strong opposition vetoes),
+            # not merely applied as an afterthought.
+            kd = 0.0
+            if cfg["use_kronos"]:
+                kd = await _kronos_direction(m5, symbol, PRIMARY_SCALP_TF)
+
+            entry, bias = engine.analyse(
+                candles_by_tf, mid, balance, bid=bid, ask=ask, kronos_score=kd,
+            )
             note = bias.reason
             await self._store_bias(session_id, bias, "analyzing" if not entry else "waiting")
             if not entry:
-                self._diag(session_id, symbol,
-                           f"no-entry bias={bias.direction} conf={bias.confidence:.2f} :: {bias.reason}")
+                # Distinguish a Kronos veto (surfaced in bias.reason) from a
+                # plain no-setup so the UI/telemetry is transparent.
+                self._diag(
+                    session_id, symbol,
+                    f"no-entry bias={bias.direction} conf={bias.confidence:.2f} "
+                    f"kronos={kd:+.2f} :: {bias.reason}"
+                )
+                if "Kronos veto" in bias.reason:
+                    await self._update_phase(
+                        session_id, "waiting",
+                        note=f"Kronos opposes ({kd:+.2f}) — waiting")
                 return False
 
-            # Optional ML directional veto.
-            if cfg["use_kronos"]:
-                kd = await _kronos_direction(m5, symbol, PRIMARY_SCALP_TF)
-                entry.kronos_score = round(kd, 3)
-                if (entry.side == "buy" and kd < -0.4) or (entry.side == "sell" and kd > 0.4):
-                    self._diag(session_id, symbol, f"kronos-veto {entry.side} kd={kd:+.2f}")
-                    await self._update_phase(session_id, "waiting",
-                                             note=f"Kronos opposes ({kd:+.2f}) — waiting")
-                    return False
+            # ── Fusion quality gate ──────────────────────────────────────────
+            # The engine already vetoes strong Kronos opposition and enforces a
+            # reward:risk floor. Here the bot enforces the strictness preset's
+            # composite quality threshold so only high-conviction, well-shaped
+            # setups reach the broker.
+            if entry.quality_score < engine.min_fusion_score:
+                self._diag(
+                    session_id, symbol,
+                    f"quality-gate skip q={entry.quality_score:.2f} "
+                    f"< {engine.min_fusion_score:.2f} ({cfg['strictness']}) "
+                    f"rr={entry.rr:.1f} conf={entry.confidence:.2f} kronos={kd:+.2f}"
+                )
+                await self._update_phase(
+                    session_id, "waiting",
+                    note=(f"Setup quality {entry.quality_score:.2f} below "
+                          f"{cfg['strictness']} floor {engine.min_fusion_score:.2f} "
+                          f"(RR {entry.rr:.1f}, conf {entry.confidence:.2f})"))
+                return False
 
             # Optional AI + economic-calendar gate.
+            fusion_note = (
+                f"q={entry.quality_score:.2f} rr={entry.rr:.1f} "
+                f"conf={entry.confidence:.2f} kronos={kd:+.2f}"
+            )
             if cfg["use_ai"]:
                 gate = await _ai_gate(symbol, entry.side, bias.reason, entry.confidence)
-                note = f"{bias.reason} | AI: {gate.get('note', '')}"
+                note = f"{bias.reason} | {fusion_note} | AI: {gate.get('note', '')}"
                 if gate.get("decision") == "skip":
                     self._diag(session_id, symbol, f"ai-skip {gate.get('note','')}")
                     await self._update_phase(session_id, "waiting", note=f"AI skip: {gate.get('note','')}")
                     return False
+            else:
+                note = f"{bias.reason} | {fusion_note}"
 
             self._diag(
                 session_id, symbol,
                 f"ENTRY {entry.order_type} {entry.lot}@{entry.entry} "
-                f"SL{entry.stop_loss} TP{entry.take_profit} conf={entry.confidence:.2f}"
+                f"SL{entry.stop_loss} TP{entry.take_profit} {fusion_note}"
             )
             await self._open_trade(session_id, login, server, password, entry, note)
             return False
@@ -589,7 +629,7 @@ class ScalpBotManager:
                     await mt5_client.cancel_order(login, server, password, int(cfg["trade1_ticket"]))
                 except Exception as e:  # noqa: BLE001
                     logger.debug(f"[ScalpBot] cancel stale {cfg['trade1_ticket']}: {e}")
-                await self._reconcile_gone(session_id, [int(cfg["trade1_ticket"])])
+                await self._reconcile_gone(session_id, [int(cfg["trade1_ticket"])], login, server, password)
                 await self._update_phase(session_id, "analyzing", note="Stale entry cancelled — re-analysing")
             else:
                 await self._update_phase(session_id, "entry_pending",
@@ -728,10 +768,15 @@ class ScalpBotManager:
                 return  # Would retreat the SL on a short
 
         # Push the updated SL to the broker.
+        # On first activation also clear the fixed TP (pass tp=0) so the
+        # trailing stop becomes the sole exit — the TP won't cut profit short
+        # before the SL has had a chance to trail up.
+        is_first = prior is None
+        tp_to_set: Optional[float] = 0.0 if is_first else None
         try:
-            await mt5_client.modify_order(login, server, password, ticket, sl=new_sl)
+            await mt5_client.modify_order(login, server, password, ticket, sl=new_sl, tp=tp_to_set)
             self._trailing_sl[state_key] = new_sl
-            prior_txt = f" prev_sl={prior:.5f}" if prior is not None else " (first activation)"
+            prior_txt = f" prev_sl={prior:.5f}" if prior is not None else " (first activation — TP cleared)"
             self._diag(
                 session_id, symbol,
                 f"TRAIL-SL ticket={ticket} side={side} new_sl={new_sl:.5f} "
@@ -741,7 +786,8 @@ class ScalpBotManager:
                 session_id,
                 "in_trade",
                 note=(
-                    f"Trailing SL active — 50% locked ({lock_profit:.2f}) @ {new_sl:.5f}"
+                    f"Trailing SL active{' — TP removed' if is_first else ''} "
+                    f"— 50% locked ({lock_profit:.2f}) @ {new_sl:.5f}"
                     f" | running P&L {current_profit:.2f}"
                 ),
             )
@@ -752,6 +798,39 @@ class ScalpBotManager:
                           entry: ScalpEntry, note: str, recovery: bool = False) -> None:
         comment = f"{COMMENT_TAG}{'-R' if recovery else ''}#{session_id}"
         symbol = await self._session_symbol(session_id)
+
+        # ── Hard lot-size sanity guard ─────────────────────────────────────────────
+        # The ScalpStrategyEngine already applies an auto-lot cap, but we add a
+        # second, independent check here as the last line of defence before any
+        # volume reaches the broker.  An entry whose lot exceeds the configured
+        # base lot by more than 50× is almost certainly a calculation error
+        # (e.g. ATR=0 from stale candles) and is unconditionally rejected.
+        try:
+            from app.core.database import AsyncSessionLocal as _ASL
+            async with _ASL() as _db:
+                _sess = await _db.get(
+                    __import__('plugins.MT5TradingPlugin.backend.models',
+                               fromlist=['MT5ScalpSession']).MT5ScalpSession,
+                    session_id,
+                )
+                _base_lot = float(getattr(_sess, 'lot_size', entry.lot) or entry.lot)
+        except Exception:
+            _base_lot = entry.lot
+
+        _max_safe_lot = max(_base_lot * 50.0, 1.0)  # never more than 50× configured lot
+        if entry.lot > _max_safe_lot:
+            logger.critical(
+                f"[ScalpBot♯{session_id}] LOT-SIZE GUARD TRIGGERED — "
+                f"computed lot={entry.lot} exceeds 50× base ({_base_lot}) for {symbol}. "
+                f"Order ABORTED. Check auto_lot / SL distance / candle quality."
+            )
+            await self._update_phase(
+                session_id, "waiting",
+                note=f"ABORTED: lot {entry.lot} exceeds safety limit ({_max_safe_lot:.2f}). "
+                     "Disable auto-lot or verify candle data.",
+            )
+            return
+
         # Use the SMC-derived order type (buy_limit, sell_limit, buy_stop, sell_stop)
         # and the zone entry price so the order rests at the institutional level.
         order_type = getattr(entry, "order_type", entry.side)
@@ -916,14 +995,60 @@ class ScalpBotManager:
         for tk in tickets:
             self._trailing_sl.pop((session_id, tk), None)
 
-    async def _reconcile_gone(self, session_id: int, tickets: List[int]) -> None:
+    async def _reconcile_gone(
+        self,
+        session_id: int,
+        tickets: List[int],
+        login: Optional[str] = None,
+        server: Optional[str] = None,
+        password: Optional[str] = None,
+    ) -> None:
         """Clear tickets that are genuinely gone (SL/TP-closed or cancelled).
 
-        Only called for tickets that were NOT found in either live positions or
-        resting pending orders — so a pending entry is never mistaken for closed.
+        When broker credentials are supplied, queries the recent deal/order
+        history to recover the actual close P&L for each ticket and updates:
+          • ``MT5ScalpTrade.pnl``  — the realised profit on that leg
+          • ``MT5ScalpTrade.close_price``
+          • ``MT5ScalpSession.wins`` / ``.losses`` / ``.session_pnl``
+
+        Without credentials (cancelled pending, stale entry), the trade is still
+        marked closed but wins/losses are not updated (no real P&L to count).
         """
         if not tickets:
             return
+
+        # ── Fetch P&L from broker deal history ─────────────────────────────────
+        pnl_by_ticket: Dict[int, float] = {}
+        close_price_by_ticket: Dict[int, float] = {}
+        if login and server and password:
+            try:
+                deals = await mt5_client.get_deals(
+                    login, server, password,
+                    date_from=datetime.utcnow() - timedelta(days=2),
+                )
+                for d in deals:
+                    tk = _order_ticket(d)
+                    if not tk:
+                        continue
+                    # Profit field name varies by broker build
+                    profit = (
+                        d.get("profit") or d.get("Profit") or
+                        d.get("closeProfit") or d.get("realizedPnL") or 0.0
+                    )
+                    pnl_by_ticket[tk] = float(profit)
+                    # Close price field name varies
+                    cp = (
+                        d.get("closePrice") or d.get("priceClose") or
+                        d.get("close_price") or d.get("price") or 0.0
+                    )
+                    close_price_by_ticket[tk] = float(cp)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"[ScalpBot] reconcile deal-fetch session={session_id}: {exc}")
+
+        # P&L total across all reconciled tickets (for session stats)
+        realised = sum(pnl_by_ticket.get(tk, 0.0) for tk in tickets)
+        has_pnl = bool(pnl_by_ticket)   # True when we got actual deal data
+
         async with AsyncSessionLocal() as db:
             session = await db.get(MT5ScalpSession, session_id)
             if not session:
@@ -939,10 +1064,23 @@ class ScalpBotManager:
                 for tr in rows.scalars().all():
                     tr.status = "closed"
                     tr.closed_at = datetime.utcnow()
+                    if tk in pnl_by_ticket:
+                        tr.pnl = pnl_by_ticket[tk]
+                    if close_price_by_ticket.get(tk, 0.0) > 0:
+                        tr.close_price = close_price_by_ticket[tk]
                 if session.trade1_ticket == tk:
                     session.trade1_ticket = None
                 if session.trade2_ticket == tk:
                     session.trade2_ticket = None
+
+            # Update session W/L/P&L when we have real broker P&L data
+            if has_pnl:
+                session.session_pnl = (session.session_pnl or 0.0) + realised
+                if realised >= 0:
+                    session.wins = (session.wins or 0) + 1
+                else:
+                    session.losses = (session.losses or 0) + 1
+
             if not session.trade1_ticket and not session.trade2_ticket:
                 session.phase = "analyzing"
             session.last_cycle_at = datetime.utcnow()
