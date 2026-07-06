@@ -8,15 +8,17 @@ from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-def _reroute_unresolvable_host(url: str, service: str, native_host: str, native_port: str) -> str:
+def _reroute_unresolvable_host(url: str, service: str, native_host: str, native_ports: List[str]) -> str:
     """Reroute a Docker service hostname to a native host when it can't resolve.
 
     docker-compose `.env` files target service names like ``postgres`` / ``redis``.
     Those only resolve inside the compose network. When the backend runs natively
-    (Homebrew / ``start.py``), the name fails DNS resolution and asyncpg/redis raise
-    ``socket.gaierror`` / ``[Errno 11001] getaddrinfo failed``. In that case we swap
-    the host+port for the native fallback so the SAME .env works both in Docker
-    (name resolves -> left untouched) and natively (name fails -> rerouted).
+    (Homebrew / docker-on-host / ``start.py``), the name fails DNS resolution and
+    asyncpg/redis raise ``socket.gaierror`` / ``[Errno 11001] getaddrinfo failed``.
+    In that case we swap the host for ``native_host`` and probe the candidate host
+    ports, picking the first that is actually listening — Homebrew and the
+    docker-exposed mapping use different ports (e.g. Postgres 5434 vs 5433), so
+    probing lets the SAME .env work in Docker, Homebrew, and docker-on-host setups.
     """
     import socket
     from urllib.parse import urlsplit, urlunsplit
@@ -35,13 +37,24 @@ def _reroute_unresolvable_host(url: str, service: str, native_host: str, native_
     except OSError:
         pass  # not resolvable (running natively) — reroute below
 
+    # Pick the first candidate port that is actually accepting connections so we
+    # target the real local service regardless of how it was started.
+    chosen_port = native_ports[0]
+    for port in native_ports:
+        try:
+            with socket.create_connection((native_host, int(port)), timeout=0.5):
+                chosen_port = port
+                break
+        except OSError:
+            continue
+
     userinfo = ""
     if parts.username:
         userinfo = parts.username
         if parts.password:
             userinfo += f":{parts.password}"
         userinfo += "@"
-    netloc = f"{userinfo}{native_host}:{native_port}"
+    netloc = f"{userinfo}{native_host}:{chosen_port}"
     return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
@@ -215,7 +228,8 @@ class Settings(BaseSettings):
         import os
         if os.name == "nt" and "localhost" in v:
             v = v.replace("localhost", "127.0.0.1")
-        v = _reroute_unresolvable_host(v, "postgres", "127.0.0.1", "5434")
+        # Probe 5434 (Homebrew), 5433 (docker-exposed), 5432 (default) in order.
+        v = _reroute_unresolvable_host(v, "postgres", "127.0.0.1", ["5434", "5433", "5432"])
         return v
 
     @field_validator("REDIS_URL", mode="before")
@@ -234,7 +248,8 @@ class Settings(BaseSettings):
         import os
         if os.name == "nt" and "localhost" in v:
             v = v.replace("localhost", "127.0.0.1")
-        v = _reroute_unresolvable_host(v, "redis", "127.0.0.1", "6379")
+        # Probe 6379 (Homebrew/native), 6380 (docker-exposed) in order.
+        v = _reroute_unresolvable_host(v, "redis", "127.0.0.1", ["6379", "6380"])
         return v
 
     @property

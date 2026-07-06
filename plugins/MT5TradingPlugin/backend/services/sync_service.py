@@ -125,6 +125,16 @@ class MT5SyncService:
                 f"[MT5Sync] {account.login}: balance={account.balance:.2f} "
                 f"{len(pending)} pending {len(positions)} positions"
             )
+
+            # Also refresh closed-trade history (Trade History). Best-effort and
+            # upsert-only, so a history hiccup never fails the main sync. Without
+            # this the deals table stays empty and Trade History shows nothing,
+            # because the view flow only calls sync_account (not sync_deals).
+            try:
+                await MT5SyncService.sync_deals(db, account)
+            except Exception as e:  # noqa: BLE001 - never block the primary sync
+                logger.warning(f"[MT5Sync] {account.login} deal-history sync skipped: {e}")
+
             return True
 
         except MT5ClientError as e:

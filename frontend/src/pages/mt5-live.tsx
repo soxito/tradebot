@@ -21,7 +21,7 @@ import { formatDateTimeCompactZA, formatTimeZA } from '@/utils/datetime'
 import {
   Monitor, Plus, Trash2, RefreshCw, AlertTriangle, CheckCircle,
   Loader2, DollarSign, TrendingUp, TrendingDown, Shield,
-  BarChart2, ArrowUpDown, X, Search, Pencil,
+  BarChart2, ArrowUpDown, X, Search, Pencil, ChevronLeft, ChevronRight,
 } from 'lucide-react'
 
 // ── Known broker server list ───────────────────────────────────────────────────
@@ -514,6 +514,9 @@ export default function MT5LivePage() {
   const [closingAll, setClosingAll]           = useState(false)
   const [cancelingAll, setCancelingAll]       = useState(false)
   const [deals, setDeals]               = useState<MT5Deal[]>([])
+  // Trade History pagination (client-side over the fetched closed deals).
+  const [histPageSize, setHistPageSize] = useState(25)   // rows per page: 10/25/50/100
+  const [histPage, setHistPage]         = useState(0)    // 0-indexed page
   const [loading, setLoading]           = useState(false)
   const [syncing, setSyncing]           = useState(false)
   const [error, setError]               = useState<string | null>(null)
@@ -601,7 +604,7 @@ export default function MT5LivePage() {
       const [posRes, ordRes, dealRes] = await Promise.all([
         apiClient.mt5.getPositions(selectedId),
         apiClient.mt5.getOrders(selectedId),
-        apiClient.mt5.getDeals(selectedId, { limit: 200 }),
+        apiClient.mt5.getDeals(selectedId, { limit: 500 }),
       ])
       setPositions(posRes.data)
       setOrders(ordRes.data)
@@ -624,6 +627,8 @@ export default function MT5LivePage() {
 
   useEffect(() => { fetchAccounts() }, [fetchAccounts])
   useEffect(() => { fetchAccountData() }, [fetchAccountData])
+  // Reset Trade History to the first page when switching accounts.
+  useEffect(() => { setHistPage(0) }, [selectedId])
 
   // Split polling: slow full sync (8s) + fast positions-only (2.5s). Both pause
   // while the tab is hidden to save CPU/network, and resume + refresh on return.
@@ -1965,6 +1970,11 @@ export default function MT5LivePage() {
               const totalPnL  = tradeDeal.reduce((s, d) => s + d.profit + d.commission + d.swap, 0)
               const winCount  = tradeDeal.filter(d => d.profit > 0).length
               const winRate   = tradeDeal.length > 0 ? Math.round((winCount / tradeDeal.length) * 100) : 0
+              // Client-side pagination over the fetched closed-trade history.
+              const totalPages = Math.max(1, Math.ceil(tradeDeal.length / histPageSize))
+              const pageIdx    = Math.min(histPage, totalPages - 1)
+              const startRow   = pageIdx * histPageSize
+              const pageDeals  = tradeDeal.slice(startRow, startRow + histPageSize)
 
               return (
                 <div className="bg-gray-800/50 border border-gray-700/50 rounded-xl overflow-hidden">
@@ -1986,6 +1996,16 @@ export default function MT5LivePage() {
                               {totalPnL >= 0 ? '+' : ''}{selected.currency} {fmt(totalPnL)}
                             </span>
                           </span>
+                          <label className="text-gray-400 flex items-center gap-1">
+                            Rows
+                            <select
+                              value={histPageSize}
+                              onChange={(e) => { setHistPageSize(Number(e.target.value)); setHistPage(0) }}
+                              className="bg-gray-900 border border-gray-700 rounded px-1.5 py-0.5 text-gray-200 focus:outline-none focus:border-tradebot-accent"
+                            >
+                              {[10, 25, 50, 100].map(n => <option key={n} value={n}>{n}</option>)}
+                            </select>
+                          </label>
                         </>
                       )}
                     </div>
@@ -1994,6 +2014,7 @@ export default function MT5LivePage() {
                   {tradeDeal.length === 0 ? (
                     <div className="p-8 text-center text-gray-500 text-sm">No deal history. Sync the account to load history.</div>
                   ) : (
+                    <>
                     <div className="overflow-x-auto">
                       <table className="w-full text-sm">
                         <thead>
@@ -2011,7 +2032,7 @@ export default function MT5LivePage() {
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-gray-700/20">
-                          {tradeDeal.map(d => {
+                          {pageDeals.map(d => {
                             const net = d.profit + d.commission + d.swap
                             return (
                               <tr key={d.id} className="hover:bg-gray-700/20 transition-colors">
@@ -2047,6 +2068,29 @@ export default function MT5LivePage() {
                         </tbody>
                       </table>
                     </div>
+                    <div className="flex items-center justify-between px-4 py-3 border-t border-gray-700/40 text-xs">
+                      <span className="text-gray-500">
+                        Showing {startRow + 1}&ndash;{Math.min(startRow + histPageSize, tradeDeal.length)} of {tradeDeal.length}
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => setHistPage(Math.max(0, pageIdx - 1))}
+                          disabled={pageIdx === 0}
+                          className="px-2.5 py-1 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1"
+                        >
+                          <ChevronLeft className="w-3.5 h-3.5" /> Back
+                        </button>
+                        <span className="text-gray-400">Page {pageIdx + 1} / {totalPages}</span>
+                        <button
+                          onClick={() => setHistPage(Math.min(totalPages - 1, pageIdx + 1))}
+                          disabled={pageIdx >= totalPages - 1}
+                          className="px-2.5 py-1 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1"
+                        >
+                          Next <ChevronRight className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+                    </>
                   )}
                 </div>
               )

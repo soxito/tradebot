@@ -148,6 +148,20 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "==> Vendoring Kronos model package into $VendorDir\model ..."
+
+# Git is required to vendor the upstream model package. If it isn't on PATH,
+# skip vendoring gracefully (the plugin keeps its heuristic fallback) instead of
+# crashing with a CommandNotFoundException.
+$GitCmd = Get-Command git -ErrorAction SilentlyContinue
+if (-not $GitCmd) {
+    Write-Host "!!  Git not found on PATH - skipping Kronos model vendoring."
+    Write-Host "    Install Git from https://git-scm.com/download/win, reopen PowerShell,"
+    Write-Host "    then re-run this script to enable the real Kronos model."
+    Write-Host "    The heuristic fallback stays active, so the app still runs."
+    Write-Host "==> Done (heuristic fallback). Restart the backend."
+    exit 0
+}
+
 if (-not (Test-Path $VendorDir)) {
     New-Item -ItemType Directory -Path $VendorDir -Force | Out-Null
 }
