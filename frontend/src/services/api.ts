@@ -634,6 +634,10 @@ export const apiClient = {
     getPositions: (accountId: number) => api.get(`/plugins/mt5/accounts/${accountId}/positions`),
     getDeals: (accountId: number, params?: { limit?: number }) =>
       api.get(`/plugins/mt5/accounts/${accountId}/deals`, { params }),
+    syncDeals: (accountId: number, forceToday = true) =>
+      api.post(`/plugins/mt5/accounts/${accountId}/deals/sync`, null, {
+        params: { force_today: forceToday },
+      }),
     placeOrder: (accountId: number, data: any) =>
       api.post(`/plugins/mt5/accounts/${accountId}/orders`, data),
     getRiskOverview: (accountId: number) =>
@@ -717,6 +721,7 @@ export const apiClient = {
         account_id: number; symbol: string; lot_size?: number; auto_lot?: boolean;
         risk_per_trade_pct?: number; max_daily_loss_pct?: number; target_profit_pct?: number;
         recovery_enabled?: boolean; use_ai?: boolean; use_kronos?: boolean; timeframe?: string;
+        strictness?: string; max_open_orders?: number; allowed_direction?: string;
       }) => api.post('/plugins/mt5/scalp/start', data),
       stop: (accountId: number, symbol: string) =>
         api.post('/plugins/mt5/scalp/stop', { account_id: accountId, symbol }),
@@ -730,6 +735,7 @@ export const apiClient = {
         lot_size?: number; auto_lot?: boolean; risk_per_trade_pct?: number;
         max_daily_loss_pct?: number; target_profit_pct?: number;
         recovery_enabled?: boolean; use_ai?: boolean; use_kronos?: boolean;
+        max_open_orders?: number; allowed_direction?: string;
       }) => api.patch(`/plugins/mt5/scalp/update/${sessionId}`, data),
     },
   },

@@ -19,6 +19,7 @@ Standalone plugin service — never imports or mutates core trading logic.
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -28,6 +29,8 @@ from sqlalchemy import select
 from app.core.database import AsyncSessionLocal
 from plugins.MT5TradingPlugin.backend.models import (
     MT5Account,
+    MT5Deal,
+    MT5DealType,
     MT5ScalpSession,
     MT5ScalpSessionStatus,
     MT5ScalpTrade,
@@ -44,6 +47,9 @@ from plugins.MT5TradingPlugin.backend.services.scalp_strategy import (
     PRIMARY_SCALP_TF,
     RECOVERY_DRAWDOWN_ATR,
     DEFAULT_STRICTNESS,
+    VOL_SPIKE_STRONG,
+    get_tf_stack,
+    get_entry_refine_tf,
 )
 from plugins.MT5TradingPlugin.backend.services.smc_strategy import (
     Candle,
@@ -65,6 +71,15 @@ COMMENT_TAG = "ScalpBot"
 # An unfilled pending entry is cancelled and re-analysed after this many seconds
 # so the bot never sits forever on a stale limit level in a fast market.
 PENDING_TTL_SECONDS = 180
+
+# Maximum concurrent open/pending orders per scalp session (configurable via
+# raw_settings["max_open_orders"]).  Default 2 = primary + optional recovery/spike.
+MAX_OPEN_ORDERS_DEFAULT: int = 2
+
+_STRICTNESS_ORDER = ["scalper", "aggressive", "balanced", "conservative"]
+_RR_RE = re.compile(r"rr=([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
+_KRONOS_RE = re.compile(r"kronos=([+-]?[0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
+_VOL_IMB_RE = re.compile(r"vol-imb:([+-]?[0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
 
 # MT5 timeframe → ccxt/exchange timeframe string (exchange fallback)
 _MT5_TF_TO_EX: Dict[str, str] = {
@@ -170,69 +185,299 @@ async def _kronos_direction(candles: List[Candle], symbol: str, timeframe: str) 
 
 async def _ai_gate(symbol: str, side: str, bias_reason: str, confidence: float) -> Dict[str, Any]:
     """
-    Optional AI confirmation via the shared AiMarketAnalyst router.
-    Also fetches economic calendar events (CPI, rates, NFP, etc.) and includes
-    them in the prompt so the AI can flag imminent high-impact news risk.
+    Multi-AI ensemble confirmation gate — queries ALL configured AI providers
+    in PARALLEL and uses majority vote for higher accuracy.
 
-    Returns ``{"decision": "take"|"skip", "note": str}``. Fails open (``take``)
-    if no AI provider is configured.
+    Also integrates:
+    - Jarvis intelligence context (telegram signals, knowledge base)
+    - Previous scalp learnings for self-improvement
+    - Economic calendar events
+
+    Returns ``{"decision": "take"|"skip", "note": str, "votes": dict}``.
+    Fails open (``take``) if no AI provider is configured.
     """
-    try:
-        from plugins.AiMarketAnalyst.backend.services.ai_router import db_chat  # type: ignore
-    except Exception:
-        return {"decision": "take", "note": "ai_unavailable"}
+    # ── Gather Jarvis + telegram + learning context ───────────────────────────
+    jarvis_ctx = await _gather_scalp_intelligence(symbol, side)
 
-    # Fetch economic calendar for this symbol (non-blocking, best-effort)
-    eco_events: List[Dict[str, Any]] = []
+    # ── Fetch economic calendar ───────────────────────────────────────────────
+    eco_context = ""
     try:
         from plugins.MT5TradingPlugin.backend.services.smc_ai import fetch_economic_events  # type: ignore
         eco_events = await fetch_economic_events(symbol)
-    except Exception:
-        pass
-
-    eco_context = ""
-    if eco_events:
-        upcoming = [e for e in eco_events if -2 <= e.get("hours_away", 99) <= 24]
+        upcoming = [e for e in (eco_events or []) if -2 <= e.get("hours_away", 99) <= 24]
         if upcoming:
             eco_context = (
-                "\nUpcoming high-impact economic events: "
+                "\nUpcoming high-impact events: "
                 + ", ".join(
                     f"{e['title']} ({e['currency']}) in {e['hours_away']:.1f}h"
                     + (f" [prev={e['previous']}, fcst={e['forecast']}]"
                        if e.get("previous") or e.get("forecast") else "")
                     for e in upcoming[:4]
-                )
-                + "."
+                ) + "."
             )
+    except Exception:
+        pass
 
     prompt = (
-        f"You are a scalping risk filter. Instrument {symbol}. The engine wants a "
-        f"{side.upper()} pending limit scalp (confidence {confidence:.2f}). "
-        f"Multi-timeframe read: {bias_reason}.{eco_context} "
-        "Reply STRICT JSON only: "
-        '{"decision":"take"|"skip","note":str}. Skip only if there is a STRONG '
-        "reason (e.g. imminent high-impact news within 2h, confirmed opposing "
-        "higher-timeframe trend, extreme overbought/oversold). "
-        "Otherwise default to take — the engine already filters most bad setups."
+        f"You are an elite scalping risk filter. Instrument: {symbol}. "
+        f"The scalp engine wants a {side.upper()} pending limit scalp "
+        f"(confidence {confidence:.2f}).\n"
+        f"Multi-timeframe bias: {bias_reason}.{eco_context}\n"
+        + (f"Market intelligence context:\n{jarvis_ctx}\n" if jarvis_ctx else "")
+        + "Reply STRICT JSON only: "
+        '{"decision":"take"|"skip","note":str}. '
+        "Skip ONLY for: imminent high-impact news (<2h), confirmed opposing HTF trend, "
+        "active telegram signals in OPPOSITE direction for this pair. "
+        "Otherwise DEFAULT to take — the SMC engine already filters most bad setups."
     )
+
+    # ── Ensemble: call ALL providers in parallel ──────────────────────────────
+    return await _ensemble_vote(symbol, side, prompt)
+
+
+async def _gather_scalp_intelligence(symbol: str, side: str) -> str:
+    """
+    Gather context from Jarvis brains + telegram signals + scalp learnings.
+    Returns a compact string for the AI gate prompt.
+    """
+    import os as _os
+    base = "http://127.0.0.1:{}".format(_os.environ.get("BACKEND_PORT", "1448"))
+    parts: List[str] = []
+
+    async with __import__("httpx").AsyncClient(timeout=5.0) as client:
+        # ── 1. Telegram signals for this symbol ────────────────────────────────
+        try:
+            sym_bare = symbol.replace("USD", "").replace("USDT", "").upper()
+            r = await client.get(
+                f"{base}/api/v1/plugins/telegram/signals",
+                params={"limit": 5},
+            )
+            if r.status_code == 200:
+                sigs = r.json() or []
+                # Filter signals for our pair (last 6h)
+                matching = []
+                for s in sigs:
+                    s_sym = (s.get("symbol") or "").upper()
+                    if sym_bare in s_sym or symbol.upper()[:6] in s_sym:
+                        matching.append(s)
+                if matching:
+                    sig_lines = []
+                    for s in matching[:3]:
+                        dir_ = s.get("direction", "?").upper()
+                        chan = s.get("channel_title", "?")
+                        conf = s.get("confidence", 0)
+                        sig_lines.append(f"{chan}: {dir_} conf={conf:.0%}")
+                    parts.append("Telegram signals: " + " | ".join(sig_lines))
+        except Exception:
+            pass
+
+        # ── 2. Obsidian knowledge context for this symbol ─────────────────────
+        try:
+            r = await client.get(f"{base}/api/v1/plugins/obsidian-knowledge/context/{symbol}")
+            if r.status_code == 200:
+                ctx = r.json() or {}
+                summary = ctx.get("summary") or ctx.get("description") or ""
+                if summary and len(summary) > 10:
+                    parts.append(f"Knowledge context: {summary[:200]}")
+        except Exception:
+            pass
+
+        # ── 3. Recent scalp learnings from AI knowledge base ──────────────────
+        try:
+            r = await client.get(
+                f"{base}/api/v1/plugins/ai-analyst/ai/knowledge",
+            )
+            if r.status_code == 200:
+                resp_data = r.json() or {}
+                # API returns either {"items": [...]} or [...] directly
+                knowledge = (
+                    resp_data.get("items", []) if isinstance(resp_data, dict)
+                    else (resp_data if isinstance(resp_data, list) else [])
+                )
+                scalp_learnings = [
+                    k for k in knowledge
+                    if "scalp" in (k.get("kind") or "").lower()
+                    or symbol.upper() in (k.get("title") or "").upper()
+                ]
+                if scalp_learnings:
+                    lessons = []
+                    for k in scalp_learnings[:3]:
+                        content = (k.get("content") or "")[:120]
+                        if content:
+                            lessons.append(content)
+                    if lessons:
+                        parts.append("Past scalp learnings: " + " | ".join(lessons))
+        except Exception:
+            pass
+
+    return "\n".join(parts) if parts else ""
+
+
+async def _ensemble_vote(symbol: str, side: str, prompt: str) -> Dict[str, Any]:
+    """
+    Call ALL enabled AI providers in PARALLEL and use majority vote.
+
+    Returns {"decision": "take"|"skip", "note": str, "votes": {provider: decision}}.
+    Fails open (take) when <2 providers respond.
+    """
     try:
-        async with AsyncSessionLocal() as db:
-            res = await db_chat(
-                db,
-                [{"role": "user", "content": prompt}],
+        from plugins.AiMarketAnalyst.backend.services.ai_router import (
+            get_enabled_providers, _call_openai_compatible,  # type: ignore
+        )
+    except Exception:
+        return {"decision": "take", "note": "ai_router_unavailable", "votes": {}}
+
+    import json as _json
+
+    async with AsyncSessionLocal() as db:
+        providers = await get_enabled_providers(db)
+
+    if not providers:
+        return {"decision": "take", "note": "no_providers", "votes": {}}
+
+    messages = [{"role": "user", "content": prompt}]
+
+    async def _query_one(p: Any) -> tuple[str, str, str]:
+        """Returns (provider_label, decision, note)."""
+        try:
+            content, _usage, _routed = await _call_openai_compatible(
+                base_url=p.base_url,
+                api_key=p.api_key,
+                model=p.default_model or "gpt-4o",
+                messages=messages,
+                temperature=0.1,
+                max_tokens=150,
                 json_mode=True,
             )
-        content = res.get("content") if isinstance(res, dict) else res
-        import json as _json
-        parsed = _json.loads(content) if isinstance(content, str) else content
-        if isinstance(parsed, dict):
-            decision = str(parsed.get("decision", "take")).lower()
-            if decision not in ("take", "skip"):
-                decision = "take"
-            return {"decision": decision, "note": str(parsed.get("note", ""))[:280]}
-    except Exception as exc:  # noqa: BLE001
-        logger.debug(f"[ScalpBot] AI gate {symbol}: {exc}")
-    return {"decision": "take", "note": "ai_error"}
+            parsed = _json.loads(content) if isinstance(content, str) else content
+            if isinstance(parsed, dict):
+                dec = str(parsed.get("decision", "take")).lower()
+                if dec not in ("take", "skip"):
+                    dec = "take"
+                note = str(parsed.get("note", ""))[:200]
+                return p.label, dec, note
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[ScalpBot] ensemble vote {p.label}/{symbol}: {exc}")
+        return p.label, "take", "error_fallback"
+
+    # Fire all providers concurrently with a generous global timeout
+    tasks = [_query_one(p) for p in providers[:9]]  # cap at 9 providers
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=20.0,
+        )
+    except asyncio.TimeoutError:
+        results = []
+
+    votes: Dict[str, str] = {}
+    notes: List[str] = []
+    take_count = 0
+    skip_count = 0
+    for r in results:
+        if isinstance(r, Exception) or not isinstance(r, tuple):
+            continue
+        label, dec, note = r
+        votes[label] = dec
+        if dec == "take":
+            take_count += 1
+        else:
+            skip_count += 1
+            if note:
+                notes.append(f"{label}: {note}")
+
+    total = take_count + skip_count
+    if total < 2:
+        # Not enough responses — fail open
+        return {"decision": "take", "note": f"ensemble_insufficient({total})", "votes": votes}
+
+    # Majority vote: skip only when >50% say skip
+    skip_ratio = skip_count / total
+    final = "skip" if skip_ratio > 0.5 else "take"
+    summary = f"{take_count}✓/{skip_count}✗ of {total} AI models"
+    if final == "skip" and notes:
+        summary += " — " + notes[0]
+
+    logger.info(f"[ScalpBot] ensemble AI {symbol} {side.upper()}: {summary} → {final.upper()}")
+    return {"decision": final, "note": summary, "votes": votes}
+
+
+async def _store_scalp_outcome_to_brain(
+    session_id: int,
+    symbol: str,
+    side: str,
+    entry_price: float,
+    close_price: float,
+    pnl: float,
+    bias_reason: str,
+    confidence: float,
+    strictness: str = "scalper",
+) -> None:
+    """
+    Store a closed scalp trade outcome to ALL knowledge brains for self-improvement:
+    1. Obsidian vault via jarvis-learn endpoint (markdown note in /trades/ folder)
+    2. AI knowledge base (ai-analyst/ai/knowledge) for future AI gate learning
+
+    This drives the self-improvement loop:
+    - Wins teach WHAT to look for (winning signal patterns)
+    - Losses teach WHAT to avoid (false setups, choppy conditions)
+    """
+    import os as _os
+    base = "http://127.0.0.1:{}".format(_os.environ.get("BACKEND_PORT", "1448"))
+
+    outcome = "WIN" if pnl >= 0 else "LOSS"
+    pnl_str = f"{pnl:+.2f}"
+    move_pips = abs(close_price - entry_price) if entry_price > 0 and close_price > 0 else 0.0
+
+    # Compact lesson derived from the trade outcome
+    if pnl >= 0:
+        lesson = (
+            f"✅ {symbol} {side.upper()} SCALP WON {pnl_str}. "
+            f"Signals that worked: {bias_reason[:300]}. "
+            f"Key: price moved {move_pips:.2f} in our favour."
+        )
+    else:
+        lesson = (
+            f"❌ {symbol} {side.upper()} SCALP LOST {pnl_str}. "
+            f"Signals present at entry: {bias_reason[:300]}. "
+            f"Review: these conditions may have been choppy or conflicting."
+        )
+
+    async with __import__("httpx").AsyncClient(timeout=8.0) as client:
+        # ── 1. Jarvis-learn (Obsidian vault) ─────────────────────────────────
+        try:
+            await client.post(
+                f"{base}/api/v1/plugins/obsidian-knowledge/jarvis-learn",
+                json={
+                    "question": f"What happened on this {symbol} scalp trade?",
+                    "answer": lesson,
+                    "tags": ["scalp", symbol.lower(), side, outcome.lower(), strictness],
+                },
+            )
+        except Exception as exc:
+            logger.debug(f"[ScalpBot] jarvis-learn store {symbol}: {exc}")
+
+        # ── 2. AI knowledge base ──────────────────────────────────────────────
+        try:
+            await client.post(
+                f"{base}/api/v1/plugins/ai-analyst/ai/knowledge",
+                json={
+                    "title": f"Scalp {outcome}: {symbol} {side.upper()} session#{session_id}",
+                    "content": lesson,
+                    "kind": "scalp_outcome",
+                    "symbol": symbol,
+                    "weight": 2.0 if abs(pnl) > 1.0 else 1.0,
+                    "source": "scalp_bot",
+                    "agent_role": "scalp_learner",
+                },
+            )
+        except Exception as exc:
+            logger.debug(f"[ScalpBot] knowledge store {symbol}: {exc}")
+
+    logger.info(
+        f"[ScalpBot] 🧠 Trade outcome stored → brain: {symbol} {side.upper()} "
+        f"{outcome} {pnl_str} (session#{session_id})"
+    )
 
 
 def _position_side(p: Dict[str, Any]) -> str:
@@ -264,6 +509,21 @@ def _order_open_price(o: Dict[str, Any]) -> float:
 
 def _match_symbol(a: str, b: str) -> bool:
     return (a or "").upper().replace("/", "") == (b or "").upper().replace("/", "")
+
+
+async def _trigger_jarvis_harvest(base: str) -> None:
+    """
+    Fire a Jarvis intelligence harvest so brains stay fresh with:
+    - Latest telegram signals and news
+    - Recent AI agent decisions
+    - Sentiment data
+    Called every 5 minutes from each scalp loop.
+    """
+    try:
+        async with __import__("httpx").AsyncClient(timeout=10.0) as client:
+            await client.post(f"{base}/api/v1/plugins/ai-analyst/ai/harvest")
+    except Exception as exc:
+        logger.debug(f"[ScalpBot] jarvis harvest trigger: {exc}")
 
 
 # ── Manager ─────────────────────────────────────────────────────────────────────
@@ -323,22 +583,54 @@ class ScalpBotManager:
         return started
 
     async def ensure_resumed(self) -> None:
-        """Idempotently resume ACTIVE sessions once after process startup.
+        """On backend startup: PAUSE any ACTIVE sessions so the user must
+        explicitly click Start to resume.  This prevents silent order placement
+        on a live account after a process restart without user confirmation.
 
         The app uses a ``lifespan`` handler, so router ``on_event("startup")``
-        hooks never fire; instead this is triggered from the frequently-polled
-        scalp status endpoint so loops recover within seconds of the UI loading.
+        hooks never fire; this is triggered from the frequently-polled scalp
+        status endpoint on first load.
         """
         if self._resumed:
             return
         self._resumed = True
         try:
-            n = await self.resume_active_sessions()
+            n = await self._pause_active_on_restart()
             if n:
-                logger.info(f"[ScalpBot] resumed {n} active session(s) after startup")
+                logger.warning(
+                    f"[ScalpBot] {n} session(s) were ACTIVE before restart — "
+                    "PAUSED for safety. User must click Start to resume."
+                )
         except Exception as e:  # noqa: BLE001
             self._resumed = False  # allow a later retry if the first attempt failed
-            logger.warning(f"[ScalpBot] resume_active_sessions failed: {e}")
+            logger.warning(f"[ScalpBot] startup-pause failed: {e}")
+
+    async def _pause_active_on_restart(self) -> int:
+        """Transition ACTIVE-but-not-running sessions to PAUSED on backend restart.
+
+        Only sessions whose asyncio loop is NOT currently running are affected
+        so that sessions started within the same process lifetime are untouched.
+        """
+        paused = 0
+        async with AsyncSessionLocal() as db:
+            rows = await db.execute(
+                select(MT5ScalpSession).where(
+                    MT5ScalpSession.status == MT5ScalpSessionStatus.ACTIVE
+                )
+            )
+            sessions = rows.scalars().all()
+            for s in sessions:
+                if not self.is_running(s.id):
+                    s.status = MT5ScalpSessionStatus.PAUSED
+                    s.phase = "paused"
+                    s.ai_note = (
+                        "⚠️ Paused after backend restart — "
+                        "click Start to resume trading on this session"
+                    )[:1000]
+                    paused += 1
+            if paused:
+                await db.commit()
+        return paused
 
     # -- db helpers ------------------------------------------------------------
 
@@ -361,8 +653,21 @@ class ScalpBotManager:
     # -- main loop -------------------------------------------------------------
 
     async def _run_loop(self, session_id: int) -> None:
+        """Main loop. Triggers a Jarvis intelligence harvest every 5 minutes
+        so the AI gate always has fresh telegram signals, sentiment, and knowledge."""
+        import os as _os
+        _harvest_base = "http://127.0.0.1:{}".format(_os.environ.get("BACKEND_PORT", "1448"))
+        _last_harvest = 0.0
+        _HARVEST_INTERVAL = 300.0  # 5 minutes
         try:
             while True:
+                # ── Periodic Jarvis harvest (refresh brains) ──────────────────
+                import time as _time
+                _now = _time.monotonic()
+                if _now - _last_harvest > _HARVEST_INTERVAL:
+                    _last_harvest = _now
+                    asyncio.ensure_future(_trigger_jarvis_harvest(_harvest_base))
+
                 stop = await self._cycle(session_id)
                 if stop:
                     break
@@ -403,8 +708,22 @@ class ScalpBotManager:
                 "start_equity": session.start_equity,
                 # Strictness preset lives in raw_settings (no dedicated column).
                 "strictness": (
-                    (session.raw_settings or {}).get("strictness", DEFAULT_STRICTNESS)
+                    (session.raw_settings or {}).get(
+                        "adaptive_strictness",
+                        (session.raw_settings or {}).get("strictness", DEFAULT_STRICTNESS),
+                    )
                     if isinstance(session.raw_settings, dict) else DEFAULT_STRICTNESS
+                ),
+                "raw_settings": (session.raw_settings or {}) if isinstance(session.raw_settings, dict) else {},
+                # Max concurrent open+pending orders for this session.
+                "max_open_orders": int(
+                    ((session.raw_settings or {}).get("max_open_orders", MAX_OPEN_ORDERS_DEFAULT))
+                    if isinstance(session.raw_settings, dict) else MAX_OPEN_ORDERS_DEFAULT
+                ),
+                # Direction filter: "buy" = only longs, "sell" = only shorts, "both" = no filter.
+                "allowed_direction": str(
+                    ((session.raw_settings or {}).get("allowed_direction", "both"))
+                    if isinstance(session.raw_settings, dict) else "both"
                 ),
             }
             login, server, password = account.login, account.server, account.password_encrypted
@@ -441,6 +760,20 @@ class ScalpBotManager:
                                        phase="stopped", error=None)
                 return True
 
+        # ── Today-loss analysis + prevention loop ───────────────────────────
+        prevention = await self._analyse_today_and_apply_prevention(
+            session_id=session_id,
+            account_id=int(account.id),
+            symbol=symbol,
+            current_strictness=cfg["strictness"],
+        )
+        cfg["strictness"] = prevention.get("strictness", cfg["strictness"])
+        if prevention.get("cooldown_active"):
+            msg = prevention.get("note", "Protective cooldown active")
+            self._diag(session_id, symbol, f"prevention cooldown :: {msg}")
+            await self._update_phase(session_id, "waiting", note=msg)
+            return False
+
         # ── Live quote first (real-time), then market data ───────────────────
         # The quote mid feeds the live candle buffer, so it must be fetched
         # before candles when the bridge history is stale.
@@ -455,19 +788,22 @@ class ScalpBotManager:
             quote_buffer.record(str(login), symbol, mid)
 
         candles_by_tf: Dict[str, List[Candle]] = {}
-        for tf in ALL_SCALP_TFS:
+        # Fetch only the TFs needed by the selected primary scalp timeframe.
+        session_tfs = get_tf_stack(cfg["timeframe"])
+        for tf in session_tfs:
             candles_by_tf[tf] = await _load_tf_candles(
                 login, server, password, symbol, tf, mid_hint=mid,
             )
-        m5 = candles_by_tf.get(PRIMARY_SCALP_TF) or []
+        primary_tf = cfg["timeframe"]
+        primary_candles = candles_by_tf.get(primary_tf) or []
         if mid <= 0:
-            mid = m5[-1].close if m5 else 0.0
-        if len(m5) < MIN_CANDLES:
+            mid = primary_candles[-1].close if primary_candles else 0.0
+        if len(primary_candles) < MIN_CANDLES:
             self._diag(session_id, symbol,
-                       f"warming-up M5={len(m5)}/{MIN_CANDLES} (live buffer building)")
+                       f"warming-up {primary_tf}={len(primary_candles)}/{MIN_CANDLES}")
             await self._update_phase(
                 session_id, "analyzing",
-                note=f"Building live candles ({len(m5)}/{MIN_CANDLES} M5 bars)")
+                note=f"Building live candles ({len(primary_candles)}/{MIN_CANDLES} {primary_tf} bars)")
             return False
 
         engine = ScalpStrategyEngine(
@@ -476,6 +812,7 @@ class ScalpBotManager:
             auto_lot=cfg["auto_lot"],
             risk_per_trade_pct=cfg["risk_per_trade_pct"],
             strictness=cfg["strictness"],
+            primary_tf=cfg["timeframe"],
         )
 
         # ── Live orders belonging to this session (positions + pending) ──────
@@ -545,7 +882,7 @@ class ScalpBotManager:
         self._diag(
             session_id, symbol,
             f"cycle bal={balance:.2f} eq={equity:.2f} mid={mid:.5f} "
-            f"t1={t1_state} t2={t2_state} combPnL={combined_pnl:+.2f} "
+            f"tf={cfg['timeframe']} t1={t1_state} t2={t2_state} combPnL={combined_pnl:+.2f} "
             f"pos={len(pos_by_ticket)} pend={len(pend_by_ticket)}"
         )
 
@@ -557,7 +894,7 @@ class ScalpBotManager:
             # not merely applied as an afterthought.
             kd = 0.0
             if cfg["use_kronos"]:
-                kd = await _kronos_direction(m5, symbol, PRIMARY_SCALP_TF)
+                kd = await _kronos_direction(primary_candles, symbol, cfg["timeframe"])
 
             entry, bias = engine.analyse(
                 candles_by_tf, mid, balance, bid=bid, ask=ask, kronos_score=kd,
@@ -576,6 +913,47 @@ class ScalpBotManager:
                     await self._update_phase(
                         session_id, "waiting",
                         note=f"Kronos opposes ({kd:+.2f}) — waiting")
+                return False
+
+            # ── Direction filter ─────────────────────────────────────────────
+            # Respect the user's "allowed_direction" setting:
+            #   "buy"  → only take BUY entries
+            #   "sell" → only take SELL entries
+            #   "both" → trade both directions (default)
+            allowed_dir = cfg.get("allowed_direction", "both")
+            if allowed_dir != "both" and entry.side != allowed_dir:
+                self._diag(
+                    session_id, symbol,
+                    f"direction-filter: entry is {entry.side.upper()} but "
+                    f"allowed_direction={allowed_dir.upper()} — skipping"
+                )
+                await self._update_phase(
+                    session_id, "waiting",
+                    note=f"Direction filter: only {allowed_dir.upper()} allowed — "
+                         f"skipped {entry.side.upper()} setup"
+                )
+                return False
+
+            # ── Max-open-orders guard (account-wide for this symbol) ──────────
+            # Count ALL open + pending orders for this symbol on this account
+            # (not just the 2 session tickets) so the cap applies globally.
+            sym_upper = symbol.upper()
+            symbol_orders_count = sum(
+                1 for o in all_orders
+                if (o.get("symbol") or o.get("Symbol") or "").upper().replace("/", "") ==
+                   sym_upper.replace("/", "")
+            )
+            # Also count session-tracked tickets even if not returned yet by get_orders
+            session_tracked = sum([
+                1 if cfg["trade1_ticket"] else 0,
+                1 if cfg["trade2_ticket"] else 0,
+            ])
+            total_open = max(symbol_orders_count, session_tracked)
+            if total_open >= cfg["max_open_orders"]:
+                self._diag(session_id, symbol,
+                           f"max-orders guard: {total_open}/{cfg['max_open_orders']} orders for {symbol} — skipping")
+                await self._update_phase(session_id, "waiting",
+                                         note=f"Max open orders reached ({total_open}/{cfg['max_open_orders']})")
                 return False
 
             # ── Fusion quality gate ──────────────────────────────────────────
@@ -618,6 +996,33 @@ class ScalpBotManager:
                 f"SL{entry.stop_loss} TP{entry.take_profit} {fusion_note}"
             )
             await self._open_trade(session_id, login, server, password, entry, note)
+
+            # ── Volume spike stacking ────────────────────────────────────────
+            # When directional volume imbalance is a strong spike AND there is
+            # still an order slot available, place a second continuation order
+            # at a wider entry to capitalise on extended momentum.
+            spike_side = entry.side
+            spike_imb = bias.volume_imbalance
+            spike_detected = (
+                (spike_side == "sell" and spike_imb <= -VOL_SPIKE_STRONG)
+                or (spike_side == "buy"  and spike_imb >= VOL_SPIKE_STRONG)
+            )
+            if spike_detected and (cfg["max_open_orders"] >= 2) and not cfg["trade2_ticket"] and total_open + 1 < cfg["max_open_orders"]:
+                stack = engine.build_spike_stack_entry(
+                    side=spike_side, current_price=mid,
+                    candles_by_tf=candles_by_tf, balance=balance,
+                    bias=bias, bid=bid, ask=ask,
+                )
+                if stack:
+                    self._diag(
+                        session_id, symbol,
+                        f"SPIKE-STACK {stack.order_type} {stack.lot}@{stack.entry} "
+                        f"SL{stack.stop_loss} TP{stack.take_profit} imb={spike_imb:+.2f}"
+                    )
+                    await self._open_trade(
+                        session_id, login, server, password, stack,
+                        f"Spike stack — imb={spike_imb:+.2f}", recovery=False,
+                    )
             return False
 
         # ── There is an active primary leg (pending or filled) ───────────────
@@ -685,7 +1090,8 @@ class ScalpBotManager:
 
         # Arm the recovery leg when the filled trade is meaningfully offside.
         if cfg["recovery_enabled"] and mid > 0 and p1_open > 0:
-            atr_m5 = _atr(m5)
+            _m5_candles = candles_by_tf.get(primary_tf) or []
+            atr_m5 = _atr(_m5_candles)
             offside = (p1_open - mid) if p1_side == "buy" else (mid - p1_open)
             if atr_m5 > 0 and offside >= RECOVERY_DRAWDOWN_ATR * atr_m5 and p1_profit < 0:
                 recovery = engine.build_recovery(
@@ -968,6 +1374,12 @@ class ScalpBotManager:
             session = await db.get(MT5ScalpSession, session_id)
             if not session:
                 return
+            brain_records_close: List[Dict[str, Any]] = []
+            sym_close = session.symbol or "UNKNOWN"
+            close_strictness = (
+                (session.raw_settings or {}).get("strictness", "scalper")
+                if isinstance(session.raw_settings, dict) else "scalper"
+            )
             for tk in tickets:
                 rows = await db.execute(
                     select(MT5ScalpTrade).where(
@@ -981,6 +1393,15 @@ class ScalpBotManager:
                     tr.close_price = price_by_ticket.get(int(tk)) or tr.entry_price
                     tr.pnl = pnl_by_ticket.get(int(tk), 0.0)
                     tr.closed_at = datetime.utcnow()
+                    if int(tk) in pnl_by_ticket:
+                        brain_records_close.append({
+                            "side": tr.side or "buy",
+                            "entry": float(tr.entry_price or 0.0),
+                            "close": float(tr.close_price or 0.0),
+                            "pnl": tr.pnl,
+                            "confidence": float(tr.confidence or 0.0),
+                            "bias_reason": tr.reason or "",
+                        })
             if record:
                 session.session_pnl = (session.session_pnl or 0.0) + realised
                 if realised >= 0:
@@ -994,6 +1415,22 @@ class ScalpBotManager:
         # Purge trailing SL state for all closed tickets.
         for tk in tickets:
             self._trailing_sl.pop((session_id, tk), None)
+        # Store outcomes to brains (fire-and-forget)
+        if record:
+            for rec in brain_records_close:
+                asyncio.ensure_future(
+                    _store_scalp_outcome_to_brain(
+                        session_id=session_id,
+                        symbol=sym_close,
+                        side=rec["side"],
+                        entry_price=rec["entry"],
+                        close_price=rec["close"],
+                        pnl=rec["pnl"],
+                        bias_reason=rec["bias_reason"],
+                        confidence=rec["confidence"],
+                        strictness=close_strictness,
+                    )
+                )
 
     async def _reconcile_gone(
         self,
@@ -1049,10 +1486,18 @@ class ScalpBotManager:
         realised = sum(pnl_by_ticket.get(tk, 0.0) for tk in tickets)
         has_pnl = bool(pnl_by_ticket)   # True when we got actual deal data
 
+        # Snapshot trade data before committing (for brain storage below)
+        brain_records: List[Dict[str, Any]] = []
+
         async with AsyncSessionLocal() as db:
             session = await db.get(MT5ScalpSession, session_id)
             if not session:
                 return
+            sym = session.symbol or "UNKNOWN"
+            sess_strictness = (
+                (session.raw_settings or {}).get("strictness", "scalper")
+                if isinstance(session.raw_settings, dict) else "scalper"
+            )
             for tk in tickets:
                 rows = await db.execute(
                     select(MT5ScalpTrade).where(
@@ -1068,6 +1513,16 @@ class ScalpBotManager:
                         tr.pnl = pnl_by_ticket[tk]
                     if close_price_by_ticket.get(tk, 0.0) > 0:
                         tr.close_price = close_price_by_ticket[tk]
+                    # Capture for brain storage (while session is still available)
+                    if tk in pnl_by_ticket:
+                        brain_records.append({
+                            "side": tr.side or "buy",
+                            "entry": float(tr.entry_price or 0.0),
+                            "close": close_price_by_ticket.get(tk, 0.0),
+                            "pnl": pnl_by_ticket[tk],
+                            "confidence": float(tr.confidence or 0.0),
+                            "bias_reason": tr.reason or "",
+                        })
                 if session.trade1_ticket == tk:
                     session.trade1_ticket = None
                 if session.trade2_ticket == tk:
@@ -1085,6 +1540,24 @@ class ScalpBotManager:
                 session.phase = "analyzing"
             session.last_cycle_at = datetime.utcnow()
             await db.commit()
+
+        # ── Store closed trade outcomes to knowledge brains ───────────────────
+        # Fire-and-forget: never block the main cycle on brain storage
+        for rec in brain_records:
+            asyncio.ensure_future(
+                _store_scalp_outcome_to_brain(
+                    session_id=session_id,
+                    symbol=sym,
+                    side=rec["side"],
+                    entry_price=rec["entry"],
+                    close_price=rec["close"],
+                    pnl=rec["pnl"],
+                    bias_reason=rec["bias_reason"],
+                    confidence=rec["confidence"],
+                    strictness=sess_strictness,
+                )
+            )
+
         # Purge trailing SL state for reconciled tickets so a future trade
         # re-using the same ticket number starts fresh.
         for tk in tickets:
@@ -1160,6 +1633,196 @@ class ScalpBotManager:
             s.phase = phase
             s.last_cycle_at = datetime.utcnow()
             await db.commit()
+
+    # -- adaptive prevention --------------------------------------------------
+
+    def _tighten_strictness(self, strictness: str) -> str:
+        cur = (strictness or DEFAULT_STRICTNESS).lower()
+        if cur not in _STRICTNESS_ORDER:
+            cur = DEFAULT_STRICTNESS
+        idx = _STRICTNESS_ORDER.index(cur)
+        return _STRICTNESS_ORDER[min(idx + 1, len(_STRICTNESS_ORDER) - 1)]
+
+    def _parse_reason_metrics(self, reason: str) -> Dict[str, float]:
+        text = reason or ""
+        out: Dict[str, float] = {}
+        m_rr = _RR_RE.search(text)
+        m_k = _KRONOS_RE.search(text)
+        m_v = _VOL_IMB_RE.search(text)
+        if m_rr:
+            out["rr"] = float(m_rr.group(1))
+        if m_k:
+            out["kronos"] = float(m_k.group(1))
+        if m_v:
+            out["vol_imb"] = float(m_v.group(1))
+        return out
+
+    async def _analyse_today_and_apply_prevention(
+        self,
+        session_id: int,
+        account_id: int,
+        symbol: str,
+        current_strictness: str,
+    ) -> Dict[str, Any]:
+        """Analyse today's filled outcomes and apply strictness/cooldown safeguards.
+
+        The goal is to prevent repeated low-quality entries after a loss streak by:
+        1) classifying loss causes from today, 2) tightening strictness one notch,
+        3) activating a temporary cooldown when mistake density is high.
+        """
+        now = datetime.utcnow()
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        async with AsyncSessionLocal() as db:
+            session = await db.get(MT5ScalpSession, session_id)
+            if not session:
+                return {"strictness": current_strictness, "cooldown_active": False}
+
+            raw = (session.raw_settings or {}) if isinstance(session.raw_settings, dict) else {}
+            today_str = day_start.date().isoformat()
+
+            # ── Day-start reset ──────────────────────────────────────────────
+            # Wipe adaptive overrides at the start of each new trading day so
+            # yesterday's losses do not permanently elevate strictness.
+            last_reset = raw.get("last_reset_date")
+            if last_reset != today_str:
+                base_strict = raw.get("strictness", DEFAULT_STRICTNESS) or DEFAULT_STRICTNESS
+                raw["adaptive_strictness"] = base_strict
+                raw["adaptive_cooldown_until"] = None
+                raw["last_triggered_date"] = None
+                raw["last_reset_date"] = today_str
+                session.raw_settings = raw
+                await db.commit()
+
+            cooldown_until = None
+            cooldown_txt = raw.get("adaptive_cooldown_until")
+            if isinstance(cooldown_txt, str):
+                try:
+                    cooldown_until = datetime.fromisoformat(cooldown_txt)
+                except ValueError:
+                    cooldown_until = None
+
+            # Active cooldown → keep it, do not re-arm each cycle.
+            if cooldown_until and cooldown_until > now:
+                strict = str(raw.get("adaptive_strictness", current_strictness) or current_strictness)
+                mins = int((cooldown_until - now).total_seconds() // 60)
+                return {
+                    "strictness": strict,
+                    "cooldown_active": True,
+                    "note": f"Protective cooldown ({mins}m left) after repeated mistakes",
+                }
+
+            rows = await db.execute(
+                select(MT5ScalpTrade).where(
+                    MT5ScalpTrade.session_id == session_id,
+                    MT5ScalpTrade.status == "closed",
+                    MT5ScalpTrade.closed_at >= day_start,
+                )
+            )
+            closed_today = rows.scalars().all()
+            losses = [t for t in closed_today if float(t.pnl or 0.0) < 0.0]
+
+            # Also inspect today's filled live-account deals for this symbol.
+            deal_rows = await db.execute(
+                select(MT5Deal).where(
+                    MT5Deal.account_id == account_id,
+                    MT5Deal.symbol == symbol,
+                    MT5Deal.mt5_time >= day_start,
+                    MT5Deal.deal_type.in_([MT5DealType.BUY, MT5DealType.SELL]),
+                )
+            )
+            deal_items = deal_rows.scalars().all()
+            deal_losses = [d for d in deal_items if float(d.profit or 0.0) < 0.0]
+
+            mistake_counts = {
+                "volume_opposition": 0,
+                "weak_confidence": 0,
+                "weak_rr": 0,
+                "kronos_opposition": 0,
+            }
+
+            for tr in losses:
+                side = (tr.side or "").lower()
+                metrics = self._parse_reason_metrics(tr.reason or "")
+                if float(tr.confidence or 0.0) < 0.60:
+                    mistake_counts["weak_confidence"] += 1
+                rr = metrics.get("rr")
+                if rr is not None and rr < 1.5:
+                    mistake_counts["weak_rr"] += 1
+                kronos = metrics.get("kronos")
+                if kronos is not None:
+                    if (side == "buy" and kronos < -0.2) or (side == "sell" and kronos > 0.2):
+                        mistake_counts["kronos_opposition"] += 1
+                imb = metrics.get("vol_imb")
+                if imb is not None:
+                    if (side == "buy" and imb < 0) or (side == "sell" and imb > 0):
+                        mistake_counts["volume_opposition"] += 1
+
+            total_closed = len(closed_today)
+            total_losses = len(losses)
+            loss_ratio = (total_losses / total_closed) if total_closed else 0.0
+
+            # Only trigger once per day — guard against re-arming every cycle.
+            already_triggered_today = (raw.get("last_triggered_date") == today_str)
+
+            trigger_guard = (
+                not already_triggered_today
+                and total_closed >= 3
+                and total_losses >= 2
+                and (
+                    loss_ratio >= 0.60
+                    or mistake_counts["volume_opposition"] >= 1
+                    or mistake_counts["weak_confidence"] >= 2
+                    or len(deal_losses) >= 3
+                )
+            )
+            severe = (
+                loss_ratio >= 0.75
+                or total_losses >= 3
+                or mistake_counts["volume_opposition"] >= 2
+                or len(deal_losses) >= 4
+            )
+
+            new_strictness = str(raw.get("adaptive_strictness", current_strictness) or current_strictness)
+            if trigger_guard:
+                new_strictness = self._tighten_strictness(new_strictness)
+
+            # Persist diagnostics every cycle for traceability.
+            raw["today_mistakes"] = {
+                "closed_trades": total_closed,
+                "losses": total_losses,
+                "loss_ratio": round(loss_ratio, 3),
+                "deal_losses": len(deal_losses),
+                **mistake_counts,
+                "scanned_at": now.isoformat(),
+            }
+            raw["adaptive_strictness"] = new_strictness
+
+            cooldown_active = False
+            note = ""
+            if trigger_guard:
+                minutes = 20 if severe else 10
+                cool_until = now + timedelta(minutes=minutes)
+                raw["adaptive_cooldown_until"] = cool_until.isoformat()
+                raw["last_triggered_date"] = today_str
+                raw["last_prevention_reason"] = (
+                    f"loss_ratio={loss_ratio:.2f}, vol_opp={mistake_counts['volume_opposition']}, "
+                    f"weak_conf={mistake_counts['weak_confidence']}"
+                )
+                cooldown_active = True
+                note = (
+                    f"Protection active: tightened to {new_strictness}, cooling down {minutes}m "
+                    f"(losses {total_losses}/{total_closed} today)"
+                )
+
+            session.raw_settings = raw
+            await db.commit()
+
+        return {
+            "strictness": new_strictness,
+            "cooldown_active": cooldown_active,
+            "note": note,
+        }
 
 
 # Singleton

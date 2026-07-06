@@ -508,8 +508,12 @@ class ScalpStartRequest(BaseModel):
     use_kronos: bool = Field(default=True)
     timeframe: str = Field(default="M5", pattern=r"^(M1|M5|M15|M30|H1)$")
     # Entry selectivity — stricter presets trade less but demand stronger
-    # confluence + reward:risk, minimising losing trades.
-    strictness: str = Field(default="balanced", pattern=r"^(conservative|balanced|aggressive)$")
+    # confluence + reward:risk, minimising losing trades. "scalper" is the
+    # most aggressive preset for fast/volatile markets (XAUUSD, BTCUSD, major FX).
+    strictness: str = Field(default="balanced", pattern=r"^(conservative|balanced|aggressive|scalper)$")
+    max_open_orders: int = Field(default=2, ge=1, le=10)
+    # Direction restriction — "buy" only buys, "sell" only sells, "both" trades both.
+    allowed_direction: str = Field(default="both", pattern=r"^(buy|sell|both)$")
 
 
 class ScalpStopRequest(BaseModel):
@@ -547,6 +551,8 @@ class ScalpStatusResponse(BaseModel):
     use_kronos: bool
     timeframe: str
     strictness: str = "balanced"
+    max_open_orders: int = 2
+    allowed_direction: str = "both"
     bias_direction: Optional[str] = None
     bias_confidence: float = 0.0
     session_pnl: float = 0.0
@@ -571,7 +577,9 @@ class ScalpUpdateRequest(BaseModel):
     recovery_enabled: Optional[bool] = None
     use_ai: Optional[bool] = None
     use_kronos: Optional[bool] = None
-    strictness: Optional[str] = Field(default=None, pattern=r"^(conservative|balanced|aggressive)$")
+    strictness: Optional[str] = Field(default=None, pattern=r"^(conservative|balanced|aggressive|scalper)$")
+    max_open_orders: Optional[int] = Field(default=None, ge=1, le=10)
+    allowed_direction: Optional[str] = Field(default=None, pattern=r"^(buy|sell|both)$")
 
 
 class ScalpSymbolResult(BaseModel):

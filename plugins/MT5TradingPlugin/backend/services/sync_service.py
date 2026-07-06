@@ -130,8 +130,11 @@ class MT5SyncService:
             # upsert-only, so a history hiccup never fails the main sync. Without
             # this the deals table stays empty and Trade History shows nothing,
             # because the view flow only calls sync_account (not sync_deals).
+            # Use a 30-day window — large enough to recover from multi-day gaps,
+            # fast enough to avoid broker-API timeouts that the 90-day window hit.
             try:
-                await MT5SyncService.sync_deals(db, account)
+                thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+                await MT5SyncService.sync_deals(db, account, date_from=thirty_days_ago)
             except Exception as e:  # noqa: BLE001 - never block the primary sync
                 logger.warning(f"[MT5Sync] {account.login} deal-history sync skipped: {e}")
 
@@ -151,10 +154,19 @@ class MT5SyncService:
     async def sync_deals(
         db: AsyncSession, account: MT5Account,
         date_from=None, date_to=None,
+        force_today: bool = False,
     ) -> int:
-        """Upsert deal history from OrderHistory (never delete old records)."""
+        """Upsert deal history from OrderHistory (never delete old records).
+
+        ``force_today=True`` fetches only the last 24 hours and updates deals
+        even if they already exist (used by the on-load auto-sync to recover
+        deals that landed in the DB with a zero/null timestamp).
+        """
         try:
             password = account.password_encrypted
+            if force_today:
+                date_from = datetime.utcnow() - timedelta(hours=24)
+                date_to   = datetime.utcnow()
             deals_data = await mt5_client.get_deals(
                 account.login, account.server, password, date_from, date_to
             )
@@ -166,7 +178,10 @@ class MT5SyncService:
             new_count = 0
             for d in deals_data:
                 ticket = int(d.get("ticket", 0))
-                if ticket in seen:
+                # Skip deals with no ticket — they cannot be uniquely identified
+                if ticket == 0:
+                    continue
+                if ticket in seen and not force_today:
                     continue
 
                 # Map type int → MT5DealType

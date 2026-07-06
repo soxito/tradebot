@@ -534,6 +534,8 @@ export default function MT5LivePage() {
   // Trade History pagination (client-side over the fetched closed deals).
   const [histPageSize, setHistPageSize] = useState(25)   // rows per page: 10/25/50/100
   const [histPage, setHistPage]         = useState(0)    // 0-indexed page
+  const [histSyncing, setHistSyncing]   = useState(false)
+  const [histSyncedAt, setHistSyncedAt] = useState<Date | null>(null)
   const [loading, setLoading]           = useState(false)
   const [syncing, setSyncing]           = useState(false)
   const [error, setError]               = useState<string | null>(null)
@@ -589,6 +591,9 @@ export default function MT5LivePage() {
   const [positionSuggestions, setPositionSuggestions] = useState<Record<number, PositionSuggestion>>({})
   const [analyzingPositions, setAnalyzingPositions] = useState(false)
   const [applyingAll, setApplyingAll]               = useState(false)
+  // Tracks the last account id for which we ran the one-time 24h history load
+  // so we don't repeat it on every 8s poll (only on initial account selection).
+  const initialSyncDoneRef = useRef<number | null>(null)
 
   // ── Fetch accounts ────────────────────────────────────────────────────────────
 
@@ -619,6 +624,12 @@ export default function MT5LivePage() {
       try {
         await apiClient.mt5.syncAccount(selectedId)
       } catch { /* non-fatal — fall back to cached data */ }
+      // Explicitly sync last 24h of deals on every cycle so new closed trades
+      // always appear. force_today=true re-upserts 24h even for existing tickets,
+      // recovering deals that landed in DB with null/zero timestamps.
+      try {
+        await apiClient.mt5.syncDeals(selectedId, true)
+      } catch { /* non-fatal — show whatever is in DB */ }
       const [posRes, ordRes, dealRes] = await Promise.all([
         apiClient.mt5.getPositions(selectedId),
         apiClient.mt5.getOrders(selectedId),
@@ -647,6 +658,34 @@ export default function MT5LivePage() {
   useEffect(() => { fetchAccountData() }, [fetchAccountData])
   // Reset Trade History to the first page when switching accounts.
   useEffect(() => { setHistPage(0) }, [selectedId])
+
+  // ── One-time 24h history sync on initial account selection ────────────────
+  // Shows a visible "Syncing last 24h…" indicator so the user knows trade
+  // history is loading.  Runs once per selectedId change, not on every poll.
+  useEffect(() => {
+    if (!selectedId || initialSyncDoneRef.current === selectedId) return
+    initialSyncDoneRef.current = selectedId
+    let cancelled = false
+
+    const run = async () => {
+      setHistSyncing(true)
+      try {
+        await apiClient.mt5.syncDeals(selectedId, true)
+        if (cancelled) return
+        const dealRes = await apiClient.mt5.getDeals(selectedId, { limit: 500 })
+        if (cancelled) return
+        setDeals(dealRes.data)
+        setHistSyncedAt(new Date())
+      } catch {
+        /* non-fatal — polling will recover deals on next cycle */
+      } finally {
+        if (!cancelled) setHistSyncing(false)
+      }
+    }
+
+    run()
+    return () => { cancelled = true }
+  }, [selectedId])
 
   // Split polling: slow full sync (8s) + fast positions-only (2.5s). Both pause
   // while the tab is hidden to save CPU/network, and resume + refresh on return.
@@ -1699,6 +1738,7 @@ export default function MT5LivePage() {
                   <MT5ScalpBotPanel
                     key={selected.id}
                     accountId={selected.id}
+                    accountType={selected.account_type}
                     serverSymbolDefault={getDefaultSymbol(selected.server)}
                     chartSymbol={chartSymbol}
                     onSymbolChange={s => {
@@ -2031,7 +2071,34 @@ export default function MT5LivePage() {
                       Trade History
                       <span className="text-xs text-gray-400">({tradeDeal.length} deals)</span>
                     </div>
-                    <div className="flex items-center gap-4 text-xs">
+                    <div className="flex items-center gap-3 text-xs flex-wrap">
+                      {/* Manual sync button — re-fetches today's deals from broker */}
+                      <button
+                        onClick={async () => {
+                          if (!selectedId || histSyncing) return
+                          setHistSyncing(true)
+                          try {
+                            await apiClient.mt5.syncDeals(selectedId, true)
+                            const dealRes = await apiClient.mt5.getDeals(selectedId, { limit: 500 })
+                            setDeals(dealRes.data)
+                            setHistSyncedAt(new Date())
+                          } catch { /* non-fatal */ }
+                          finally { setHistSyncing(false) }
+                        }}
+                        disabled={histSyncing || !selectedId}
+                        className="flex items-center gap-1 px-2.5 py-1 rounded-md border border-gray-700 text-gray-400 hover:border-tradebot-accent/60 hover:text-white transition disabled:opacity-40"
+                        title="Fetch today's closed trades from broker"
+                      >
+                        {histSyncing
+                          ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          : <RefreshCw className="w-3.5 h-3.5" />}
+                        {histSyncing ? 'Syncing…' : 'Sync history'}
+                      </button>
+                      {histSyncedAt && (
+                        <span className="text-gray-500 text-[11px]">
+                          synced {histSyncedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        </span>
+                      )}
                       {tradeDeal.length > 0 && (
                         <>
                           <span className="text-gray-400">

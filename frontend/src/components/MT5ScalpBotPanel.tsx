@@ -47,6 +47,9 @@ interface ScalpStatus {
   use_ai: boolean
   use_kronos: boolean
   timeframe: string
+  strictness: string
+  max_open_orders: number
+  allowed_direction: string
   bias_direction: string | null
   bias_confidence: number
   session_pnl: number
@@ -84,14 +87,18 @@ interface Props {
   chartSymbol?: string
   /** Fired when user picks a symbol so the chart can sync. */
   onSymbolChange?: (symbol: string) => void
+  /** Account type — used to warn before launching on live accounts. */
+  accountType?: string
 }
 
 const PHASE_LABEL: Record<string, string> = {
   analyzing: 'ANALYZING',
   waiting: 'WAITING',
   in_trade: 'IN TRADE',
+  entry_pending: 'ENTRY PENDING',
   recovery: 'RECOVERY',
   stopped: 'STOPPED',
+  paused: 'PAUSED',
   error: 'ERROR',
 }
 
@@ -99,8 +106,10 @@ const PHASE_COLOR: Record<string, string> = {
   analyzing: 'text-blue-400 bg-blue-500/15',
   waiting: 'text-amber-400 bg-amber-500/15',
   in_trade: 'text-green-400 bg-green-500/15',
+  entry_pending: 'text-cyan-400 bg-cyan-500/15',
   recovery: 'text-orange-400 bg-orange-500/15',
   stopped: 'text-gray-400 bg-gray-500/15',
+  paused: 'text-yellow-400 bg-yellow-500/15',
   error: 'text-red-400 bg-red-500/15',
 }
 
@@ -110,7 +119,36 @@ function pnlColor(v: number): string {
   return 'text-gray-300'
 }
 
-export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault, chartSymbol, onSymbolChange }: Props) {
+// ── All supported forex and commodity pairs for scalping ───────────────────
+const PAIR_GROUPS = {
+  '🥇 Commodities':  ['XAUUSD', 'XAGUSD', 'USOIL', 'UKOIL'],
+  '💱 Forex Majors': ['EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 'USDCAD', 'NZDUSD'],
+  '🔀 Forex Minors': [
+    'EURGBP', 'EURJPY', 'EURCAD', 'EURCHF', 'EURAUD', 'EURNZD',
+    'GBPJPY', 'GBPAUD', 'GBPCAD', 'GBPCHF', 'GBPNZD',
+    'AUDJPY', 'AUDCAD', 'AUDCHF', 'AUDNZD', 'CADJPY', 'CHFJPY', 'NZDJPY',
+  ],
+  '₿ Crypto':        ['BTCUSD', 'ETHUSD'],
+}
+const ALL_ACTIVE_PAIRS = Object.values(PAIR_GROUPS).flat()
+
+// ── Scalp bot recommended defaults ─────────────────────────────────────────
+// M5 is empirically the best timeframe for scalping: enough structure for
+// clean entry signals while still being fast enough to capture intraday moves.
+const SCALP_DEFAULTS = {
+  lotSize:          0.01  as number,
+  autoLot:          false as boolean,
+  maxDailyLoss:     3     as number,
+  targetProfit:     1.5   as number,
+  recovery:         true  as boolean,
+  useAi:            true  as boolean,
+  useKronos:        true  as boolean,
+  maxOpenOrders:    2     as number,
+  scalpTf:          'M5'  as 'M1' | 'M5' | 'M15' | 'M30' | 'H1',
+  allowedDirection: 'both' as 'buy' | 'sell' | 'both',
+}
+
+export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault, chartSymbol, onSymbolChange, accountType }: Props) {
   const [symbol, setSymbol] = useState(chartSymbol || serverSymbolDefault || 'XAUUSD')
   const [query, setQuery] = useState('')
   const [results, setResults] = useState<{ symbol: string; description: string | null }[]>([])
@@ -118,21 +156,32 @@ export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault, chart
   const [showResults, setShowResults] = useState(false)
 
   // Settings
-  const [lotSize, setLotSize] = useState(0.01)
-  const [autoLot, setAutoLot] = useState(false)
-  const [maxDailyLoss, setMaxDailyLoss] = useState(3)
-  const [targetProfit, setTargetProfit] = useState(1.5)
-  const [recovery, setRecovery] = useState(true)
-  const [useAi, setUseAi] = useState(true)
-  const [useKronos, setUseKronos] = useState(true)
+  const [lotSize, setLotSize] = useState(SCALP_DEFAULTS.lotSize)
+  const [autoLot, setAutoLot] = useState(SCALP_DEFAULTS.autoLot)
+  const [maxDailyLoss, setMaxDailyLoss] = useState(SCALP_DEFAULTS.maxDailyLoss)
+  const [targetProfit, setTargetProfit] = useState(SCALP_DEFAULTS.targetProfit)
+  const [recovery, setRecovery] = useState(SCALP_DEFAULTS.recovery)
+  const [useAi, setUseAi] = useState(SCALP_DEFAULTS.useAi)
+  const [useKronos, setUseKronos] = useState(SCALP_DEFAULTS.useKronos)
+  const [maxOpenOrders, setMaxOpenOrders] = useState(SCALP_DEFAULTS.maxOpenOrders)
+  const [allowedDirection, setAllowedDirection] = useState<'buy' | 'sell' | 'both'>(SCALP_DEFAULTS.allowedDirection)
+  const [scalpTf, setScalpTf] = useState<'M1' | 'M5' | 'M15' | 'M30' | 'H1'>(SCALP_DEFAULTS.scalpTf)
   const [showSettings, setShowSettings] = useState(false)
 
   const [session, setSession] = useState<ScalpStatus | null>(null)
+  const [allSessions, setAllSessions] = useState<ScalpStatus[]>([])   // ALL active sessions for this account
   const [trades, setTrades] = useState<ScalpTradeRow[]>([])
   const [busy, setBusy] = useState(false)
+  const [busySymbol, setBusySymbol] = useState<string | null>(null)   // which symbol is being started/stopped
   const [applying, setApplying] = useState(false)
   const [applySuccess, setApplySuccess] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [launchingPairs, setLaunchingPairs] = useState(false)   // launching pair bundle
+  const [showPairPicker, setShowPairPicker] = useState(false)   // pair-picker panel open
+  const [pairSearchQuery, setPairSearchQuery] = useState('')    // filter inside pair picker
+  const [selectedPairs, setSelectedPairs] = useState<Set<string>>(  // user-selected pairs
+    () => new Set(['XAUUSD', 'GBPUSD', 'EURUSD'])               // default 3 popular pairs
+  )
 
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Tracks which session id we last synced settings from so we don't
@@ -152,6 +201,8 @@ export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault, chart
     try {
       const res = await apiClient.mt5.scalp.status(accountId)
       const list: ScalpStatus[] = res.data || []
+      // Store ALL sessions for the multi-pair dashboard.
+      setAllSessions(list)
       const match = list.find(s => s.symbol.toUpperCase() === symbol.toUpperCase()) || null
       setSession(prev => {
         if (!match) syncedSessionId.current = null
@@ -187,6 +238,9 @@ export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault, chart
       setRecovery(session.recovery_enabled)
       setUseAi(session.use_ai)
       setUseKronos(session.use_kronos)
+      setMaxOpenOrders(session.max_open_orders ?? 2)
+      setAllowedDirection((session.allowed_direction as any) || 'both')
+      setScalpTf((session.timeframe as any) || 'M5')
       setSymbol(session.symbol)
       // also tell chart to sync
       if (session.symbol && session.symbol !== symbol) {
@@ -219,7 +273,7 @@ export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault, chart
 
   const handleActivate = async () => {
     if (!symbol.trim()) return
-    setBusy(true); setError(null)
+    setBusy(true); setBusySymbol(symbol); setError(null)
     try {
       await apiClient.mt5.scalp.start({
         account_id: accountId,
@@ -231,27 +285,96 @@ export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault, chart
         recovery_enabled: recovery,
         use_ai: useAi,
         use_kronos: useKronos,
-        timeframe: 'M5',
+        timeframe: scalpTf,
+        max_open_orders: maxOpenOrders,
+        strictness: 'scalper',
+        allowed_direction: allowedDirection,
       })
       await refreshStatus()
     } catch (e: any) {
       setError(e?.response?.data?.detail || e?.message || 'Failed to start scalp bot')
     } finally {
-      setBusy(false)
+      setBusy(false); setBusySymbol(null)
     }
   }
 
   const handleStop = async () => {
-    setBusy(true); setError(null)
+    setBusy(true); setBusySymbol(symbol); setError(null)
     try {
       await apiClient.mt5.scalp.stop(accountId, symbol.trim().toUpperCase())
       await refreshStatus()
     } catch (e: any) {
       setError(e?.response?.data?.detail || e?.message || 'Failed to stop scalp bot')
     } finally {
-      setBusy(false)
+      setBusy(false); setBusySymbol(null)
     }
   }
+
+  // Stop a specific pair from the multi-session dashboard
+  const handleStopSymbol = async (sym: string) => {
+    setBusySymbol(sym); setError(null)
+    try {
+      await apiClient.mt5.scalp.stop(accountId, sym)
+      await refreshStatus()
+    } catch (e: any) {
+      setError(e?.response?.data?.detail || e?.message || `Failed to stop ${sym}`)
+    } finally {
+      setBusySymbol(null)
+    }
+  }
+
+  // Launch only the user-selected pairs
+  const handleLaunchSelected = async () => {
+    const activePairs = allSessions.filter(s => s.status === 'active').map(s => s.symbol)
+    const pairsToLaunch = [...selectedPairs].filter(p => !activePairs.includes(p))
+
+    if (pairsToLaunch.length === 0) {
+      setError('All selected pairs are already running — choose different pairs')
+      return
+    }
+
+    // Confirm on live/prop accounts
+    if (accountType === 'live' || accountType === 'prop') {
+      const confirmed = window.confirm(
+        `⚠️ LIVE ACCOUNT WARNING\n\nStart ${pairsToLaunch.length} scalp bot(s) on a LIVE account:\n${pairsToLaunch.join(', ')}\n\nAccount: ${accountType.toUpperCase()}\n\nContinue?`
+      )
+      if (!confirmed) return
+    }
+
+    setLaunchingPairs(true); setError(null)
+    const payload = {
+      account_id: accountId,
+      lot_size: lotSize,
+      auto_lot: autoLot,
+      max_daily_loss_pct: maxDailyLoss,
+      target_profit_pct: targetProfit,
+      recovery_enabled: recovery,
+      use_ai: useAi,
+      use_kronos: useKronos,
+      timeframe: scalpTf,
+      max_open_orders: maxOpenOrders,
+      strictness: 'scalper' as const,
+      allowed_direction: allowedDirection,
+    }
+    try {
+      await Promise.allSettled(
+        pairsToLaunch.map(sym => apiClient.mt5.scalp.start({ ...payload, symbol: sym }))
+      )
+      // Switch chart to first selected pair
+      const first = pairsToLaunch[0]
+      setSymbol(first); onSymbolChange?.(first)
+      setShowPairPicker(false)
+      await refreshStatus()
+    } catch (e: any) {
+      setError(e?.response?.data?.detail || e?.message || 'Failed to launch pairs')
+    } finally {
+      setLaunchingPairs(false)
+    }
+  }
+
+  // Legacy alias kept for backward-compat
+  const handleLaunchAllPairs = handleLaunchSelected
+  const handleLaunch3Pairs  = handleLaunchSelected
 
   const handleCloseAll = async () => {
     setBusy(true); setError(null)
@@ -278,6 +401,9 @@ export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault, chart
         recovery_enabled: recovery,
         use_ai: useAi,
         use_kronos: useKronos,
+        max_open_orders: maxOpenOrders,
+        allowed_direction: allowedDirection,
+        // timeframe update requires session restart; only include when changed
       })
       setApplySuccess(true)
       setTimeout(() => setApplySuccess(false), 2000)
@@ -287,6 +413,19 @@ export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault, chart
     } finally {
       setApplying(false)
     }
+  }
+
+  const handleReset = () => {
+    setLotSize(SCALP_DEFAULTS.lotSize)
+    setAutoLot(SCALP_DEFAULTS.autoLot)
+    setMaxDailyLoss(SCALP_DEFAULTS.maxDailyLoss)
+    setTargetProfit(SCALP_DEFAULTS.targetProfit)
+    setRecovery(SCALP_DEFAULTS.recovery)
+    setUseAi(SCALP_DEFAULTS.useAi)
+    setUseKronos(SCALP_DEFAULTS.useKronos)
+    setMaxOpenOrders(SCALP_DEFAULTS.maxOpenOrders)
+    setAllowedDirection(SCALP_DEFAULTS.allowedDirection)
+    setScalpTf(SCALP_DEFAULTS.scalpTf)
   }
 
   const phase = session?.phase || 'analyzing'
@@ -306,11 +445,234 @@ export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault, chart
           )}
         </div>
         <div className="flex items-center gap-2 text-[11px] text-gray-400">
-          <span>All TFs · M5 trigger</span>
+          <span>All TFs · {session ? session.timeframe : scalpTf} trigger</span>
         </div>
       </div>
 
       <div className="p-4 space-y-4">
+
+        {/* ── Multi-Pair Dashboard: shows ALL running sessions ── */}
+        {allSessions.length > 0 && (
+          <div className="rounded-xl border border-gray-700/50 bg-gray-900/40 overflow-hidden">
+            <div className="px-3 py-2 border-b border-gray-700/40 flex items-center justify-between">
+              <span className="text-[11px] font-semibold text-gray-300 uppercase tracking-wide">
+                Active Pairs ({allSessions.length})
+              </span>
+              <div className="flex items-center gap-3">
+                <span className="text-[11px] text-gray-500">
+                  Total P&amp;L:{' '}
+                  <span className={`font-bold ${
+                    allSessions.reduce((s, x) => s + x.combined_pnl, 0) >= 0
+                      ? 'text-green-400' : 'text-red-400'
+                  }`}>
+                    {allSessions.reduce((s, x) => s + x.combined_pnl, 0) >= 0 ? '+' : ''}
+                    {allSessions.reduce((s, x) => s + x.combined_pnl, 0).toFixed(2)}
+                  </span>
+                </span>
+                <button
+                  onClick={handleCloseAll}
+                  disabled={busy || launchingPairs}
+                  className="text-[10px] text-red-300 hover:text-red-200 px-2 py-0.5 rounded border border-red-500/30 hover:border-red-500/60 transition disabled:opacity-40"
+                >
+                  Stop All
+                </button>
+              </div>
+            </div>
+            <div className="divide-y divide-gray-800/60">
+              {allSessions.map(s => {
+                const ph = s.phase || 'analyzing'
+                const isBusy = busySymbol === s.symbol
+                const isCurrentPair = s.symbol.toUpperCase() === symbol.toUpperCase()
+                const dirLabel = s.allowed_direction && s.allowed_direction !== 'both'
+                  ? s.allowed_direction.toUpperCase() : null
+                return (
+                  <div
+                    key={s.session_id}
+                    className={`flex items-center gap-2 px-3 py-2 text-xs cursor-pointer hover:bg-gray-800/30 transition ${isCurrentPair ? 'bg-tradebot-accent/5' : ''}`}
+                    onClick={() => { setSymbol(s.symbol); setQuery(''); onSymbolChange?.(s.symbol) }}
+                  >
+                    <span className={`font-semibold w-16 shrink-0 ${isCurrentPair ? 'text-tradebot-accent' : 'text-white'}`}>{s.symbol}</span>
+                    <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold shrink-0 ${PHASE_COLOR[ph] || PHASE_COLOR.analyzing}`}>{PHASE_LABEL[ph] || ph.toUpperCase()}</span>
+                    {dirLabel && (
+                      <span className={`px-1 py-0.5 rounded text-[9px] font-bold shrink-0 ${dirLabel === 'BUY' ? 'bg-green-900/40 text-green-400' : 'bg-red-900/40 text-red-400'}`}>{dirLabel} ONLY</span>
+                    )}
+                    <span className={`shrink-0 ${s.bias_direction === 'buy' ? 'text-green-400' : s.bias_direction === 'sell' ? 'text-red-400' : 'text-gray-500'}`}>
+                      {s.bias_direction === 'buy' ? '▲' : s.bias_direction === 'sell' ? '▼' : '—'}
+                    </span>
+                    <span className={`ml-auto font-bold tabular-nums ${pnlColor(s.combined_pnl)}`}>
+                      {s.combined_pnl >= 0 ? '+' : ''}{s.combined_pnl.toFixed(2)}
+                    </span>
+                    {s.open_trades.length > 0 && (
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded font-semibold ${s.open_trades[0].side === 'buy' ? 'bg-blue-900/40 text-blue-300' : 'bg-orange-900/40 text-orange-300'}`}>
+                        {s.open_trades[0].side.toUpperCase()}
+                      </span>
+                    )}
+                    <button
+                      onClick={e => { e.stopPropagation(); handleStopSymbol(s.symbol) }}
+                      disabled={isBusy}
+                      className="shrink-0 text-gray-600 hover:text-red-400 transition disabled:opacity-40"
+                      title={`Stop ${s.symbol}`}
+                    >
+                      {isBusy ? <Loader2 className="w-3 h-3 animate-spin" /> : <Square className="w-3 h-3" />}
+                    </button>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* ── Pair Picker — select which pairs to scalp ── */}
+        {(() => {
+          const activePairs = new Set(allSessions.filter(s => s.status === 'active').map(s => s.symbol))
+          const readyToLaunch = [...selectedPairs].filter(p => !activePairs.has(p)).length
+          const pairFilter = pairSearchQuery.trim().toUpperCase()
+
+          return (
+            <div className="rounded-xl border border-gray-700/50 overflow-hidden">
+              {/* Header row — always visible */}
+              <button
+                type="button"
+                onClick={() => setShowPairPicker(v => !v)}
+                className="w-full flex items-center justify-between px-3 py-2.5 bg-gray-900/50 hover:bg-gray-900/70 transition text-sm"
+              >
+                <div className="flex items-center gap-2">
+                  <Zap className="w-4 h-4 text-tradebot-accent" />
+                  <span className="font-semibold text-white">Choose Pairs to Scalp</span>
+                  {selectedPairs.size > 0 && (
+                    <span className="px-2 py-0.5 rounded-full bg-tradebot-accent/20 text-tradebot-accent text-[10px] font-bold">
+                      {selectedPairs.size} selected
+                    </span>
+                  )}
+                </div>
+                <div className="flex items-center gap-2">
+                  {readyToLaunch > 0 && (
+                    <span className="text-[10px] text-gray-400">{readyToLaunch} ready to launch</span>
+                  )}
+                  {showPairPicker ? <ChevronUp className="w-4 h-4 text-gray-400" /> : <ChevronDown className="w-4 h-4 text-gray-400" />}
+                </div>
+              </button>
+
+              {/* Expandable picker body */}
+              {showPairPicker && (
+                <div className="border-t border-gray-700/50 bg-gray-950/60">
+                  {/* Search + Select all / Clear row */}
+                  <div className="flex items-center gap-2 px-3 py-2 border-b border-gray-800/60">
+                    <div className="relative flex-1">
+                      <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-500" />
+                      <input
+                        type="text"
+                        value={pairSearchQuery}
+                        onChange={e => setPairSearchQuery(e.target.value)}
+                        placeholder="Filter pairs…"
+                        className="w-full pl-7 pr-2 py-1 rounded bg-gray-900 border border-gray-700 text-xs text-white placeholder-gray-500 focus:border-tradebot-accent/50 outline-none"
+                      />
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const available = ALL_ACTIVE_PAIRS.filter(p => !activePairs.has(p) && (!pairFilter || p.includes(pairFilter)))
+                        setSelectedPairs(prev => new Set([...prev, ...available]))
+                      }}
+                      className="text-[10px] px-2 py-1 rounded border border-gray-700 text-gray-300 hover:border-tradebot-accent/50 hover:text-tradebot-accent transition whitespace-nowrap"
+                    >Select all</button>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedPairs(new Set())}
+                      className="text-[10px] px-2 py-1 rounded border border-gray-700 text-gray-300 hover:border-red-500/40 hover:text-red-400 transition"
+                    >Clear</button>
+                  </div>
+
+                  {/* Pair groups */}
+                  <div className="max-h-64 overflow-y-auto px-3 py-2 space-y-3">
+                    {Object.entries(PAIR_GROUPS).map(([group, pairs]) => {
+                      const visible = pairs.filter(p =>
+                        !pairFilter || p.includes(pairFilter) || group.toUpperCase().includes(pairFilter)
+                      )
+                      if (visible.length === 0) return null
+                      return (
+                        <div key={group}>
+                          <div className="flex items-center gap-2 mb-1.5">
+                            <span className="text-[10px] font-bold text-gray-400 uppercase tracking-wide">{group}</span>
+                            <div className="flex-1 h-px bg-gray-800/80" />
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const allSelected = visible.every(p => selectedPairs.has(p))
+                                setSelectedPairs(prev => {
+                                  const next = new Set(prev)
+                                  visible.forEach(p => allSelected ? next.delete(p) : next.add(p))
+                                  return next
+                                })
+                              }}
+                              className="text-[9px] text-gray-500 hover:text-gray-300 transition"
+                            >
+                              {visible.every(p => selectedPairs.has(p)) ? 'deselect' : 'select all'}
+                            </button>
+                          </div>
+                          <div className="flex flex-wrap gap-1.5">
+                            {visible.map(p => {
+                              const isActive = activePairs.has(p)
+                              const isSelected = selectedPairs.has(p)
+                              return (
+                                <button
+                                  key={p}
+                                  type="button"
+                                  disabled={isActive}
+                                  onClick={() => setSelectedPairs(prev => {
+                                    const next = new Set(prev)
+                                    isSelected ? next.delete(p) : next.add(p)
+                                    return next
+                                  })}
+                                  className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-semibold border transition ${
+                                    isActive
+                                      ? 'bg-green-900/20 border-green-700/40 text-green-400 cursor-default opacity-70'
+                                      : isSelected
+                                      ? 'bg-tradebot-accent/20 border-tradebot-accent/60 text-tradebot-accent'
+                                      : 'bg-gray-900/60 border-gray-700/50 text-gray-300 hover:border-gray-500 hover:text-white'
+                                  }`}
+                                  title={isActive ? `${p} is already running` : isSelected ? `Deselect ${p}` : `Select ${p}`}
+                                >
+                                  {isActive ? (
+                                    <span className="w-2 h-2 rounded-full bg-green-500 shrink-0" />
+                                  ) : isSelected ? (
+                                    <Check className="w-2.5 h-2.5 shrink-0" />
+                                  ) : null}
+                                  {p}
+                                </button>
+                              )
+                            })}
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+
+                  {/* Launch selected footer */}
+                  <div className="px-3 py-2 border-t border-gray-800/60 flex items-center justify-between gap-2">
+                    <span className="text-[11px] text-gray-500">
+                      {readyToLaunch > 0
+                        ? `${readyToLaunch} pair${readyToLaunch === 1 ? '' : 's'} will start`
+                        : 'No new pairs selected'}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleLaunchSelected}
+                      disabled={launchingPairs || busy || readyToLaunch === 0}
+                      className="flex items-center gap-1.5 px-4 py-1.5 rounded-lg bg-tradebot-accent/20 border border-tradebot-accent/50 text-tradebot-accent text-xs font-bold hover:bg-tradebot-accent/30 disabled:opacity-40 transition"
+                    >
+                      {launchingPairs
+                        ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Launching…</>
+                        : <><Zap className="w-3.5 h-3.5" /> Launch {readyToLaunch > 0 ? readyToLaunch : ''} Selected</>
+                      }
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )
+        })()}
+
         {/* ── Symbol search + activate ── */}
         <div className="flex flex-col sm:flex-row gap-2">
           <div className="relative flex-1">
@@ -412,6 +774,18 @@ export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault, chart
           </div>
         )}
 
+        {/* ── Restart-pause warning — session was PAUSED after backend restart ── */}
+        {session && session.phase === 'paused' && session.ai_note?.includes('backend restart') && (
+          <div className="flex items-start gap-2 text-xs text-yellow-300 bg-yellow-500/10 border border-yellow-500/25 rounded-lg px-3 py-2.5">
+            <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-yellow-400" />
+            <div className="flex-1">
+              <div className="font-semibold text-yellow-300 mb-0.5">Bot paused after backend restart</div>
+              <div className="text-yellow-400/80">{session.ai_note}</div>
+              <div className="mt-1.5 text-yellow-500/70">Click <strong className="text-yellow-300">Activate</strong> to resume trading on this session.</div>
+            </div>
+          </div>
+        )}
+
         {/* ── Settings (collapsible, always editable even when active) ── */}
         <div>
           <div className="flex items-center justify-between">
@@ -423,8 +797,19 @@ export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault, chart
               Settings
               {active && <span className="ml-1 text-[10px] text-tradebot-accent/70">(editable while running)</span>}
             </button>
-            {/* Apply button — visible when session is active and settings panel is open */}
-            {active && showSettings && (
+            <div className="flex items-center gap-2">
+              {/* Reset to defaults — always available when settings panel is open */}
+              {showSettings && !active && (
+                <button
+                  onClick={handleReset}
+                  title={`Reset to defaults (M5 · 0.01 lot · 3% loss limit · 1.5% target)`}
+                  className="flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] text-gray-400 border border-gray-700 hover:border-gray-500 hover:text-white transition"
+                >
+                  ↺ Defaults
+                </button>
+              )}
+              {/* Apply button — visible when session is active and settings panel is open */}
+              {active && showSettings && (
               <button
                 onClick={handleApply}
                 disabled={applying}
@@ -444,9 +829,37 @@ export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault, chart
                 {applySuccess ? 'Applied!' : 'Apply changes'}
               </button>
             )}
+            </div>
           </div>
           {showSettings && (
             <div className="mt-3 grid grid-cols-2 md:grid-cols-3 gap-3 text-xs">
+              {/* Scalp timeframe selector */}
+              <div className="col-span-2 md:col-span-3">
+                <label className="block text-gray-400 mb-1.5">
+                  Scalp timeframe
+                  <span className="ml-2 text-[10px] text-gray-600">(default: M5 — best for most markets)</span>
+                  {active && <span className="text-yellow-400/70 ml-1 text-[10px]">(restart required to change)</span>}
+                </label>
+                <div className="flex gap-1.5 flex-wrap">
+                  {(['M1', 'M5', 'M15', 'M30', 'H1'] as const).map(tf => (
+                    <button
+                      key={tf}
+                      disabled={!!active}
+                      onClick={() => setScalpTf(tf)}
+                      className={`px-3 py-1 rounded-md text-xs font-semibold border transition ${
+                        scalpTf === tf
+                          ? 'bg-tradebot-accent text-black border-tradebot-accent'
+                          : 'bg-gray-900 border-gray-700 text-gray-300 hover:border-tradebot-accent/50'
+                      } disabled:opacity-50 disabled:cursor-not-allowed`}
+                    >
+                      {tf}{tf === SCALP_DEFAULTS.scalpTf ? <span className="ml-0.5 text-[9px] opacity-60">★</span> : null}
+                    </button>
+                  ))}
+                </div>
+                <p className="mt-0.5 text-[10px] text-gray-500">
+                  Volume pressure &amp; entry signals are read from {scalpTf} candles. Higher TFs provide trend direction.
+                </p>
+              </div>
               {/* Lot size — always editable */}
               <div className="col-span-1">
                 <label className="block text-gray-400 mb-1">
@@ -478,6 +891,62 @@ export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault, chart
                   <input type="checkbox" checked={autoLot} onChange={e => setAutoLot(e.target.checked)} />
                   Auto lot (risk-based)
                 </label>
+              </div>
+              {/* Max open orders */}
+              <div className="col-span-1">
+                <label className="block text-gray-400 mb-1">
+                  Max open orders
+                  {active && <span className="text-tradebot-accent/70 ml-1">✎</span>}
+                </label>
+                <div className="flex items-center gap-1">
+                  <button
+                    onClick={() => setMaxOpenOrders(v => Math.max(1, v - 1))}
+                    className="px-2 py-1 rounded bg-gray-900 border border-gray-700 text-gray-300"
+                  >−</button>
+                  <input
+                    type="number" step="1" min="1" max="10" value={maxOpenOrders}
+                    onChange={e => setMaxOpenOrders(Math.min(10, Math.max(1, +e.target.value || 1)))}
+                    className="w-full text-center py-1 rounded bg-gray-900 border border-gray-700 text-white"
+                  />
+                  <button
+                    onClick={() => setMaxOpenOrders(v => Math.min(10, v + 1))}
+                    className="px-2 py-1 rounded bg-gray-900 border border-gray-700 text-gray-300"
+                  >+</button>
+                </div>
+                <p className="mt-0.5 text-[10px] text-gray-500">
+                  {maxOpenOrders === 1 ? 'Primary only' : maxOpenOrders === 2 ? 'Primary + spike/recovery' : `Up to ${maxOpenOrders} concurrent orders`}
+                </p>
+              </div>
+              {/* Direction restriction */}
+              <div className="col-span-1">
+                <label className="block text-gray-400 mb-1">
+                  Trade direction
+                  {active && <span className="text-tradebot-accent/70 ml-1">✎</span>}
+                </label>
+                <div className="flex gap-1">
+                  {(['both', 'buy', 'sell'] as const).map(dir => (
+                    <button
+                      key={dir}
+                      onClick={() => setAllowedDirection(dir)}
+                      className={`flex-1 py-1.5 rounded text-xs font-semibold border transition ${
+                        allowedDirection === dir
+                          ? dir === 'buy'
+                            ? 'bg-green-600/30 border-green-500/60 text-green-300'
+                            : dir === 'sell'
+                            ? 'bg-red-600/30 border-red-500/60 text-red-300'
+                            : 'bg-tradebot-accent/20 border-tradebot-accent/60 text-tradebot-accent'
+                          : 'bg-gray-900 border-gray-700 text-gray-400 hover:border-gray-500'
+                      }`}
+                    >
+                      {dir === 'both' ? '↕ Both' : dir === 'buy' ? '▲ Buy only' : '▼ Sell only'}
+                    </button>
+                  ))}
+                </div>
+                <p className="mt-0.5 text-[10px] text-gray-500">
+                  {allowedDirection === 'both' ? 'Bot trades both longs and shorts' :
+                   allowedDirection === 'buy' ? 'Only BUY entries — bearish setups skipped' :
+                   'Only SELL entries — bullish setups skipped'}
+                </p>
               </div>
               {/* Max daily loss */}
               <div className="col-span-1">

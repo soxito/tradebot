@@ -381,8 +381,13 @@ async def sync_deals(
     account_id: int,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    force_today: bool = Query(default=False),
 ):
-    """Trigger deal history sync for an account."""
+    """Trigger deal history sync for an account.
+
+    ``force_today=true`` fetches the last 48 hours and upserts existing
+    records — use this to recover deals that are missing or have null timestamps.
+    """
     async with AsyncSessionLocal() as db:
         account = await db.get(MT5Account, account_id)
         if not account:
@@ -390,8 +395,8 @@ async def sync_deals(
 
         df = datetime.fromisoformat(date_from) if date_from else None
         dt = datetime.fromisoformat(date_to) if date_to else None
-        count = await MT5SyncService.sync_deals(db, account, df, dt)
-        return {"new_deals": count}
+        count = await MT5SyncService.sync_deals(db, account, df, dt, force_today=force_today)
+        return {"new_deals": count, "synced_at": datetime.utcnow().isoformat()}
 
 
 # ── Account Groups (Aggregation) ──────────────────────────
@@ -1753,6 +1758,14 @@ async def _scalp_status_payload(db, session: MT5ScalpSession) -> ScalpStatusResp
             (session.raw_settings or {}).get("strictness", "balanced")
             if isinstance(session.raw_settings, dict) else "balanced"
         ),
+        max_open_orders=int(
+            (session.raw_settings or {}).get("max_open_orders", 2)
+            if isinstance(session.raw_settings, dict) else 2
+        ),
+        allowed_direction=(
+            (session.raw_settings or {}).get("allowed_direction", "both")
+            if isinstance(session.raw_settings, dict) else "both"
+        ),
         bias_direction=session.bias_direction, bias_confidence=session.bias_confidence or 0.0,
         session_pnl=round(session.session_pnl or 0.0, 2),
         total_trades=session.total_trades or 0, wins=session.wins or 0,
@@ -1802,7 +1815,11 @@ async def scalp_start(data: ScalpStartRequest):
         session.use_ai = data.use_ai
         session.use_kronos = data.use_kronos
         session.timeframe = data.timeframe
-        session.raw_settings = data.model_dump()
+        session.raw_settings = {
+            **data.model_dump(),
+            "max_open_orders": data.max_open_orders,
+            "allowed_direction": data.allowed_direction,
+        }
         await db.commit()
         await db.refresh(session)
         session_id = session.id
@@ -2026,6 +2043,14 @@ async def scalp_update_settings(session_id: int, data: ScalpUpdateRequest):
             # the running loop picks up the new preset on its next cycle.
             rs = dict(session.raw_settings) if isinstance(session.raw_settings, dict) else {}
             rs["strictness"] = data.strictness
+            session.raw_settings = rs
+        if data.max_open_orders is not None:
+            rs = dict(session.raw_settings) if isinstance(session.raw_settings, dict) else {}
+            rs["max_open_orders"] = data.max_open_orders
+            session.raw_settings = rs
+        if data.allowed_direction is not None:
+            rs = dict(session.raw_settings) if isinstance(session.raw_settings, dict) else {}
+            rs["allowed_direction"] = data.allowed_direction
             session.raw_settings = rs
         await db.commit()
         await db.refresh(session)
