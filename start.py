@@ -1539,6 +1539,11 @@ def preflight_check(mode: str) -> bool:
     print(f"  {C.BOLD}MT5 REST bridge (mtapi-io){C.RESET}")
     sep()
 
+    # Auto-detect the port the bridge is really on and sync it to .env FIRST,
+    # so the check below (and the backend) target the live bridge. On Windows
+    # the bridge often runs on :8090 while the project default is :8092.
+    detect_and_sync_mt5_url()
+
     mt5_port_val = _mt5_port()
     mt5_up = port_open("localhost", mt5_port_val, 0.5)
     if mt5_up:
@@ -1606,6 +1611,113 @@ def _mt5_port() -> int:
         return parsed.port or 8092
     except Exception:
         return 8092
+
+
+def _mt5_candidate_ports() -> list:
+    """Ports to probe for a live mtapi-io bridge — configured port first,
+    then the common alternatives people run mt5rest on (8090 is the usual
+    Windows default, 8092 is this project's default)."""
+    ports: list = []
+    try:
+        cfg = _mt5_port()
+        if cfg:
+            ports.append(cfg)
+    except Exception:
+        pass
+    for p in (8090, 8092, 8080, 8000):
+        if p not in ports:
+            ports.append(p)
+    return ports
+
+
+def _is_mt5_bridge(host: str, port: int, timeout: float = 1.0) -> bool:
+    """Return True if an mtapi-io mt5rest bridge answers HTTP on host:port.
+
+    A bare TCP-open check is not enough (some unrelated service could hold the
+    port), so we confirm an HTTP server actually responds. mt5rest exposes a
+    Swagger UI at ``/`` and REST endpoints such as ``/CheckConnect`` — any HTTP
+    status back (even 400/404) proves a live HTTP service is listening."""
+    if not port_open(host, port, min(timeout, 0.5)):
+        return False
+    import urllib.request
+    import urllib.error
+    for path in ("/CheckConnect", "/swagger/index.html", "/"):
+        url = f"http://{host}:{port}{path}"
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
+                resp.read(256)
+                return True
+        except urllib.error.HTTPError:
+            # Server answered with an HTTP status → it IS a live HTTP service.
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _write_env_var(key: str, value: str) -> bool:
+    """Replace-in-place (or append) ``KEY=value`` in the repo ``.env``.
+
+    Unlike ``ensure_env_obsidian()`` (append-only), this rewrites an existing
+    line so a stale value is corrected. Returns True when the file changed."""
+    dotenv = ROOT / ".env"
+    line_new = f"{key}={value}"
+    try:
+        lines = dotenv.read_text().splitlines() if dotenv.exists() else []
+        found = changed = False
+        for i, ln in enumerate(lines):
+            s = ln.strip()
+            if s.startswith("#") or "=" not in s:
+                continue
+            if s.split("=", 1)[0].strip() == key:
+                found = True
+                if s != line_new:
+                    lines[i] = line_new
+                    changed = True
+                break
+        if not found:
+            lines.append(line_new)
+            changed = True
+        if changed:
+            dotenv.write_text("\n".join(lines) + "\n")
+        return changed
+    except Exception as ex:
+        warn(f"Could not update {key} in .env: {ex}")
+        return False
+
+
+def detect_and_sync_mt5_url() -> None:
+    """Detect the port the mtapi-io bridge is *actually* listening on and
+    persist ``MT5_API_URL`` to ``.env`` so the backend connects to it.
+
+    On Windows the bridge is often started manually on a different port
+    (e.g. :8090) than this project's default (:8092). Without this sync the
+    MT5 client raises ``Connection failed / mtapi-io unreachable at
+    http://localhost:8092`` even though the bridge is live on :8090."""
+    global MT5_API_URL
+    host = "localhost"
+    configured = _mt5_port()
+    detected = None
+    for port in _mt5_candidate_ports():
+        if _is_mt5_bridge(host, port, 1.0):
+            detected = port
+            break
+    if detected is None:
+        return  # nothing live yet — leave config; docker block may still start it
+    if detected == configured:
+        return  # already pointing at the live bridge
+    new_url = f"http://{host}:{detected}"
+    changed = _write_env_var("MT5_API_URL", new_url)
+    MT5_API_URL = new_url
+    os.environ["MT5_API_URL"] = new_url
+    try:
+        _DOTENV["MT5_API_URL"] = new_url
+    except Exception:
+        pass
+    if changed:
+        ok(f"MT5 bridge detected on :{detected} — updated .env MT5_API_URL → {new_url}")
+    else:
+        info(f"MT5 bridge detected on :{detected} (.env already correct)")
 
 
 def _docker_available() -> bool:
