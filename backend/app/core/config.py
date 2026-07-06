@@ -3,8 +3,9 @@ Application Configuration
 Loads settings from environment variables
 """
 import secrets
+import re as _re
 from typing import List
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -214,6 +215,29 @@ class Settings(BaseSettings):
     OBSIDIAN_INJECT_CONTEXT: bool = False
     OBSIDIAN_CONTEXT_NOTES_LIMIT: int = 5
     OBSIDIAN_CONTEXT_TOKEN_BUDGET: int = 800
+
+    @model_validator(mode='before')
+    @classmethod
+    def strip_inline_env_comments(cls, values: dict) -> dict:
+        """Strip inline shell comments from .env string values before type coercion.
+
+        A .env line like::
+
+            SOME_BOOL=false   # enable this in production
+
+        is loaded as the raw string ``'false   # enable this in production'``.
+        Pydantic cannot parse that as a bool (or int, etc.), so we strip
+        everything from the first ``\\s+#`` onwards before field validators run.
+        """
+        cleaned: dict = {}
+        for key, val in values.items():
+            if isinstance(val, str):
+                # Strip inline comment: keep only the part before ` #` or `\t#`
+                stripped = _re.sub(r'[ \t]+#.*$', '', val).strip()
+                cleaned[key] = stripped
+            else:
+                cleaned[key] = val
+        return cleaned
 
     @field_validator("DATABASE_URL", mode="before")
     @classmethod
