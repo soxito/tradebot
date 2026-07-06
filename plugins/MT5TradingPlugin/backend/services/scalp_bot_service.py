@@ -273,6 +273,10 @@ class ScalpBotManager:
     def __init__(self) -> None:
         self._tasks: Dict[int, asyncio.Task] = {}
         self._resumed: bool = False
+        # Maps (session_id, ticket) → best SL price we have applied as a trailing
+        # stop.  Used by _maybe_trail_sl to guarantee the SL only advances in
+        # the profitable direction (never pulled backward).
+        self._trailing_sl: Dict[tuple, float] = {}
 
     # -- lifecycle -------------------------------------------------------------
 
@@ -624,6 +628,21 @@ class ScalpBotManager:
                                      note=f"Target hit +{p1_profit:.2f}")
             return False
 
+        # ── Trailing SL ──────────────────────────────────────────────────────
+        # Once the trade has gained ≥ 80 % of the session target, lock 50 % of
+        # the current profit by moving the SL to the break-even + 50 % price.
+        # Every subsequent cycle the SL is recalculated and advanced (never
+        # retreated) so the locked fraction grows with the running profit.
+        if target_amt > 0 and p1_profit >= 0.8 * target_amt and cfg["trade1_ticket"]:
+            await self._maybe_trail_sl(
+                session_id, login, server, password, symbol,
+                ticket=int(cfg["trade1_ticket"]),
+                side=p1_side,
+                open_price=p1_open,
+                lot=p1_lot,
+                current_profit=p1_profit,
+            )
+
         # Arm the recovery leg when the filled trade is meaningfully offside.
         if cfg["recovery_enabled"] and mid > 0 and p1_open > 0:
             atr_m5 = _atr(m5)
@@ -647,6 +666,87 @@ class ScalpBotManager:
         if balance <= 0 or target_pct <= 0:
             return 0.0
         return balance * (target_pct / 100.0)
+
+    async def _maybe_trail_sl(
+        self,
+        session_id: int,
+        login: str,
+        server: str,
+        password: str,
+        symbol: str,
+        ticket: int,
+        side: str,
+        open_price: float,
+        lot: float,
+        current_profit: float,
+    ) -> None:
+        """
+        Trail the SL on the primary scalp position to always lock 50 % of the
+        running profit once 80 % of the session target has been reached.
+
+        Algorithm
+        ---------
+        1. Derive the *price distance* whose P&L equals 50 % of current_profit:
+              lock_profit = 0.5 × current_profit
+              price_to_lock = lock_profit / (lot × contract_size)
+        2. Place the SL at open_price ± price_to_lock (+ for BUY, − for SELL).
+        3. Only ever advance the SL in the favourable direction — once set, it is
+           never moved backward regardless of whether profit dips between cycles.
+        4. Snap the computed price to the symbol's broker tick size to avoid
+           invalid-price rejections.
+        """
+        if lot <= 0 or open_price <= 0 or current_profit <= 0:
+            return
+
+        from plugins.MT5TradingPlugin.backend.services.smc_strategy import (  # type: ignore
+            contract_size_for_symbol,
+            point_size_for_symbol,
+        )
+        contract = contract_size_for_symbol(symbol)
+        if contract <= 0:
+            return
+
+        # Price distance that, at close, yields 50 % of the current profit.
+        lock_profit = 0.5 * current_profit
+        price_to_lock = lock_profit / (lot * contract)
+
+        # SL price that captures lock_profit if the trade closes at that level.
+        new_sl = (open_price + price_to_lock) if side == "buy" else (open_price - price_to_lock)
+
+        # Snap to broker tick (avoids INVALID_PRICE broker rejects).
+        ps = point_size_for_symbol(symbol)
+        if ps > 0:
+            new_sl = round(new_sl / ps) * ps
+
+        # Trail-forward-only: never move the SL in the loss direction.
+        state_key = (session_id, ticket)
+        prior = self._trailing_sl.get(state_key)
+        if prior is not None:
+            if side == "buy" and new_sl <= prior:
+                return  # Would retreat the SL on a long
+            if side == "sell" and new_sl >= prior:
+                return  # Would retreat the SL on a short
+
+        # Push the updated SL to the broker.
+        try:
+            await mt5_client.modify_order(login, server, password, ticket, sl=new_sl)
+            self._trailing_sl[state_key] = new_sl
+            prior_txt = f" prev_sl={prior:.5f}" if prior is not None else " (first activation)"
+            self._diag(
+                session_id, symbol,
+                f"TRAIL-SL ticket={ticket} side={side} new_sl={new_sl:.5f} "
+                f"locked={lock_profit:.2f} profit={current_profit:.2f}{prior_txt}",
+            )
+            await self._update_phase(
+                session_id,
+                "in_trade",
+                note=(
+                    f"Trailing SL active — 50% locked ({lock_profit:.2f}) @ {new_sl:.5f}"
+                    f" | running P&L {current_profit:.2f}"
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[ScalpBot] trail SL modify ticket={ticket}: {exc}")
 
     async def _open_trade(self, session_id: int, login: str, server: str, password: str,
                           entry: ScalpEntry, note: str, recovery: bool = False) -> None:
@@ -812,6 +912,9 @@ class ScalpBotManager:
             session.trade2_ticket = None
             session.last_cycle_at = datetime.utcnow()
             await db.commit()
+        # Purge trailing SL state for all closed tickets.
+        for tk in tickets:
+            self._trailing_sl.pop((session_id, tk), None)
 
     async def _reconcile_gone(self, session_id: int, tickets: List[int]) -> None:
         """Clear tickets that are genuinely gone (SL/TP-closed or cancelled).
@@ -844,6 +947,10 @@ class ScalpBotManager:
                 session.phase = "analyzing"
             session.last_cycle_at = datetime.utcnow()
             await db.commit()
+        # Purge trailing SL state for reconciled tickets so a future trade
+        # re-using the same ticket number starts fresh.
+        for tk in tickets:
+            self._trailing_sl.pop((session_id, tk), None)
 
     async def _mark_trade_filled(self, session_id: int, ticket: int) -> None:
         """Flip a resting pending trade row to 'open' once the broker fills it."""

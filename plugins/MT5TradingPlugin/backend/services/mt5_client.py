@@ -192,21 +192,107 @@ class MT5Client:
     # ── Session ───────────────────────────────────────────────────────────────
 
     async def connect(self, login: str, server: str, password: str) -> str:
-        """ConnectEx: establish session, return token string."""
-        data = await self._get("/ConnectEx", params={
-            "user": login, "password": password, "server": server,
-        })
-        if isinstance(data, str):
-            token = data.strip('"').strip()
-        elif isinstance(data, dict):
-            token = str(data.get("id") or data.get("token") or data.get("result", ""))
-        else:
-            token = str(data)
+        """ConnectEx: establish session, return token string.
 
-        if not token or len(token) < 3:
-            raise MT5ClientError(f"ConnectEx returned: {data!r}", 401)
-        if token.lower().startswith("error"):
-            raise MT5ClientError(f"ConnectEx failed: {token}", 401)
+        Handles two common error codes automatically:
+        * ``TOO_FREQUENT_FAIL_CONNECT`` — the bridge rate-limits repeated failed
+          connections.  Parse the required wait (milliseconds) from the message
+          and sleep once before a single retry.
+        * ``Server not found: <name>`` — the supplied server name is unknown to
+          the broker registry.  Query the Search API with the broker prefix from
+          the server name, pick the closest demo/real match, and retry once with
+          the corrected server string.
+        """
+        async def _do_connect(srv: str) -> str:
+            data = await self._get("/ConnectEx", params={
+                "user": login, "password": password, "server": srv,
+            })
+            if isinstance(data, str):
+                token = data.strip('"').strip()
+            elif isinstance(data, dict):
+                # Error dict — normalise and raise so callers can inspect the code.
+                code = (data.get("code") or "").upper()
+                msg  = data.get("message", repr(data))
+                if code or "message" in data:
+                    raise MT5ClientError(f"ConnectEx returned: {data!r}", 401)
+                token = str(data.get("id") or data.get("token") or data.get("result", ""))
+            else:
+                token = str(data)
+
+            if not token or len(token) < 3:
+                raise MT5ClientError(f"ConnectEx returned: {data!r}", 401)
+            if token.lower().startswith("error"):
+                raise MT5ClientError(f"ConnectEx failed: {token}", 401)
+            return token
+
+        import re as _re
+
+        try:
+            token = await _do_connect(server)
+        except MT5ClientError as first_err:
+            raw = str(first_err)
+
+            # ── Rate-limit backoff ────────────────────────────────────────────
+            # e.g. "…Please wait 5000 milliseconds to try again…"
+            wait_match = _re.search(r"wait (\d+) milliseconds", raw, _re.IGNORECASE)
+            if "TOO_FREQUENT_FAIL_CONNECT" in raw or wait_match:
+                wait_ms = int(wait_match.group(1)) if wait_match else 5000
+                logger.info(
+                    f"[MT5] {login}@{server} rate-limited — waiting {wait_ms}ms before retry"
+                )
+                await asyncio.sleep(wait_ms / 1000.0 + 0.2)
+                try:
+                    token = await _do_connect(server)
+                except MT5ClientError as retry_err:
+                    raw = str(retry_err)  # fall through to server-not-found check
+                    raise retry_err if "server not found" not in raw.lower() else retry_err
+
+            # ── Server-name auto-resolution ───────────────────────────────────
+            # e.g. "Server not found: Exness-Demo" → search for real server names
+            srv_missing = _re.search(r"server not found[:\s]+(\S+)", raw, _re.IGNORECASE)
+            if srv_missing:
+                bad_srv = (srv_missing.group(1).strip("\"',)") or server)
+                # Derive company search term from the server string.
+                # "Exness-Demo" → "Exness"; "ICMarkets-Live01" → "ICMarkets"
+                company_guess = _re.split(r"[-_.]", bad_srv)[0]
+                logger.info(
+                    f"[MT5] Server not found '{bad_srv}' — searching broker registry for '{company_guess}'"
+                )
+                try:
+                    candidates = await self.search_broker(company_guess)
+                except Exception:
+                    candidates = []
+
+                # Pick the best matching server name:
+                #   prefer an exact case-insensitive match, then a demo match
+                #   if the supplied name contained 'demo', else any real server.
+                want_demo = "demo" in server.lower()
+                best: Optional[str] = None
+                for broker_group in candidates:
+                    for entry in (broker_group.get("results") or []):
+                        srv_name = entry.get("name", "")
+                        if srv_name.lower() == bad_srv.lower():
+                            best = srv_name   # exact match wins immediately
+                            break
+                        if best is None:
+                            if want_demo and "demo" in srv_name.lower():
+                                best = srv_name
+                            elif not want_demo and "real" in srv_name.lower():
+                                best = srv_name
+                    if best and best.lower() == bad_srv.lower():
+                        break  # exact match found, stop searching
+
+                if best and best.lower() != server.lower():
+                    logger.info(f"[MT5] Resolved server '{server}' → '{best}' — retrying")
+                    try:
+                        token = await _do_connect(best)
+                        self._tokens.set(login, best, token)
+                        logger.info(f"[MT5] Connected {login}@{best} (resolved) token={token[:10]}...")
+                        return token
+                    except MT5ClientError:
+                        pass  # fall through and raise the original error
+
+            raise first_err
 
         self._tokens.set(login, server, token)
         logger.info(f"[MT5] Connected {login}@{server} token={token[:10]}...")
@@ -542,9 +628,13 @@ class MT5Client:
     # ── Broker search ─────────────────────────────────────────────────────────
 
     async def search_broker(self, name: str) -> List[Dict]:
-        """Find broker server IP/port by company name (no auth)."""
+        """Find broker server names by company name (no auth required).
+
+        The mtapi-io /Search endpoint expects ?company=<name>.
+        Returns a list of { companyName, results: [{ name, access: [...] }] }.
+        """
         try:
-            result = await self._get("/Search", params={"broker": name})
+            result = await self._get("/Search", params={"company": name})
             return result if isinstance(result, list) else result.get("result", [])
         except Exception as e:
             logger.warning(f"[MT5] Search: {e}")

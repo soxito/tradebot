@@ -61,10 +61,27 @@ const BROKER_SERVERS: { broker: string; servers: string[] }[] = [
   { broker: 'IG Markets', servers: [
     'IGUKPro-Demo','IGUKPro-Live',
   ]},
-  // Exness
+  // Exness — correct server names from live broker registry
   { broker: 'Exness', servers: [
-    'Exness-Real','Exness-Real2','Exness-Real3','Exness-Real4',
-    'Exness-Trial','Exness-Demo',
+    // CY entity
+    'ExnessCY-Demo','ExnessCY-LP_Real1',
+    // SC entity
+    'ExnessSCLtd-Demo','ExnessSCLtd-LP_Real1',
+    'ExnessSC-MT5Real','ExnessSC-MT5Real2','ExnessSC-MT5Real3',
+    'ExnessSC-MT5Real4','ExnessSC-MT5Real5','ExnessSC-MT5Real6',
+    'ExnessSC-MT5Real7','ExnessSC-MT5Real8','ExnessSC-MT5Real9',
+    'ExnessSC-MT5Real10','ExnessSC-MT5Real11','ExnessSC-MT5Real12',
+    'ExnessSC-MT5Real14','ExnessSC-MT5Real15',
+    // UK entity
+    'ExnessUK-Demo','ExnessUK-LP_Real1',
+    // MU entity
+    'ExnessMU-MT5Real','ExnessMU-MT5Real2','ExnessMU-MT5Real3',
+    'ExnessMU-MT5Real4','ExnessMU-MT5Real5','ExnessMU-MT5Real6',
+    'ExnessMU-MT5Real7','ExnessMU-MT5Real8','ExnessMU-MT5Real9',
+    'ExnessMU-MT5Real10','ExnessMU-MT5Real11','ExnessMU-MT5Real12',
+    'ExnessMU-MT5Real14','ExnessMU-MT5Real15',
+    // KE entity
+    'ExnessKE-MT5Real4','ExnessKE-MT5Real9','ExnessKE-MT5Real10','ExnessKE-MT5Real21',
   ]},
   // RoboForex
   { broker: 'RoboForex', servers: [
@@ -531,6 +548,7 @@ export default function MT5LivePage() {
   const [testResult, setTestResult]     = useState<{
     reachable: boolean; balance?: number; equity?: number; currency?: string;
     leverage?: number; company?: string; name?: string; error?: string; hint?: string;
+    server_suggestions?: { server: string; company: string }[];
   } | null>(null)
   const [testLoading, setTestLoading]   = useState(false)
   // Retest for already-saved accounts
@@ -1331,13 +1349,42 @@ export default function MT5LivePage() {
                       Connection failed
                     </div>
                     <p className="text-red-300 text-xs mb-1">{testResult.error}</p>
-                    {testResult.hint && <p className="text-gray-400 text-xs">{testResult.hint}</p>}
-                    <div className="mt-2 p-2 rounded bg-gray-800/50 text-xs text-gray-400 space-y-0.5">
-                      <div className="font-medium text-gray-300">How to set up mtapi-io:</div>
-                      <div>1. Download from <span className="text-tradebot-accent">mtapi.io</span></div>
-                      <div>2. Run: <code className="text-yellow-400">mtapi.exe</code> on your Windows PC with MT5 open</div>
-                      <div>3. Set <code className="text-yellow-400">MT5_API_URL=http://YOUR_PC_IP:8090</code> in your .env</div>
-                    </div>
+                    {testResult.hint && <p className="text-yellow-300 text-xs mb-2">{testResult.hint}</p>}
+
+                    {/* ── Server name suggestions ── */}
+                    {(testResult.server_suggestions?.length ?? 0) > 0 && (
+                      <div className="mt-2">
+                        <p className="text-xs text-gray-400 mb-1.5">
+                          Suggested server names for this broker — click to use:
+                        </p>
+                        <div className="flex flex-wrap gap-1.5 max-h-36 overflow-y-auto">
+                          {testResult.server_suggestions!.map((s, i) => (
+                            <button
+                              key={i}
+                              type="button"
+                              onClick={() => {
+                                setAddForm(p => ({ ...p, server: s.server }))
+                                setTestResult(null)
+                              }}
+                              className="px-2 py-1 text-xs rounded-lg bg-blue-900/40 border border-blue-700/40 text-blue-300 hover:bg-blue-700/40 hover:text-white transition-colors"
+                              title={s.company}
+                            >
+                              {s.server}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Only show setup steps when no server suggestions were found */}
+                    {(testResult.server_suggestions?.length ?? 0) === 0 && (
+                      <div className="mt-2 p-2 rounded bg-gray-800/50 text-xs text-gray-400 space-y-0.5">
+                        <div className="font-medium text-gray-300">How to set up mtapi-io:</div>
+                        <div>1. Download from <span className="text-tradebot-accent">mtapi.io</span></div>
+                        <div>2. Run: <code className="text-yellow-400">mtapi.exe</code> on your Windows PC with MT5 open</div>
+                        <div>3. Set <code className="text-yellow-400">MT5_API_URL=http://YOUR_PC_IP:8092</code> in your .env</div>
+                      </div>
+                    )}
                   </>
                 )}
               </div>

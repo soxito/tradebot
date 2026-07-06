@@ -709,7 +709,8 @@ async def sync_all():
 async def test_connection(data: MT5AccountCreate):
     """
     Test mtapi-io connectivity with the given credentials without saving.
-    Returns connection result + account info if successful.
+    Returns connection result + account info if successful, or an error with
+    server name suggestions when the broker server cannot be found.
     """
     try:
         info = await mt5_client.get_account_info(data.login, data.server, data.password)
@@ -723,10 +724,34 @@ async def test_connection(data: MT5AccountCreate):
             "name":     info.get("name", ""),
         }
     except Exception as e:
+        err_str = str(e)
+
+        # When the server name is not found, search the broker registry and
+        # return suggestions so the UI can offer a corrected server dropdown.
+        suggestions: list = []
+        import re as _re
+        srv_missing = _re.search(r"server not found[:\s]+(\S+)", err_str, _re.IGNORECASE)
+        if srv_missing:
+            bad_srv = srv_missing.group(1).strip("\"',)")
+            company_guess = _re.split(r"[-_.]", bad_srv)[0]
+            try:
+                raw_results = await mt5_client.search_broker(company_guess)
+                for broker_group in raw_results:
+                    for entry in (broker_group.get("results") or []):
+                        suggestions.append({
+                            "server": entry.get("name"),
+                            "company": broker_group.get("companyName", ""),
+                        })
+            except Exception:
+                pass
+
         return {
             "reachable": False,
-            "error": str(e),
+            "error": err_str,
+            "server_suggestions": suggestions[:20],
             "hint": (
+                f"Server '{data.server}' not found — select one of the suggested server names below."
+                if suggestions else
                 "Make sure mtapi-io is running on the URL configured in MT5_API_URL "
                 f"(currently: {mt5_client.base_url}) and your MT5 terminal is open."
             ),
@@ -1475,9 +1500,23 @@ async def get_equity_history(account_id: int):
 
 @router.get("/broker-search")
 async def broker_search(name: str):
-    """Find broker server IP/port by company name (uses /Search endpoint)."""
-    results = await mt5_client.search_broker(name)
-    return {"query": name, "results": results, "count": len(results)}
+    """Search the mtapi-io broker registry by company name.
+
+    Returns a flattened list of { server, company, access } objects that the
+    UI can use directly as a server-name autocomplete dropdown.
+    """
+    raw = await mt5_client.search_broker(name)
+    # Flatten: [{ companyName, results:[{name,access}] }]  →  [{server,company,access}]
+    flat: list = []
+    for group in raw:
+        company_name = group.get("companyName", "")
+        for entry in (group.get("results") or []):
+            flat.append({
+                "server":  entry.get("name", ""),
+                "company": company_name,
+                "access":  entry.get("access", []),
+            })
+    return {"query": name, "servers": flat, "count": len(flat)}
 
 
 # ── Auto-Manage Loop ───────────────────────────────────────────────────────────
