@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Kronos Forecast Plugin — one-time setup (Windows / PowerShell).
+    Kronos Forecast Plugin - one-time setup (Windows / PowerShell).
 
 .DESCRIPTION
     Windows equivalent of setup_kronos.sh.
@@ -47,7 +47,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
+# --- Paths --------------------------------------------------------------------
 $ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $PluginDir  = (Resolve-Path (Join-Path $ScriptDir "..")).Path
 $RepoRoot   = (Resolve-Path (Join-Path $PluginDir "..\..")).Path
@@ -65,7 +65,7 @@ if (Test-Path $VenvPy) {
 }
 Write-Host "==> Using Python: $PY"
 
-# ── self-test: prove OHLCV data + a forecast resolve end-to-end ──────────────
+# --- self-test: prove OHLCV data + a forecast resolve end-to-end ---------------
 $SelfTestCode = @'
 import asyncio, sys, os
 sys.path.insert(0, os.getcwd())                            # REPO_ROOT (for plugins.*)
@@ -84,7 +84,7 @@ async def main() -> int:
         rows = await fs._fetch_ohlcv("binance", "BTCUSDT", "1h", 200)
         if not rows or len(rows) < 5:
             print("    FAIL: No OHLCV data available for this symbol/exchange.")
-            print("          (public ccxt fallback returned nothing — check network access)")
+            print("          (public ccxt fallback returned nothing - check network access)")
             return 2
         last_close = rows[-1][4]
         print(f"    OK: fetched {len(rows)} OHLCV candles (last close ~ {last_close}).")
@@ -142,7 +142,7 @@ if ($LASTEXITCODE -ne 0) { throw "pip install of Kronos requirements failed." }
 Write-Host "==> Verifying ccxt is importable (required for OHLCV fallback)..."
 & $PY -c "import ccxt" 2>$null
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "    ccxt missing — installing..."
+    Write-Host "    ccxt missing - installing..."
     & $PY -m pip install "ccxt>=4.0.0"
     if ($LASTEXITCODE -ne 0) { throw "pip install of ccxt failed." }
 }

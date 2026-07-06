@@ -76,11 +76,11 @@ export default function Dashboard() {
             title="Exchanges"
             value={
               exchangeStatus
-                ? `${exchangeStatus.initialized_count} Active`
+                ? `${exchangeStatus.initialized_count ?? 0} Active`
                 : 'Unknown'
             }
             status={
-              exchangeStatus && exchangeStatus.initialized_count > 0
+              exchangeStatus && (exchangeStatus.initialized_count ?? 0) > 0
                 ? 'success'
                 : 'warning'
             }

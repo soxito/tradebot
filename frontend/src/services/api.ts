@@ -652,6 +652,11 @@ export const apiClient = {
       api.post('/plugins/mt5/trade/close', data),
     cancelPendingOrder: (accountId: number, ticket: number) =>
       api.delete(`/plugins/mt5/trade/cancel/${ticket}`, { params: { account_id: accountId } }),
+    // Bulk close/cancel (optionally scoped to one symbol)
+    closeAllPositions: (accountId: number, symbol?: string) =>
+      api.post(`/plugins/mt5/trade/close-all/${accountId}`, null, { params: symbol ? { symbol } : undefined }),
+    cancelAllPending: (accountId: number, symbol?: string) =>
+      api.post(`/plugins/mt5/trade/cancel-all/${accountId}`, null, { params: symbol ? { symbol } : undefined }),
     // Symbol info from MT5 broker
     getSymbolParams: (accountId: number, symbol: string) =>
       api.get(`/plugins/mt5/symbols/${symbol}/params`, { params: { account_id: accountId } }),

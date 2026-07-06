@@ -541,7 +541,7 @@ class ScalpBotManager:
         # ── State machine ────────────────────────────────────────────────────
         if not cfg["trade1_ticket"]:
             # Flat → look for a fresh entry.
-            entry, bias = engine.analyse(candles_by_tf, mid, balance)
+            entry, bias = engine.analyse(candles_by_tf, mid, balance, bid=bid, ask=ask)
             note = bias.reason
             await self._store_bias(session_id, bias, "analyzing" if not entry else "waiting")
             if not entry:

@@ -8,6 +8,44 @@ from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def _reroute_unresolvable_host(url: str, service: str, native_host: str, native_port: str) -> str:
+    """Reroute a Docker service hostname to a native host when it can't resolve.
+
+    docker-compose `.env` files target service names like ``postgres`` / ``redis``.
+    Those only resolve inside the compose network. When the backend runs natively
+    (Homebrew / ``start.py``), the name fails DNS resolution and asyncpg/redis raise
+    ``socket.gaierror`` / ``[Errno 11001] getaddrinfo failed``. In that case we swap
+    the host+port for the native fallback so the SAME .env works both in Docker
+    (name resolves -> left untouched) and natively (name fails -> rerouted).
+    """
+    import socket
+    from urllib.parse import urlsplit, urlunsplit
+
+    if not url:
+        return url
+    try:
+        parts = urlsplit(url)
+    except Exception:
+        return url
+    if parts.hostname != service:
+        return url
+    try:
+        socket.getaddrinfo(service, None)
+        return url  # resolvable (inside Docker) — keep as-is
+    except OSError:
+        pass  # not resolvable (running natively) — reroute below
+
+    userinfo = ""
+    if parts.username:
+        userinfo = parts.username
+        if parts.password:
+            userinfo += f":{parts.password}"
+        userinfo += "@"
+    netloc = f"{userinfo}{native_host}:{native_port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
+
 class Settings(BaseSettings):
     """Application settings from environment variables"""
     
@@ -167,32 +205,36 @@ class Settings(BaseSettings):
     @field_validator("DATABASE_URL", mode="before")
     @classmethod
     def normalize_database_url(cls, v: str) -> str:
-        """On Windows, replace 'localhost' with '127.0.0.1' in DATABASE_URL.
+        """Normalise the database host for the current runtime.
 
-        asyncpg on Windows resolves 'localhost' to ::1 (IPv6) but PostgreSQL
-        typically only listens on 127.0.0.1 (IPv4), causing errno 11001
-        (WSAHOST_NOT_FOUND / getaddrinfo failed).
+        - Windows: 'localhost' -> '127.0.0.1' (asyncpg resolves localhost to ::1
+          but PostgreSQL listens on 127.0.0.1, causing errno 11001 getaddrinfo).
+        - Docker service name 'postgres' used while running natively can't resolve
+          -> reroute to the native Postgres (Homebrew/start.py default 5434).
         """
         import os
         if os.name == "nt" and "localhost" in v:
             v = v.replace("localhost", "127.0.0.1")
+        v = _reroute_unresolvable_host(v, "postgres", "127.0.0.1", "5434")
         return v
 
     @field_validator("REDIS_URL", mode="before")
     @classmethod
     def normalize_redis_url(cls, v: str) -> str:
-        """Ensure REDIS_URL always carries a valid scheme.
+        """Ensure REDIS_URL carries a valid scheme and a resolvable host.
 
-        A bare 'host:port' or 'host:port/db' in .env causes redis-py to raise
-        'Redis URL must specify one of the following schemes (redis://, ...)'.  
-        Prepend 'redis://' when the scheme is missing.
+        - A bare 'host:port' in .env makes redis-py raise 'Redis URL must specify
+          one of the following schemes' -> prepend 'redis://' when missing.
+        - Windows: 'localhost' -> '127.0.0.1'.
+        - Docker service name 'redis' used while running natively can't resolve
+          -> reroute to the native Redis (127.0.0.1:6379).
         """
         if v and "://" not in v:
             v = f"redis://{v}"
-        # Also replace localhost with 127.0.0.1 on Windows
         import os
         if os.name == "nt" and "localhost" in v:
             v = v.replace("localhost", "127.0.0.1")
+        v = _reroute_unresolvable_host(v, "redis", "127.0.0.1", "6379")
         return v
 
     @property

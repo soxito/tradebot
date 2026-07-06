@@ -161,18 +161,16 @@ const fmtPx = (v?: number | null): string => {
 };
 
 export default function KronosForecastPage() {
-  // Remember the last-used pair/exchange/timeframe across visits (client-only).
-  const readStored = (key: string, fallback: string): string => {
-    if (typeof window === 'undefined') return fallback;
-    try { return window.localStorage.getItem(key) || fallback; } catch { return fallback; }
-  };
-  const [pairInput, setPairInput] = useState(() => readStored('kronos:symbol', 'BTC/USDT'));
-  const [symbol, setSymbol] = useState(() => readStored('kronos:symbol', 'BTC/USDT'));
-  const [exchange, setExchange] = useState(() => readStored('kronos:exchange', 'bitget'));
-  const [timeframe, setTimeframe] = useState(() => readStored('kronos:timeframe', '1h'));
-  const [marginMode, setMarginMode] = useState<'crossed' | 'isolated'>(
-    () => (readStored('kronos:marginMode', 'isolated') === 'crossed' ? 'crossed' : 'isolated'),
-  );
+  // Last-used pair/exchange/timeframe are persisted to localStorage, but MUST be
+  // initialised with deterministic SSR-safe defaults. Reading localStorage during
+  // the initial render causes a hydration mismatch (the server has no window and
+  // renders the fallback, while the client renders the stored value). We hydrate
+  // from localStorage in an effect AFTER mount instead — see below.
+  const [pairInput, setPairInput] = useState('BTC/USDT');
+  const [symbol, setSymbol] = useState('BTC/USDT');
+  const [exchange, setExchange] = useState('bitget');
+  const [timeframe, setTimeframe] = useState('1h');
+  const [marginMode, setMarginMode] = useState<'crossed' | 'isolated'>('isolated');
   const [predLen, setPredLen] = useState(24);
   const [samples, setSamples] = useState(10);
   const [temperature, setTemperature] = useState(1.0);
@@ -197,8 +195,27 @@ export default function KronosForecastPage() {
     return () => document.removeEventListener('mousedown', handler);
   }, []);
 
-  // Persist the active pair/exchange/timeframe so the page reopens on the last one.
+  // Hydrate persisted preferences from localStorage AFTER mount so the first
+  // client render matches the server HTML (prevents the hydration mismatch).
+  const prefsHydrated = useRef(false);
   useEffect(() => {
+    try {
+      const s = window.localStorage.getItem('kronos:symbol');
+      const ex = window.localStorage.getItem('kronos:exchange');
+      const tf = window.localStorage.getItem('kronos:timeframe');
+      const mm = window.localStorage.getItem('kronos:marginMode');
+      if (s) { setSymbol(s); setPairInput(s); }
+      if (ex) setExchange(ex);
+      if (tf) setTimeframe(tf);
+      if (mm === 'crossed' || mm === 'isolated') setMarginMode(mm);
+    } catch { /* ignore private-mode / quota errors */ }
+  }, []);
+
+  // Persist the active pair/exchange/timeframe so the page reopens on the last one.
+  // Skip the first run so mount-time defaults never clobber the stored values
+  // before the hydrate effect above has read them.
+  useEffect(() => {
+    if (!prefsHydrated.current) { prefsHydrated.current = true; return; }
     if (typeof window === 'undefined') return;
     try {
       window.localStorage.setItem('kronos:symbol', symbol);

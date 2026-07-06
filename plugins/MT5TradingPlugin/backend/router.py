@@ -1334,6 +1334,104 @@ async def cancel_pending_order(ticket: int, account_id: int = Query(...)):
             raise HTTPException(502, f"Cancel failed: {e}")
 
 
+def _order_ticket_val(o: dict) -> int:
+    """Ticket id from a position/order payload (handles key-casing variants)."""
+    for k in ("ticket", "order", "Ticket", "Order"):
+        v = o.get(k)
+        if v:
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                continue
+    return 0
+
+
+def _same_symbol(a: str, b: str) -> bool:
+    return (a or "").upper().replace("/", "") == (b or "").upper().replace("/", "")
+
+
+@router.post("/trade/close-all/{account_id}")
+async def close_all_positions(account_id: int, symbol: Optional[str] = Query(None)):
+    """Close every open market position — optionally only for one ``symbol``."""
+    async with AsyncSessionLocal() as db:
+        account = await db.get(MT5Account, account_id)
+        if not account:
+            raise HTTPException(404, "Account not found")
+        try:
+            positions = await mt5_client.get_positions(
+                account.login, account.server, account.password_encrypted
+            )
+        except Exception as e:
+            raise HTTPException(502, f"Failed to load positions: {e}")
+
+        closed: List[int] = []
+        failed: List[dict] = []
+        for p in positions:
+            if symbol and not _same_symbol(str(p.get("symbol", "")), symbol):
+                continue
+            tk = _order_ticket_val(p)
+            if not tk:
+                continue
+            try:
+                await mt5_client.close_position(
+                    account.login, account.server, account.password_encrypted, tk
+                )
+                closed.append(tk)
+            except Exception as e:  # noqa: BLE001
+                failed.append({"ticket": tk, "error": str(e)[:200]})
+
+        try:
+            await MT5SyncService.sync_account(db, account)
+        except Exception:  # noqa: BLE001
+            pass
+        return {
+            "success": not failed,
+            "closed": closed, "closed_count": len(closed),
+            "failed": failed, "failed_count": len(failed),
+        }
+
+
+@router.post("/trade/cancel-all/{account_id}")
+async def cancel_all_pending_orders(account_id: int, symbol: Optional[str] = Query(None)):
+    """Cancel every pending order — optionally only for one ``symbol``."""
+    async with AsyncSessionLocal() as db:
+        account = await db.get(MT5Account, account_id)
+        if not account:
+            raise HTTPException(404, "Account not found")
+        try:
+            pending = await mt5_client.get_pending_orders(
+                account.login, account.server, account.password_encrypted
+            )
+        except Exception as e:
+            raise HTTPException(502, f"Failed to load pending orders: {e}")
+
+        cancelled: List[int] = []
+        failed: List[dict] = []
+        for o in pending:
+            if symbol and not _same_symbol(str(o.get("symbol", "")), symbol):
+                continue
+            tk = _order_ticket_val(o)
+            if not tk:
+                continue
+            try:
+                await mt5_client.cancel_order(
+                    account.login, account.server, account.password_encrypted, tk
+                )
+                cancelled.append(tk)
+            except Exception as e:  # noqa: BLE001
+                failed.append({"ticket": tk, "error": str(e)[:200]})
+
+        try:
+            await MT5SyncService.sync_account(db, account)
+        except Exception:  # noqa: BLE001
+            pass
+        return {
+            "success": not failed,
+            "cancelled": cancelled, "cancelled_count": len(cancelled),
+            "failed": failed, "failed_count": len(failed),
+        }
+
+
 # ── Equity History / Stats ────────────────────────────────────────
 
 @router.get("/equity-history")

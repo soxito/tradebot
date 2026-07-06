@@ -176,7 +176,8 @@ class MT5Client:
             except httpx.ConnectError:
                 last = MT5ClientError(
                     f"mtapi-io unreachable at {self.base_url}. "
-                    "Run: docker run --rm -p 8090:80 mtapiio/mt5rest", 503
+                    "Run: docker run -d --name mt5rest --restart always "
+                    "--platform linux/amd64 -p 8092:80 timurila/mt5rest", 503
                 )
                 logger.warning(f"[MT5] connection refused {path}")
             except MT5ClientError:

@@ -59,6 +59,25 @@ RECOVERY_DRAWDOWN_ATR = 1.0
 # Recovery size relative to the original lot (kept < 2× to bound exposure).
 RECOVERY_LOT_MULTIPLIER = 1.5
 
+# ── Real-time scalp entry tuning ─────────────────────────────────────────────
+# The scalp must engage the *current* candle movement, so the resting entry has
+# to sit close to live price rather than at a distant institutional zone.
+
+# Max entry distance from live price (as a fraction of M5 ATR) for a same-side
+# SMC zone to still count as a "scalp-range" entry; farther zones are replaced
+# by a market-adjacent real-time entry.
+MAX_ENTRY_DISTANCE_ATR = 0.6
+# Live-momentum strength (0..1) above which the current move is treated as a
+# continuation breakout (stop entry just beyond price) vs a pullback (limit).
+MOMENTUM_STRONG = 0.45
+# Minimum live-momentum strength to scalp on momentum alone when the
+# higher-timeframe bias is flat (lets FX pairs with neutral HTF bias still
+# scalp a clear real-time move).
+MOMENTUM_MIN_STANDALONE = 0.5
+# Tight scalp geometry off the M1 micro-ATR (real-time entry timeframe).
+RT_SL_ATR_M1 = 1.1
+RT_TP_ATR_M1 = 1.7
+
 
 # ── Data structures ──────────────────────────────────────────────────────────────
 
@@ -240,6 +259,115 @@ class ScalpStrategyEngine:
         actual_risk = round(lot * sl_distance * self.contract_size, 2)
         return lot, actual_risk
 
+    # -- real-time movement ----------------------------------------------------
+
+    def _realtime_momentum(
+        self, m1: List[Candle], m5: List[Candle], current_price: float,
+    ) -> tuple[str, float]:
+        """Read the *live* candle movement from the freshest bars.
+
+        Uses the fastest available series (M1 built from live quotes, else M5)
+        and blends three signals over the last few bars: net directional move,
+        the forming candle's body direction against the live price, and how
+        persistently closes have advanced.  Returns ``(direction, strength)``
+        where direction is ``"buy" | "sell" | "neutral"`` and strength is 0..1.
+        """
+        ref = m1 if len(m1) >= 6 else m5
+        if len(ref) < 6 or current_price <= 0:
+            return "neutral", 0.0
+
+        recent = ref[-6:]
+        first = float(recent[0].close)
+        last = float(current_price)               # live price = the current tick
+        move = last - first
+
+        # Average bar range → normaliser for velocity (avoid divide-by-zero).
+        avg_range = sum(abs(float(c.high) - float(c.low)) for c in recent) / len(recent)
+        avg_range = avg_range or (self.pip_size or 1e-9)
+        velocity = move / (avg_range * len(recent))          # ~ bars of range moved
+
+        # Forming candle: is the live price above/below the last bar's open?
+        cur_open = float(recent[-1].open)
+        body_dir = 1 if last >= cur_open else -1
+
+        # Persistence: fraction of the recent closes that advanced.
+        ups = sum(1 for i in range(1, len(recent))
+                  if float(recent[i].close) >= float(recent[i - 1].close))
+        up_frac = ups / (len(recent) - 1)
+
+        strength = max(0.0, min(1.0, abs(velocity) * 2.0))
+
+        if move > 0 and body_dir > 0 and up_frac >= 0.5:
+            return "buy", strength
+        if move < 0 and body_dir < 0 and up_frac <= 0.5:
+            return "sell", strength
+        return "neutral", strength * 0.5
+
+    def _build_realtime_entry(
+        self, side: str, current_price: float, m1: List[Candle], m5: List[Candle],
+        balance: float, confidence: float, momentum_strength: float,
+        bid: float, ask: float, bias: ScalpBias, confluence: List[str],
+    ) -> ScalpEntry:
+        """Build a market-adjacent scalp entry that engages the current move.
+
+        Strong live momentum → a **stop** order just beyond price (rides the
+        breakout continuation).  Moderate momentum → a **limit** order a hair
+        inside price (fills on the next micro-pullback, then rides the move).
+        Geometry is tight, driven by the M1 micro-ATR so SL/TP suit scalping.
+        """
+        pip = self.pip_size or 1.0
+        micro_atr = _atr(m1) if len(m1) >= 14 else 0.0
+        if micro_atr <= 0:
+            micro_atr = (bias.atr_m5 or pip * 10) * 0.4
+        micro_atr = max(micro_atr, pip * 2)
+
+        sl_dist = max(pip * 4, micro_atr * RT_SL_ATR_M1)
+        tp_dist = max(sl_dist * 1.5, micro_atr * RT_TP_ATR_M1)
+
+        # Stop trigger / limit offset must clear the live spread so the order
+        # rests on the correct side of the market and is immediately valid.
+        spread = abs(ask - bid) if (ask > 0 and bid > 0) else pip
+        trigger = max(pip * 1.0, micro_atr * 0.12, spread * 1.2)
+
+        strong = momentum_strength >= MOMENTUM_STRONG
+        ref_ask = ask if ask > 0 else current_price
+        ref_bid = bid if bid > 0 else current_price
+
+        if side == "buy":
+            if strong:
+                entry = ref_ask + trigger          # buy_stop above the ask → continuation
+                otype = "buy_stop"
+            else:
+                entry = ref_bid - trigger          # buy_limit just below → micro-pullback
+                otype = "buy_limit"
+            stop_loss = entry - sl_dist
+            take_profit = entry + tp_dist
+        else:
+            if strong:
+                entry = ref_bid - trigger          # sell_stop below the bid → continuation
+                otype = "sell_stop"
+            else:
+                entry = ref_ask + trigger          # sell_limit just above → micro-pullback
+                otype = "sell_limit"
+            stop_loss = entry + sl_dist
+            take_profit = entry - tp_dist
+
+        entry = round(entry, 6)
+        stop_loss = round(stop_loss, 6)
+        take_profit = round(take_profit, 6)
+        lot, risk_amount = self._resolve_lot(balance, sl_dist)
+
+        mode = "momentum-stop" if strong else "pullback-limit"
+        return ScalpEntry(
+            side=side, entry=entry, stop_loss=stop_loss, take_profit=take_profit,
+            lot=lot, confidence=round(confidence, 3),
+            reason=f"Real-time {mode} scalp — {bias.reason}",
+            order_type=otype,
+            confluence=confluence + [f"rt:{mode}", f"mom:{momentum_strength:.2f}"],
+            sl_pips=round(sl_dist / pip, 1), tp_pips=round(tp_dist / pip, 1),
+            risk_amount=risk_amount,
+        )
+
     # -- entry -----------------------------------------------------------------
 
     def analyse(
@@ -247,98 +375,112 @@ class ScalpStrategyEngine:
         candles_by_tf: Dict[str, List[Candle]],
         current_price: float,
         balance: float = 0.0,
+        bid: float = 0.0,
+        ask: float = 0.0,
     ) -> tuple[Optional[ScalpEntry], ScalpBias]:
         """
-        Produce a market scalp entry when the timeframe stack aligns.
+        Produce a scalp entry that engages the *current* candle movement.
+
+        Blends the multi-timeframe SMC bias with live-candle momentum:
+          • HTF bias + live momentum agree → high-quality continuation scalp.
+          • HTF bias set, momentum flat → follow the bias.
+          • HTF bias flat, live momentum strong → scalp the live move in real time.
+        The resting order is kept within scalp range of live price (an in-range
+        SMC zone when available, else a market-adjacent momentum entry), so it
+        fills on the current move instead of waiting at a distant level.
 
         Returns ``(entry_or_None, bias)`` so callers can surface the live bias
         even when no trade is taken.
         """
         bias = self.compute_bias(candles_by_tf)
 
+        m1 = candles_by_tf.get(ENTRY_REFINE_TF) or []
         m5 = candles_by_tf.get(PRIMARY_SCALP_TF) or []
-        if len(m5) < 40 or bias.atr_m5 <= 0 or current_price <= 0:
-            return None, bias
-        if bias.direction == "neutral" or bias.confidence < self.min_confidence:
+        if len(m5) < 40 or current_price <= 0:
             return None, bias
 
-        # Confirm the fast-frame SMC agrees with the higher-timeframe direction.
+        # ── Live candle movement (real-time momentum) ────────────────────────
+        mom_dir, mom_strength = self._realtime_momentum(m1, m5, current_price)
+
+        # ── Decide the scalp side ────────────────────────────────────────────
+        side: Optional[str] = None
+        confidence = bias.confidence
+        confluence = [f"{tf}:{b}" for tf, b in bias.tf_bias.items()]
+
+        if bias.direction in ("buy", "sell"):
+            if mom_dir == bias.direction:
+                side = bias.direction
+                confidence = min(1.0, bias.confidence + 0.15 + mom_strength * 0.2)
+                confluence.append("HTF+live-aligned")
+            elif mom_dir == "neutral":
+                if bias.confidence >= self.min_confidence:
+                    side = bias.direction
+                    confluence.append("HTF-bias")
+            else:
+                # Live move opposes the higher-timeframe trend — stand aside.
+                return None, bias
+        elif mom_dir in ("buy", "sell") and mom_strength >= MOMENTUM_MIN_STANDALONE:
+            # No dominant HTF trend, but a clear live move — scalp it in real time.
+            side = mom_dir
+            confidence = max(self.min_confidence, min(0.9, 0.5 + mom_strength * 0.4))
+            confluence.append("live-momentum")
+
+        if side is None or confidence < self.min_confidence:
+            return None, bias
+
+        atr = bias.atr_m5
+        pip = self.pip_size or 1.0
+        max_dist = max(atr * MAX_ENTRY_DISTANCE_ATR, pip * 3)
+
+        # ── Prefer an in-range SMC zone entry; else a market-adjacent entry ──
         eng = SMCStrategyEngine(symbol=self.symbol, min_confidence=0.0)
         m5_analysis = eng.analyze(m5)
         m5_signals = m5_analysis.get("signals", []) if isinstance(m5_analysis, dict) else []
-        m5_sides = {s.get("side") for s in m5_signals}
-        confluence = [f"{tf}:{b}" for tf, b in bias.tf_bias.items()]
-        if m5_sides and bias.direction not in m5_sides:
-            # Fast frame is not offering a same-side setup — skip to avoid
-            # trading straight into fresh M5 supply/demand.
-            return None, bias
-        if bias.direction in m5_sides:
-            confluence.append("M5-SMC-aligned")
 
-        side = bias.direction
-        atr = bias.atr_m5
-        pip = self.pip_size or 1.0
-
-        # ── Prefer SMC zone entry from M5 signals (limit order at OB/FVG) ──────
-        # When the M5 SMC engine has a same-direction pending setup, use its
-        # zone price (buy_limit/sell_limit/buy_stop/sell_stop) so we enter at
-        # institutional levels rather than at market.
         best_signal: Optional[Dict[str, Any]] = None
         for sig in m5_signals:
-            if sig.get("side") == side and sig.get("entry") and sig.get("stop_loss"):
+            if (sig.get("side") == side and sig.get("entry") and sig.get("stop_loss")
+                    and abs(float(sig.get("entry", 0)) - current_price) <= max_dist):
                 best_signal = sig
                 break
 
         if best_signal:
-            raw_entry   = float(best_signal.get("entry", current_price))
-            raw_sl      = float(best_signal.get("stop_loss", 0) or 0)
-            raw_tp1     = float(best_signal.get("tp1", 0) or 0)
-            raw_tp      = float(best_signal.get("take_profit", 0) or raw_tp1 or 0)
-            otype       = best_signal.get("order_type", f"{side}_limit")
-            # Fall back to ATR geometry when zone values are degenerate
+            raw_entry = float(best_signal.get("entry", current_price))
+            raw_sl    = float(best_signal.get("stop_loss", 0) or 0)
+            raw_tp1   = float(best_signal.get("tp1", 0) or 0)
+            raw_tp    = float(best_signal.get("take_profit", 0) or raw_tp1 or 0)
+            otype     = best_signal.get("order_type", f"{side}_limit")
             if raw_sl <= 0 or raw_tp <= 0 or raw_entry <= 0:
-                raw_entry = current_price
-                raw_sl    = current_price - atr * self.sl_atr_mult if side == "buy" else current_price + atr * self.sl_atr_mult
-                raw_tp    = current_price + atr * self.tp_atr_mult if side == "buy" else current_price - atr * self.tp_atr_mult
-                otype     = f"{side}_limit"
+                # Degenerate zone → fall back to the real-time entry.
+                return self._build_realtime_entry(
+                    side, current_price, m1, m5, balance, confidence,
+                    mom_strength, bid, ask, bias, confluence,
+                ), bias
             entry_price = round(raw_entry, 6)
             stop_loss   = round(raw_sl, 6)
             take_profit = round(raw_tp, 6)
-            extra       = [f"zone:{best_signal.get('zone_kind','ob')}", f"rr:{best_signal.get('rr',0):.1f}"]
-            confluence  = confluence + extra
-        else:
-            # Fallback: ATR-based limit entry (slight pullback/push vs current price)
-            sl_dist  = atr * self.sl_atr_mult
-            tp_dist  = atr * self.tp_atr_mult
-            pullback = atr * 0.3  # wait for 30% ATR retracement before fill
-            if side == "buy":
-                entry_price = round(current_price - pullback, 6)
-                stop_loss   = round(current_price - sl_dist, 6)
-                take_profit = round(current_price + tp_dist, 6)
-                otype       = "buy_limit"
-            else:
-                entry_price = round(current_price + pullback, 6)
-                stop_loss   = round(current_price + sl_dist, 6)
-                take_profit = round(current_price - tp_dist, 6)
-                otype       = "sell_limit"
+            confluence  = confluence + [
+                f"zone:{best_signal.get('zone_kind','ob')}",
+                f"rr:{best_signal.get('rr',0):.1f}", "in-range",
+            ]
+            sl_dist = abs(entry_price - stop_loss)
+            tp_dist = abs(take_profit - entry_price)
+            lot, risk_amount = self._resolve_lot(balance, sl_dist)
+            entry = ScalpEntry(
+                side=side, entry=entry_price, stop_loss=stop_loss,
+                take_profit=take_profit, lot=lot,
+                confidence=round(confidence, 3),
+                reason=f"SMC zone scalp — {bias.reason}",
+                order_type=otype, confluence=confluence,
+                sl_pips=round(sl_dist / pip, 1), tp_pips=round(tp_dist / pip, 1),
+                risk_amount=risk_amount,
+            )
+            return entry, bias
 
-        sl_dist = abs(entry_price - stop_loss)
-        tp_dist = abs(take_profit - entry_price)
-        lot, risk_amount = self._resolve_lot(balance, sl_dist)
-
-        entry = ScalpEntry(
-            side=side,
-            entry=entry_price,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            lot=lot,
-            confidence=round(bias.confidence, 3),
-            reason=bias.reason,
-            order_type=otype,
-            confluence=confluence,
-            sl_pips=round(sl_dist / pip, 1),
-            tp_pips=round(tp_dist / pip, 1),
-            risk_amount=risk_amount,
+        # No in-range zone → engage the current move with a market-adjacent entry.
+        entry = self._build_realtime_entry(
+            side, current_price, m1, m5, balance, confidence,
+            mom_strength, bid, ask, bias, confluence,
         )
         return entry, bias
 

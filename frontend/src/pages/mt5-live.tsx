@@ -510,6 +510,9 @@ export default function MT5LivePage() {
   const [positions, setPositions]       = useState<MT5Position[]>([])
   const [orders, setOrders]             = useState<MT5Order[]>([])
   const [cancelingTicket, setCancelingTicket] = useState<number | null>(null)
+  const [closingTicket, setClosingTicket]     = useState<number | null>(null)
+  const [closingAll, setClosingAll]           = useState(false)
+  const [cancelingAll, setCancelingAll]       = useState(false)
   const [deals, setDeals]               = useState<MT5Deal[]>([])
   const [loading, setLoading]           = useState(false)
   const [syncing, setSyncing]           = useState(false)
@@ -974,11 +977,33 @@ export default function MT5LivePage() {
 
   const handleClosePosition = async (ticket: number) => {
     if (!selectedId) return
+    if (!confirm(`Close position #${ticket}?`)) return
+    setClosingTicket(ticket)
     try {
       await apiClient.mt5.closeTrade({ account_id: selectedId, ticket })
       await fetchAccountData()
     } catch (e: any) {
       setError(apiErr(e))
+    } finally {
+      setClosingTicket(null)
+    }
+  }
+
+  const handleCloseAllPositions = async () => {
+    if (!selectedId || positions.length === 0) return
+    if (!confirm(`Close ALL ${positions.length} open position${positions.length !== 1 ? 's' : ''}?`)) return
+    setClosingAll(true)
+    setError(null)
+    try {
+      const res = await apiClient.mt5.closeAllPositions(selectedId)
+      const closed = res.data?.closed_count ?? 0
+      const failed = res.data?.failed_count ?? 0
+      if (failed > 0) setError(`Closed ${closed} position${closed !== 1 ? 's' : ''}, ${failed} failed`)
+      await fetchAccountData()
+    } catch (e: any) {
+      setError(apiErr(e))
+    } finally {
+      setClosingAll(false)
     }
   }
 
@@ -993,6 +1018,24 @@ export default function MT5LivePage() {
       setError(apiErr(e))
     } finally {
       setCancelingTicket(null)
+    }
+  }
+
+  const handleCancelAllOrders = async () => {
+    if (!selectedId || orders.length === 0) return
+    if (!confirm(`Cancel ALL ${orders.length} pending order${orders.length !== 1 ? 's' : ''}?`)) return
+    setCancelingAll(true)
+    setError(null)
+    try {
+      const res = await apiClient.mt5.cancelAllPending(selectedId)
+      const cancelled = res.data?.cancelled_count ?? 0
+      const failed = res.data?.failed_count ?? 0
+      if (failed > 0) setError(`Cancelled ${cancelled} order${cancelled !== 1 ? 's' : ''}, ${failed} failed`)
+      await fetchAccountData()
+    } catch (e: any) {
+      setError(apiErr(e))
+    } finally {
+      setCancelingAll(false)
     }
   }
 
@@ -1629,6 +1672,21 @@ export default function MT5LivePage() {
                       <span className={`text-xs font-bold ${pnlColor(totalFloating)}`}>
                         {totalFloating >= 0 ? '+' : ''}{fmt(totalFloating)}
                       </span>
+                      {/* Close All positions */}
+                      {positions.length > 0 && selectedId && (
+                        <button
+                          onClick={handleCloseAllPositions}
+                          disabled={closingAll}
+                          title="Close all open positions"
+                          className="flex items-center gap-1 px-2.5 py-1 rounded bg-red-600/25 text-red-300 hover:bg-red-600/35 disabled:opacity-50 transition-colors text-xs border border-red-600/30"
+                        >
+                          {closingAll
+                            ? <span className="w-3 h-3 border border-current border-t-transparent rounded-full animate-spin" />
+                            : <X className="w-3 h-3" />
+                          }
+                          Close All
+                        </button>
+                      )}
                       {/* Analyse button — only when there are positions */}
                       {positions.length > 0 && selectedId && (
                         <button
@@ -1669,10 +1727,12 @@ export default function MT5LivePage() {
                       {positions.map(pos => {
                         const sug = positionSuggestions[pos.mt5_ticket]
                         return (
-                        <button
+                        <div
                           key={pos.id}
+                          role="button"
+                          tabIndex={0}
                           onClick={() => setChartSymbol(pos.symbol)}
-                          className={`w-full text-left px-4 py-3 hover:bg-gray-700/30 transition-colors ${
+                          className={`w-full text-left px-4 py-3 hover:bg-gray-700/30 transition-colors cursor-pointer ${
                             chartSymbol === pos.symbol ? 'bg-gray-700/20' : ''
                           }`}
                         >
@@ -1692,9 +1752,20 @@ export default function MT5LivePage() {
                                 </span>
                               )}
                             </div>
-                            <span className={`text-sm font-bold ${pnlColor(pos.profit)}`}>
-                              {pos.profit >= 0 ? '+' : ''}{fmt(pos.profit)}
-                            </span>
+                            <div className="flex items-center gap-2">
+                              <span className={`text-sm font-bold ${pnlColor(pos.profit)}`}>
+                                {pos.profit >= 0 ? '+' : ''}{fmt(pos.profit)}
+                              </span>
+                              <button
+                                onClick={(e) => { e.stopPropagation(); handleClosePosition(pos.mt5_ticket) }}
+                                disabled={closingTicket === pos.mt5_ticket || closingAll}
+                                title="Close this position"
+                                className="flex items-center gap-1 px-2 py-0.5 rounded bg-red-600/80 hover:bg-red-600 text-white text-xs disabled:opacity-50"
+                              >
+                                <X className="w-3 h-3" />
+                                {closingTicket === pos.mt5_ticket ? '...' : 'Close'}
+                              </button>
+                            </div>
                           </div>
                           <div className="flex items-center gap-3 mt-1 text-xs text-gray-500">
                             <span>@ {pos.price_open}</span>
@@ -1725,7 +1796,7 @@ export default function MT5LivePage() {
                               ℹ {sug.reason}
                             </div>
                           )}
-                        </button>
+                        </div>
                         )
                       })}
                     </div>
@@ -1734,10 +1805,26 @@ export default function MT5LivePage() {
 
                 {/* Pending Orders */}
                 <div className="bg-gray-800/50 border border-gray-700/50 rounded-xl overflow-hidden">
-                  <div className="px-4 py-3 border-b border-gray-700/40 flex items-center gap-2 text-sm font-medium text-white">
-                    <BarChart2 className="w-4 h-4 text-yellow-400" />
-                    Pending Orders
-                    <span className="text-xs text-gray-400">({orders.length})</span>
+                  <div className="px-4 py-3 border-b border-gray-700/40 flex items-center justify-between">
+                    <div className="flex items-center gap-2 text-sm font-medium text-white">
+                      <BarChart2 className="w-4 h-4 text-yellow-400" />
+                      Pending Orders
+                      <span className="text-xs text-gray-400">({orders.length})</span>
+                    </div>
+                    {orders.length > 0 && selectedId && (
+                      <button
+                        onClick={handleCancelAllOrders}
+                        disabled={cancelingAll}
+                        title="Cancel all pending orders"
+                        className="flex items-center gap-1 px-2.5 py-1 rounded bg-red-600/25 text-red-300 hover:bg-red-600/35 disabled:opacity-50 transition-colors text-xs border border-red-600/30"
+                      >
+                        {cancelingAll
+                          ? <span className="w-3 h-3 border border-current border-t-transparent rounded-full animate-spin" />
+                          : <X className="w-3 h-3" />
+                        }
+                        Cancel All
+                      </button>
+                    )}
                   </div>
 
                   {orders.length === 0 ? (

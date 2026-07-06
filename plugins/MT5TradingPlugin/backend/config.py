@@ -11,8 +11,14 @@ from dataclasses import dataclass
 class MT5Config:
     """MT5 plugin configuration — loaded from environment."""
 
-    # mtapi-io REST API base URL
-    api_url: str = os.getenv("MT5_API_URL", "http://localhost:8090")
+    # mtapi-io REST API base URL.
+    # Default is port 8092 — the project's standard host port for the mtapi-io
+    # bridge (matches the `mt5rest` Docker container `8092:80` mapping and the
+    # MT5_API_URL start.py injects). The raw `mtapiio/mt5rest` image docs use
+    # 8090, but this project standardised on 8092; keeping 8090 here caused the
+    # client to hit a dead port whenever MT5_API_URL wasn't explicitly set,
+    # breaking account sync (no positions/orders, order placement failing).
+    api_url: str = os.getenv("MT5_API_URL", "http://localhost:8092")
 
     # Polling interval for account sync (seconds)
     poll_interval: int = int(os.getenv("MT5_POLL_INTERVAL", "10"))

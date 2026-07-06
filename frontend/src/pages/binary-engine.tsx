@@ -272,9 +272,9 @@ export default function BinaryEnginePage() {
   const [codecSearch, setCodecSearch]     = useState('')
   const [codecFilter, setCodecFilter]     = useState<'all' | 'active' | 'available'>('all')
   const [expandedCodec, setExpandedCodec] = useState<string | null>(null)
-  const [codecConfigs, setCodecConfigs]   = useState<Record<string, Record<string, unknown>>>(() => {
-    try { return JSON.parse(localStorage.getItem('paul.codecConfigs') || '{}') } catch { return {} }
-  })
+  // SSR-safe: initialise with deterministic defaults; hydrate from localStorage
+  // in a post-mount effect to avoid a hydration mismatch.
+  const [codecConfigs, setCodecConfigs]   = useState<Record<string, Record<string, unknown>>>({})
   const [codecTestState, setCodecTestState] = useState<Record<string, 'idle' | 'testing' | 'ok' | 'fail'>>({})
   const [codecTestMsg,   setCodecTestMsg]   = useState<Record<string, string>>({})
 
@@ -295,9 +295,8 @@ export default function BinaryEnginePage() {
   const [dgEot,        setDgEot]        = useState(0.7)
   const [dgEagerEot,   setDgEagerEot]   = useState(0)
   const [dgEotMs,      setDgEotMs]      = useState(5000)
-  const [dgUpgradePaul, setDgUpgradePaul] = useState(() => {
-    try { return localStorage.getItem('jarvis.deepgramMode') === 'true' } catch { return false }
-  })
+  // SSR-safe: initialise with false; hydrate from localStorage post-mount.
+  const [dgUpgradePaul, setDgUpgradePaul] = useState(false)
   const dgCanvasRef = useRef<HTMLCanvasElement>(null)
   const dgRafRef    = useRef<number>(0)
 
@@ -375,6 +374,17 @@ export default function BinaryEnginePage() {
     draw()
     return () => cancelAnimationFrame(dgRafRef.current)
   }, [activeTab, dg.isSpeaking, dg.getOutputFreqData])
+
+  // Hydrate localStorage-backed state AFTER mount so the first client render
+  // matches the server HTML (prevents hydration mismatch for codecConfigs and
+  // dgUpgradePaul which must start with deterministic SSR-safe defaults).
+  useEffect(() => {
+    try {
+      const storedCodecs = localStorage.getItem('paul.codecConfigs')
+      if (storedCodecs) setCodecConfigs(JSON.parse(storedCodecs))
+      setDgUpgradePaul(localStorage.getItem('jarvis.deepgramMode') === 'true')
+    } catch { /* ignore private-mode / quota errors */ }
+  }, [])
 
   // Sync "Upgrade PaulChat" toggle to localStorage
   useEffect(() => {
