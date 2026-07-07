@@ -41,15 +41,36 @@ export const api = axios.create({
   timeout: 30000,
 });
 
-// Global error interceptor — handles network, timeout, and server errors
+// Auto-retry interceptor — transparently retries network errors and 502/503/504
+// up to MAX_RETRIES times with a short delay so brief backend restarts / port
+// conflicts don't surface as hard UI errors.
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 1500;
+
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
 api.interceptors.response.use(
   (response) => response,
-  (error) => {
+  async (error) => {
+    const config = error.config as AxiosRequestConfig & { _retryCount?: number };
+    if (!config) return Promise.reject(error);
+
+    const isNetworkError = !error.response && (error.code === 'ERR_NETWORK' || error.request);
+    const isRetryableStatus = error.response?.status === 502 || error.response?.status === 503 || error.response?.status === 504;
+
+    if (isNetworkError || isRetryableStatus) {
+      config._retryCount = (config._retryCount ?? 0) + 1;
+      if (config._retryCount <= MAX_RETRIES) {
+        await sleep(RETRY_DELAY_MS * config._retryCount);
+        return api(config);
+      }
+    }
+
     if (error.code === 'ECONNABORTED') {
       console.error('[API] Request timed out');
     } else if (!error.response) {
       console.error('[API] Network error — backend may be unreachable');
-    } else if (error.response.status >= 500) {
+    } else if (error.response?.status >= 500) {
       console.error(`[API] Server error ${error.response.status}:`, error.response.data?.detail || '');
     }
     return Promise.reject(error);
@@ -636,8 +657,12 @@ export const apiClient = {
       api.get(`/plugins/mt5/accounts/${accountId}/deals`, { params }),
     syncDeals: (accountId: number, forceToday = true) =>
       api.post(`/plugins/mt5/accounts/${accountId}/deals/sync`, null, {
-        params: { force_today: forceToday },
+        params: { force_today: forceToday, days_back: 30 },
       }),
+    syncDealsFullHistory: (accountId: number) =>
+      api.post(`/plugins/mt5/accounts/${accountId}/deals/sync/full`),
+    analyzeTradeHistory: (accountId: number, limit = 50) =>
+      api.post(`/plugins/mt5/accounts/${accountId}/deals/analyze-history`, null, { params: { limit } }),
     placeOrder: (accountId: number, data: any) =>
       api.post(`/plugins/mt5/accounts/${accountId}/orders`, data),
     getRiskOverview: (accountId: number) =>

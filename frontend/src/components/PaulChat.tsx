@@ -818,7 +818,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
       } catch { /* backend offline — stay quiet */ }
     }
     poll()
-    const id = setInterval(poll, 7000)
+    const id = setInterval(() => { if (!document.hidden) poll() }, 7000)
     return () => { alive = false; clearInterval(id) }
   }, [])
 

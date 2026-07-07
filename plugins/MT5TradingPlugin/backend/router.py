@@ -382,11 +382,16 @@ async def sync_deals(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     force_today: bool = Query(default=False),
+    days_back: int = Query(default=30, ge=1, le=365),
 ):
     """Trigger deal history sync for an account.
 
-    ``force_today=true`` fetches the last 48 hours and upserts existing
-    records — use this to recover deals that are missing or have null timestamps.
+    Fetches the last ``days_back`` days (default 30) of broker deal history.
+    ``force_today=true`` is kept for backward-compat — it now fetches the same
+    full window so every sync call returns a complete month of history.
+
+    Pass ``date_from`` / ``date_to`` (ISO format) to specify a custom window.
+    Pass ``days_back=90`` to fetch 3 months (e.g. for the full-history button).
     """
     async with AsyncSessionLocal() as db:
         account = await db.get(MT5Account, account_id)
@@ -395,8 +400,85 @@ async def sync_deals(
 
         df = datetime.fromisoformat(date_from) if date_from else None
         dt = datetime.fromisoformat(date_to) if date_to else None
-        count = await MT5SyncService.sync_deals(db, account, df, dt, force_today=force_today)
+        count = await MT5SyncService.sync_deals(
+            db, account, df, dt,
+            force_today=force_today,
+            days_back=days_back,
+        )
         return {"new_deals": count, "synced_at": datetime.utcnow().isoformat()}
+
+
+@router.post("/accounts/{account_id}/deals/sync/full")
+async def sync_deals_full(account_id: int):
+    """Full 90-day broker history sync — use for the manual 'Sync history' button.
+
+    Fetches 90 days of broker deal history, stores all new deals to the DB,
+    and triggers Jarvis brain analysis for each new closed trade.
+    """
+    async with AsyncSessionLocal() as db:
+        account = await db.get(MT5Account, account_id)
+        if not account:
+            raise HTTPException(404, "Account not found")
+        count = await MT5SyncService.sync_deals(
+            db, account, force_today=True, days_back=90
+        )
+        return {"new_deals": count, "synced_at": datetime.utcnow().isoformat()}
+
+
+@router.post("/accounts/{account_id}/deals/analyze-history")
+async def analyze_trade_history(account_id: int, limit: int = 50):
+    """Analyze existing closed trade deals and store analysis to Jarvis brain.
+
+    Processes up to ``limit`` recent trade deals from the DB (buy/sell type with
+    non-zero profit), fetches economic events and sentiment for each trade date,
+    composes a lesson, and stores it to the Obsidian vault + AI knowledge base.
+
+    Use this once after initial setup to bootstrap the Jarvis brain with
+    historical trade context.
+    """
+    from plugins.MT5TradingPlugin.backend.services.sync_service import _store_trade_deals_to_brain
+    from plugins.MT5TradingPlugin.backend.models import MT5DealType
+
+    async with AsyncSessionLocal() as db:
+        account = await db.get(MT5Account, account_id)
+        if not account:
+            raise HTTPException(404, "Account not found")
+
+        result = await db.execute(
+            select(MT5Deal)
+            .where(
+                MT5Deal.account_id == account_id,
+                MT5Deal.deal_type.in_([MT5DealType.BUY, MT5DealType.SELL]),
+                MT5Deal.profit != 0,
+                MT5Deal.symbol.isnot(None),
+            )
+            .order_by(MT5Deal.mt5_time.desc())
+            .limit(limit)
+        )
+        deals = result.scalars().all()
+
+    brain_deals = [
+        {
+            "ticket": d.mt5_ticket,
+            "symbol": d.symbol,
+            "side": "buy" if d.deal_type == MT5DealType.BUY else "sell",
+            "price": float(d.price or 0),
+            "volume": float(d.volume or 0),
+            "profit": float(d.profit or 0),
+            "mt5_time": d.mt5_time,
+            "raw": {},
+        }
+        for d in deals
+    ]
+
+    # Fire brain storage (non-blocking)
+    import asyncio
+    asyncio.ensure_future(_store_trade_deals_to_brain(account, brain_deals))
+
+    return {
+        "queued": len(brain_deals),
+        "message": f"Queued {len(brain_deals)} trade deals for Jarvis brain analysis",
+    }
 
 
 # ── Account Groups (Aggregation) ──────────────────────────

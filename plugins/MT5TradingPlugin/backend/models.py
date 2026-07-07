@@ -7,7 +7,7 @@ References core tables by ID only — no cross-boundary FK constraints.
 from datetime import datetime
 from sqlalchemy import (
     Column, Integer, String, Float, Boolean, DateTime, Text, JSON,
-    Enum as SQLEnum, Index, BigInteger
+    Enum as SQLEnum, Index, BigInteger, UniqueConstraint
 )
 from sqlalchemy.orm import DeclarativeBase
 import enum
@@ -176,6 +176,9 @@ class MT5Deal(MT5Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (
+        # Uniqueness enforced at DB level — prevents race conditions during concurrent syncs.
+        # Matches the constraint added via migration: uq_mt5_deals_account_ticket
+        UniqueConstraint("account_id", "mt5_ticket", name="uq_mt5_deals_account_ticket"),
         Index("ix_mt5_deals_account_time", "account_id", "mt5_time"),
         Index("ix_mt5_deals_symbol_time", "symbol", "mt5_time"),
     )

@@ -44,7 +44,7 @@ function SignalsOverlayPanel() {
         .catch(() => {})
     }
     load()
-    const t = setInterval(load, 30_000)
+    const t = setInterval(() => { if (!document.hidden) load() }, 30_000)
     return () => clearInterval(t)
   }, [])
 
@@ -187,7 +187,7 @@ function BrainLearningConsole() {
 
   useEffect(() => {
     load()
-    const t = setInterval(load, 10_000)
+    const t = setInterval(() => { if (!document.hidden) load() }, 10_000)
     return () => clearInterval(t)
   }, [load])
 
@@ -750,7 +750,7 @@ export default function IntelligencePage() {
     finally { setLoading(false) }
   }, [])
 
-  // ── Poll active nodes every 5 s ─────────────────────────────────────────────
+  // ── Poll active nodes every 5 s (paused when tab is hidden) ────────────────
   useEffect(() => {
     const poll = async () => {
       try {
@@ -759,7 +759,7 @@ export default function IntelligencePage() {
       } catch { /* ignore */ }
     }
     poll()
-    const t = setInterval(poll, 5000)
+    const t = setInterval(() => { if (!document.hidden) poll() }, 5000)
     return () => clearInterval(t)
   }, [])
 
@@ -796,6 +796,7 @@ export default function IntelligencePage() {
     loadGraph(); loadSide()
     // Live knowledge polling — new JARVIS insights arrive every ~15 s
     const knowledgePoll = setInterval(async () => {
+      if (document.hidden) return   // skip when tab is not visible
       try {
         const k = await apiClient.aiAnalyst.getKnowledge()
         const items: any[] = k.data?.items || []

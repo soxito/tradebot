@@ -454,7 +454,7 @@ export default function MT5Chart({
       }
 
       if (!cancelled) {
-        const delay = failStreak >= 3 ? 30_000 : 2_000   // 2s normal, 30s on failure
+        const delay = failStreak >= 3 ? 30_000 : document.hidden ? 15_000 : 2_000
         timeoutId = setTimeout(poll, delay)
       }
     }

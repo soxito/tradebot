@@ -10,18 +10,35 @@
  */
 import Head from 'next/head'
 import { useState, useEffect, useCallback, useRef } from 'react'
+import dynamic from 'next/dynamic'
 import { apiClient } from '@/services/api'
-import MT5Chart, { MT5PositionForChart, MT5DealForChart } from '@/components/MT5Chart'
-import MT5AdvancedChart from '@/components/MT5AdvancedChart'
-import MT5SniperChart from '@/components/MT5SniperChart'
-import MT5ScalpBotPanel from '@/components/MT5ScalpBotPanel'
+import type { MT5PositionForChart, MT5DealForChart } from '@/components/MT5Chart'
 import ChartErrorBoundary from '@/components/ChartErrorBoundary'
 import MT5AccountBadge from '@/components/MT5AccountBadge'
+
+// Heavy chart components — lazy loaded so they don't block the initial render.
+// Each chart weighs ~300-500 kB parsed JS (lightweight-charts + TA logic).
+const MT5Chart = dynamic(() => import('@/components/MT5Chart'), {
+  ssr: false,
+  loading: () => <div className="flex items-center justify-center h-96 bg-gray-800/50 rounded-xl text-gray-500 text-sm">Loading chart…</div>,
+})
+const MT5AdvancedChart = dynamic(() => import('@/components/MT5AdvancedChart'), {
+  ssr: false,
+  loading: () => <div className="flex items-center justify-center h-96 bg-gray-800/50 rounded-xl text-gray-500 text-sm">Loading chart…</div>,
+})
+const MT5SniperChart = dynamic(() => import('@/components/MT5SniperChart'), {
+  ssr: false,
+  loading: () => <div className="flex items-center justify-center h-96 bg-gray-800/50 rounded-xl text-gray-500 text-sm">Loading chart…</div>,
+})
+const MT5ScalpBotPanel = dynamic(() => import('@/components/MT5ScalpBotPanel'), {
+  ssr: false,
+  loading: () => <div className="flex items-center justify-center h-48 bg-gray-800/50 rounded-xl text-gray-500 text-sm">Loading scalpbot…</div>,
+})
 import { formatDateTimeCompactZA, formatTimeZA } from '@/utils/datetime'
 import {
   Monitor, Plus, Trash2, RefreshCw, AlertTriangle, CheckCircle,
   Loader2, DollarSign, TrendingUp, TrendingDown, Shield,
-  BarChart2, ArrowUpDown, X, Search, Pencil, ChevronLeft, ChevronRight,
+  BarChart2, ArrowUpDown, X, Search, Pencil, ChevronLeft, ChevronRight, Brain,
 } from 'lucide-react'
 
 // ── Known broker server list ───────────────────────────────────────────────────
@@ -597,17 +614,29 @@ export default function MT5LivePage() {
 
   // ── Fetch accounts ────────────────────────────────────────────────────────────
 
+  // Count consecutive backend-unreachable poll failures so we don't flash the
+  // error banner on every 8-second tick during a brief outage — only show it
+  // after 2+ consecutive failures, and auto-clear it the moment a request succeeds.
+  const networkFailCountRef = useRef(0)
+
   const fetchAccounts = useCallback(async () => {
     try {
       setLoading(true)
       const res = await apiClient.mt5.getAccounts()
       const list: MT5Account[] = res.data
       setAccounts(list)
+      networkFailCountRef.current = 0   // backend is reachable — clear any error
+      setError(null)
       if (list.length > 0 && selectedId === null) {
         setSelectedId(list[0].id)
       }
     } catch (e: any) {
-      setError(apiErr(e))
+      networkFailCountRef.current += 1
+      // Only surface a hard error after 2 consecutive failures so a single
+      // missed request (e.g. backend restart) doesn't alarm the user.
+      if (networkFailCountRef.current >= 2) {
+        setError(apiErr(e))
+      }
     } finally {
       setLoading(false)
     }
@@ -624,11 +653,10 @@ export default function MT5LivePage() {
       try {
         await apiClient.mt5.syncAccount(selectedId)
       } catch { /* non-fatal — fall back to cached data */ }
-      // Explicitly sync last 24h of deals on every cycle so new closed trades
-      // always appear. force_today=true re-upserts 24h even for existing tickets,
-      // recovering deals that landed in DB with null/zero timestamps.
+      // Sync new deals from broker (last 30 days, insert-only for existing tickets).
+      // This picks up any new closed trades since the last poll without creating duplicates.
       try {
-        await apiClient.mt5.syncDeals(selectedId, true)
+        await apiClient.mt5.syncDeals(selectedId, false)
       } catch { /* non-fatal — show whatever is in DB */ }
       const [posRes, ordRes, dealRes] = await Promise.all([
         apiClient.mt5.getPositions(selectedId),
@@ -638,9 +666,14 @@ export default function MT5LivePage() {
       setPositions(posRes.data)
       setOrders(ordRes.data)
       setDeals(dealRes.data)
+      networkFailCountRef.current = 0   // successful data fetch — clear any stale error
+      setError(null)
     } catch (e: any) {
-      // non-fatal — show in error banner without clobbering account data
-      setError(apiErr(e))
+      // non-fatal — only show after 2+ consecutive failures to avoid spam
+      networkFailCountRef.current += 1
+      if (networkFailCountRef.current >= 2) {
+        setError(apiErr(e))
+      }
     }
   }, [selectedId])
 
@@ -670,6 +703,8 @@ export default function MT5LivePage() {
     const run = async () => {
       setHistSyncing(true)
       try {
+        // Full 30-day sync on initial load — ensures complete month of history
+        // is available and stores any new closed trades to Jarvis brain
         await apiClient.mt5.syncDeals(selectedId, true)
         if (cancelled) return
         const dealRes = await apiClient.mt5.getDeals(selectedId, { limit: 500 })
@@ -696,7 +731,7 @@ export default function MT5LivePage() {
     }
     const startFast = () => {
       if (fastPollRef.current) clearInterval(fastPollRef.current)
-      fastPollRef.current = setInterval(fetchPositionsFast, 2500)
+      fastPollRef.current = setInterval(fetchPositionsFast, 5000)
     }
     const stopAll = () => {
       if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
@@ -1243,11 +1278,17 @@ export default function MT5LivePage() {
           </div>
         </div>
 
-        {/* Error banner */}
+        {/* Error banner — only shown after repeated failures; auto-clears on recovery */}
         {error && (
           <div className="flex items-center gap-2 p-3 bg-red-900/30 border border-red-700/50 rounded-lg text-red-300 text-sm">
             <AlertTriangle className="w-4 h-4 flex-shrink-0" />
             <span className="flex-1">{error}</span>
+            <button
+              onClick={() => { setError(null); networkFailCountRef.current = 0; fetchAccounts() }}
+              className="px-2 py-0.5 text-xs bg-red-800/50 hover:bg-red-700/60 rounded mr-1"
+            >
+              Retry
+            </button>
             <button onClick={() => setError(null)} className="text-red-400 hover:text-red-200">
               <X className="w-4 h-4" />
             </button>
@@ -2072,13 +2113,14 @@ export default function MT5LivePage() {
                       <span className="text-xs text-gray-400">({tradeDeal.length} deals)</span>
                     </div>
                     <div className="flex items-center gap-3 text-xs flex-wrap">
-                      {/* Manual sync button — re-fetches today's deals from broker */}
+                      {/* Manual sync button — fetches full 90-day history from broker */}
                       <button
                         onClick={async () => {
                           if (!selectedId || histSyncing) return
                           setHistSyncing(true)
                           try {
-                            await apiClient.mt5.syncDeals(selectedId, true)
+                            // Full 90-day sync — gets complete broker history + stores to brain
+                            await (apiClient.mt5 as any).syncDealsFullHistory(selectedId)
                             const dealRes = await apiClient.mt5.getDeals(selectedId, { limit: 500 })
                             setDeals(dealRes.data)
                             setHistSyncedAt(new Date())
@@ -2087,12 +2129,28 @@ export default function MT5LivePage() {
                         }}
                         disabled={histSyncing || !selectedId}
                         className="flex items-center gap-1 px-2.5 py-1 rounded-md border border-gray-700 text-gray-400 hover:border-tradebot-accent/60 hover:text-white transition disabled:opacity-40"
-                        title="Fetch today's closed trades from broker"
+                        title="Fetch full 90-day trade history from broker and store to Jarvis brain"
                       >
                         {histSyncing
                           ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
                           : <RefreshCw className="w-3.5 h-3.5" />}
                         {histSyncing ? 'Syncing…' : 'Sync history'}
+                      </button>
+                      {/* Analyze historical trades → Jarvis brain */}
+                      <button
+                        onClick={async () => {
+                          if (!selectedId) return
+                          try {
+                            const res = await (apiClient.mt5 as any).analyzeTradeHistory(selectedId, 50)
+                            alert(`✅ Queued ${res.data?.queued || 0} trades for Jarvis brain analysis`)
+                          } catch { alert('Failed to queue analysis') }
+                        }}
+                        disabled={!selectedId || tradeDeal.length === 0}
+                        className="flex items-center gap-1 px-2.5 py-1 rounded-md border border-purple-700/50 text-purple-400 hover:border-purple-500 hover:text-purple-300 transition disabled:opacity-40"
+                        title="Send last 50 closed trades to Jarvis brain for AI analysis with news context"
+                      >
+                        <Brain className="w-3.5 h-3.5" />
+                        Analyze to Brain
                       </button>
                       {histSyncedAt && (
                         <span className="text-gray-500 text-[11px]">

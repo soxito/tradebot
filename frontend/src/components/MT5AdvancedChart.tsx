@@ -525,7 +525,6 @@ export default function MT5AdvancedChart({
         failStreak = 0
         const { bid, ask } = res.data as { bid: number; ask: number; time: number }
         setLivePrice({ bid, ask })
-
         const cs = candleSeries.current
         const ls = lineSeries.current
         const thisCandle = candleStart(Math.floor(Date.now() / 1000))
@@ -559,7 +558,7 @@ export default function MT5AdvancedChart({
       } catch {
         failStreak++
       }
-      if (!cancelled) timeoutId = setTimeout(poll, failStreak >= 3 ? 30_000 : 2_000)
+      if (!cancelled) timeoutId = setTimeout(poll, failStreak >= 3 ? 30_000 : document.hidden ? 15_000 : 2_000)
     }
 
     const reload = setInterval(() => {

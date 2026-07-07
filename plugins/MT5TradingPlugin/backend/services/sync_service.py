@@ -13,9 +13,10 @@ mtapi-io OrderHistory item (closed deal):
   closePrice, profit, commission, swap, closeTime, comment
 """
 from typing import Optional
-from datetime import datetime
-from sqlalchemy import select, delete
+from datetime import datetime, timedelta
+from sqlalchemy import select, delete, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from loguru import logger
 
 from plugins.MT5TradingPlugin.backend.models import (
@@ -41,6 +42,130 @@ def _parse_dt(val) -> Optional[datetime]:
         ts = val / 1000 if val > 1e10 else val
         return datetime.utcfromtimestamp(ts)
     return None
+
+
+async def _store_trade_deals_to_brain(account: "MT5Account", deals: list) -> None:
+    """
+    Store newly synced closed trade deals to the Jarvis knowledge brain.
+
+    For each trade deal:
+    1. Fetches economic events / news that were happening on the trade date
+    2. Composes a rich lesson (what happened, why, news context)
+    3. Writes to Obsidian vault (jarvis-learn endpoint)
+    4. Writes to AI knowledge base for future AI gate decisions
+
+    This drives the self-improvement loop — Jarvis learns from EVERY real
+    broker-confirmed trade outcome, not just scalp bot trades.
+    """
+    import os as _os
+    import json as _json
+    base = "http://127.0.0.1:{}".format(_os.environ.get("BACKEND_PORT", "1448"))
+
+    async with __import__("httpx").AsyncClient(timeout=15.0) as client:
+        for deal in deals:
+            try:
+                symbol  = deal["symbol"]
+                side    = deal["side"]
+                price   = deal["price"]
+                pnl     = deal["profit"]
+                volume  = deal["volume"]
+                ticket  = deal["ticket"]
+                mt5_time = deal.get("mt5_time")
+                outcome = "WIN" if pnl >= 0 else "LOSS"
+                pnl_str = f"{pnl:+.2f}"
+                trade_date = mt5_time.strftime("%Y-%m-%d") if mt5_time else "unknown"
+
+                # ── Fetch economic events around the trade time ───────────────
+                eco_context = ""
+                try:
+                    r = await client.get(
+                        f"{base}/api/v1/sentiment/economic-calendar",
+                        params={"date": trade_date, "currency": symbol[:3] if symbol else ""},
+                        timeout=5.0,
+                    )
+                    if r.status_code == 200:
+                        events = r.json() if isinstance(r.json(), list) else []
+                        if events:
+                            eco_context = "\nEconomic events on trade day: " + ", ".join(
+                                f"{e.get('title','')} ({e.get('impact','?')} impact)"
+                                for e in events[:4]
+                            )
+                except Exception:
+                    pass
+
+                # ── Fetch sentiment/news for this symbol on trade day ─────────
+                news_context = ""
+                try:
+                    r = await client.get(
+                        f"{base}/api/v1/sentiment/",
+                        params={"symbol": symbol, "limit": 3},
+                        timeout=5.0,
+                    )
+                    if r.status_code == 200:
+                        news = r.json() if isinstance(r.json(), list) else []
+                        if news:
+                            news_context = "\nRecent sentiment: " + "; ".join(
+                                f"{n.get('label','?')} ({n.get('score',0):+.2f})"
+                                for n in news[:3] if n.get("symbol","").upper() == symbol.upper()
+                            )
+                except Exception:
+                    pass
+
+                # ── Compose trade lesson ──────────────────────────────────────
+                account_label = f"LIVE" if getattr(account, "account_type", "") == "live" else "DEMO"
+                if pnl >= 0:
+                    lesson = (
+                        f"✅ {account_label} TRADE WON {pnl_str} | {symbol} {side.upper()} "
+                        f"@{price:.5g} vol={volume} ticket={ticket} date={trade_date}."
+                        f"{eco_context}{news_context} "
+                        f"Analysis: This {side} trade on {symbol} was profitable. "
+                        f"Study the market structure and news alignment on {trade_date} "
+                        f"for future similar setups."
+                    )
+                else:
+                    lesson = (
+                        f"❌ {account_label} TRADE LOST {pnl_str} | {symbol} {side.upper()} "
+                        f"@{price:.5g} vol={volume} ticket={ticket} date={trade_date}."
+                        f"{eco_context}{news_context} "
+                        f"Analysis: This {side} trade on {symbol} lost. "
+                        f"Review what opposing signals were present on {trade_date} "
+                        f"to avoid similar setups."
+                    )
+
+                # ── Store to Obsidian vault (jarvis-learn) ────────────────────
+                await client.post(
+                    f"{base}/api/v1/plugins/obsidian-knowledge/jarvis-learn",
+                    json={
+                        "question": f"What happened on the {symbol} {side} trade on {trade_date}?",
+                        "answer": lesson[:1500],
+                        "tags": [
+                            "trade-outcome", symbol.lower(), side, outcome.lower(),
+                            account_label.lower(), trade_date,
+                        ],
+                    },
+                )
+
+                # ── Store to AI knowledge base ────────────────────────────────
+                await client.post(
+                    f"{base}/api/v1/plugins/ai-analyst/ai/knowledge",
+                    json={
+                        "title": f"Broker {outcome}: {symbol} {side.upper()} {pnl_str} on {trade_date} #{ticket}",
+                        "content": lesson[:1500],
+                        "kind": "broker_trade_outcome",
+                        "symbol": symbol,
+                        "weight": 2.5 if abs(pnl) > 5.0 else 1.5,
+                        "source": "broker_sync",
+                        "agent_role": "trade_journal",
+                    },
+                )
+
+                logger.info(
+                    f"[MT5Sync] 🧠 Trade #{ticket} {symbol} {side.upper()} {pnl_str} "
+                    f"→ brain stored ({account_label} {trade_date})"
+                )
+
+            except Exception as exc:
+                logger.debug(f"[MT5Sync] brain store deal #{deal.get('ticket')}: {exc}")
 
 
 class MT5SyncService:
@@ -155,36 +280,39 @@ class MT5SyncService:
         db: AsyncSession, account: MT5Account,
         date_from=None, date_to=None,
         force_today: bool = False,
+        days_back: int = 30,
     ) -> int:
         """Upsert deal history from OrderHistory (never delete old records).
 
-        ``force_today=True`` fetches only the last 24 hours and updates deals
-        even if they already exist (used by the on-load auto-sync to recover
-        deals that landed in the DB with a zero/null timestamp).
+        ``force_today=True`` now fetches the last ``days_back`` days (default 30)
+        and upserts existing records — provides a full month of trade history on
+        every sync.  Pass ``days_back`` to customise the window.
+
+        ``date_from`` / ``date_to`` override the automatic window.
         """
         try:
             password = account.password_encrypted
-            if force_today:
-                date_from = datetime.utcnow() - timedelta(hours=24)
+            if force_today or (date_from is None and date_to is None):
+                # Default to last 30 days so the user always sees full month history
+                date_from = datetime.utcnow() - timedelta(days=days_back)
                 date_to   = datetime.utcnow()
             deals_data = await mt5_client.get_deals(
                 account.login, account.server, password, date_from, date_to
             )
-            existing = await db.execute(
-                select(MT5Deal.mt5_ticket).where(MT5Deal.account_id == account.id)
-            )
-            seen = {row[0] for row in existing.fetchall()}
 
-            new_count = 0
+            # Build rows to upsert. We resolve all values in Python first so the
+            # INSERT ... ON CONFLICT DO NOTHING is a single atomic operation per row —
+            # this is the only race-condition-safe approach when multiple async tasks
+            # (sync_account + background scheduler) may call sync_deals concurrently.
+            rows_to_upsert = []
+            new_trade_deals_map: dict = {}  # ticket → deal info (only new ones)
+
             for d in deals_data:
                 ticket = int(d.get("ticket", 0))
-                # Skip deals with no ticket — they cannot be uniquely identified
                 if ticket == 0:
-                    continue
-                if ticket in seen and not force_today:
-                    continue
+                    continue  # can't uniquely identify without a ticket
 
-                # Map type int → MT5DealType
+                # Map type int → MT5DealType string
                 t = d.get("type", 0)
                 if t == 0:
                     dtype = MT5DealType.BUY
@@ -199,34 +327,102 @@ class MT5SyncService:
                 else:
                     dtype = MT5DealType.BUY  # fallback
 
-                # Time from closeTime (closed orders) or time field
                 mt5_time = _parse_dt(
                     d.get("closeTime") or d.get("time") or d.get("openTime")
                 )
+                volume = float(d["lots"]) if d.get("lots") else (
+                         float(d["volume"]) if d.get("volume") else None)
+                price  = float(d.get("closePrice") or d.get("price") or 0) or None
+                pnl    = float(d.get("profit", 0))
+                symbol = d.get("symbol") or ""
 
-                db.add(MT5Deal(
-                    account_id=account.id,
-                    mt5_ticket=ticket,
-                    mt5_order_ticket=d.get("order"),
-                    mt5_position_ticket=d.get("positionId"),
-                    symbol=d.get("symbol"),
-                    deal_type=dtype,
-                    volume=float(d["lots"])  if d.get("lots")  else (
-                           float(d["volume"]) if d.get("volume") else None),
-                    price=float(d.get("closePrice") or d.get("price") or 0) or None,
-                    profit=float(d.get("profit", 0)),
-                    commission=float(d.get("commission", 0)),
-                    swap=float(d.get("swap", 0)),
-                    fee=float(d.get("fee", 0)),
-                    comment=d.get("comment"),
-                    mt5_time=mt5_time,
-                    raw_data=d,
-                ))
-                new_count += 1
+                rows_to_upsert.append({
+                    "account_id":          account.id,
+                    "mt5_ticket":          ticket,
+                    "mt5_order_ticket":    d.get("order"),
+                    "mt5_position_ticket": d.get("positionId"),
+                    "symbol":              symbol or None,
+                    "deal_type":           dtype.value,
+                    "volume":              volume,
+                    "price":               price,
+                    "profit":              pnl,
+                    "commission":          float(d.get("commission", 0)),
+                    "swap":                float(d.get("swap", 0)),
+                    "fee":                 float(d.get("fee", 0)),
+                    "comment":             d.get("comment"),
+                    "mt5_time":            mt5_time,
+                    "raw_data":            d,
+                    "created_at":          datetime.utcnow(),
+                    # For brain tracking
+                    "_dtype":              dtype,
+                    "_pnl":                pnl,
+                    "_mt5_time":           mt5_time,
+                })
 
-            if new_count:
-                await db.commit()
-            logger.debug(f"[MT5Sync] {account.login}: {new_count} new deals")
+            if not rows_to_upsert:
+                return 0
+
+            # Fetch existing tickets once for brain-tracking (only new deals need brain store)
+            existing_res = await db.execute(
+                select(MT5Deal.mt5_ticket).where(MT5Deal.account_id == account.id)
+            )
+            existing_tickets = {row[0] for row in existing_res.fetchall()}
+
+            new_count = 0
+            for row in rows_to_upsert:
+                # Pop the helper fields before inserting
+                dtype   = row.pop("_dtype")
+                pnl     = row.pop("_pnl")
+                mt5_t   = row.pop("_mt5_time")
+                ticket  = row["mt5_ticket"]
+                symbol  = row.get("symbol") or ""
+
+                # INSERT ... ON CONFLICT (account_id, mt5_ticket) DO NOTHING
+                # This is atomic and safe against concurrent sync calls.
+                stmt = (
+                    pg_insert(MT5Deal)
+                    .values(**row)
+                    .on_conflict_do_nothing(
+                        index_elements=["account_id", "mt5_ticket"]
+                    )
+                )
+                result = await db.execute(stmt)
+                inserted = result.rowcount  # 1 if inserted, 0 if conflict skipped
+
+                if inserted:
+                    new_count += 1
+                    # Track new BUY/SELL deals with non-zero profit for brain
+                    if dtype in (MT5DealType.BUY, MT5DealType.SELL) and pnl != 0.0 and symbol:
+                        new_trade_deals_map[ticket] = {
+                            "ticket":   ticket,
+                            "symbol":   symbol,
+                            "side":     "buy" if dtype == MT5DealType.BUY else "sell",
+                            "price":    row.get("price") or 0,
+                            "volume":   row.get("volume") or 0,
+                            "profit":   pnl,
+                            "mt5_time": mt5_t,
+                        }
+                elif force_today and mt5_t is not None:
+                    # On force re-sync: patch null/zero timestamps on existing rows
+                    await db.execute(
+                        text(
+                            "UPDATE mt5_deals SET mt5_time=:ts, profit=:pnl "
+                            "WHERE account_id=:aid AND mt5_ticket=:tk "
+                            "  AND (mt5_time IS NULL OR profit = 0)"
+                        ),
+                        {"ts": mt5_t, "pnl": pnl, "aid": account.id, "tk": ticket},
+                    )
+
+            await db.commit()
+            logger.debug(f"[MT5Sync] {account.login}: {new_count} new deals inserted")
+
+            # Store new closed trades to knowledge brain (fire-and-forget)
+            if new_trade_deals_map:
+                import asyncio
+                asyncio.ensure_future(
+                    _store_trade_deals_to_brain(account, list(new_trade_deals_map.values()))
+                )
+
             return new_count
 
         except Exception as e:

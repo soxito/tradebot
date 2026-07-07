@@ -355,7 +355,7 @@ export default function TelegramSignalsPage() {
 
   useEffect(() => {
     loadSignalPrices()
-    const t = setInterval(loadSignalPrices, 15000)
+    const t = setInterval(() => { if (!document.hidden) loadSignalPrices() }, 15000)
     return () => clearInterval(t)
   }, [loadSignalPrices])
 
