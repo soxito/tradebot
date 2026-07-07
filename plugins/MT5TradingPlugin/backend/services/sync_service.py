@@ -426,7 +426,15 @@ class MT5SyncService:
             return new_count
 
         except Exception as e:
-            logger.error(f"[MT5Sync] deals {account.login}: {e}")
+            err_str = str(e)
+            # URL/network errors are expected when MT5 bridge is not running;
+            # log at WARNING (not ERROR) so they don't flood the error log.
+            _expected = ("missing an 'http://'", "Request URL is missing", "unreachable",
+                         "connection refused", "suppressed", "No scheme")
+            if any(p in err_str for p in _expected):
+                logger.warning(f"[MT5Sync] deals {account.login}: {err_str}")
+            else:
+                logger.error(f"[MT5Sync] deals {account.login}: {err_str}")
             return 0
 
     @staticmethod

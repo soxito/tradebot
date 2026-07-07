@@ -84,8 +84,12 @@ async def get_balance(
             "balance": balance,
         }
     except Exception as e:
-        logger.warning(f"Failed to get balance for {exchange.value}: {e}")
-        return {"exchange": exchange.value, "balance": None, "error": str(e)}
+        err_str = str(e)
+        # Suppress repeated logging when the circuit breaker is already active
+        # (back-off message contains "suppressed") — the connector already logged once.
+        if "suppressed" not in err_str.lower():
+            logger.warning(f"Failed to get balance for {exchange.value}: {e}")
+        return {"exchange": exchange.value, "balance": None, "error": err_str}
 
 
 @router.get("/{exchange}/ticker/{symbol}")
@@ -437,8 +441,10 @@ async def get_bitget_futures_balance(
         balance = await connector.get_futures_balance(product_type=product_type)
         return {"exchange": "bitget", "product_type": product_type, "balance": balance}
     except Exception as e:
-        logger.warning(f"Failed to get Bitget futures balance: {e}")
-        return {"exchange": "bitget", "product_type": product_type, "balance": [], "error": str(e)}
+        err_str = str(e)
+        if "suppressed" not in err_str.lower():
+            logger.warning(f"Failed to get Bitget futures balance: {e}")
+        return {"exchange": "bitget", "product_type": product_type, "balance": [], "error": err_str}
 
 
 @router.get("/bitget/futures/positions")

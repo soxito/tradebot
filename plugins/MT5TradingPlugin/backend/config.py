@@ -4,7 +4,24 @@ MT5 Plugin — Configuration
 Reads plugin-specific settings from env vars and plugin_settings table.
 """
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+
+_MT5_DEFAULT_URL = "http://localhost:8092"
+
+
+def _validated_mt5_url(raw: str) -> str:
+    """Return a valid MT5 API URL, falling back to the default if the value is
+    empty or missing the http(s) scheme (which causes httpx to raise
+    'Request URL is missing an http:// or https:// protocol').
+    """
+    url = raw.strip() if raw else ""
+    if url and (url.startswith("http://") or url.startswith("https://")):
+        return url
+    if url:
+        # Non-empty but schemeless — prepend http://
+        return f"http://{url}"
+    return _MT5_DEFAULT_URL
 
 
 @dataclass
@@ -18,7 +35,11 @@ class MT5Config:
     # 8090, but this project standardised on 8092; keeping 8090 here caused the
     # client to hit a dead port whenever MT5_API_URL wasn't explicitly set,
     # breaking account sync (no positions/orders, order placement failing).
-    api_url: str = os.getenv("MT5_API_URL", "http://localhost:8092")
+    api_url: str = field(
+        default_factory=lambda: _validated_mt5_url(
+            os.getenv("MT5_API_URL", _MT5_DEFAULT_URL)
+        )
+    )
 
     # Polling interval for account sync (seconds)
     poll_interval: int = int(os.getenv("MT5_POLL_INTERVAL", "10"))

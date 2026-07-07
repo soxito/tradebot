@@ -17,6 +17,7 @@ Docker: docker run --rm -p 8090:80 mtapiio/mt5rest
 Docs:   https://mt5.mtapi.io/index.html
 """
 import asyncio
+import os
 import re
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timedelta
@@ -159,15 +160,66 @@ class TokenStore:
             self._store[k]["last_check"] = datetime.utcnow()
 
 
+# ── URL-error circuit breaker constants ───────────────────────────────────────
+_URL_ERR_PHRASES = (
+    "missing an 'http://'",
+    "missing an 'https://'",
+    "Request URL is missing",
+    "Invalid URL",
+    "No scheme",
+    "no host",
+)
+_URL_CB_BACKOFF = 60   # seconds between "bad URL" retries (re-reads env each time)
+
+
 # ── Client ────────────────────────────────────────────────────────────────────
 
 class MT5Client:
     """Async HTTP client for mtapi-io using token-based session auth."""
 
     def __init__(self, base_url: Optional[str] = None):
-        self.base_url = (base_url or mt5_config.api_url).rstrip("/")
+        self._base_url_arg = base_url  # remember for self-healing
+        self.base_url = self._resolve_url(base_url)
         self._http: Optional[httpx.AsyncClient] = None
         self._tokens = TokenStore()
+        # Circuit breaker for "URL missing protocol" errors — avoids flooding
+        # the log when MT5_API_URL is empty/schemeless in the environment.
+        self._url_err_last: float = 0.0   # monotonic timestamp of last bad-URL event
+        self._url_err_logged = False       # have we logged the actionable message?
+
+    @staticmethod
+    def _resolve_url(base_url: Optional[str]) -> str:
+        """Return a valid absolute URL.  Falls back to env → default in that order."""
+        raw = base_url or os.environ.get("MT5_API_URL", "") or ""
+        raw = raw.strip()
+        if raw.startswith("http://") or raw.startswith("https://"):
+            return raw.rstrip("/")
+        # Empty or schemeless — try the config module's validated value
+        try:
+            from plugins.MT5TradingPlugin.backend.config import _validated_mt5_url
+            return _validated_mt5_url(raw).rstrip("/")
+        except Exception:
+            return "http://localhost:8092"
+
+    def _maybe_reheal_url(self) -> bool:
+        """
+        Re-read MT5_API_URL from the environment.  Called after every
+        bad-URL backoff window so a running process heals itself as soon
+        as the operator corrects the env var (e.g. adds the right URL to .env
+        and reloads the environment, or sets it in the shell).
+        Returns True if the URL was fixed and the httpx client should be reset.
+        """
+        fresh = self._resolve_url(self._base_url_arg)
+        if fresh == self.base_url:
+            return False
+        logger.info(f"[MT5] base_url healed: {self.base_url!r} → {fresh!r}")
+        self.base_url = fresh
+        # Force recreation of the httpx client with the new base URL
+        if self._http and not self._http.is_closed:
+            asyncio.ensure_future(self._http.aclose())
+        self._http = None
+        self._url_err_logged = False
+        return True
 
     async def _get_http(self) -> httpx.AsyncClient:
         if self._http is None or self._http.is_closed:
@@ -181,6 +233,20 @@ class MT5Client:
             await self._http.aclose()
 
     async def _get(self, path: str, params: Optional[Dict] = None, retries: int = 1) -> Any:
+        # ── Bad-URL circuit breaker ───────────────────────────────────────────
+        import time as _time
+        now = _time.monotonic()
+        if self._url_err_last and (now - self._url_err_last) < _URL_CB_BACKOFF:
+            raise MT5ClientError(
+                f"MT5_API_URL is invalid — set it to http://host:8092 in .env "
+                f"(retry in {int(_URL_CB_BACKOFF - (now - self._url_err_last))}s)",
+                503,
+            )
+        if self._url_err_last:
+            # Back-off window expired — try to self-heal from env
+            self._maybe_reheal_url()
+            self._url_err_last = 0.0   # reset so the next failure starts a fresh window
+
         http = await self._get_http()
         last: Exception = MT5ClientError("no attempt")
         for attempt in range(retries + 1):
@@ -215,7 +281,22 @@ class MT5Client:
             except MT5ClientError:
                 raise
             except Exception as e:
-                last = MT5ClientError(str(e))
+                err_str = str(e)
+                # Detect httpx "Request URL is missing http:// protocol" errors.
+                # These flood the log when MT5_API_URL is empty/schemeless.
+                # Log once with an actionable message, then suppress for _URL_CB_BACKOFF seconds.
+                if any(phrase in err_str for phrase in _URL_ERR_PHRASES):
+                    if not self._url_err_logged:
+                        logger.error(
+                            f"[MT5] MT5_API_URL={self.base_url!r} has no scheme — "
+                            "all requests blocked. "
+                            "Fix: add MT5_API_URL=http://localhost:8092 to your .env "
+                            f"(suppressing further errors for {_URL_CB_BACKOFF}s)."
+                        )
+                        self._url_err_logged = True
+                    self._url_err_last = _time.monotonic()
+                    raise MT5ClientError(err_str, 503)
+                last = MT5ClientError(err_str)
                 logger.error(f"[MT5] {path}: {e}")
             if attempt < retries:
                 await asyncio.sleep(1.5 ** attempt)

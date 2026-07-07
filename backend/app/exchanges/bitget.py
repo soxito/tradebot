@@ -1,7 +1,7 @@
 """
 Bitget Exchange Connector
 Uses official Bitget v2 API signing for authenticated endpoints (balance, orders)
-and ccxt for public data (OHLCV, tickers, markets).
+and ccxt for public data (OHLCV, tickers, markers).
 """
 import time
 import ccxt.async_support as ccxt
@@ -9,6 +9,35 @@ from typing import Dict, Any, Optional, List, Tuple
 from app.exchanges.base import ExchangeConnector, OrderSide, OrderType
 from app.exchanges.bitget_sdk import BitgetClient, BitgetAPIError
 from loguru import logger
+
+
+# ── Permission-error circuit breaker ─────────────────────────────────────────
+# Bitget error 40014 ("Incorrect permissions") means the API key lacks the scope
+# for that endpoint.  Retrying every few seconds just floods the logs without
+# ever succeeding.  We back off for PERM_BACKOFF_SECONDS after the first error
+# and only try again once the window has passed (so we catch key rotations while
+# staying quiet otherwise).
+_PERM_BACKOFF_SECONDS = 600   # 10-minute silence window after a 40014
+_PERM_ERROR_CODES = frozenset({"40014", "40015", "40016"})  # permission family
+_perm_error_ts: Dict[str, float] = {}  # endpoint_key → timestamp of last 40014
+
+
+def _perm_blocked(endpoint_key: str) -> bool:
+    """Return True if this endpoint is still in its permission-error back-off window."""
+    ts = _perm_error_ts.get(endpoint_key, 0.0)
+    return (time.monotonic() - ts) < _PERM_BACKOFF_SECONDS
+
+
+def _record_perm_error(endpoint_key: str, err: "BitgetAPIError") -> None:
+    """Log once and set the back-off timer for this endpoint."""
+    if not _perm_blocked(endpoint_key):
+        logger.warning(
+            f"[Bitget] Permission error on {endpoint_key!r} (code {err.code}): {err.message}. "
+            f"Suppressing further attempts for {_PERM_BACKOFF_SECONDS // 60} min. "
+            "Grant the required API-key permissions or update the key in Settings."
+        )
+    _perm_error_ts[endpoint_key] = time.monotonic()
+
 
 
 class BitgetConnector(ExchangeConnector):
@@ -90,6 +119,10 @@ class BitgetConnector(ExchangeConnector):
         if not self.native_client:
             return await super().get_balance(currency)
 
+        _key = "get_balance"
+        if _perm_blocked(_key):
+            raise BitgetAPIError("40014", "Permission error (suppressed — back-off active)")
+
         try:
             result = await self.native_client.get_account_assets(coin=currency)
             assets = result.get("data", [])
@@ -120,7 +153,10 @@ class BitgetConnector(ExchangeConnector):
             return balance
 
         except BitgetAPIError as e:
-            logger.error(f"[{self.exchange_name}] Native API balance error: {e}")
+            if e.code in _PERM_ERROR_CODES:
+                _record_perm_error(_key, e)
+            else:
+                logger.error(f"[{self.exchange_name}] Native API balance error: {e}")
             raise
         except Exception as e:
             logger.error(f"[{self.exchange_name}] Balance error, trying ccxt fallback: {e}")
@@ -284,8 +320,16 @@ class BitgetConnector(ExchangeConnector):
         """Get futures account balances"""
         if not self.native_client:
             raise RuntimeError("Native client not initialized")
-        result = await self.native_client.get_futures_accounts(product_type=product_type)
-        return result.get("data", [])
+        _key = f"get_futures_balance:{product_type}"
+        if _perm_blocked(_key):
+            raise BitgetAPIError("40014", "Permission error (suppressed — back-off active)")
+        try:
+            result = await self.native_client.get_futures_accounts(product_type=product_type)
+            return result.get("data", [])
+        except BitgetAPIError as e:
+            if e.code in _PERM_ERROR_CODES:
+                _record_perm_error(_key, e)
+            raise
 
     async def get_futures_positions(
         self,
@@ -318,8 +362,17 @@ class BitgetConnector(ExchangeConnector):
             raise RuntimeError("Native client not initialized")
         rows: List[Dict[str, Any]] = []
         for pt in self.FUTURES_PRODUCT_TYPES:
+            _key = f"get_futures_balance:{pt}"
+            if _perm_blocked(_key):
+                continue
             try:
                 result = await self.native_client.get_futures_accounts(product_type=pt)
+            except BitgetAPIError as e:
+                if e.code in _PERM_ERROR_CODES:
+                    _record_perm_error(_key, e)
+                else:
+                    logger.debug(f"[{self.exchange_name}] futures balance {pt} skipped: {e}")
+                continue
             except Exception as e:
                 logger.debug(f"[{self.exchange_name}] futures balance {pt} skipped: {e}")
                 continue

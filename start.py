@@ -517,7 +517,16 @@ def simulate_pc_models() -> None:
          f"poll×{detected['poll_multiplier']}, "
          f"workers {detected['backend_workers']}")
 
-MT5_API_URL   = _DOTENV.get("MT5_API_URL", os.environ.get("MT5_API_URL", "http://localhost:8092"))
+_MT5_URL_RAW = _DOTENV.get("MT5_API_URL", os.environ.get("MT5_API_URL", "")) or ""
+# Guard: an empty / schemeless MT5_API_URL (e.g. MT5_API_URL= in .env) causes
+# httpx to raise "Request URL is missing http:// protocol" on every request.
+# Ensure it is always a proper absolute URL before injecting it into the backend.
+if not _MT5_URL_RAW or not (_MT5_URL_RAW.startswith("http://") or _MT5_URL_RAW.startswith("https://")):
+    MT5_API_URL = "http://localhost:8092"
+    if _MT5_URL_RAW:
+        warn(f"MT5_API_URL={_MT5_URL_RAW!r} is missing scheme — defaulting to {MT5_API_URL}")
+else:
+    MT5_API_URL = _MT5_URL_RAW
 MT5_IMAGE     = "timurila/mt5rest"     # Docker image for mtapi-io REST bridge
 MT5_CONTAINER = "mt5rest"
 

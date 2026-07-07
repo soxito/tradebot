@@ -47,6 +47,12 @@ import {
 // Users can still type any custom server manually.
 
 const BROKER_SERVERS: { broker: string; servers: string[] }[] = [
+  // MetaQuotes — official MetaTrader 5 demo & real servers (for testing and direct MetaQuotes accounts)
+  { broker: 'MetaQuotes (Official)', servers: [
+    'MetaQuotes-Demo',
+    'MetaQuotes-Real',
+    'MetaQuotes-Server',
+  ]},
   // IC Markets
   { broker: 'IC Markets', servers: [
     'ICMarkets-Live01','ICMarkets-Live02','ICMarkets-Live03','ICMarkets-Live04',
