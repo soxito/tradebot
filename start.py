@@ -209,43 +209,144 @@ def _physical_cores(logical: int) -> int:
     return logical
 
 
-def detect_resources() -> Dict[str, object]:
-    """Detect CPU + RAM and derive resource-aware settings for the app."""
-    logical = os.cpu_count() or 4
-    physical = _physical_cores(logical)
-    ram_gb = _total_ram_bytes() / (1024 ** 3)
+# ── PC model catalogue ────────────────────────────────────────────────────────
+# Representative hardware classes used for simulation and for documentation of
+# what settings the app would use on each class of machine.
+#
+#   name          : human label
+#   physical_cores: real CPU cores (not hyper-threads)
+#   logical_cores : threads reported by the OS
+#   ram_gb        : total RAM (as the OS sees it)
+#
+_PC_MODELS: List[Dict[str, object]] = [
+    # ── Entry class ──────────────────────────────────────────────────────────
+    {"name": "Budget (2c/4GB)",       "physical": 2, "logical": 4,  "ram_gb": 4},
+    {"name": "Old laptop (2c/8GB)",   "physical": 2, "logical": 4,  "ram_gb": 8},
+    # ── Mid-range ────────────────────────────────────────────────────────────
+    {"name": "Mid laptop (4c/8GB)",   "physical": 4, "logical": 8,  "ram_gb": 8},
+    {"name": "Mid desktop (4c/16GB)", "physical": 4, "logical": 8,  "ram_gb": 16},
+    # ── Modern thin-and-light ────────────────────────────────────────────────
+    {"name": "i5/M2 Air (6c/16GB)",   "physical": 6, "logical": 10, "ram_gb": 16},
+    {"name": "i7/M2 Pro (8c/16GB)",   "physical": 8, "logical": 16, "ram_gb": 16},
+    # ── High-end ─────────────────────────────────────────────────────────────
+    {"name": "i7/M2 Pro (8c/32GB)",   "physical": 8, "logical": 16, "ram_gb": 32},
+    {"name": "Ryzen 9 (10c/32GB)",    "physical": 10,"logical": 20, "ram_gb": 32},
+    # ── Workstation ──────────────────────────────────────────────────────────
+    {"name": "Workstation (16c/64GB)","physical": 16,"logical": 32, "ram_gb": 64},
+]
 
-    # Node heap for the Next.js dev server — leave plenty of RAM for the OS and
-    # the browser (which is the real memory hog on 8 GB laptops).
-    if ram_gb <= 9:          # ~8 GB machines (e.g. Apple M2 2022)
+
+def _compute_settings(physical: int, logical: int, ram_gb: float) -> Dict[str, object]:
+    """
+    Derive resource-aware settings for a machine described by its core/RAM spec.
+
+    This is the single source of truth used by both the live `detect_resources()`
+    path and the `--simulate` table so the two are always in sync.
+
+    Knobs returned
+    ──────────────
+    node_heap_mb      : Node.js --max-old-space-size for the Next.js dev server
+    ml_threads        : OMP/MKL/TORCH thread cap for backend ML/BLAS libraries
+    ui_tier           : "low" | "medium" | "high" | "ultra"  (→ NEXT_PUBLIC_PERF_TIER)
+    disable_3d        : bool — kill all Three.js/WebGL when tier is "low"
+    poll_multiplier   : float — scale all frontend polling intervals by this factor
+                        (>1 slows polls on weak machines, 1.0 = default cadence)
+    db_pool_size      : int — SQLAlchemy async connection-pool ceiling
+    backend_workers   : int — uvicorn worker count (1 unless high-core + high-RAM)
+    redis_maxmemory_mb: int — Redis maxmemory cap in MB (0 = no cap)
+    enable_charts     : bool — expose live chart endpoints / ws feeds
+    heartbeat_tick_s  : int — Agent Paul background heartbeat interval in seconds
+    """
+    # ── Node heap ─────────────────────────────────────────────────────────────
+    if ram_gb <= 5:       # 4 GB machines (shared with OS + browser)
+        node_heap = 768
+    elif ram_gb <= 9:     # 8 GB laptops
         node_heap = 1536
-    elif ram_gb <= 17:       # ~16 GB machines (e.g. M2 Pro)
+    elif ram_gb <= 17:    # 16 GB mainstream
         node_heap = 3072
-    else:
+    elif ram_gb <= 33:    # 32 GB high-end
         node_heap = 4096
+    else:                 # 64 GB+ workstations
+        node_heap = 6144
 
-    # ML/BLAS thread cap — leave 2 cores for the event loop + OS so torch/numpy
-    # can't saturate the CPU and stall the API on smaller machines.
+    # ── ML thread cap ────────────────────────────────────────────────────────
     if physical > 4:
         ml_threads = max(2, physical - 2)
     else:
-        # Low-core machines (≤4 physical, e.g. a dual-core i5-4300U reporting
-        # 2 physical / 4 logical): keep ML work from starving the async event
-        # loop + OS by leaving ~2 logical cores free (but always ≥1 thread).
-        ml_threads = max(1, min(physical, logical - 2))
+        # Dual/quad-core: keep ≥1 thread but don't starve event-loop + OS.
+        ml_threads = max(1, min(physical, max(1, logical - 2)))
 
-    # UI quality-tier hint for the frontend (mirrors devicePerformance.ts).
-    lc = logical
-    if lc <= 4:
+    # ── UI tier ──────────────────────────────────────────────────────────────
+    if logical <= 4:
         ui_tier = "low"
-    elif lc <= 8:
+    elif logical <= 8:
         ui_tier = "medium"
-    elif lc <= 10:
+    elif logical <= 12:
         ui_tier = "high"
     else:
         ui_tier = "ultra"
+    # RAM cap: a 16-thread Xeon with 8 GB is still "medium"
     if ram_gb <= 9 and ui_tier in ("high", "ultra"):
         ui_tier = "medium"
+    if ram_gb <= 5:
+        ui_tier = "low"
+
+    # ── Poll multiplier ───────────────────────────────────────────────────────
+    # Weak machines get slower polls to cut CPU/network overhead at idle.
+    if ui_tier == "low":
+        poll_multiplier = 3.0     # 5 s becomes 15 s, 15 s becomes 45 s
+    elif ui_tier == "medium" and ram_gb <= 9:
+        poll_multiplier = 2.0
+    elif ui_tier == "medium":
+        poll_multiplier = 1.5
+    else:
+        poll_multiplier = 1.0     # high / ultra → normal cadence
+
+    # ── DB pool size ──────────────────────────────────────────────────────────
+    # With NullPool (current), this only matters for the pool used by plugins.
+    # Cap it to avoid holding open too many PG connections on low-RAM hosts.
+    if ram_gb <= 5:
+        db_pool_size = 2
+    elif ram_gb <= 9:
+        db_pool_size = 4
+    elif ram_gb <= 17:
+        db_pool_size = 8
+    else:
+        db_pool_size = 16
+
+    # ── Uvicorn worker count ──────────────────────────────────────────────────
+    # Multiple workers fork the process: only useful when physical cores ≥ 4
+    # and there's enough RAM to sustain them (each FastAPI worker ~150–250 MB).
+    if physical >= 8 and ram_gb >= 16:
+        backend_workers = min(4, physical // 2)
+    elif physical >= 4 and ram_gb >= 12:
+        backend_workers = 2
+    else:
+        backend_workers = 1   # single-worker avoids fork overhead on weak machines
+
+    # ── Redis memory cap ──────────────────────────────────────────────────────
+    # Prevent Redis from ballooning on machines with ≤8 GB RAM.
+    if ram_gb <= 5:
+        redis_maxmemory_mb = 64
+    elif ram_gb <= 9:
+        redis_maxmemory_mb = 128
+    elif ram_gb <= 17:
+        redis_maxmemory_mb = 256
+    else:
+        redis_maxmemory_mb = 0   # no cap — let Redis self-regulate
+
+    # ── Chart streams ─────────────────────────────────────────────────────────
+    # Very weak machines can skip the live-chart WebSocket feeds entirely.
+    enable_charts = ui_tier != "low" or ram_gb > 5
+
+    # ── Agent Paul heartbeat ──────────────────────────────────────────────────
+    # Slow the idle-brain tick on weak machines so it doesn't burn background CPU.
+    if ui_tier == "low":
+        heartbeat_tick_s = 600   # 10 min
+    elif ui_tier == "medium":
+        heartbeat_tick_s = 300   # 5 min (default)
+    else:
+        heartbeat_tick_s = 180   # 3 min — more responsive on powerful machines
 
     return {
         "logical": logical,
@@ -254,12 +355,91 @@ def detect_resources() -> Dict[str, object]:
         "node_heap_mb": node_heap,
         "ml_threads": ml_threads,
         "ui_tier": ui_tier,
-        # Hard 3D/WebGL kill-switch for very weak GPUs (e.g. the Intel HD 4400
-        # in an i5-4300U): on the 'low' tier we tell the browser to skip the
-        # Three.js robot / SOX orb / force-graph-3d entirely instead of relying
-        # only on the adaptive FPS downgrade.
         "disable_3d": ui_tier == "low",
+        "poll_multiplier": poll_multiplier,
+        "db_pool_size": db_pool_size,
+        "backend_workers": backend_workers,
+        "redis_maxmemory_mb": redis_maxmemory_mb,
+        "enable_charts": enable_charts,
+        "heartbeat_tick_s": heartbeat_tick_s,
     }
+
+
+def _apply_profile_override(settings: Dict[str, object]) -> Dict[str, object]:
+    """
+    Honour the TRADEBOT_PROFILE env-var to let users pin the performance tier
+    without editing hardware.  Valid values: minimal | low | medium | high | ultra.
+
+    The override adjusts the derived knobs in a consistent, self-contained way
+    rather than just renaming the tier label — so ml_threads, poll_multiplier,
+    etc. all move together.
+    """
+    profile = os.environ.get("TRADEBOT_PROFILE", "").strip().lower()
+    if not profile or profile not in ("minimal", "low", "medium", "high", "ultra"):
+        return settings  # no override — use hardware-detected values
+
+    warn(f"TRADEBOT_PROFILE={profile!r} override active")
+
+    physical = int(settings["physical"])
+    logical  = int(settings["logical"])
+    ram_gb   = float(settings["ram_gb"])
+
+    # Build override deltas per profile
+    overrides: Dict[str, object] = {}
+    if profile == "minimal":
+        overrides = {
+            "ui_tier": "low", "disable_3d": True, "poll_multiplier": 4.0,
+            "ml_threads": 1, "node_heap_mb": 512, "db_pool_size": 2,
+            "backend_workers": 1, "redis_maxmemory_mb": 64,
+            "enable_charts": False, "heartbeat_tick_s": 900,
+        }
+    elif profile == "low":
+        overrides = {
+            "ui_tier": "low", "disable_3d": True, "poll_multiplier": 3.0,
+            "ml_threads": max(1, physical // 2),
+            "node_heap_mb": min(int(settings["node_heap_mb"]), 1024),
+            "db_pool_size": 2, "backend_workers": 1,
+            "redis_maxmemory_mb": 128, "enable_charts": False,
+            "heartbeat_tick_s": 600,
+        }
+    elif profile == "medium":
+        overrides = {
+            "ui_tier": "medium", "disable_3d": False, "poll_multiplier": 1.5,
+            "ml_threads": max(2, physical - 1),
+            "node_heap_mb": min(int(settings["node_heap_mb"]), 2048),
+            "db_pool_size": 6, "backend_workers": min(2, int(settings["backend_workers"])),
+            "redis_maxmemory_mb": 256, "enable_charts": True,
+            "heartbeat_tick_s": 300,
+        }
+    elif profile == "high":
+        overrides = {
+            "ui_tier": "high", "disable_3d": False, "poll_multiplier": 1.0,
+            "ml_threads": max(2, physical - 2),
+            "node_heap_mb": max(int(settings["node_heap_mb"]), 3072),
+            "db_pool_size": 10, "backend_workers": min(4, int(settings["backend_workers"])),
+            "redis_maxmemory_mb": 0, "enable_charts": True,
+            "heartbeat_tick_s": 180,
+        }
+    elif profile == "ultra":
+        overrides = {
+            "ui_tier": "ultra", "disable_3d": False, "poll_multiplier": 1.0,
+            "ml_threads": max(4, physical - 2),
+            "node_heap_mb": max(int(settings["node_heap_mb"]), 4096),
+            "db_pool_size": 16, "backend_workers": max(4, int(settings["backend_workers"])),
+            "redis_maxmemory_mb": 0, "enable_charts": True,
+            "heartbeat_tick_s": 120,
+        }
+
+    return {**settings, **overrides}
+
+
+def detect_resources() -> Dict[str, object]:
+    """Detect CPU + RAM and derive resource-aware settings for the app."""
+    logical  = os.cpu_count() or 4
+    physical = _physical_cores(logical)
+    ram_gb   = _total_ram_bytes() / (1024 ** 3)
+    settings = _compute_settings(physical, logical, ram_gb)
+    return _apply_profile_override(settings)
 
 
 def get_resources() -> Dict[str, object]:
@@ -274,9 +454,68 @@ def print_resources() -> None:
     header("System resources")
     ok(f"CPU: {r['physical']} physical / {r['logical']} logical cores")
     ok(f"RAM: {r['ram_gb']} GB")
-    info(f"Frontend Node heap: {r['node_heap_mb']} MB  ·  backend ML threads: {r['ml_threads']}  ·  UI tier: {str(r['ui_tier']).upper()}")
+    ok(f"Node heap: {r['node_heap_mb']} MB  ·  ML threads: {r['ml_threads']}  ·  UI tier: {str(r['ui_tier']).upper()}")
+    ok(f"Backend workers: {r['backend_workers']}  ·  DB pool: {r['db_pool_size']}  ·  Poll×{r['poll_multiplier']}")
     if r.get("disable_3d"):
         info("Low-power GPU profile: 3D/WebGL effects disabled (robot · orb · 3D graph)")
+    if not r.get("enable_charts"):
+        info("Chart live-feeds disabled on this tier (enable with TRADEBOT_PROFILE=medium+)")
+
+
+def simulate_pc_models() -> None:
+    """
+    Print a table showing what settings each representative PC class would receive.
+    Run with:  python3 start.py --simulate
+    """
+    header("PC model resource simulation")
+    sep()
+    # Column widths
+    W = {
+        "name": 26, "tier": 6, "heap": 5, "threads": 5,
+        "poll": 5, "pool": 4, "workers": 4, "redis": 6,
+        "3d": 3, "charts": 6,
+    }
+    hdr = (
+        f"{'Model':<{W['name']}} {'Tier':<{W['tier']}} "
+        f"{'Heap':>{W['heap']}} {'MLt':>{W['threads']}} "
+        f"{'Poll×':>{W['poll']}} {'Pool':>{W['pool']}} "
+        f"{'Wkr':>{W['workers']}} {'Redis':>{W['redis']}} "
+        f"{'3D':<{W['3d']}} {'Charts':<{W['charts']}}"
+    )
+    print(f"  {C.BOLD}{hdr}{C.RESET}")
+    sep()
+    for m in _PC_MODELS:
+        s = _compute_settings(int(m["physical"]), int(m["logical"]), float(m["ram_gb"]))
+        tier = str(s["ui_tier"]).upper()
+        tier_color = {
+            "LOW": C.RED, "MEDIUM": C.YELLOW,
+            "HIGH": C.GREEN, "ULTRA": C.CYAN,
+        }.get(tier, C.RESET)
+        redis_label = f"{s['redis_maxmemory_mb']}M" if s["redis_maxmemory_mb"] else "none"
+        row = (
+            f"{m['name']:<{W['name']}} "
+            f"{tier_color}{tier:<{W['tier']}}{C.RESET} "
+            f"{str(s['node_heap_mb'])+'M':>{W['heap']}} "
+            f"{s['ml_threads']:>{W['threads']}} "
+            f"{s['poll_multiplier']:>{W['poll']}.1f} "
+            f"{s['db_pool_size']:>{W['pool']}} "
+            f"{s['backend_workers']:>{W['workers']}} "
+            f"{redis_label:>{W['redis']}} "
+            f"{'no' if s['disable_3d'] else 'yes':<{W['3d']}} "
+            f"{'yes' if s['enable_charts'] else 'no':<{W['charts']}}"
+        )
+        print(f"  {row}")
+    sep()
+    print(f"\n  {C.CYAN}Override:  TRADEBOT_PROFILE=minimal|low|medium|high|ultra{C.RESET}")
+    print(f"  {C.CYAN}Example:   TRADEBOT_PROFILE=low python3 start.py{C.RESET}")
+    detected = detect_resources()
+    print()
+    info(f"This machine → {detected['physical']}c/{detected['ram_gb']}GB → "
+         f"tier {str(detected['ui_tier']).upper()}, "
+         f"heap {detected['node_heap_mb']}M, "
+         f"threads {detected['ml_threads']}, "
+         f"poll×{detected['poll_multiplier']}, "
+         f"workers {detected['backend_workers']}")
 
 MT5_API_URL   = _DOTENV.get("MT5_API_URL", os.environ.get("MT5_API_URL", "http://localhost:8092"))
 MT5_IMAGE     = "timurila/mt5rest"     # Docker image for mtapi-io REST bridge
@@ -443,7 +682,32 @@ def _npm_cmd() -> str:
 
 
 def _npx_cmd() -> str:
-    return shutil.which("npx") or ("npx.cmd" if IS_WINDOWS else "npx")
+    # 1. Prefer whatever is already on PATH
+    found = shutil.which("npx") or shutil.which("npx.cmd")
+    if found:
+        return found
+    # 2. Windows-specific: check common Node install locations
+    if IS_WINDOWS:
+        _appdata = os.environ.get("APPDATA", "")
+        _progfiles = os.environ.get("ProgramFiles", "C:\\Program Files")
+        _progfiles86 = os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")
+        for base in (_progfiles, _progfiles86, str(HOME / "AppData" / "Roaming")):
+            for cand in (
+                Path(base) / "npm" / "npx.cmd",
+                Path(base) / "nodejs" / "npx.cmd",
+                Path(base) / "Node.js" / "npx.cmd",
+            ):
+                if cand.exists():
+                    return str(cand)
+        # nvm-windows stores binaries in different locations
+        for cand in (
+            HOME / "AppData" / "Roaming" / "nvm" / "npx.cmd",
+            Path("C:\\Program Files\\nodejs\\npx.cmd"),
+        ):
+            if cand.exists():
+                return str(cand)
+        return "npx.cmd"
+    return "npx"
 
 
 def http_ok(url: str, timeout: float = 5.0) -> bool:
@@ -2736,7 +3000,10 @@ def start_backend(pg_port: int, redis_port: int, mode: str) -> bool:
     log_file = ROOT / "backend.log"
 
     # Start with a copy of the current shell environment.
-    env = {**os.environ, "PYTHONPATH": f"{BACKEND_DIR}:{ROOT}"}
+    # Use os.pathsep (':' on Unix, ';' on Windows) — the hard-coded ':' broke
+    # module imports on Windows where Python can't parse Unix-style paths.
+    _pp_sep = os.pathsep
+    env = {**os.environ, "PYTHONPATH": f"{BACKEND_DIR}{_pp_sep}{ROOT}"}
 
     # Load .env — user-set values WIN over shell environment (so keys like
     # DATABASE_URL, REDIS_URL, and all API keys are taken verbatim from the
@@ -2781,25 +3048,68 @@ def start_backend(pg_port: int, redis_port: int, mode: str) -> bool:
         env.setdefault(_k, _ml)
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-    # On low-core machines (≤2 physical cores, e.g. the dual-core i5-4300U)
-    # uvicorn's --reload is a needless tax: it spawns a second supervisor
-    # process AND a constant filesystem watcher that steals CPU from the API.
-    # Skip it there and run a single lean process. Override with TRADEBOT_RELOAD.
+    # Resource-aware backend settings injected as env so FastAPI/plugins can read them.
+    env.setdefault("TRADEBOT_DB_POOL_SIZE",    str(_res["db_pool_size"]))
+    env.setdefault("TRADEBOT_POLL_MULTIPLIER", str(_res["poll_multiplier"]))
+    env.setdefault("TRADEBOT_ENABLE_CHARTS",   "1" if _res["enable_charts"] else "0")
+    # Override Agent Paul heartbeat tick only if user hasn't pinned it already.
+    env.setdefault("PAUL_HEARTBEAT_TICK_SECONDS", str(_res["heartbeat_tick_s"]))
+
+    # Redis memory cap — only apply when Redis is running locally and we have a
+    # real cap (redis_maxmemory_mb > 0) to set. Emit CONFIG SET so it takes
+    # effect immediately without needing a redis.conf edit.
+    _redis_cap = int(_res["redis_maxmemory_mb"])
+    if _redis_cap > 0:
+        try:
+            import subprocess as _sp
+            _redis_cli = shutil.which("redis-cli")
+            if _redis_cli:
+                _redis_port = int(os.environ.get("REDIS_PORT", "6379"))
+                _sp.run(
+                    [_redis_cli, "-p", str(_redis_port),
+                     "CONFIG", "SET", "maxmemory", f"{_redis_cap}mb",
+                     "CONFIG", "SET", "maxmemory-policy", "allkeys-lru"],
+                    capture_output=True, timeout=5
+                )
+        except Exception:
+            pass  # Redis may not be up yet; the cap will be applied on reconnect
+
+    # --reload: disabled on Windows (watchfiles reloader is incompatible with
+    # the SelectorEventLoop policy we set for asyncpg, causes a second crash
+    # on the watchfiles process), on ≤2-core machines (CPU starvation), and
+    # in production.  Override with TRADEBOT_RELOAD=1 to force it on.
     _reload_override = os.environ.get("TRADEBOT_RELOAD")
     if _reload_override is not None:
         use_reload = _reload_override.strip().lower() in ("1", "true", "yes", "on")
+    elif IS_WINDOWS:
+        use_reload = False          # watchfiles + SelectorEventLoop = crash
     else:
         use_reload = int(_res["physical"]) > 2
+
+    # Multi-worker mode: only available without --reload (workers fork, reloader
+    # doesn't work with multiple workers). Workers > 1 also only helps on machines
+    # with enough cores and RAM (enforced inside _compute_settings).
+    _workers = int(_res["backend_workers"])
+    if use_reload:
+        _workers = 1   # --reload + --workers > 1 is unsupported by uvicorn
+
     uvicorn_cmd = [str(UVICORN_BIN), "app.main:app",
-                   "--host", "0.0.0.0", "--port", str(BACKEND_PORT)]
+                   "--host", "0.0.0.0", "--port", str(BACKEND_PORT),
+                   "--loop", "asyncio"]   # explicit: prevents uvloop probe crash on Win
+    if _workers > 1:
+        uvicorn_cmd += ["--workers", str(_workers)]
+        info(f"Backend workers: {_workers}  (tier {str(_res['ui_tier']).upper()}, {_res['ram_gb']} GB RAM)")
     if use_reload:
         uvicorn_cmd += ["--reload",
                         "--reload-dir", str(BACKEND_DIR / "app"),
                         "--reload-dir", str(ROOT / "plugins")]
     else:
-        info("Low-core machine — starting backend without --reload (set "
-             "TRADEBOT_RELOAD=1 to force auto-reload)")
+        reason = "Windows (incompatible with SelectorEventLoop)" if IS_WINDOWS else "low-core machine"
+        info(f"Reload disabled ({reason}) — set TRADEBOT_RELOAD=1 to force")
 
+    # Windows: hide the console window that would otherwise flash open for the
+    # uvicorn child process (CREATE_NO_WINDOW = 0x08000000).
+    _win_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0
     with open(log_file, "w") as lf:
         proc = subprocess.Popen(
             uvicorn_cmd,
@@ -2807,15 +3117,20 @@ def start_backend(pg_port: int, redis_port: int, mode: str) -> bool:
             env=env,
             stdout=lf,
             stderr=subprocess.STDOUT,
+            creationflags=_win_flags,
         )
 
     # Write PID
     (ROOT / "backend.pid").write_text(str(proc.pid))
 
-    if wait_for_port("localhost", BACKEND_PORT, "FastAPI backend", max_wait=60):
+    # Use 127.0.0.1 not localhost for the readiness check: on Windows,
+    # 'localhost' resolves to ::1 (IPv6) first, causing a ~1s TCP timeout on
+    # every attempt before falling back to 127.0.0.1 (the actual binding).
+    _check_host = "127.0.0.1"
+    if wait_for_port(_check_host, BACKEND_PORT, "FastAPI backend", max_wait=60):
         # Extra: hit /health or /api/v1 to confirm it responds
         time.sleep(1)
-        if http_ok(f"http://localhost:{BACKEND_PORT}/api/v1/health", timeout=5):
+        if http_ok(f"http://{_check_host}:{BACKEND_PORT}/api/v1/health", timeout=5):
             ok("Backend /health endpoint OK")
         else:
             warn("Backend port open but /health not ready yet (still loading plugins)")
@@ -2855,22 +3170,43 @@ def start_frontend() -> bool:
         "PORT": str(FRONTEND_PORT),
         "NODE_OPTIONS": _node_opts,
         "NEXT_PUBLIC_PERF_TIER": str(_res["ui_tier"]),
+        # Poll-multiplier: frontend hooks multiply their base interval by this
+        # value — weak machines poll less often, reducing CPU + network churn.
+        "NEXT_PUBLIC_POLL_MULTIPLIER": str(_res["poll_multiplier"]),
         # Hard-disable WebGL on weak GPUs (low tier) — see detect_resources().
         "NEXT_PUBLIC_DISABLE_3D": "1" if _res.get("disable_3d") else "0",
+        # Disable live chart feeds on very low-tier machines to save CPU.
+        "NEXT_PUBLIC_ENABLE_CHARTS": "1" if _res.get("enable_charts", True) else "0",
     }
 
     with open(log_file, "w") as lf:
-        proc = subprocess.Popen(
-            [_npx_cmd(), "next", "dev", "--port", str(FRONTEND_PORT)],
-            cwd=FRONTEND_DIR,
-            env=env,
-            stdout=lf,
-            stderr=subprocess.STDOUT,
-        )
+        # On Windows, npx / next are .cmd batch files that need shell=True (or
+        # cmd /c) to execute.  On POSIX they are real executables → no shell.
+        _npx = _npx_cmd()
+        if IS_WINDOWS:
+            _frontend_cmd = f'"{_npx}" next dev --port {FRONTEND_PORT}'
+            _win_flags_fe = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            proc = subprocess.Popen(
+                _frontend_cmd,
+                shell=True,
+                cwd=FRONTEND_DIR,
+                env=env,
+                stdout=lf,
+                stderr=subprocess.STDOUT,
+                creationflags=_win_flags_fe,
+            )
+        else:
+            proc = subprocess.Popen(
+                [_npx, "next", "dev", "--port", str(FRONTEND_PORT)],
+                cwd=FRONTEND_DIR,
+                env=env,
+                stdout=lf,
+                stderr=subprocess.STDOUT,
+            )
 
     (ROOT / "frontend.pid").write_text(str(proc.pid))
 
-    if wait_for_port("localhost", FRONTEND_PORT, "Next.js frontend", max_wait=90):
+    if wait_for_port("127.0.0.1", FRONTEND_PORT, "Next.js frontend", max_wait=90):
         ok("Frontend ready")
         return True
     try:
@@ -3079,10 +3415,12 @@ def print_summary(results: Dict[str, bool], mode: str, pg_port: int, redis_port:
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     parser = argparse.ArgumentParser(description="TradeBot startup script")
-    parser.add_argument("--brew",   action="store_true", help="Use Homebrew postgres/redis")
-    parser.add_argument("--docker", action="store_true", help="Use Docker postgres/redis")
-    parser.add_argument("--stop",   action="store_true", help="Stop all services")
-    parser.add_argument("--status", action="store_true", help="Show service status")
+    parser.add_argument("--brew",     action="store_true", help="Use Homebrew postgres/redis")
+    parser.add_argument("--docker",   action="store_true", help="Use Docker postgres/redis")
+    parser.add_argument("--stop",     action="store_true", help="Stop all services")
+    parser.add_argument("--status",   action="store_true", help="Show service status")
+    parser.add_argument("--simulate", action="store_true",
+                        help="Show resource settings for all PC model classes and exit")
     args = parser.parse_args()
 
     if args.stop:
@@ -3091,6 +3429,10 @@ def main() -> None:
 
     if args.status:
         status()
+        return
+
+    if args.simulate:
+        simulate_pc_models()
         return
 
     forced = "brew" if args.brew else ("docker" if args.docker else None)

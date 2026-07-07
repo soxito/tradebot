@@ -10,6 +10,7 @@
  */
 import Head from 'next/head'
 import { useState, useEffect, useCallback, useRef } from 'react'
+import { pollMultiplier } from '@/utils/devicePerformance'
 import dynamic from 'next/dynamic'
 import { apiClient } from '@/services/api'
 import type { MT5PositionForChart, MT5DealForChart } from '@/components/MT5Chart'
@@ -731,7 +732,7 @@ export default function MT5LivePage() {
     }
     const startFast = () => {
       if (fastPollRef.current) clearInterval(fastPollRef.current)
-      fastPollRef.current = setInterval(fetchPositionsFast, 5000)
+      fastPollRef.current = setInterval(fetchPositionsFast, 5000 * pollMultiplier())
     }
     const stopAll = () => {
       if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
@@ -841,7 +842,7 @@ export default function MT5LivePage() {
     // Sync status on mount
     fetchAutoManageStatus()
     // Poll status every 15s
-    amStatusPollRef.current = setInterval(fetchAutoManageStatus, 15000)
+    amStatusPollRef.current = setInterval(fetchAutoManageStatus, 15000 * pollMultiplier())
     return () => {
       // Stop loop when page unmounts
       if (amStatusPollRef.current) clearInterval(amStatusPollRef.current)
@@ -915,7 +916,7 @@ export default function MT5LivePage() {
     }
 
     fetchExchBalance()
-    const id = setInterval(fetchExchBalance, 15000)   // refresh every 15s
+    const id = setInterval(fetchExchBalance, 15000 * pollMultiplier())   // refresh every 15s
     return () => { cancelled = true; clearInterval(id) }
   }, [selectedId, accounts])
 

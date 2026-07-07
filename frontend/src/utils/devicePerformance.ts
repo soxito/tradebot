@@ -187,3 +187,33 @@ export function describeTier(tier: PerfTier, info: DeviceInfo = detectDevice()):
   if (info.memGB != null) parts.push(`${info.memGB}GB+`)
   return parts.join(' · ')
 }
+
+/**
+ * Returns the poll-interval multiplier injected by start.py.
+ * Weak machines get a value > 1 (e.g. 2.0 or 3.0) so all polling loops
+ * automatically slow down without changing their hard-coded base interval.
+ *
+ * Usage:
+ *   const INTERVAL = 5_000 * pollMultiplier()  // 5 s → 15 s on low tier
+ */
+export function pollMultiplier(): number {
+  const env = typeof process !== 'undefined'
+    ? process.env.NEXT_PUBLIC_POLL_MULTIPLIER
+    : undefined
+  if (!env) return 1.0
+  const v = parseFloat(env)
+  return isFinite(v) && v > 0 ? v : 1.0
+}
+
+/**
+ * Whether live chart WebSocket/poll feeds are enabled.
+ * start.py sets NEXT_PUBLIC_ENABLE_CHARTS='0' on very low-tier machines
+ * to skip chart updates entirely and reduce CPU/network.
+ */
+export function chartsEnabled(): boolean {
+  const env = typeof process !== 'undefined'
+    ? process.env.NEXT_PUBLIC_ENABLE_CHARTS
+    : undefined
+  // Default enabled; only disabled when explicitly set to '0'
+  return env !== '0' && env !== 'false'
+}

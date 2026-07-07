@@ -185,9 +185,7 @@ def jarvis_learn_all_brains(
     vault (file + DB row), AI Analyst store, and PaulKnowledge.
     Fire-and-forget — never blocks the caller."""
     try:
-        loop = asyncio.get_event_loop()
-        if not loop.is_running():
-            return
+        loop = asyncio.get_running_loop()
         _tags = list(set((tags or []) + ["jarvis", action] + ([symbol] if symbol else [])))
         loop.create_task(
             _vault_capture_with_db(action, symbol, summary, detail, _tags, order_id or "")

@@ -11,7 +11,7 @@ import Head from 'next/head'
 import Link from 'next/link'
 import { useCallback, useEffect, useRef, useState, useMemo } from 'react'
 import { apiClient } from '@/services/api'
-import { threeDisabled } from '@/utils/devicePerformance'
+import { threeDisabled, pollMultiplier } from '@/utils/devicePerformance'
 import {
   Network, Sparkles, Search, Brain, Trash2, RefreshCw, Gauge,
   Layers, X, Save, Check, Maximize2, Minimize2, PanelRightClose, PanelRightOpen,
@@ -44,7 +44,7 @@ function SignalsOverlayPanel() {
         .catch(() => {})
     }
     load()
-    const t = setInterval(() => { if (!document.hidden) load() }, 30_000)
+    const t = setInterval(() => { if (!document.hidden) load() }, 30_000 * pollMultiplier())
     return () => clearInterval(t)
   }, [])
 
@@ -187,7 +187,7 @@ function BrainLearningConsole() {
 
   useEffect(() => {
     load()
-    const t = setInterval(() => { if (!document.hidden) load() }, 10_000)
+    const t = setInterval(() => { if (!document.hidden) load() }, 10_000 * pollMultiplier())
     return () => clearInterval(t)
   }, [load])
 
@@ -759,7 +759,7 @@ export default function IntelligencePage() {
       } catch { /* ignore */ }
     }
     poll()
-    const t = setInterval(() => { if (!document.hidden) poll() }, 5000)
+    const t = setInterval(() => { if (!document.hidden) poll() }, 5000 * pollMultiplier())
     return () => clearInterval(t)
   }, [])
 

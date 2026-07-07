@@ -1,6 +1,7 @@
 import Head from 'next/head'
 import dynamic from 'next/dynamic'
 import { useState, useEffect, useCallback, useRef } from 'react'
+import { pollMultiplier } from '@/utils/devicePerformance'
 import { useTradeStore } from '@/store/useTradeStore'
 import { apiClient } from '@/services/api'
 import { formatPrice } from '@/utils/price'
@@ -889,7 +890,7 @@ export default function TradingPage() {
     fetchBalance()
     fetchSignals()
     fetchSimAccount()
-    const interval = setInterval(() => { fetchTicker(); fetchSignals() }, 15000)
+    const interval = setInterval(() => { fetchTicker(); fetchSignals() }, 15000 * pollMultiplier())
     return () => clearInterval(interval)
   }, [mounted, fetchTicker, fetchBalance, fetchSignals, fetchSimAccount])
 
@@ -911,7 +912,7 @@ export default function TradingPage() {
     if (!mounted || !simAccount?.is_active) return
     refreshSimData()
     if (streamLive) return
-    const interval = setInterval(refreshSimData, 10000)
+    const interval = setInterval(refreshSimData, 10000 * pollMultiplier())
     return () => clearInterval(interval)
   }, [mounted, simAccount?.is_active, refreshSimData, streamLive])
 
@@ -920,7 +921,7 @@ export default function TradingPage() {
     if (!mounted || tradingMode !== 'live') return
     refreshLiveData()
     if (streamLive) return
-    const interval = setInterval(refreshLiveData, 10000)
+    const interval = setInterval(refreshLiveData, 10000 * pollMultiplier())
     return () => clearInterval(interval)
   }, [mounted, tradingMode, refreshLiveData, streamLive])
 

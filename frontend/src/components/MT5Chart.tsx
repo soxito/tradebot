@@ -15,6 +15,7 @@ import { createChart, IChartApi, ISeriesApi, SeriesMarker, Time, LineStyle } fro
 import { apiClient } from '@/services/api'
 import { Search, RefreshCw, ChevronDown } from 'lucide-react'
 import { formatTimeZA } from '@/utils/datetime'
+import { pollMultiplier } from '@/utils/devicePerformance'
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -454,7 +455,7 @@ export default function MT5Chart({
       }
 
       if (!cancelled) {
-        const delay = failStreak >= 3 ? 30_000 : document.hidden ? 15_000 : 2_000
+        const delay = failStreak >= 3 ? 30_000 * pollMultiplier() : document.hidden ? 15_000 * pollMultiplier() : 2_000 * pollMultiplier()
         timeoutId = setTimeout(poll, delay)
       }
     }
@@ -465,7 +466,7 @@ export default function MT5Chart({
         liveBarRef.current = null   // reset so next tick initialises fresh live bar
         fetchCandles()
       }
-    }, 60_000)
+    }, 60_000 * pollMultiplier())
 
     poll()
     return () => {

@@ -1,6 +1,14 @@
 """
 Main FastAPI Application Entry Point
 """
+# ── Windows asyncio policy fix ────────────────────────────────────────────────
+# asyncpg requires SelectorEventLoop on Windows (not the default ProactorEventLoop).
+# Must be set BEFORE any asyncio or uvicorn code runs; has no effect on other OSes.
+import sys as _sys
+if _sys.platform == "win32":
+    import asyncio as _asyncio
+    _asyncio.set_event_loop_policy(_asyncio.WindowsSelectorEventLoopPolicy())
+
 import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request

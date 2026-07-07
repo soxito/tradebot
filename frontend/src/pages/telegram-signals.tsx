@@ -1,5 +1,6 @@
 import Head from 'next/head'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { pollMultiplier } from '@/utils/devicePerformance'
 import { apiClient } from '@/services/api'
 import {
   Activity,
@@ -355,7 +356,7 @@ export default function TelegramSignalsPage() {
 
   useEffect(() => {
     loadSignalPrices()
-    const t = setInterval(() => { if (!document.hidden) loadSignalPrices() }, 15000)
+    const t = setInterval(() => { if (!document.hidden) loadSignalPrices() }, 15000 * pollMultiplier())
     return () => clearInterval(t)
   }, [loadSignalPrices])
 
@@ -1648,7 +1649,7 @@ function VolumeMonitorView(props: {
 
   useEffect(() => {
     load()
-    const t = setInterval(load, 12000)
+    const t = setInterval(load, 12000 * pollMultiplier())
     return () => clearInterval(t)
   }, [load])
 
@@ -2656,7 +2657,7 @@ function ConnectAIView(props: {
 
   useEffect(() => {
     loadUsage()
-    const t = setInterval(loadUsage, 20000)
+    const t = setInterval(loadUsage, 20000 * pollMultiplier())
     return () => clearInterval(t)
   }, [loadUsage, providers.length])
 

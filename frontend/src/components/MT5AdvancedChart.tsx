@@ -24,6 +24,7 @@ import {
   Maximize2, Minimize2, Ruler, Eraser, Activity,
 } from 'lucide-react'
 import { formatTimeZA } from '@/utils/datetime'
+import { pollMultiplier } from '@/utils/devicePerformance'
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -558,12 +559,12 @@ export default function MT5AdvancedChart({
       } catch {
         failStreak++
       }
-      if (!cancelled) timeoutId = setTimeout(poll, failStreak >= 3 ? 30_000 : document.hidden ? 15_000 : 2_000)
+      if (!cancelled) timeoutId = setTimeout(poll, failStreak >= 3 ? 30_000 * pollMultiplier() : document.hidden ? 15_000 * pollMultiplier() : 2_000 * pollMultiplier())
     }
 
     const reload = setInterval(() => {
       if (!cancelled) { liveBar.current = null; fetchCandles() }
-    }, 60_000)
+    }, 60_000 * pollMultiplier())
 
     poll()
     return () => {
