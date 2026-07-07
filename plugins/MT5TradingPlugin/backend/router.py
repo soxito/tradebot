@@ -48,6 +48,29 @@ from plugins.MT5TradingPlugin.backend.config import mt5_config
 
 router = APIRouter(prefix="/plugins/mt5", tags=["MT5 Trading"])
 
+
+def _mt5_connection_hint(current_url: str) -> str:
+    """Return a human-readable setup hint when the MT5 bridge is unreachable."""
+    if not current_url or not (current_url.startswith("http://") or current_url.startswith("https://")):
+        return (
+            "MT5_API_URL is not configured. "
+            "To connect MT5:\n"
+            "1. On your Windows PC: download mtapi.exe from https://mtapi.io, "
+            "   open MT5, then run mtapi.exe\n"
+            "2. Find your Windows PC's local IP (run ipconfig in cmd)\n"
+            "3. Add to .env:  MT5_API_URL=http://YOUR_PC_IP:8092\n"
+            "4. Restart the backend — start.py will auto-detect it on the network"
+        )
+    return (
+        f"MT5 bridge unreachable at {current_url}. "
+        "Make sure:\n"
+        "• mtapi.exe is running on your Windows PC with MT5 open\n"
+        f"• The URL in .env (MT5_API_URL={current_url}) points to the correct PC IP and port\n"
+        "• Port 8092 is not blocked by firewall on the Windows PC\n"
+        "Tip: run 'python3 start.py' — it auto-detects the bridge on the local network"
+    )
+
+
 # Default user_id for single-user mode (no auth system in core yet)
 DEFAULT_USER_ID = 1
 
@@ -839,8 +862,7 @@ async def test_connection(data: MT5AccountCreate):
             "hint": (
                 f"Server '{data.server}' not found — select one of the suggested server names below."
                 if suggestions else
-                "Make sure mtapi-io is running on the URL configured in MT5_API_URL "
-                f"(currently: {mt5_client.base_url}) and your MT5 terminal is open."
+                _mt5_connection_hint(mt5_client.base_url)
             ),
         }
 

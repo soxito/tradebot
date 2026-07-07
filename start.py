@@ -1959,38 +1959,124 @@ def _write_env_var(key: str, value: str) -> bool:
         return False
 
 
+def _local_network_prefixes() -> List[str]:
+    """Return subnet prefixes (e.g. ['192.168.1', '10.0.0']) for all non-loopback
+    IPv4 interfaces.  Used to scan nearby hosts for the MT5 bridge."""
+    prefixes: List[str] = []
+    try:
+        import subprocess as _sp
+        # Use 'ip route' (Linux) or 'netstat -rn' (macOS) to find default gateway
+        if platform.system().lower() == "darwin":
+            r = _sp.run(["netstat", "-rn", "-f", "inet"], capture_output=True, text=True, timeout=5)
+            for ln in r.stdout.splitlines():
+                parts = ln.split()
+                if len(parts) >= 2 and parts[0] not in ("default", "Destination"):
+                    # e.g. "192.168.1.0/24   192.168.1.1   UGSc ..."
+                    cidr = parts[0].split("/")[0]
+                    if cidr.startswith(("192.168.", "10.", "172.")):
+                        prefix = ".".join(cidr.split(".")[:3])
+                        if prefix not in prefixes:
+                            prefixes.append(prefix)
+        # hostname -I / ifconfig as fallback
+        r2 = _sp.run(["hostname", "-I"] if platform.system().lower() == "linux"
+                     else ["ifconfig"], capture_output=True, text=True, timeout=5)
+        import re as _re
+        for ip in _re.findall(r"(\d+\.\d+\.\d+)\.\d+", r2.stdout):
+            if ip.startswith(("192.168.", "10.", "172.")) and ip not in prefixes:
+                prefixes.append(ip)
+    except Exception:
+        pass
+    return prefixes or ["192.168.1", "192.168.0", "10.0.0"]
+
+
 def detect_and_sync_mt5_url() -> None:
     """Detect the port the mtapi-io bridge is *actually* listening on and
     persist ``MT5_API_URL`` to ``.env`` so the backend connects to it.
 
-    On Windows the bridge is often started manually on a different port
-    (e.g. :8090) than this project's default (:8092). Without this sync the
-    MT5 client raises ``Connection failed / mtapi-io unreachable at
-    http://localhost:8092`` even though the bridge is live on :8090."""
+    Scans in order:
+    1. localhost on common ports (bridge running on this machine via Docker)
+    2. LAN hosts on the local subnet (bridge on a Windows PC on the network)
+    """
     global MT5_API_URL
-    host = "localhost"
-    configured = _mt5_port()
-    detected = None
-    for port in _mt5_candidate_ports():
-        if _is_mt5_bridge(host, port, 1.0):
-            detected = port
-            break
-    if detected is None:
-        return  # nothing live yet — leave config; docker block may still start it
-    if detected == configured:
-        return  # already pointing at the live bridge
-    new_url = f"http://{host}:{detected}"
-    changed = _write_env_var("MT5_API_URL", new_url)
-    MT5_API_URL = new_url
-    os.environ["MT5_API_URL"] = new_url
+    configured_host = "localhost"
     try:
-        _DOTENV["MT5_API_URL"] = new_url
+        from urllib.parse import urlparse as _up
+        parsed = _up(MT5_API_URL)
+        if parsed.hostname and parsed.hostname != "localhost":
+            configured_host = parsed.hostname
+    except Exception:
+        pass
+
+    # ── 1. localhost probe ───────────────────────────────────────────────────
+    for port in _mt5_candidate_ports():
+        if _is_mt5_bridge("127.0.0.1", port, 0.8):
+            new_url = f"http://127.0.0.1:{port}"
+            changed = _write_env_var("MT5_API_URL", new_url)
+            MT5_API_URL = new_url
+            os.environ["MT5_API_URL"] = new_url
+            try:
+                _DOTENV["MT5_API_URL"] = new_url
+            except Exception:
+                pass
+            if changed:
+                ok(f"MT5 bridge detected on localhost:{port} — updated .env MT5_API_URL → {new_url}")
+            else:
+                info(f"MT5 bridge detected on localhost:{port} (.env already correct)")
+            return  # found — no need to scan network
+
+    # ── 2. LAN scan (Windows PC running mtapi.exe on the network) ────────────
+    # Only scan if MT5_API_URL is not pointing to a non-localhost host that is
+    # already confirmed live; this avoids a slow scan on every startup.
+    if configured_host not in ("localhost", "127.0.0.1") and _is_mt5_bridge(configured_host, _mt5_port(), 1.5):
+        info(f"MT5 bridge already live at configured URL ({MT5_API_URL})")
+        return
+
+    prefixes = _local_network_prefixes()
+    info(f"Scanning local network for MT5 bridge (subnets: {', '.join(prefixes)}) …")
+    found_url: Optional[str] = None
+
+    import concurrent.futures as _cf
+
+    def _probe(host: str, port: int) -> Optional[str]:
+        if _is_mt5_bridge(host, port, 0.6):
+            return f"http://{host}:{port}"
+        return None
+
+    # Build probe list: gateway + common last-octets first (PCs usually get
+    # .1/.100/.101/.102 from DHCP), then sweep .2–.254.
+    priority_octets = list(range(1, 10)) + list(range(100, 115)) + list(range(10, 100)) + list(range(115, 254))
+    probes: List[tuple] = []
+    for prefix in prefixes[:2]:  # cap to 2 subnets to avoid 5 min startup scans
+        for octet in priority_octets:
+            host = f"{prefix}.{octet}"
+            for port in (8092, 8090):
+                probes.append((host, port))
+
+    with _cf.ThreadPoolExecutor(max_workers=64) as pool:
+        futures = {pool.submit(_probe, h, p): (h, p) for h, p in probes}
+        for fut in _cf.as_completed(futures):
+            result = fut.result()
+            if result and not found_url:
+                found_url = result
+                # Cancel remaining work once found
+                for f in futures:
+                    f.cancel()
+                break
+
+    if not found_url:
+        return  # not found — leave config as-is, Docker block may still start it
+
+    changed = _write_env_var("MT5_API_URL", found_url)
+    MT5_API_URL = found_url
+    os.environ["MT5_API_URL"] = found_url
+    try:
+        _DOTENV["MT5_API_URL"] = found_url
     except Exception:
         pass
     if changed:
-        ok(f"MT5 bridge detected on :{detected} — updated .env MT5_API_URL → {new_url}")
+        ok(f"MT5 bridge auto-detected at {found_url} — saved to .env MT5_API_URL")
     else:
-        info(f"MT5 bridge detected on :{detected} (.env already correct)")
+        info(f"MT5 bridge detected at {found_url} (.env already correct)")
 
 
 def _docker_available() -> bool:
