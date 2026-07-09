@@ -307,21 +307,70 @@ class KronosEngine:
         if self._predictor is None:
             raise RuntimeError(self._load_error or "Kronos model not available")
 
+        n = max(1, samples)
         paths: List[pd.DataFrame] = []
         # Serialise access to the shared predictor — its RoPE cache is mutable
         # instance state and is not safe under concurrent forward passes.
-        with self._infer_lock:
-            for _ in range(max(1, samples)):
-                pred_df = self._predictor.predict(
-                    df=df,
-                    x_timestamp=x_timestamp,
-                    y_timestamp=y_timestamp,
-                    pred_len=pred_len,
+        # Timeout prevents a hung MPS forward pass from blocking the lock forever.
+        _INFER_TIMEOUT = int(os.getenv("KRONOS_INFER_TIMEOUT_S", "120"))
+        acquired = self._infer_lock.acquire(timeout=_INFER_TIMEOUT)
+        if not acquired:
+            raise RuntimeError(
+                f"Kronos _infer_lock not acquired within {_INFER_TIMEOUT}s — "
+                "another inference may be hung. Falling back to heuristic."
+            )
+        try:
+            # ── Batched path: N paths in one MPS/GPU forward pass (5-10× faster) ──
+            # predict_batch([df]*n) tiles the single input into a batch of size n,
+            # generating all N stochastic paths simultaneously.  Each path is
+            # independently stochastic because nucleus sampling fires independently
+            # for every position in the batch.  predict_batch requires all series
+            # to have the same seq_len — guaranteed here since we repeat the same df.
+            try:
+                paths = self._predictor.predict_batch(
+                    [df] * n,
+                    [x_timestamp] * n,
+                    [y_timestamp] * n,
+                    pred_len,
                     T=temperature,
                     top_p=top_p,
                     sample_count=1,
+                    verbose=False,
                 )
-                paths.append(pred_df)
+                logger.debug(f"[Kronos] predict_batch {n} paths (MPS batched)")
+            except Exception as exc:
+                # OOM, shape mismatch, or API version issue → fall back to
+                # sequential predict() calls (original behaviour).
+                logger.warning(
+                    f"[Kronos] predict_batch failed ({type(exc).__name__}: {exc}); "
+                    "falling back to sequential predict()"
+                )
+                paths = []
+                for _ in range(n):
+                    pred_df = self._predictor.predict(
+                        df=df,
+                        x_timestamp=x_timestamp,
+                        y_timestamp=y_timestamp,
+                        pred_len=pred_len,
+                        T=temperature,
+                        top_p=top_p,
+                        sample_count=1,
+                        verbose=False,
+                    )
+                    paths.append(pred_df)
+
+        finally:
+            self._infer_lock.release()
+
+        # Release MPS unified memory fragments after inference so subsequent
+        # forecasts don't degrade due to memory fragmentation.
+        try:
+            import torch
+            if str(kronos_config.device) == "mps":
+                torch.mps.empty_cache()
+        except Exception:
+            pass
+
         return paths
 
 
@@ -343,6 +392,36 @@ def _warmup_in_background() -> None:
             kronos_engine._load()
             if kronos_engine.available:
                 logger.success(f"[Kronos] Warm-load complete ({kronos_engine.active_model})")
+                # ── MPS JIT warmup ────────────────────────────────────────────
+                # Run a tiny dummy inference so the first real user forecast hits
+                # a pre-compiled MPS computation graph instead of paying the
+                # cold-first-call JIT compilation penalty (~2-5s on M2 Pro).
+                try:
+                    import numpy as np
+                    dummy_df = pd.DataFrame(
+                        {c: np.ones(10, dtype="float32") * 1000.0
+                         for c in ["open", "high", "low", "close", "volume", "amount"]}
+                    )
+                    dummy_x_ts = pd.Series(
+                        pd.date_range("2024-01-01", periods=10, freq="1h")
+                    )
+                    dummy_y_ts = pd.Series(
+                        pd.date_range("2024-01-01 10:00", periods=1, freq="1h")
+                    )
+                    kronos_engine._predictor.predict(
+                        dummy_df, dummy_x_ts, dummy_y_ts,
+                        pred_len=1, T=1.0, top_p=0.9, sample_count=1, verbose=False,
+                    )
+                    logger.success("[Kronos] MPS warm-up inference complete")
+                    # Clear the warmup allocation from unified memory
+                    try:
+                        import torch
+                        if str(kronos_config.device) == "mps":
+                            torch.mps.empty_cache()
+                    except Exception:
+                        pass
+                except Exception as warm_exc:
+                    logger.debug(f"[Kronos] MPS warm-up inference skipped: {warm_exc}")
         except Exception as exc:
             logger.debug(f"[Kronos] warm-load skipped: {exc}")
 

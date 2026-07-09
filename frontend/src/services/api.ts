@@ -95,12 +95,17 @@ export const apiClient = {
     exchange: string,
     symbol: string,
     timeframe: string = '1h',
-    limit: number = 100
+    limit: number = 100,
+    signal?: AbortSignal,
   ) => {
     // Remove slash from symbol for URL path (BTC/USDT -> BTCUSDT)
     const urlSymbol = symbol.replace('/', '');
     return api.get(`/exchanges/${exchange}/ohlcv/${urlSymbol}`, {
-      params: { timeframe, limit }
+      params: { timeframe, limit },
+      // Give the backend 22 s to fetch + retry before we cancel the request.
+      // Default 30 s is too short when the exchange is slow or we have retries.
+      timeout: 60000,
+      signal,
     });
   },
   placeSpotOrder: (data: {

@@ -1,6 +1,8 @@
 """
 Exchange API Routes
 """
+import asyncio
+import time
 from typing import Dict, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -164,6 +166,13 @@ async def get_ticker(exchange: SupportedExchange, symbol: str):
         }
 
 
+# ── OHLCV in-memory cache (avoids hammering the exchange on every chart refresh)
+_OHLCV_CACHE: Dict[str, dict] = {}
+_OHLCV_TTL_S = 30          # serve cached candles for 30 s — enough to cover the
+_OHLCV_FETCH_TIMEOUT_S = 22 # hard cut-off on the ccxt call so we never exceed the
+                             # frontend 60 s axios timeout even after 2-3 retries.
+
+
 @router.get("/{exchange}/ohlcv/{symbol}")
 async def get_ohlcv(
     exchange: SupportedExchange,
@@ -205,11 +214,22 @@ async def get_ohlcv(
             if not matched and is_crypto and upper.endswith("USD") and len(upper) > 3:
                 symbol = symbol[:-3] + "/USDT"
 
+    cache_key = f"{exchange.value}:{symbol}:{timeframe}:{limit}"
+    now_ts = time.time()
+    cached = _OHLCV_CACHE.get(cache_key)
+    if cached and (now_ts - cached["ts"]) < _OHLCV_TTL_S:
+        return cached["payload"]
+
     try:
-        # Prefer the connector's get_ohlcv (handles swap symbol conversion)
+        # Prefer the connector's get_ohlcv (handles swap symbol conversion).
+        # Wrap every ccxt call with asyncio.wait_for so a hanging exchange can
+        # never block the FastAPI worker beyond the frontend's axios timeout.
         connector = exchange_manager.get_exchange(exchange)
         if connector:
-            ohlcv_data = await connector.get_ohlcv(symbol, timeframe, limit)
+            ohlcv_data = await asyncio.wait_for(
+                connector.get_ohlcv(symbol, timeframe, limit),
+                timeout=_OHLCV_FETCH_TIMEOUT_S,
+            )
         else:
             # No credentials — create temporary swap instance
             exchange_instance = await get_exchange_for_public_data(exchange)
@@ -219,11 +239,14 @@ async def get_ohlcv(
                 swap_symbol += ":USDT"
             elif ":" not in swap_symbol and swap_symbol.endswith("/USDC"):
                 swap_symbol += ":USDC"
-            ohlcv_data = await exchange_instance.fetch_ohlcv(
-                symbol=swap_symbol, timeframe=timeframe, limit=limit,
+            ohlcv_data = await asyncio.wait_for(
+                exchange_instance.fetch_ohlcv(
+                    symbol=swap_symbol, timeframe=timeframe, limit=limit,
+                ),
+                timeout=_OHLCV_FETCH_TIMEOUT_S,
             )
             # Do NOT close — the public instance is cached and reused across calls.
-        
+
         # Transform to lightweight-charts format
         candlestick_data = [
             {
@@ -236,16 +259,34 @@ async def get_ohlcv(
             }
             for candle in ohlcv_data
         ]
-        
-        return {
+
+        payload = {
             "exchange": exchange.value,
             "symbol": symbol,
             "timeframe": timeframe,
             "data": candlestick_data,
             "count": len(candlestick_data),
         }
+        # Store in cache so the next chart refresh within 30 s is instant
+        _OHLCV_CACHE[cache_key] = {"ts": time.time(), "payload": payload}
+        # Evict stale entries when cache grows large
+        if len(_OHLCV_CACHE) > 500:
+            stale_keys = [k for k, v in list(_OHLCV_CACHE.items()) if (time.time() - v["ts"]) > _OHLCV_TTL_S * 4]
+            for k in stale_keys:
+                _OHLCV_CACHE.pop(k, None)
+        return payload
+    except asyncio.TimeoutError:
+        logger.warning(f"OHLCV fetch timed out for {symbol} on {exchange.value} after {_OHLCV_FETCH_TIMEOUT_S}s")
+        # Return stale cache if available rather than an empty response
+        stale = _OHLCV_CACHE.get(cache_key)
+        if stale:
+            return stale["payload"]
+        return {"exchange": exchange.value, "symbol": symbol, "timeframe": timeframe, "data": [], "count": 0, "error": "Exchange response timed out — retrying"}
     except Exception as e:
         logger.warning(f"Failed to get OHLCV for {symbol} on {exchange.value}: {e}")
+        stale = _OHLCV_CACHE.get(cache_key)
+        if stale:
+            return stale["payload"]
         return {"exchange": exchange.value, "symbol": symbol, "timeframe": timeframe, "data": [], "count": 0, "error": str(e)}
 
 

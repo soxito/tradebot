@@ -49,8 +49,26 @@ from plugins.MT5TradingPlugin.backend.config import mt5_config
 router = APIRouter(prefix="/plugins/mt5", tags=["MT5 Trading"])
 
 
-def _mt5_connection_hint(current_url: str) -> str:
-    """Return a human-readable setup hint when the MT5 bridge is unreachable."""
+def _mt5_connection_hint(current_url: str, error: str = "") -> str:
+    """Return a human-readable hint for MT5 connection failures.
+
+    Distinguishes between:
+    - Bridge genuinely unreachable (URL empty or bridge not running)
+    - Bridge reachable but credentials / server are wrong
+    """
+    # Credential / account errors — bridge is reachable, user data is wrong
+    _cred_phrases = (
+        "INVALID_ACCOUNT", "AUTHORIZATION_FAILED", "INVALID_PASSWORD",
+        "NO_CONNECTION", "TIMEOUT", "TOO_FREQUENT",
+    )
+    if any(p in error.upper() for p in _cred_phrases):
+        return (
+            "MT5 bridge is reachable but the connection was rejected by the broker:\n"
+            f"• Check your login number, password, and server name\n"
+            f"• Make sure your MT5 terminal is open on the Windows PC\n"
+            f"• Error detail: {error[:200]}"
+        )
+
     if not current_url or not (current_url.startswith("http://") or current_url.startswith("https://")):
         return (
             "MT5_API_URL is not configured. "
@@ -69,6 +87,15 @@ def _mt5_connection_hint(current_url: str) -> str:
         "• Port 8092 is not blocked by firewall on the Windows PC\n"
         "Tip: run 'python3 start.py' — it auto-detects the bridge on the local network"
     )
+
+
+# ── Bridge-responded error codes (bridge reachable, broker rejected) ──────────
+_BROKER_SIDE_ERRORS = frozenset({
+    "INVALID_ACCOUNT", "AUTHORIZATION_FAILED", "INVALID_PASSWORD",
+    "NO_CONNECTION", "SERVER_NOT_FOUND", "UNKNOWN_SYMBOL",
+    "NOT_ENOUGH_MONEY", "TOO_FREQUENT_FAIL_CONNECT",
+})
+
 
 
 # Default user_id for single-user mode (no auth system in core yet)
@@ -855,14 +882,22 @@ async def test_connection(data: MT5AccountCreate):
             except Exception:
                 pass
 
+        # Distinguish: broker side error (bridge is reachable, credentials/server
+        # wrong) vs bridge truly unreachable (URL error, connection refused).
+        err_upper = err_str.upper()
+        bridge_responded = any(code in err_upper for code in _BROKER_SIDE_ERRORS)
+
         return {
-            "reachable": False,
+            # True when the MT5 bridge itself answered — even if the broker
+            # rejected the credentials. The UI can then show a credential-focused
+            # error instead of a "bridge not running" setup wizard.
+            "reachable": bridge_responded,
             "error": err_str,
             "server_suggestions": suggestions[:20],
             "hint": (
                 f"Server '{data.server}' not found — select one of the suggested server names below."
                 if suggestions else
-                _mt5_connection_hint(mt5_client.base_url)
+                _mt5_connection_hint(mt5_client.base_url, err_str)
             ),
         }
 

@@ -101,8 +101,10 @@ export default function TradingViewChart({
   const priceLinesRef = useRef<any[]>([]);
   const orderLinesRef = useRef<any[]>([]);
   // True until the candles have been fitted once for the current chart instance.
-  // Prevents the 60s background refresh from resetting the user's zoom/pan.
+  // Prevents the background refresh from resetting the user's zoom/pan.
   const didFitRef = useRef(false);
+  // Abort controller so in-flight fetch is cancelled when symbol/timeframe changes
+  const abortRef = useRef<AbortController | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
@@ -137,6 +139,11 @@ export default function TradingViewChart({
       }
     };
 
+    // Cancel any previous in-flight request before starting a new one.
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     try {
       setError(null);
 
@@ -168,7 +175,8 @@ export default function TradingViewChart({
         exchange,
         symbol,
         timeframe,
-        200  // Fetch 200 candles for good chart history
+        200,  // Fetch 200 candles for good chart history
+        controller.signal,
       );
 
       // Bail if the symbol changed while this request was in flight — prevents
@@ -208,7 +216,8 @@ export default function TradingViewChart({
         setLoading(false);
       }
     } catch (err: any) {
-      if (isStale()) return;
+      // AbortError = request was intentionally cancelled (symbol changed) — not an error.
+      if (err?.name === 'AbortError' || err?.code === 'ERR_CANCELED' || isStale()) return;
       console.error('Failed to fetch chart data:', err);
       // Clear stale candles on error too, so a failed load can't leave the
       // previous symbol's chart on screen under the new symbol's label.
@@ -264,8 +273,16 @@ export default function TradingViewChart({
     // Initial data fetch
     fetchChartData();
 
-    // Auto-refresh every 60 seconds
-    const refreshInterval = setInterval(fetchChartData, 60000);
+    // Adaptive refresh: fast timeframes get more frequent updates for real-time feel.
+    // 1m → 10 s | 3m/5m → 15 s | 15m/30m → 30 s | 1h+ → 60 s
+    const refreshMs = (() => {
+      const tf = timeframe.toLowerCase();
+      if (tf === '1m') return 10_000;
+      if (tf === '3m' || tf === '5m') return 15_000;
+      if (tf === '15m' || tf === '30m') return 30_000;
+      return 60_000;
+    })();
+    const refreshInterval = setInterval(fetchChartData, refreshMs);
 
     // Keep the chart sized to its container. ResizeObserver catches layout
     // changes that a window 'resize' event misses (tab switch, sidebar toggle,

@@ -87,8 +87,9 @@ class KronosConfig:
     # Cap how much history we ever pull from the exchange for a single forecast
     max_lookback: int = int(os.getenv("KRONOS_MAX_LOOKBACK", "512"))
 
-    # Cache forecasts for this many seconds (per symbol/timeframe/params)
-    cache_ttl_s: int = int(os.getenv("KRONOS_CACHE_TTL_S", "60"))
+    # Cache forecasts for this many seconds (per symbol/timeframe/params).
+    # 180s is safe for 1h/4h charts — prices don't shift meaningfully in 3 min.
+    cache_ttl_s: int = int(os.getenv("KRONOS_CACHE_TTL_S", "180"))
 
 
 kronos_config = KronosConfig()

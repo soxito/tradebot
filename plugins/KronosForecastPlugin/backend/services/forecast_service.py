@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
@@ -446,17 +447,31 @@ async def run_forecast(
     loop = asyncio.get_event_loop()
     engine = "kronos"
     heuristic_reason: Optional[str] = None
+    # Wrap inference in asyncio.wait_for so a hung MPS forward pass can never
+    # stall the request indefinitely. Timeout matches the lock timeout in the
+    # engine (+30s grace so the lock error fires first).
+    _infer_timeout = int(os.getenv("KRONOS_INFER_TIMEOUT_S", "120")) + 30
     try:
         # predict_paths loads the model on first use *inside this worker thread*
         # (never the event loop, so a ~60s cold-load can't freeze the backend)
         # and raises if the model is genuinely unavailable → heuristic fallback.
-        paths = await loop.run_in_executor(
-            None,
-            lambda: kronos_engine.predict_paths(
-                df, x_ts, y_ts, pred_len,
-                temperature=temperature, top_p=top_p, samples=samples,
+        paths = await asyncio.wait_for(
+            loop.run_in_executor(
+                None,
+                lambda: kronos_engine.predict_paths(
+                    df, x_ts, y_ts, pred_len,
+                    temperature=temperature, top_p=top_p, samples=samples,
+                ),
             ),
+            timeout=_infer_timeout,
         )
+    except asyncio.TimeoutError:
+        logger.warning(
+            f"[Kronos] inference timed out after {_infer_timeout}s, using heuristic"
+        )
+        engine = "heuristic"
+        heuristic_reason = f"Inference timed out after {_infer_timeout}s (MPS hang?)"
+        paths = _heuristic_paths(df, pred_len, samples)
     except Exception as exc:
         logger.warning(f"[Kronos] inference unavailable, using heuristic: {exc}")
         engine = "heuristic"
