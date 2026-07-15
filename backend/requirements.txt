@@ -58,6 +58,9 @@ psutil==7.2.2  # live system CPU/RAM stats for the JARVIS Room HUD
 
 # AI / LLM
 openai==1.82.0
+
+# ngrok — tunneling for backend + frontend exposure
+ngrok==1.4.0
 # tradingagents is installed separately with --no-deps (see start.py) because its
 # published deps require chainlit>=2.11.1 (unreleased) and Python>=3.12.
 # The package itself works fine without those deps when imported conditionally.

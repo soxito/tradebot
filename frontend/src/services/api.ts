@@ -865,6 +865,8 @@ export const apiClient = {
       api.get('/jarvis/analyze-positions', { params: { account_id: accountId } }),
     /** Live host CPU / RAM / load stats for the JARVIS Room system HUD. */
     systemStats: () => api.get('/jarvis/system-stats'),
+    /** Task-to-model routing map + live provider status for the AI Models panel. */
+    aiTaskStatus: () => api.get('/jarvis/ai-task-status'),
     /** Searchable crypto-pair catalog (symbol, name, market cap, 24h volume). */
     pairs: (q?: string, limit = 50) =>
       api.get('/jarvis/pairs', { params: { q, limit } }),
@@ -1067,6 +1069,61 @@ export const apiClient = {
     /** Batch forecast several symbols at once. */
     batch: (data: { exchange?: string; timeframe?: string; symbols: string[]; lookback?: number; pred_len?: number; samples?: number }) =>
       api.post('/plugins/kronos/batch', data),
+  },
+
+  // ─── Ngrok ───
+  ngrok: {
+    getStatus: () => api.get('/ngrok/status'),
+    start: () => api.post('/ngrok/start'),
+    stop: () => api.post('/ngrok/stop'),
+    restart: () => api.post('/ngrok/restart'),
+    getConfig: () => api.get('/ngrok/config'),
+    updateConfig: (data: {
+      authtoken_override?: string;
+      backend_addr_override?: string;
+      frontend_addr_override?: string;
+      enable_on_start?: boolean;
+    }) => api.patch('/ngrok/config', data),
+  },
+
+  // ── Vibe Trading Plugin (HKUDS/Vibe-Trading sidecar) ──────────────────────
+  vibeTradingPlugin: {
+    status: () => api.get('/plugins/vibe-trading/status'),
+    startSidecar: () => api.post('/plugins/vibe-trading/status/start'),
+    getRuns: () => api.get('/plugins/vibe-trading/runs'),
+    getRun: (runId: string) => api.get(`/plugins/vibe-trading/runs/${runId}`),
+    getRunPine: (runId: string) => api.get(`/plugins/vibe-trading/runs/${runId}/pine`),
+    research: (prompt: string, symbol?: string) =>
+      api.post('/plugins/vibe-trading/research', { prompt, symbol }, { timeout: 120000 }),
+    backtest: (symbol: string, strategy: string, timeframe?: string) =>
+      api.post('/plugins/vibe-trading/backtest', { symbol, strategy, timeframe }, { timeout: 180000 }),
+    getSwarmPresets: () => api.get('/plugins/vibe-trading/swarm/presets'),
+    runSwarm: (preset: string, symbol: string, extra?: Record<string, unknown>) =>
+      api.post('/plugins/vibe-trading/swarm', { preset, symbol, extra }, { timeout: 180000 }),
+    listAlphas: (params?: { zoo?: string; theme?: string; limit?: number }) =>
+      api.get('/plugins/vibe-trading/alpha/list', { params }),
+    benchAlphas: (payload: { zoo?: string; universe?: string; period?: string; top?: number }) =>
+      api.post('/plugins/vibe-trading/alpha/bench', payload, { timeout: 180000 }),
+    createScheduled: (prompt: string, schedule: string, symbol?: string, config?: Record<string, unknown>) =>
+      api.post('/plugins/vibe-trading/scheduled', { prompt, schedule, symbol, config }),
+    getScheduled: () => api.get('/plugins/vibe-trading/scheduled'),
+    cancelScheduled: (jobId: string) => api.delete(`/plugins/vibe-trading/scheduled/${jobId}`),
+    enrichSignal: (symbol: string, timeframe?: string) =>
+      api.post('/plugins/vibe-trading/enrich/signal', { symbol, timeframe }, { timeout: 60000 }),
+    getMcpSchema: () => api.get('/plugins/vibe-trading/mcp/schema'),
+  },
+
+  // ── OpenHuman Plugin ──────────────────────────────────────────────────────
+  openHuman: {
+    status: () => api.get('/plugins/openhuman/status'),
+    syncMemory: () => api.post('/plugins/openhuman/memory/sync', null, { timeout: 60000 }),
+    getEntries: (limit = 50) =>
+      api.get('/plugins/openhuman/memory/entries', { params: { limit } }),
+    queryMemory: (q: string) =>
+      api.get('/plugins/openhuman/memory/query', { params: { q } }),
+    research: (prompt: string, symbol?: string) =>
+      api.post('/plugins/openhuman/research', { prompt, symbol }, { timeout: 30000 }),
+    getMcpSchema: () => api.get('/plugins/openhuman/mcp/schema'),
   },
 };
 

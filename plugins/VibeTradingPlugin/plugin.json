@@ -1,0 +1,27 @@
+{
+  "name": "Vibe Trading",
+  "slug": "vibe-trading",
+  "version": "1.0.0",
+  "description": "Integration with HKUDS/Vibe-Trading — a personal trading agent with natural-language backtesting, 460 pre-built alphas (Alpha Zoo), multi-agent swarm research, shadow account analysis, and Pine Script/MT5 export. Runs as a sidecar FastAPI server on :8899.",
+  "author": "TradeBot",
+  "requires": { "python": ">=3.11", "tradebot": ">=0.1.0" },
+  "service_provider": "backend.router",
+  "provides": {
+    "routes": ["backend/router.py"],
+    "models": ["backend/models.py"],
+    "pages": [],
+    "overlays": false,
+    "scheduled_jobs": []
+  },
+  "permissions": [
+    "market.data.read",
+    "ai.research.read",
+    "ai.backtest.run"
+  ],
+  "settings_keys": [
+    "vibe_trading.url",
+    "vibe_trading.api_auth_key",
+    "vibe_trading.enable_scheduler",
+    "vibe_trading.auto_start"
+  ]
+}

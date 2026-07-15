@@ -1319,13 +1319,15 @@ async def bot_receive_update(
                 return {"ok": False, "error": "invalid_secret"}
 
         allowed = list((cfg.allowed_chat_ids_json if cfg else None) or [])
-        reply_text, parse_mode = await parse_and_execute(request, token, allowed, db)
+        result = await parse_and_execute(request, token, allowed, db)
+        reply_text, parse_mode = result[0], result[1]
+        reply_markup = result[2] if len(result) > 2 else None
 
         if reply_text:
             msg = (request.get("message") or request.get("edited_message") or {})
             chat_id = msg.get("chat", {}).get("id")
             if chat_id:
-                await bot_send_message(token, chat_id, reply_text, parse_mode)
+                await bot_send_message(token, chat_id, reply_text, parse_mode, reply_markup)
 
     except Exception as exc:  # noqa: BLE001
         logger.warning("[BotWebhook] Update processing error: {}", exc)

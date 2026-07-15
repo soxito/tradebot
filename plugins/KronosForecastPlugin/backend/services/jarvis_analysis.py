@@ -24,17 +24,31 @@ from plugins.KronosForecastPlugin.backend.schemas import (
 
 _SYSTEM_PROMPT = (
     "You are JARVIS, a precise crypto/markets forecasting analyst. You are given "
-    "a Sox foundation-model price forecast plus live market context. Explain "
-    "the forecast in clear, structured prose a trader can act on. Cover: "
-    "(1) predicted direction and magnitude, (2) confidence and what the p10-p90 "
-    "band implies about uncertainty, (3) the target vs current price, (4) for "
-    "crypto, how the market cap / 24h volume / rank frames conviction and "
-    "liquidity risk, (5) one concrete, risk-aware takeaway. "
+    "a Sox foundation-model price forecast plus live market context. Write a "
+    "thorough, well-structured analysis — a minimum of 500 words — that a trader "
+    "can act on immediately. Always cover ALL of the following sections in full; "
+    "never truncate or abbreviate any section: "
+    "(1) FORECAST DIRECTION & MAGNITUDE — explain the predicted % change, the "
+    "model's reasoning, and what price levels matter most; "
+    "(2) CONFIDENCE & UNCERTAINTY — interpret the confidence score, explain what "
+    "the p10-p90 band width signals (tight = conviction, wide = high dispersion), "
+    "and identify which scenarios could invalidate the forecast; "
+    "(3) TARGET vs CURRENT PRICE — analyse the distance to the target, discuss "
+    "what achieving or missing it implies for the broader trend, and note any key "
+    "support/resistance levels in the band range; "
+    "(4) MARKET CONTEXT — for crypto, explain how the market-cap size and rank "
+    "shape liquidity risk, whether 24h volume supports the move, and how these "
+    "factors strengthen or weaken conviction in the forecast; "
+    "(5) ACTIONABLE TAKEAWAY — give one specific, risk-aware recommendation with "
+    "a clear entry rationale, stop-loss zone, and take-profit target derived from "
+    "the forecast numbers. "
     "If an OPEN POSITION is provided, add a final section titled 'Position:' that "
     "gives a specific, forecast-aware recommendation — hold, add, reduce, or close "
-    "— and concrete stop-loss / take-profit levels using the target and p10-p90 "
-    "band, factoring the position side, entry, current PnL, leverage and "
-    "liquidation price. Be concise (max ~220 words), never fabricate numbers."
+    "— with concrete stop-loss and take-profit levels using the p10-p90 band, "
+    "factoring the position side, entry price, current PnL, leverage, and "
+    "liquidation price. "
+    "Write in clear, flowing prose. Target 500-620 words total. "
+    "Never fabricate numbers. Always finish every sentence you start."
 )
 
 
@@ -173,34 +187,95 @@ def _build_user_prompt(
 
 
 async def _run_llm(user_prompt: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Return (analysis_text, provider, error) via the AI Analyst gateway (guarded)."""
+    """Return (analysis_text, provider, error) via the AI Analyst gateway (guarded).
+
+    Implements two-attempt failover:
+    1. Normal routing (circuit breakers active).
+    2. If the first attempt returns no usable text, retry with bypass_circuits=True
+       so providers blocked by the circuit breaker are tried again immediately.
+    This prevents a single transient Groq/provider failure from permanently falling
+    back to the deterministic summary for the next 2 minutes.
+    """
     try:
         from app.core.database import AsyncSessionLocal
         from plugins.AiMarketAnalyst.backend.services.ai_router import db_chat
     except Exception as exc:
         return None, None, f"AI gateway unavailable: {exc}"
+
+    _msgs = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+    _kwargs: dict = dict(
+        max_tokens=1500,    # generous budget for 500-620 word thorough analysis
+        temperature=0.38,   # slightly warmer → richer, more detailed prose
+        agent_name="kronos-jarvis",
+        agent_role="forecaster",
+        source="forecaster",  # NOT "agent" — avoids per_agent_max_tokens DB cap
+        preferred_providers=["nvidia", "github"],  # NVIDIA first, GitHub gpt-4o fallback
+        bypass_circuits=True,  # always try NVIDIA/GitHub even if circuit was tripped
+    )
+
+    def _extract(result: dict) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        """Extract (text, provider, error) from a db_chat result dict."""
+        if not result.get("ok"):
+            return None, result.get("provider"), result.get("error") or "AI call failed"
+        content = result.get("content")
+        if isinstance(content, dict):
+            content = content.get("text") or content.get("content") or str(content)
+        text = (content or "").strip()
+        return (text or None), result.get("provider"), None
+
+    # Groq (and some other providers) truncates responses to a few hundred tokens.
+    # Reject any response shorter than this — it means the model was cut off.
+    # 500 words × ~5 chars/word = ~2500 chars minimum for a proper analysis.
+    _MIN_CHARS = 2500  # ~500 words; anything shorter is a truncated response
+
+    # ── Attempt 1: NVIDIA only, circuit bypassed (──────────────────────────
     try:
         async with AsyncSessionLocal() as db:
-            result = await db_chat(
-                db,
-                [
-                    {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                max_tokens=420,
-                agent_name="kronos-jarvis",
-                agent_role="forecaster",
-                source="agent",
-            )
+            result1 = await db_chat(db, _msgs, **_kwargs)
     except Exception as exc:
-        return None, None, f"AI call failed: {exc}"
-    if not result.get("ok"):
-        return None, result.get("provider"), result.get("error") or "AI call failed"
-    content = result.get("content")
-    if isinstance(content, dict):
-        content = content.get("text") or content.get("content") or str(content)
-    text = (content or "").strip()
-    return (text or None), result.get("provider"), None
+        logger.warning("[Kronos JARVIS] db_chat exception on attempt 1: {}", exc)
+        result1 = {"ok": False, "error": f"AI call failed: {exc}"}
+
+    text1, provider1, err1 = _extract(result1)
+    if text1 and len(text1) >= _MIN_CHARS:
+        return text1, provider1, None  # full, complete NVIDIA response
+
+    # Either empty OR suspiciously short → retry
+    if text1:
+        first_issue = (
+            f"response too short ({len(text1)} chars via {provider1})"
+        )
+        logger.info(
+            "[Kronos JARVIS] Attempt 1 response too short ({} chars via {}) — "
+            "retrying …",
+            len(text1), provider1,
+        )
+    else:
+        first_issue = err1 or "empty response from provider"
+        logger.info(
+            "[Kronos JARVIS] Attempt 1 yielded no content ({}); retrying …",
+            first_issue,
+        )
+
+    # ── Attempt 2: retry NVIDIA (circuit already bypassed in _kwargs) ───────
+    try:
+        async with AsyncSessionLocal() as db:
+            result2 = await db_chat(db, _msgs, **_kwargs)
+    except Exception as exc:
+        logger.warning("[Kronos JARVIS] db_chat exception on attempt 2: {}", exc)
+        result2 = {"ok": False, "error": f"retry failed: {exc}"}
+
+    text2, provider2, err2 = _extract(result2)
+    if text2 and len(text2) >= _MIN_CHARS:
+        logger.info("[Kronos JARVIS] Attempt 2 succeeded via {}", provider2)
+        return text2, provider2, None  # retry succeeded
+
+    # Both attempts failed — surface a compact combined error
+    combined = first_issue if (not err2 or err2 == first_issue) else f"{first_issue} | retry: {err2}"
+    return None, provider2 or provider1, combined
 
 
 async def _capture_to_vault(
@@ -427,7 +502,14 @@ async def analyze_forecast(
     note: Optional[str] = None
     if analysis is None:
         analysis = _fallback_analysis(resp, market, position)
-        note = err or "AI provider unavailable — showing deterministic summary."
+        # Build a concise, non-alarming note so the UI gives useful context
+        # without showing raw error strings from the provider.
+        if err:
+            # Shorten provider error chains — keep max 120 chars
+            short_err = err[:120] + ("…" if len(err) > 120 else "")
+            note = f"AI unavailable ({short_err}) — rule-based summary shown."
+        else:
+            note = "AI provider returned no content — rule-based summary shown."
         learned = False
         position_advice = _fallback_position_advice(resp, position)
     else:

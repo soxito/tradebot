@@ -1,0 +1,33 @@
+{
+  "name": "OpenManus",
+  "slug": "openmanus",
+  "version": "1.0.0",
+  "description": "Integrates FoundationAgents/OpenManus as a plugin sidecar. Routes Jarvis, Kronos, Sniper SMC, and MT5 scalp AI calls through OpenManus MCP first, with phased fallback to the existing AiMarketAnalyst router. Provides install management, health/status, call-provenance telemetry, and a compliance audit log.",
+  "author": "TradeBot",
+  "requires": { "python": ">=3.10", "tradebot": ">=0.1.0" },
+  "service_provider": "backend.router",
+  "provides": {
+    "routes": ["backend/router.py"],
+    "models": ["backend/models.py"],
+    "migrations": [],
+    "pages": [],
+    "overlays": false,
+    "scheduled_jobs": []
+  },
+  "permissions": [
+    "ai.agents.manage",
+    "ai.research.read",
+    "ai.decisions.view"
+  ],
+  "settings_keys": [
+    "openmanus.host",
+    "openmanus.port",
+    "openmanus.mcp_transport",
+    "openmanus.mcp_path",
+    "openmanus.enabled",
+    "openmanus.fallback_enabled",
+    "openmanus.timeout_s",
+    "openmanus.install_dir",
+    "openmanus.python_bin"
+  ]
+}

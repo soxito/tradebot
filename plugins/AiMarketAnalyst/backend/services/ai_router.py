@@ -229,12 +229,23 @@ async def _call_openai_compatible(
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
+    # Reasoning models (o3, o1 family) do not accept temperature or max_tokens;
+    # they require max_completion_tokens instead.
+    _reasoning_prefixes = ("o3", "o1", "o1-mini", "o1-preview", "o1-pro")
+    _is_reasoning = any(
+        model == m or model.split("/")[-1].startswith(m)
+        for m in _reasoning_prefixes
+    )
     payload: dict[str, Any] = {
         "model": model,
         "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
     }
+    if _is_reasoning:
+        # Reasoning models: use max_completion_tokens, omit temperature
+        payload["max_completion_tokens"] = max_tokens
+    else:
+        payload["temperature"] = temperature
+        payload["max_tokens"] = max_tokens
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
 
@@ -274,6 +285,136 @@ async def get_enabled_providers(db: AsyncSession) -> list[AILLMProvider]:
     return list(res.scalars().all())
 
 
+async def get_all_available_brain_providers(db: AsyncSession) -> list[AILLMProvider]:
+    """Return ALL enabled, credentialed, non-circuit-open, non-capped providers.
+
+    Used by the JARVIS multi-brain network to spread brain manager calls
+    across ALL available AI providers rather than relying on one model.
+    Adding a new provider in Connect AI tab → it is automatically included
+    in the next brain cycle with no code changes required.
+    Providers are returned ordered by priority (lowest number = highest priority).
+    """
+    settings = await get_router_settings(db)
+    providers = await get_enabled_providers(db)
+    return [
+        p for p in providers
+        if p.api_key and p.base_url
+        and not _cb_open(p.id)
+        and not _is_capped(p, settings.reserve_pct)
+    ]
+
+
+async def call_targeted_provider(
+    db: AsyncSession,
+    provider_label_fragment: str,
+    model: str,
+    messages: list[dict[str, str]],
+    *,
+    temperature: float = 0.35,
+    max_tokens: int = 800,
+    json_mode: bool = False,
+    agent_name: str | None = None,
+    source: str = "chat",
+) -> dict[str, Any]:
+    """Call a specific provider by label fragment and model, bypassing router ordering.
+
+    Finds the first enabled provider whose label contains `provider_label_fragment`
+    (case-insensitive) and is not circuit-open. Calls it directly so ONLY that
+    provider's circuit is affected on failure — other providers are untouched.
+
+    Returns the same structure as db_chat: {ok, content, provider, model, usage}
+    or {ok: False, error} on failure (caller should fall back to db_chat).
+    """
+    settings = await get_router_settings(db)
+    providers = await get_enabled_providers(db)
+
+    target = next(
+        (
+            p for p in providers
+            if provider_label_fragment.lower() in (p.label or "").lower()
+            and not _cb_open(p.id)
+        ),
+        None,
+    )
+    if not target:
+        return {
+            "ok": False,
+            "error": f"No available provider matching '{provider_label_fragment}'",
+            "content": None,
+        }
+
+    now = datetime.utcnow()
+    _reset_usage_windows(target, now)
+    if _is_capped(target, settings.reserve_pct):
+        return {
+            "ok": False,
+            "error": f"Provider '{target.label}' is at its usage cap",
+            "content": None,
+        }
+
+    orig_chars = _chars(messages)
+    try:
+        content, usage, routed_via = await _call_openai_compatible(
+            base_url=target.base_url,
+            api_key=target.api_key,
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            json_mode=json_mode,
+        )
+        target.total_calls = (target.total_calls or 0) + 1
+        target.daily_calls = (target.daily_calls or 0) + 1
+        target.monthly_calls = (target.monthly_calls or 0) + 1
+        target.status = "ok"
+        target.last_error = None
+        target.last_model_used = routed_via or model
+        target.last_tested_at = datetime.utcnow()
+        db.add(AIUsageRecord(
+            provider_id=target.id,
+            provider_label=target.label,
+            agent_name=agent_name,
+            agent_role="jarvis",
+            model=routed_via or model,
+            source=source,
+            prompt_tokens=usage["prompt_tokens"],
+            completion_tokens=usage["completion_tokens"],
+            total_tokens=usage["total_tokens"],
+            orig_chars=orig_chars,
+            comp_chars=orig_chars,
+            success=True,
+        ))
+        await db.commit()
+        return {
+            "ok": True,
+            "content": content,
+            "provider": target.label,
+            "model": model,
+            "routed_via": routed_via,
+            "usage": usage,
+        }
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)[:300]
+        target.total_errors = (target.total_errors or 0) + 1
+        target.status = "error"
+        target.last_error = msg
+        db.add(AIUsageRecord(
+            provider_id=target.id,
+            provider_label=target.label,
+            agent_name=agent_name,
+            agent_role="jarvis",
+            model=model,
+            source=source,
+            orig_chars=orig_chars,
+            comp_chars=orig_chars,
+            success=False,
+        ))
+        await db.commit()
+        _cb_trip(target.id)
+        logger.debug("[call_targeted_provider] {} / {} failed: {}", target.label, model, msg)
+        return {"ok": False, "error": msg, "content": None}
+
+
 async def db_chat(
     db: AsyncSession,
     messages: list[dict[str, str]],
@@ -285,13 +426,84 @@ async def db_chat(
     agent_name: str | None = None,
     agent_role: str | None = None,
     source: str = "chat",
+    bypass_circuits: bool = False,
+    preferred_providers: list[str] | None = None,
 ) -> dict[str, Any]:
     """Call the next provider chosen by the load-balancing strategy; failover on error.
 
     Applies Headroom compression, enforces the free-tier reserve, records token
     usage + compression savings per call, and returns
     {ok, content, provider, model, usage} or {ok: False, error}.
+
+    OpenManus-first routing (Phase 3):
+    If the OpenManusPlugin is installed and OPENMANUS_ENABLED=true, attempts
+    to route through the OpenManus MCP server first. Falls through to the
+    standard provider loop on failure (phased fallback strategy).
     """
+    # ── OpenManus MCP primary route (transparent to callers) ─────────────────
+    try:
+        import os as _os
+        _om_enabled = _os.getenv("OPENMANUS_ENABLED", "true").lower() not in ("0", "false", "no", "off")
+        if _om_enabled:
+            from plugins.OpenManusPlugin.backend.services.openmanus_client import (
+                mcp_health as _om_health,
+                mcp_chat as _om_chat,
+            )
+            from plugins.OpenManusPlugin.backend.services.adapter import (
+                _extract_content_from_mcp as _om_extract,
+            )
+            # Fast reachability probe (3s timeout)
+            if await _om_health():
+                _t0 = time.time()
+                _om_resp = await _om_chat(messages=list(messages))
+                _latency = (time.time() - _t0) * 1000
+                _content = _om_extract(_om_resp)
+                if _content:
+                    # Log to openmanus_call_log (best-effort)
+                    try:
+                        from plugins.OpenManusPlugin.backend.models import (
+                            OpenManusCallLog as _OmLog,
+                            RouteSource as _OmRS,
+                        )
+                        _chars_prompt = _chars(messages)
+                        _usage_est = {
+                            "prompt_tokens": max(1, _chars_prompt // 4),
+                            "completion_tokens": max(1, len(_content) // 4),
+                            "total_tokens": max(1, (_chars_prompt + len(_content)) // 4),
+                        }
+                        _log = _OmLog(
+                            flow=source,
+                            agent_name=agent_name,
+                            source=source,
+                            route_source=_OmRS.openmanus,
+                            provider_label="openmanus",
+                            model="openmanus-mcp",
+                            prompt_tokens=_usage_est["prompt_tokens"],
+                            completion_tokens=_usage_est["completion_tokens"],
+                            total_tokens=_usage_est["total_tokens"],
+                            latency_ms=round(_latency, 2),
+                            success=True,
+                            schema_ok=True,
+                        )
+                        db.add(_log)
+                        await db.commit()
+                    except Exception:
+                        pass  # never block on logging
+                    return {
+                        "ok": True,
+                        "content": _content,
+                        "provider": "openmanus",
+                        "model": "openmanus-mcp",
+                        "routed_via": "openmanus-mcp",
+                        "usage": _usage_est,
+                        "route_source": "openmanus",
+                    }
+                else:
+                    logger.debug("[OpenManus] empty response — falling through to provider loop")
+    except Exception as _om_exc:  # noqa: BLE001
+        logger.debug("[OpenManus] db_chat hook skipped: {}", _om_exc)
+    # ─────────────────────────────────────────────────────────────────────────
+
     settings = await get_router_settings(db)
     providers = await get_enabled_providers(db)
     if not providers:
@@ -307,13 +519,27 @@ async def db_chat(
             send_messages = messages
     comp_chars = _chars(send_messages)
 
-    # Clamp tokens to the per-agent ceiling when this is an agent call
+    # Clamp tokens to the per-agent ceiling when this is an agent call.
+    # Never clamp below 1200 — analysis responses need room to finish sentences.
     if source == "agent" and settings.per_agent_max_tokens:
-        max_tokens = min(max_tokens, settings.per_agent_max_tokens)
+        floor = 1200
+        max_tokens = max(floor, min(max_tokens, settings.per_agent_max_tokens))
 
     ordered = _order_providers(providers, settings.strategy, settings.round_robin_cursor)
     if not ordered:
         return {"ok": False, "error": "No usable (keyed) providers", "content": None}
+
+    # Filter to preferred providers when the caller restricts provider selection
+    # (e.g. Kronos JARVIS analysis must use NVIDIA NIM, never fall to Groq).
+    if preferred_providers:
+        _pref_lower = [p_.lower() for p_ in preferred_providers]
+        ordered = [
+            p for p in ordered
+            if any(tok in (p.label or "").lower() for tok in _pref_lower)
+            or any(tok in (p.base_url or "").lower() for tok in _pref_lower)
+        ]
+        if not ordered:
+            return {"ok": False, "error": f"No preferred providers available: {preferred_providers}", "content": None}
 
     # advance the round-robin cursor for the next call
     if settings.strategy == "round_robin":
@@ -322,7 +548,7 @@ async def db_chat(
     errors: list[str] = []
     now = datetime.utcnow()
     for p in ordered:
-        if _cb_open(p.id):
+        if not bypass_circuits and _cb_open(p.id):
             errors.append(f"{p.label}: circuit open")
             continue
         # Roll usage windows, then skip if the free-tier cap (minus reserve) is reached
@@ -434,8 +660,8 @@ async def test_provider(provider: AILLMProvider) -> dict[str, Any]:
                 {"role": "system", "content": "You are a connectivity test. Reply with the single word OK."},
                 {"role": "user", "content": "ping"},
             ],
-            temperature=0.0,
-            max_tokens=5,
+            temperature=0.1,
+            max_tokens=50,
             json_mode=False,
         )
         return {

@@ -1,0 +1,1 @@
+"""OpenManusPlugin — services package."""

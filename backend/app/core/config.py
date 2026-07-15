@@ -199,6 +199,18 @@ class Settings(BaseSettings):
     PRICE_TICK_INTERVAL_SECONDS: int = 5
     PRICE_TICK_MAX_SYMBOLS: int = 30
 
+    # ── ngrok tunnel ──────────────────────────────────────────────────────────
+    # Auth token from https://dashboard.ngrok.com/authtokens
+    NGROK_AUTHTOKEN: str = ""
+    # Auto-start ngrok on backend startup (set True to enable hybrid auto-start)
+    NGROK_AUTO_START: bool = False
+    # Local backend address to forward (e.g. http://localhost:1448)
+    NGROK_BACKEND_ADDR: str = "http://localhost:1448"
+    # Local frontend address to forward (e.g. http://localhost:3000)
+    NGROK_FRONTEND_ADDR: str = "http://localhost:3000"
+    # OAuth provider — always "google". Field kept for config snapshot visibility.
+    NGROK_OAUTH_PROVIDER: str = "google"
+
     # Plugin system
     PLUGIN_AUTO_MOUNT: bool = True
     PLUGIN_STRICT_MODE: bool = False

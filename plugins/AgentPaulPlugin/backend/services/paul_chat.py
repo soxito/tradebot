@@ -517,64 +517,141 @@ async def build_jarvis_system_prompt(
                 f"  {t['symbol']} {t['action']} entry={t.get('entry_price')} {pnl_str} [{t['status']}]"
             )
 
-    # ── Live market prices (fetched FRESH from exchange, no fabrication) ──────
-    # Always inject real prices so the LLM never falls back to training data.
+    # ── Live market prices (ALL supported pairs, FRESH from exchange) ──────────
+    # Fetches complete ticker lists sorted by 24h volume — never just 5 symbols.
     try:
         import re as _re_price
         import httpx as _httpx
-        # Extract symbols from user message + always include BTC/ETH/SOL
-        _default_pairs = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
-        _mentioned = _re_price.findall(r'\b([A-Z]{2,6}(?:USDT?|USD|BTC))\b', (user_msg or "").upper())
-        _pairs_to_fetch = list(dict.fromkeys(_mentioned + _default_pairs))[:6]
+        import asyncio as _aio2
+
+        # Extract any specific symbols mentioned by the user (still prioritised)
+        _mentioned = _re_price.findall(
+            r'\b([A-Z]{2,6}(?:USDT?|USD|BTC))\b', (user_msg or "").upper()
+        )
 
         _price_lines: list[str] = []
 
-        # --- Primary: Bitget exchange via SDK ---
+        # --- Primary: Bitget ccxt fetch_tickers (ALL markets, one call) ---
         try:
             from app.exchanges.manager import exchange_manager, SupportedExchange  # type: ignore
             _connector = exchange_manager.get_exchange(SupportedExchange.BITGET)
             if _connector is not None:
-                import asyncio as _aio2
-                async def _fetch_one(sym: str) -> str | None:
-                    try:
-                        t = await _connector.get_futures_ticker(sym)
-                        _data = t
-                        if isinstance(t, dict) and "data" in t:
-                            _d = t["data"]
-                            _data = (_d[0] if isinstance(_d, list) and _d else _d) or t
-                        last = _data.get("lastPr") or _data.get("last") or _data.get("close") or _data.get("markPrice")
-                        chg = _data.get("change24h") or _data.get("priceChangePercent") or ""
-                        if last:
-                            chg_str = f" ({float(chg)*100:+.2f}%)" if chg else ""
-                            return f"  {sym}: ${float(last):,.2f}{chg_str}"
-                    except Exception:
-                        return None
-                _results = await _aio2.gather(*[_fetch_one(s) for s in _pairs_to_fetch], return_exceptions=True)
-                _price_lines = [r for r in _results if isinstance(r, str)]
+                try:
+                    _all_t = await _connector.exchange.fetch_tickers()
+                    _usdt_t = [
+                        (sym, t) for sym, t in _all_t.items()
+                        if "/USDT" in sym
+                    ]
+                    _usdt_t.sort(
+                        key=lambda x: float(x[1].get("quoteVolume") or 0), reverse=True
+                    )
+                    for _sym, _t in _usdt_t[:80]:
+                        _last = _t.get("last") or _t.get("close")
+                        _chg  = _t.get("percentage")
+                        if _last:
+                            _clean = _sym.split(":")[0].replace("/", "")
+                            _chg_s = f" ({float(_chg):+.2f}%/24h)" if _chg is not None else ""
+                            _price_lines.append(f"  {_clean}: ${float(_last):,.4f}{_chg_s}")
+                except Exception:
+                    # ccxt bulk failed — fall back to SDK individual calls
+                    _default_syms = [
+                        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+                        "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
+                    ] + [s for s in _mentioned if s not in [
+                        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"
+                    ]]
+                    async def _fetch_one(sym: str) -> str | None:
+                        try:
+                            t = await _connector.get_futures_ticker(sym)
+                            _data = t
+                            if isinstance(t, dict) and "data" in t:
+                                _d = t["data"]
+                                _data = (_d[0] if isinstance(_d, list) and _d else _d) or t
+                            last = (_data.get("lastPr") or _data.get("last")
+                                    or _data.get("close") or _data.get("markPrice"))
+                            chg = _data.get("change24h") or _data.get("priceChangePercent") or ""
+                            if last:
+                                chg_str = f" ({float(chg)*100:+.2f}%/24h)" if chg else ""
+                                return f"  {sym}: ${float(last):,.4f}{chg_str}"
+                        except Exception:
+                            return None
+                    _results = await _aio2.gather(
+                        *[_fetch_one(s) for s in list(dict.fromkeys(_default_syms))[:20]],
+                        return_exceptions=True,
+                    )
+                    _price_lines = [r for r in _results if isinstance(r, str)]
         except Exception as _exc_sdk:
             logger.debug(f"[JARVIS] SDK ticker skipped: {_exc_sdk}")
 
-        # --- Fallback: Binance public REST (no auth required) ---
+        # --- Fallback: Binance ALL USDT pairs sorted by 24h quoteVolume ---
         if not _price_lines:
             try:
-                async with _httpx.AsyncClient(timeout=5.0) as _hc:
-                    _resp = await _hc.get(
-                        "https://api.binance.com/api/v3/ticker/price",
-                        params={"symbols": '["' + '","'.join(_pairs_to_fetch) + '"]'},
+                async with _httpx.AsyncClient(timeout=8.0) as _hc:
+                    _resp = await _hc.get("https://api.binance.com/api/v3/ticker/24hr")
+                    _all_bnb = _resp.json() if isinstance(_resp.json(), list) else []
+                    _usdt_bnb = [
+                        t for t in _all_bnb
+                        if isinstance(t, dict) and str(t.get("symbol", "")).endswith("USDT")
+                    ]
+                    _usdt_bnb.sort(
+                        key=lambda x: float(x.get("quoteVolume") or 0), reverse=True
                     )
-                    for item in _resp.json():
+                    for item in _usdt_bnb[:80]:
                         sym = item.get("symbol", "")
-                        px = item.get("price")
+                        px  = item.get("lastPrice")
+                        chg = item.get("priceChangePercent")
                         if sym and px:
-                            _price_lines.append(f"  {sym}: ${float(px):,.2f}")
+                            chg_str = f" ({float(chg):+.2f}%/24h)" if chg else ""
+                            _price_lines.append(f"  {sym}: ${float(px):,.4f}{chg_str}")
             except Exception as _exc_bnb:
                 logger.debug(f"[JARVIS] Binance fallback skipped: {_exc_bnb}")
 
+        # --- CoinGecko: top 100 by market cap (final fallback) ---
+        if not _price_lines:
+            try:
+                async with _httpx.AsyncClient(timeout=8.0) as _hc:
+                    _cg_resp = await _hc.get(
+                        "https://api.coingecko.com/api/v3/coins/markets",
+                        params={
+                            "vs_currency": "usd",
+                            "order": "market_cap_desc",
+                            "per_page": 100,
+                            "page": 1,
+                            "sparkline": "false",
+                        },
+                        headers={"Accept": "application/json"},
+                    )
+                    for coin in (_cg_resp.json() or []):
+                        sym = (coin.get("symbol") or "").upper() + "USDT"
+                        px  = coin.get("current_price")
+                        chg = coin.get("price_change_percentage_24h")
+                        if px:
+                            chg_str = f" ({float(chg):+.2f}%/24h)" if chg is not None else ""
+                            _price_lines.append(f"  {sym}: ${float(px):,.4f}{chg_str}")
+            except Exception as _exc_cg:
+                logger.debug(f"[JARVIS] CoinGecko fallback skipped: {_exc_cg}")
+
         if _price_lines:
+            _btc_line = next((p for p in _price_lines if "BTCUSDT" in p), "")
+            _btc_now = _btc_line.split("$")[-1].split()[0].rstrip(",") if _btc_line else ""
+            _btc_warn = f" BTC is currently at ${_btc_now}." if _btc_now else ""
             parts.insert(1,  # place right after persona, before everything else
-                "## ⚡ LIVE Market Prices (fetched this second — use ONLY these, never training data)\n"
+                f"## ⚡ LIVE Market Prices — {len(_price_lines)} pairs "
+                "(FETCHED THIS SECOND — use ONLY these, NEVER training data)\n"
                 + "\n".join(_price_lines)
-                + "\n⚠️ BTC is NOT at $78,000. Use the prices above. Training data is outdated."
+                + f"\n🚨 CRITICAL: These prices are LIVE and accurate.{_btc_warn} "
+                "Your training data is months/years old. "
+                "NEVER quote any price not listed above. "
+                "If asked for a price not listed, say 'I don't have that live price right now.'"
+            )
+        else:
+            # No prices fetched — explicitly warn AI NOT to hallucinate prices
+            parts.insert(1,
+                "## ⚠️ LIVE Market Prices — TEMPORARILY UNAVAILABLE\n"
+                "Live price feed could not be reached this request. "
+                "DO NOT quote any specific price from training data — training data is months/years old. "
+                "If asked for a current price, tell the user: "
+                "'I don't have a live feed right now — please check your exchange for the latest price.'"
             )
     except Exception as _px:
         logger.debug(f"[JARVIS] live price inject error: {_px}")

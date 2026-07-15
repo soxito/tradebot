@@ -207,6 +207,7 @@ async def init_db():
             ("sim_accounts", "tradingagents_max_risk_discuss_rounds", "INTEGER DEFAULT 2"),
         ]
         _VALID_TABLES.add("signal_monitor_pairs")
+        _VALID_TABLES.add("ngrok_config")
         async with engine.begin() as conn:
             for table, column, col_type in migrations:
                 # Validate identifiers against whitelist

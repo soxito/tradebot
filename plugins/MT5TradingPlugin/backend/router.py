@@ -1009,14 +1009,31 @@ _MT5_SYMBOL_TO_EX: dict[str, str] = {
 
 
 def _symbol_to_exchange(symbol: str) -> Optional[str]:
-    """Map an MT5 symbol to a Bitget/exchange tradeable pair."""
-    s = (symbol or "").upper().replace("/", "")
+    """Map an MT5 symbol to a Bitget/exchange tradeable pair.
+
+    Handles:
+    - Explicit MT5 overrides (XAUUSD, BTCUSD, etc.)
+    - Glued USDT pairs: BTCUSDT → BTC/USDT
+    - USD-priced pairs: XAUUSD → XAU/USDT (via explicit map)
+    - Bare base tickers: BTC → BTC/USDT, ETH → ETH/USDT
+    """
+    s = (symbol or "").upper().strip().replace("/", "").replace(" ", "")
     if s in _MT5_SYMBOL_TO_EX:
         return _MT5_SYMBOL_TO_EX[s]
+    # Glued USDT pair: BTCUSDT → BTC/USDT
     if s.endswith("USDT") and len(s) > 4:
         return f"{s[:-4]}/USDT"
-    if s.endswith("USD") and not s.endswith("USDT") and len(s) > 3:
+    # USDC pairs: BTCUSDC → BTC/USDC
+    if s.endswith("USDC") and len(s) > 4:
+        return f"{s[:-4]}/USDC"
+    # USD-priced (non-USDT): handled mostly by explicit map above, but catch remainder
+    if s.endswith("USD") and len(s) > 3:
         return f"{s[:-3]}/USDT"
+    # Bare base ticker: BTC, ETH, SOL, XRP, BNB, DOGE, etc.
+    # Any 2-10 uppercase letters not matching the patterns above → assume USDT pair
+    import re as _re_sym
+    if _re_sym.fullmatch(r'[A-Z0-9]{2,10}', s):
+        return f"{s}/USDT"
     return None
 
 

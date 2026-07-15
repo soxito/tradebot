@@ -138,41 +138,22 @@ async def _llm_extract(
         "Return JSON only with keys: direction, symbols, levels, confidence, is_signal, is_news, summary, matched_keywords."
     )
 
-    payload = {
-        "model": cfg.llm_model,
-        "temperature": 0,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": prompt},
-            {
-                "role": "user",
-                "content": f"source_kind={source_kind}\ntext={text}",
-            },
-        ],
-    }
-
-    headers = {
-        "Authorization": f"Bearer {cfg.openai_api_key}",
-        "Content-Type": "application/json",
-    }
+    user_msg = f"source_kind={source_kind}\ntext={text}"
 
     try:
-        async with httpx.AsyncClient(timeout=cfg.llm_timeout_seconds) as client:
-            response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers=headers,
-                json=payload,
-            )
-            response.raise_for_status()
-            data = response.json()
+        # Route through db_chat so every call goes via OpenManus → provider pool.
+        from plugins.AiMarketAnalyst.backend.services.ai_router import db_chat
+        content = await db_chat(
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": user_msg},
+            ],
+            model=cfg.llm_model or None,
+            temperature=0,
+        )
     except Exception:
         return None
 
-    content = (
-        data.get("choices", [{}])[0]
-        .get("message", {})
-        .get("content", "")
-    )
     if not content:
         return None
 

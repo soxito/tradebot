@@ -1537,6 +1537,51 @@ function BotControlPanel({
         </button>
       </div>
 
+      {/* ── Command execution status banner ── */}
+      {botInfo?.ok && (
+        <div className={`rounded-lg border px-4 py-3 mb-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 ${
+          pollingEnabled
+            ? 'border-emerald-500/40 bg-emerald-500/10'
+            : 'border-red-500/50 bg-red-500/10'
+        }`}>
+          <div className="flex items-start gap-3">
+            <span className="text-2xl shrink-0">{pollingEnabled ? '🟢' : '🔴'}</span>
+            <div>
+              <div className="text-sm font-semibold text-white">
+                @{botInfo.username}
+                <span className="ml-2 text-xs font-normal text-gray-400">ID: {botInfo.bot_id}</span>
+              </div>
+              <div className={`text-xs mt-0.5 ${pollingEnabled ? 'text-emerald-300' : 'text-red-300'}`}>
+                {pollingEnabled
+                  ? '✅ Polling active — commands from Telegram are being processed'
+                  : '⚠️ Polling is OFF — commands sent to this bot will NOT execute. Click Start Polling.'}
+              </div>
+              {!pollingEnabled && (
+                <div className="text-xs text-amber-300 mt-0.5">
+                  /forecast, /order, /mt5, /jarvis etc. require polling to be active.
+                </div>
+              )}
+            </div>
+          </div>
+          {!pollingEnabled && (
+            <button
+              onClick={handleTogglePolling}
+              disabled={togglingPolling}
+              className="shrink-0 px-5 py-2 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium disabled:opacity-60 whitespace-nowrap"
+            >
+              {togglingPolling ? 'Starting...' : '▶ Start Polling'}
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Bot token missing banner */}
+      {!loadingInfo && botInfo && !botInfo.ok && (
+        <div className="rounded-lg border border-red-500/50 bg-red-500/10 px-4 py-3 mb-4 text-sm text-red-300">
+          ❌ No valid bot token set. Go to <strong>API Details</strong> above and enter your Bot Token from @BotFather, then save.
+        </div>
+      )}
+
       {/* Bot Identity */}
       <div className="rounded-lg border border-gray-700 bg-gray-900/40 p-4 mb-4">
         <h3 className="text-sm font-medium text-gray-200 mb-2">Bot Identity</h3>

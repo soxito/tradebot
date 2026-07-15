@@ -1,0 +1,27 @@
+{
+  "name": "OpenHuman",
+  "slug": "openhuman",
+  "version": "1.0.0",
+  "description": "Integration with tinyhumansai/openhuman — a local-first personal AI brain with Memory Tree, agent orchestration, and MCP support. TradeBot connects as an MCP tool server so OpenHuman can call TradeBot signals, Kronos forecasts, and JARVIS analysis. Memory sync via agentmemory backend.",
+  "author": "TradeBot",
+  "requires": { "python": ">=3.10", "tradebot": ">=0.1.0" },
+  "service_provider": "backend.router",
+  "provides": {
+    "routes": ["backend/router.py"],
+    "models": ["backend/models.py"],
+    "pages": [],
+    "overlays": false,
+    "scheduled_jobs": []
+  },
+  "permissions": [
+    "market.data.read",
+    "ai.research.read",
+    "memory.read",
+    "memory.write"
+  ],
+  "settings_keys": [
+    "openhuman.agentmemory_url",
+    "openhuman.api_url",
+    "openhuman.mcp_sse_enabled"
+  ]
+}

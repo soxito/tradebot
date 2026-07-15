@@ -76,6 +76,8 @@ export const NAV_ROUTES: { label: string; path: string; aliases: string[] }[] = 
   { label: 'Telegram', path: '/telegram', aliases: ['telegram', 'connect telegram', 'connect ai'] },
   { label: 'AI Profiles', path: '/ai-agents-admin', aliases: ['ai profiles', 'profiles', 'agent profiles', 'providers'] },
   { label: 'Trade History', path: '/history', aliases: ['trade history', 'history', 'past trades'] },
+  { label: 'Vibe Trading', path: '/vibe-trading', aliases: ['vibe trading', 'vibe', 'backtest', 'alpha zoo', 'research agent', 'swarm research'] },
+  { label: 'Agent Hub', path: '/openhuman-hub', aliases: ['agent hub', 'open human', 'openhuman', 'hub', 'ai brain', 'agent brain'] },
   { label: 'Settings', path: '/settings', aliases: ['settings', 'preferences', 'config', 'configuration'] },
 ]
 

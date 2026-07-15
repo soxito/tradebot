@@ -604,6 +604,7 @@ class TelegramSignalMonitor:
 
     def __init__(self) -> None:
         self._task: asyncio.Task | None = None
+        self._bot_polling_task: asyncio.Task | None = None
         self._running = False
         self._last_run: datetime | None = None
         self._last_poll: datetime | None = None
@@ -694,6 +695,7 @@ class TelegramSignalMonitor:
         from plugins.TelegramSignalNewsPlugin.backend.services.bot_service import (
             get_updates,
             send_message,
+            answer_callback_query,
         )
         from plugins.TelegramSignalNewsPlugin.backend.services.command_service import (
             parse_and_execute,
@@ -741,16 +743,36 @@ class TelegramSignalMonitor:
                         offset = update_id + 1
 
                     try:
-                        chat_id = (
-                            (update.get("message") or update.get("edited_message") or {})
-                            .get("chat", {}).get("id")
-                        )
+                        # Resolve chat_id — works for both message and callback_query
+                        if "callback_query" in update:
+                            cq = update["callback_query"]
+                            chat_id = (cq.get("message") or {}).get("chat", {}).get("id")
+                            cq_id = cq.get("id")
+                        else:
+                            chat_id = (
+                                (update.get("message") or update.get("edited_message") or {})
+                                .get("chat", {}).get("id")
+                            )
+                            cq_id = None
+
                         async with session_factory() as db2:
-                            reply_text, parse_mode = await parse_and_execute(
+                            result = await parse_and_execute(
                                 update, token, allowed, db2
                             )
+
+                        # Normalise to 3-tuple (text, parse_mode, reply_markup)
+                        if len(result) == 2:
+                            reply_text, parse_mode, reply_markup = result[0], result[1], None
+                        else:
+                            reply_text, parse_mode, reply_markup = result
+
+                        # Acknowledge button press first so Telegram removes the spinner
+                        if cq_id:
+                            ack_text = "⏳ Processing…" if reply_text else "✅"
+                            await answer_callback_query(token, cq_id, text=ack_text)
+
                         if reply_text and chat_id:
-                            await send_message(token, chat_id, reply_text, parse_mode)
+                            await send_message(token, chat_id, reply_text, parse_mode, reply_markup)
                     except Exception as update_exc:  # noqa: BLE001
                         logger.warning("[BotPolling] Update processing error: {}", update_exc)
 

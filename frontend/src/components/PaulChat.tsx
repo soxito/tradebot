@@ -2348,8 +2348,18 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
       // Try to extract a symbol from the user's message
       let symbol = 'XAUUSD'
       if (requestText) {
-        const symMatch = requestText.toUpperCase().match(/\b(XAUUSD|XAGUSD|EURUSD|GBPUSD|USDJPY|NAS100|US30|BTC|ETH|SOL|XRP)\b/)
-        if (symMatch) symbol = symMatch[0]
+        const symMatch = requestText.toUpperCase().match(
+          /\b(XAUUSD|XAGUSD|EURUSD|GBPUSD|USDJPY|NAS100|US30|BTCUSDT|ETHUSDT|SOLUSDT|XRPUSDT|BNBUSDT|DOGEUSDT|ADAUSDT|AVAXUSDT|BTC|ETH|SOL|XRP|BNB|DOGE|ADA|AVAX)\b/
+        )
+        if (symMatch) {
+          // Normalise bare crypto base tickers → USDT pair
+          const _bareToUsdt: Record<string, string> = {
+            BTC: 'BTCUSDT', ETH: 'ETHUSDT', SOL: 'SOLUSDT',
+            XRP: 'XRPUSDT', BNB: 'BNBUSDT', DOGE: 'DOGEUSDT',
+            ADA: 'ADAUSDT', AVAX: 'AVAXUSDT',
+          }
+          symbol = _bareToUsdt[symMatch[0]] ?? symMatch[0]
+        }
       }
       const ctx = {
         accountId: a.id,
@@ -3749,6 +3759,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
           energy={robotEnergy}
           avatarStyle={avatarStyle}
           extRobotActive={robotLocked}
+          useOpenHumanMascot={true}
           onClick={() => !robotLocked && setOpen(o => !o)}
         />
       )}

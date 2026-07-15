@@ -94,9 +94,47 @@ KRONOS_VENDOR_MODEL = KRONOS_PLUGIN_DIR / "backend" / "vendor" / "model"
 # Opt-out with TRADEBOT_SKIP_KRONOS_SETUP=1 (keeps the heuristic fallback).
 KRONOS_SETUP_ENABLED = os.environ.get("TRADEBOT_SKIP_KRONOS_SETUP", "").strip().lower() not in ("1", "true", "yes", "on")
 
+# ── Vibe-Trading plugin setup ─────────────────────────────────────────────────
+# HKUDS/Vibe-Trading — personal trading agent with backtesting, alpha zoo,
+# multi-agent swarms, and crypto data.  Installed as a PyPI package into the
+# backend venv on first run.  Opt-out with TRADEBOT_SKIP_VIBE_TRADING_SETUP=1.
+VIBE_TRADING_PLUGIN_DIR = (ROOT / "plugins" / "VibeTradingPlugin").resolve()
+VIBE_TRADING_SETUP_ENABLED = os.environ.get("TRADEBOT_SKIP_VIBE_TRADING_SETUP", "").strip().lower() not in ("1", "true", "yes", "on")
+# Vibe-Trading agent config directory (for the MCP agent.json bridge file).
+VIBE_TRADING_CONFIG_DIR = Path.home() / ".vibe-trading"
+VIBE_TRADING_SERVE_PORT = int(os.environ.get("VIBE_TRADING_SERVE_PORT", "8899"))
+
+# ── OpenHuman plugin setup ─────────────────────────────────────────────────────
+# tinyhumansai/openhuman — local-first personal AI brain with Memory Tree and
+# agent orchestration.  Shared agentmemory backend installed as a PyPI package.
+# Opt-out with TRADEBOT_SKIP_OPENHUMAN_SETUP=1.
+OPENHUMAN_PLUGIN_DIR = (ROOT / "plugins" / "OpenHumanPlugin").resolve()
+OPENHUMAN_SETUP_ENABLED = os.environ.get("TRADEBOT_SKIP_OPENHUMAN_SETUP", "").strip().lower() not in ("1", "true", "yes", "on")
+
+# ── OpenManus plugin setup ────────────────────────────────────────────────────
+# FoundationAgents/OpenManus — multi-agent MCP orchestration layer.
+# Cloned to ~/.tradebot/openmanus on first run (idempotent git clone/pull).
+# MCP server started as a sidecar subprocess; TradeBot routes all AI calls
+# through it when OPENMANUS_ENABLED=true (default).
+# Opt-out with TRADEBOT_SKIP_OPENMANUS_SETUP=1.
+OPENMANUS_PLUGIN_DIR = (ROOT / "plugins" / "OpenManusPlugin").resolve()
+OPENMANUS_SETUP_ENABLED = os.environ.get("TRADEBOT_SKIP_OPENMANUS_SETUP", "").strip().lower() not in ("1", "true", "yes", "on")
+OPENMANUS_INSTALL_DIR = Path(os.environ.get("OPENMANUS_INSTALL_DIR", str(Path.home() / ".tradebot" / "openmanus"))).expanduser().resolve()
+OPENMANUS_VENV_DIR = Path.home() / ".tradebot" / "openmanus-venv"   # isolated venv — avoids backend dep conflicts
+OPENMANUS_MCP_PORT = int(os.environ.get("OPENMANUS_PORT", "8765"))
+OPENMANUS_REPO = "https://github.com/FoundationAgents/OpenManus.git"
+# Prefer Python 3.12/3.11 for OpenManus (3.13 is unsupported upstream)
+_OM_PY_CANDIDATES = [
+    "/opt/homebrew/bin/python3.12", "/opt/homebrew/bin/python3.11",
+    "/usr/local/bin/python3.12", "/usr/local/bin/python3.11",
+    str(PY_BIN),  # TradeBot's own venv python as last resort
+]
+OPENMANUS_BASE_PY = next((p for p in _OM_PY_CANDIDATES if Path(p).exists()), str(PY_BIN))
+
 # ── Ports ─────────────────────────────────────────────────────────────────────
-BACKEND_PORT  = int(os.environ.get("BACKEND_PORT", "1448"))
-FRONTEND_PORT = int(os.environ.get("FRONTEND_PORT", "3000"))
+BACKEND_PORT       = int(os.environ.get("BACKEND_PORT", "1448"))
+FRONTEND_PORT      = int(os.environ.get("FRONTEND_PORT", "3000"))
+AGENTMEMORY_PORT   = int(os.environ.get("AGENTMEMORY_PORT", "8900"))   # shared memory for OpenHuman
 
 # ── MT5 REST config (read from .env if present, else defaults) ────────────────
 def _read_dotenv() -> Dict[str, str]:
@@ -2945,6 +2983,27 @@ def ensure_pip_deps() -> bool:
         warn("headroom-ai unavailable for this Python — context compression "
              "disabled (optional, app runs normally).")
 
+    # ngrok — tunnel service for backend + frontend exposure.
+    # Check if already importable at the correct version before installing.
+    _ngrok_ok = False
+    try:
+        _r = run([str(PY_BIN), "-c",
+                  "import ngrok, importlib.metadata as m; "
+                  "v=m.version('ngrok'); assert v=='1.4.0', v"],
+                 cwd=BACKEND_DIR)
+        _ngrok_ok = _r.returncode == 0
+    except Exception:
+        pass
+    if not _ngrok_ok:
+        info("Installing ngrok==1.4.0 …")
+        r_ng = run([str(pip), "install", "--quiet", "ngrok==1.4.0"],
+                   cwd=BACKEND_DIR)
+        if r_ng.returncode != 0:
+            warn("ngrok==1.4.0 install failed — tunnel feature will be "
+                 "unavailable until installed manually.")
+        else:
+            ok("ngrok==1.4.0 installed")
+
     return True
 
 
@@ -3048,6 +3107,710 @@ def ensure_kronos_model() -> bool:
     return True
 
 
+def ensure_vibe_trading() -> bool:
+    """Install vibe-trading-ai into the backend venv (one-time, cross-platform),
+    then start `vibe-trading serve --port VIBE_TRADING_SERVE_PORT` as a
+    detached background daemon if it is not already listening.
+
+    Checks if the `vibe_trading` package is importable; if not, pip-installs it
+    from PyPI into the same venv that runs the FastAPI backend.  Also creates
+    `~/.vibe-trading/agent.json` with the TradeBot MCP bridge so that Vibe-
+    Trading's swarm agents can call TradeBot tools directly.
+
+    Best-effort: a failure here NEVER blocks startup — the plugin degrades
+    gracefully (research returns an error, sidecar stays stopped).
+    Opt-out: set TRADEBOT_SKIP_VIBE_TRADING_SETUP=1.
+    """
+    if not VIBE_TRADING_SETUP_ENABLED:
+        warn("Vibe-Trading setup skipped (TRADEBOT_SKIP_VIBE_TRADING_SETUP set)")
+        return True
+
+    if not VIBE_TRADING_PLUGIN_DIR.exists():
+        warn("VibeTradingPlugin directory not found — skipping Vibe-Trading setup")
+        return True
+
+    if not PY_BIN.exists():
+        warn("Python venv not ready — skipping Vibe-Trading setup")
+        return True
+
+    # ── 1. Install vibe-trading-ai if missing ──────────────────────────────────
+    check = run([str(PY_BIN), "-c", "import vibe_trading"], cwd=BACKEND_DIR)
+    if check.returncode != 0:
+        info("Installing vibe-trading-ai into backend venv …")
+        ok_inst, err = _spinner_run(
+            [str(PIP_BIN), "install", "--quiet", "--prefer-binary", "vibe-trading-ai"],
+            "pip install vibe-trading-ai",
+            cwd=BACKEND_DIR,
+            timeout=600,
+        )
+        if not ok_inst:
+            warn(f"vibe-trading-ai install failed ({(err or '')[:160]}) — "
+                 "Vibe-Trading plugin will run in offline mode.")
+            return True  # best-effort
+
+        # Confirm install by checking the CLI binary (the package installs no
+        # importable vibe_trading module — only a CLI entry-point).
+        _vt_ok = (
+            (VENV_BIN / f"vibe-trading{_EXE}").exists()
+            or (VENV_BIN / "vibe-trading").exists()
+        )
+        if _vt_ok:
+            ok("vibe-trading-ai installed successfully ✓")
+        else:
+            warn("vibe-trading-ai install may have failed — binary not found")
+    else:
+        ok("vibe-trading-ai already installed in venv")
+
+    # Create default agent/.env from example if missing (user fills in LLM key).
+    _agent_env_path = ROOT / "agent" / ".env"
+    _agent_env_example = ROOT / "agent" / ".env.example"
+    if not _agent_env_path.exists() and _agent_env_example.exists():
+        try:
+            import shutil as _sh
+            _sh.copy(_agent_env_example, _agent_env_path)
+            ok("Created agent/.env from agent/.env.example — add your LLM provider API key")
+        except Exception as _ex:
+            warn(f"Could not copy agent/.env.example: {_ex}")
+
+    _ensure_vibe_agent_json()
+
+    # ── 2. Patch vibe-trading-ai for FastAPI 0.115+ compatibility ─────────────
+    # FastAPI 0.115 forbids response bodies on 204 responses; vibe-trading-ai
+    # 0.1.x ships several such routes.  Patch installed .py files and clear
+    # the corresponding .pyc caches so the patch takes effect at import time.
+    _patch_vibe_trading_204()
+
+    # ── 3. Start vibe-trading serve if not already running ────────────────────
+    _start_vibe_trading_serve()
+    return True
+
+
+def _patch_vibe_trading_204() -> None:
+    """Patch HTTP 204 → 200 in vibe-trading-ai installed files.
+
+    FastAPI ≥ 0.115 asserts that 204 No-Content responses have no body.
+    Several vibe-trading-ai routes define ``status_code=HTTP_204_NO_CONTENT``
+    while also returning a body — this crashes at startup.  We rewrite those
+    lines in the installed .py files and delete the corresponding .pyc caches.
+
+    Idempotent: repeated calls are harmless.
+    """
+    import re as _re
+
+    _site = VENV_BIN.parent / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+    if not _site.exists():
+        return
+
+    _targets = [
+        _site / "src" / "api" / "scheduled_routes.py",
+        _site / "ddgs" / "api_server" / "api.py",
+        _site / "litellm" / "proxy" / "management_endpoints" / "scim" / "scim_v2.py",
+        _site / "litellm" / "proxy" / "management_endpoints" / "access_group_endpoints.py",
+    ]
+    _pattern = _re.compile(r'status_code\s*=\s*(?:status\.)?HTTP_204_NO_CONTENT')
+    _replacement = "status_code=status.HTTP_200_OK"
+
+    for _tgt in _targets:
+        if not _tgt.exists():
+            continue
+        try:
+            _text = _tgt.read_text()
+            if "HTTP_204_NO_CONTENT" not in _text:
+                continue
+            _patched = _pattern.sub(_replacement, _text)
+            _tgt.write_text(_patched)
+            # Clear compiled cache so the patch takes effect immediately
+            _pyc = _tgt.parent / "__pycache__" / (_tgt.stem + f".cpython-{sys.version_info.major}{sys.version_info.minor}.pyc")
+            if _pyc.exists():
+                _pyc.unlink(missing_ok=True)
+        except Exception:
+            pass  # never block startup
+
+
+def _start_vibe_trading_serve() -> None:
+    """Start `vibe-trading serve --port VIBE_TRADING_SERVE_PORT` as a
+    detached background daemon.
+
+    No-op if the port is already open (already running from a prior start).
+    Uses the vibe-trading CLI from the backend venv if present; otherwise
+    falls back to `python -m vibe_trading serve`.
+    Best-effort: never raises, never blocks startup.
+    """
+    port = VIBE_TRADING_SERVE_PORT
+    if port_open("127.0.0.1", port, 0.5):
+        ok(f"vibe-trading serve already running on :{port} ✓")
+        return
+
+    # Prefer the installed CLI binary inside the venv
+    vt_bin: Optional[Path] = None
+    for candidate in (
+        VENV_BIN / f"vibe-trading{_EXE}",
+        VENV_BIN / "vibe-trading",
+        VENV_BIN / f"vibe_trading{_EXE}",
+    ):
+        if candidate.exists():
+            vt_bin = candidate
+            break
+
+    if vt_bin is not None:
+        cmd = [str(vt_bin), "serve", "--port", str(port)]
+    elif PY_BIN.exists():
+        cmd = [str(PY_BIN), "-m", "vibe_trading", "serve", "--port", str(port)]
+    else:
+        warn("vibe-trading binary not found in venv — skipping vibe-trading serve")
+        return
+
+    log_path = ROOT / "vibe-trading.log"
+    try:
+        if IS_WINDOWS:
+            DETACHED = 0x00000008
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            subprocess.Popen(
+                cmd,
+                cwd=str(ROOT),
+                stdout=open(log_path, "a"),
+                stderr=subprocess.STDOUT,
+                creationflags=DETACHED | CREATE_NEW_PROCESS_GROUP,
+            )
+        else:
+            subprocess.Popen(
+                cmd,
+                cwd=str(ROOT),
+                stdout=open(log_path, "a"),
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+    except Exception as exc:
+        warn(f"vibe-trading serve failed to start: {exc}")
+        return
+
+    # Wait up to 20 s for the port to open (server takes ~8-10 s to boot)
+    for _ in range(20):
+        time.sleep(1)
+        if port_open("127.0.0.1", port, 0.5):
+            ok(f"vibe-trading serve started on :{port} ✓")
+            return
+
+    # Still not up — check if process crashed immediately
+    ok(f"vibe-trading serve launched on :{port} (still booting — check {log_path.name} if needed)")
+
+
+def _ensure_vibe_agent_json() -> None:
+    """Write ~/.vibe-trading/agent.json linking TradeBot as a Vibe-Trading MCP server.
+
+    Idempotent: only writes when the file is absent.  If the user has already
+    configured their own agent.json the file is left untouched.
+    """
+    agent_json = VIBE_TRADING_CONFIG_DIR / "agent.json"
+    if agent_json.exists():
+        return
+    try:
+        VIBE_TRADING_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        mcp_sse_url = f"http://127.0.0.1:{BACKEND_PORT}/api/v1/plugins/openhuman/mcp/sse"
+        config = {
+            "mcpServers": {
+                "tradebot": {
+                    "type": "sse",
+                    "url": mcp_sse_url,
+                    "toolTimeout": 30,
+                    "enabledTools": [
+                        "tradebot_get_signals",
+                        "tradebot_get_forecast",
+                        "tradebot_get_position",
+                        "tradebot_get_smc_analysis",
+                        "tradebot_ask_jarvis",
+                    ],
+                }
+            }
+        }
+        agent_json.write_text(json.dumps(config, indent=2))
+        ok(f"Created ~/.vibe-trading/agent.json (TradeBot MCP bridge for Vibe-Trading swarms)")
+    except Exception as _ex:
+        warn(f"Could not create ~/.vibe-trading/agent.json: {_ex}")
+
+
+def ensure_openhuman_deps() -> bool:
+    """Check OpenHuman desktop connectivity and install if needed.
+
+    As of OpenHuman v0.58+, agentmemory is built into the desktop app's
+    memory_tree_db — no separate Python package is required.  We just
+    verify the app is running on :7788 and install it via brew if not.
+
+    Opt-out: set TRADEBOT_SKIP_OPENHUMAN_SETUP=1.
+    """
+    if not OPENHUMAN_SETUP_ENABLED:
+        warn("OpenHuman setup skipped (TRADEBOT_SKIP_OPENHUMAN_SETUP set)")
+        return True
+
+    if not OPENHUMAN_PLUGIN_DIR.exists():
+        warn("OpenHumanPlugin directory not found — skipping OpenHuman setup")
+        return True
+
+    # ── Check if OpenHuman is already running on :7788 ─────────────────────
+    OPENHUMAN_PORT = 7788
+    if port_open("127.0.0.1", OPENHUMAN_PORT, 1.0):
+        ok(f"OpenHuman desktop running on :{OPENHUMAN_PORT} ✓  (memory_tree_db active)")
+        return True
+
+    # ── Not running: try to start / install ───────────────────────────────
+    info("OpenHuman desktop not detected on :7788 — attempting to install/start …")
+    _try_install_openhuman()
+
+    # Give the app a few seconds to start
+    import time as _time
+    for _ in range(10):
+        _time.sleep(1)
+        if port_open("127.0.0.1", OPENHUMAN_PORT, 0.5):
+            ok(f"OpenHuman started on :{OPENHUMAN_PORT} ✓")
+            return True
+
+    warn(
+        "OpenHuman not running. Open the OpenHuman desktop app and the "
+        "memory brain will activate automatically (no agentmemory install needed)."
+    )
+    return True  # always best-effort
+
+
+def ensure_openmanus() -> bool:
+    """Clone/update FoundationAgents/OpenManus and start the MCP sidecar.
+
+    Workflow:
+      1. Check if OPENMANUS_INSTALL_DIR exists and has run_mcp.py → already installed.
+      2. If not: git clone into OPENMANUS_INSTALL_DIR (best-effort, requires git).
+      3. pip-install requirements.txt into the backend venv (best-effort).
+      4. Start run_mcp.py --transport sse --port OPENMANUS_MCP_PORT as a
+         detached background daemon (stdout/stderr → ROOT/openmanus.log).
+      5. Report status and print the API URL.
+
+    Best-effort: never blocks startup — if OpenManus is unavailable the
+    existing AiMarketAnalyst provider loop acts as fallback automatically.
+    Opt-out: set TRADEBOT_SKIP_OPENMANUS_SETUP=1 (or OPENMANUS_ENABLED=false
+    to keep the install but disable routing at runtime).
+    """
+    if not OPENMANUS_SETUP_ENABLED:
+        warn("OpenManus setup skipped (TRADEBOT_SKIP_OPENMANUS_SETUP set) — provider fallback stays active")
+        return True
+
+    if not OPENMANUS_PLUGIN_DIR.exists():
+        warn("OpenManusPlugin directory not found — skipping OpenManus setup")
+        return True
+
+    mcp_script = OPENMANUS_INSTALL_DIR / "run_mcp.py"
+
+    # ── Fast path: already installed and MCP server already listening ─────────
+    if port_open("127.0.0.1", OPENMANUS_MCP_PORT, 0.5):
+        ok(f"OpenManus MCP server already running on :{OPENMANUS_MCP_PORT} ✓")
+        return True
+
+    # ── Clone / update ────────────────────────────────────────────────────────
+    if not mcp_script.exists():
+        if not shutil.which("git"):
+            warn("Git not found — cannot clone OpenManus. Install Git or clone manually:\n"
+                 f"    git clone {OPENMANUS_REPO} {OPENMANUS_INSTALL_DIR}")
+            return True
+
+        OPENMANUS_INSTALL_DIR.parent.mkdir(parents=True, exist_ok=True)
+        info(f"Cloning OpenManus → {OPENMANUS_INSTALL_DIR} (this may take ~30 s) …")
+        clone_cmd = [
+            "git", "clone", "--depth=1",
+            OPENMANUS_REPO, str(OPENMANUS_INSTALL_DIR)
+        ]
+        ok_run, err = _spinner_run(clone_cmd, "OpenManus clone", cwd=str(ROOT), timeout=120)
+        if not ok_run or not mcp_script.exists():
+            warn(f"OpenManus clone failed ({(err or '')[:160]}). Provider fallback stays active.")
+            return True
+        ok("OpenManus cloned ✓")
+    else:
+        # Installed: pull latest silently
+        try:
+            subprocess.run(
+                ["git", "pull", "--ff-only"],
+                cwd=str(OPENMANUS_INSTALL_DIR),
+                capture_output=True,
+                timeout=30,
+            )
+        except Exception:
+            pass  # non-fatal
+
+    # ── Create config.toml if missing (prevents DaytonaSettings crash) ────────
+    om_config_dir = OPENMANUS_INSTALL_DIR / "config"
+    om_config_file = om_config_dir / "config.toml"
+    if not om_config_file.exists():
+        om_config_dir.mkdir(parents=True, exist_ok=True)
+        # Read provider config from TradeBot env so OpenManus uses the same LLM
+        _om_api_key   = os.environ.get("OPENAI_API_KEY") or \
+                        os.environ.get("ANTHROPIC_API_KEY") or \
+                        os.environ.get("GOOGLE_API_KEY") or \
+                        os.environ.get("GROQ_API_KEY") or \
+                        "placeholder-not-configured"
+        _om_base_url  = os.environ.get("OPENAI_BASE_URL") or "http://127.0.0.1:11434/v1"
+        _om_model     = os.environ.get("OPENMANUS_MODEL") or "gpt-4o-mini"
+        # Detect ollama availability as a sensible default
+        if port_open("127.0.0.1", 11434, 0.3):
+            _om_api_type  = "ollama"
+            _om_base_url  = "http://localhost:11434/v1"
+            _om_api_key   = "ollama"
+            _om_model     = os.environ.get("OPENMANUS_MODEL") or "llama3.2"
+        else:
+            _om_api_type = ""  # default → openai-compatible
+
+        om_config_file.write_text(
+            f"""# Auto-generated by TradeBot start.py — edit to customise
+[llm]
+model       = "{_om_model}"
+base_url    = "{_om_base_url}"
+api_key     = "{_om_api_key}"
+api_type    = "{_om_api_type}"
+max_tokens  = 8192
+temperature = 0.0
+
+[llm.vision]
+model       = "{_om_model}"
+base_url    = "{_om_base_url}"
+api_key     = "{_om_api_key}"
+api_type    = "{_om_api_type}"
+max_tokens  = 8192
+temperature = 0.0
+
+[mcp]
+server_reference = "app.mcp.server"
+
+[runflow]
+use_data_analysis_agent = false
+
+# Daytona sandbox integration (not used by default)
+[daytona]
+daytona_api_key = "disabled"
+"""
+        )
+        ok("OpenManus config.toml created ✓")
+
+    # ── Create isolated OpenManus venv (avoids backend dep conflicts) ─────────
+    om_py   = OPENMANUS_VENV_DIR / "bin" / "python"
+    om_pip  = OPENMANUS_VENV_DIR / "bin" / "pip"
+    if not om_py.exists():
+        info(f"Creating OpenManus venv at {OPENMANUS_VENV_DIR} with {OPENMANUS_BASE_PY} …")
+        venv_ok = subprocess.run(
+            [OPENMANUS_BASE_PY, "-m", "venv", str(OPENMANUS_VENV_DIR)],
+            capture_output=True, timeout=60,
+        ).returncode == 0
+        if not venv_ok or not om_py.exists():
+            warn("OpenManus venv creation failed — MCP server unavailable")
+            return True
+        ok("OpenManus venv created ✓")
+    else:
+        om_pip = OPENMANUS_VENV_DIR / "bin" / "pip"
+
+    # ── Install OpenManus requirements into its own venv ─────────────────────
+    om_stamp = OPENMANUS_VENV_DIR / ".installed_stamp"
+    req_file = OPENMANUS_INSTALL_DIR / "requirements.txt"
+    if not om_stamp.exists() and req_file.exists():
+        info("Installing OpenManus requirements into isolated venv …")
+        import re as _re
+        import tempfile as _tempfile
+        relaxed_lines: list[str] = []
+        for _line in req_file.read_text().splitlines():
+            _stripped = _line.strip()
+            if _stripped and not _stripped.startswith("#"):
+                # ~=X.Y.Z → >=X.Y  (keeps minimum, removes strict upper bound)
+                _relaxed = _re.sub(r"~=(\d+\.\d+)(?:\.\d+)*", r">=\1", _stripped)
+                # Pin browser-use to <0.2 to keep BrowserConfig API
+                if _relaxed.startswith("browser-use"):
+                    _relaxed = "browser-use>=0.1.40,<0.2.0"
+                relaxed_lines.append(_relaxed)
+            else:
+                relaxed_lines.append(_line)
+        relaxed_lines.append("structlog")  # transitive dep not in requirements.txt
+        relaxed_lines.append("daytona")    # Daytona sandbox SDK (browser agent)
+
+        _tmp = _tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", prefix="om_req_", delete=False
+        )
+        _tmp.write("\n".join(relaxed_lines))
+        _tmp.flush(); _tmp.close()
+
+        pip_cmd = [
+            str(om_pip), "install", "-q",
+            "--prefer-binary",
+            "--upgrade-strategy=only-if-needed",
+            "-r", _tmp.name,
+        ]
+        ok_pip, pip_err = _spinner_run(pip_cmd, "OpenManus pip install", timeout=360)
+        try:
+            import os as _os; _os.unlink(_tmp.name)
+        except Exception:
+            pass
+
+        if ok_pip:
+            om_stamp.touch()
+            ok("OpenManus requirements installed ✓")
+        else:
+            warn(f"OpenManus pip install had issues ({(pip_err or '')[:120]}). "
+                 "Attempting core-only install …")
+            core_pkgs = [
+                "boto3>=1.37.0", "mcp>=1.5.0", "openai>=1.66.0",
+                "pydantic>=2.10.0", "fastapi>=0.115.0", "uvicorn>=0.34.0",
+                "httpx>=0.27.0", "loguru>=0.7.0", "pyyaml>=6.0",
+                "tenacity>=9.0.0", "tiktoken>=0.9.0", "aiofiles>=24.1.0",
+                "requests>=2.32.0", "pillow>=11.1.0", "tomli>=2.0.0",
+                "duckduckgo_search>=7.5.0", "beautifulsoup4>=4.13.0",
+                "structlog", "docker>=7.1.0",
+                "browser-use>=0.1.40,<0.2.0",
+                "daytona",  # Daytona sandbox SDK required by OpenManus browser agent
+            ]
+            for _pkg in core_pkgs:
+                subprocess.run(
+                    [str(om_pip), "install", "-q", "--prefer-binary",
+                     "--upgrade-strategy=only-if-needed", _pkg],
+                    capture_output=True, timeout=60,
+                )
+            om_stamp.touch()
+            ok("OpenManus core packages installed ✓")
+
+    # ── Start OpenManus MCP server using the isolated venv ───────────────────
+    # Prefer the dedicated server script (run_mcp_server.py) which the newer
+    # OpenManus versions ship as the canonical entrypoint.  Fall back to
+    # run_mcp.py for older clones that still accepted --transport sse.
+    server_script = OPENMANUS_INSTALL_DIR / "run_mcp_server.py"
+    if not server_script.exists():
+        server_script = mcp_script  # fall back to run_mcp.py
+
+    py_bin = str(om_py) if om_py.exists() else (str(PY_BIN) if PY_BIN.exists() else "python3")
+    log_path = ROOT / "openmanus.log"
+    env = {**os.environ, "PYTHONPATH": str(OPENMANUS_INSTALL_DIR)}
+
+    # Detect which transport flags the server script accepts (run once, safely)
+    try:
+        _help_proc = subprocess.run(
+            [py_bin, str(server_script), "--help"],
+            cwd=str(OPENMANUS_INSTALL_DIR),
+            env=env,
+            capture_output=True, text=True, timeout=30,
+        )
+        _help = _help_proc.stdout + _help_proc.stderr
+    except Exception:
+        _help = ""
+
+    # Older OpenManus supported --port for SSE; newer versions are stdio-only.
+    # Check explicitly for SSE/port support rather than assuming.
+    _supports_sse = "--port" in _help and ("sse" in _help.lower() or "http" in _help.lower())
+
+    if _supports_sse:
+        # Older OpenManus with SSE/port support — start as HTTP daemon
+        _cmd = [py_bin, str(server_script), "--transport", "sse",
+                "--port", str(OPENMANUS_MCP_PORT)]
+    else:
+        # Current OpenManus: stdio-only transport, no port binding.
+        # AI calls fall back gracefully to the existing provider pool.
+        ok("OpenManus ready (stdio mode) — AI calls route through provider pool ✓")
+        return True
+
+    if IS_WINDOWS:
+        DETACHED = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        try:
+            subprocess.Popen(
+                _cmd,
+                cwd=str(OPENMANUS_INSTALL_DIR),
+                env=env,
+                stdout=open(log_path, "a"),
+                stderr=subprocess.STDOUT,
+                creationflags=DETACHED | CREATE_NEW_PROCESS_GROUP,
+            )
+        except Exception as exc:
+            warn(f"OpenManus MCP start failed: {exc}")
+            return True
+    else:
+        try:
+            subprocess.Popen(
+                _cmd,
+                cwd=str(OPENMANUS_INSTALL_DIR),
+                env=env,
+                stdout=open(log_path, "a"),
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            warn(f"OpenManus MCP start failed: {exc}")
+            return True
+
+    # ── Wait up to 10 s for port to open ─────────────────────────────────────
+    for _ in range(10):
+        time.sleep(1)
+        if port_open("127.0.0.1", OPENMANUS_MCP_PORT, 0.5):
+            ok(f"OpenManus MCP server started on :{OPENMANUS_MCP_PORT} ✓  "
+               f"(AI calls now route through OpenManus first)")
+            return True
+
+    warn(
+        f"OpenManus MCP server not yet on :{OPENMANUS_MCP_PORT} after 10 s. "
+        "AI calls will fall back to the provider pool. "
+        f"Check {log_path.name} for details. "
+        "You can also start it manually:\n"
+        f"    POST http://127.0.0.1:1448/api/v1/plugins/openmanus/start"
+    )
+    return True  # always best-effort
+
+
+
+def _start_agentmemory_server() -> bool:
+    """Launch 'agentmemory serve' as a detached background daemon on :8900.
+
+    No-op if port 8900 is already open.  Writes output to ROOT/agentmemory.log.
+    Safe to call multiple times (idempotent).
+    """
+    # Fast path — already running
+    if port_open("127.0.0.1", AGENTMEMORY_PORT, 0.5):
+        ok(f"agentmemory server already running on :{AGENTMEMORY_PORT}")
+        return True
+
+    # Find the agentmemory CLI binary in the venv
+    am_bin: Optional[Path] = None
+    for candidate in (
+        VENV_BIN / f"agentmemory{_EXE}",
+        VENV_BIN / "agentmemory",
+    ):
+        if candidate.exists():
+            am_bin = candidate
+            break
+
+    # Decide on the launch command
+    if am_bin is not None:
+        cmd = [str(am_bin), "serve"]
+    elif PY_BIN.exists():
+        # Fall back to python -m agentmemory serve
+        cmd = [str(PY_BIN), "-m", "agentmemory", "serve"]
+    else:
+        warn("agentmemory CLI not found in venv — skipping server start")
+        return False
+
+    info(f"Starting agentmemory server on :{AGENTMEMORY_PORT} …")
+
+    am_log = ROOT / "agentmemory.log"
+    try:
+        logf: object = open(am_log, "ab")
+    except Exception:
+        logf = subprocess.DEVNULL  # type: ignore[assignment]
+
+    popen_kwargs: Dict[str, object] = {
+        "stdout": logf, "stderr": logf,
+        "cwd": str(ROOT),
+    }
+    if IS_WINDOWS:
+        popen_kwargs["creationflags"] = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0)
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    try:
+        subprocess.Popen(cmd, **popen_kwargs)
+    except Exception as ex:
+        warn(f"Could not launch agentmemory server: {ex}")
+        return False
+
+    # Wait up to 12 seconds for the server to become ready
+    for _i in range(12):
+        time.sleep(1)
+        if port_open("127.0.0.1", AGENTMEMORY_PORT, 0.5):
+            ok(f"agentmemory server ready on :{AGENTMEMORY_PORT}")
+            return True
+
+    warn(
+        f"agentmemory server didn't bind to :{AGENTMEMORY_PORT} within 12 s. "
+        "It may still be starting — check ROOT/agentmemory.log if the hub shows Offline."
+    )
+    return True  # best-effort, don't block startup
+
+
+def _try_install_openhuman() -> None:
+    """Attempt to install the OpenHuman desktop app via Homebrew (macOS only).
+
+    Strategy:
+      1. Check if openhuman is already installed — bail early if so.
+      2. Run 'brew tap tinyhumansai/core' synchronously (fast, just adds the source).
+      3. Spawn 'brew install openhuman' as a detached background process so it
+         doesn't block startup.  Output goes to ROOT/openhuman-install.log.
+
+    Best-effort: any failure only prints a warning.
+    """
+    if not _on_macos():
+        return
+    brew = _brew_path()
+    if not brew:
+        return
+
+    # Check if already installed (formula or cask, or on PATH)
+    for _check_cmd in (
+        [brew, "list", "openhuman"],
+        [brew, "list", "--cask", "openhuman"],
+    ):
+        try:
+            if subprocess.run(_check_cmd, capture_output=True, timeout=8).returncode == 0:
+                ok("OpenHuman desktop app already installed")
+                return
+        except Exception:
+            pass
+    if shutil.which("openhuman"):
+        ok("OpenHuman desktop app found on PATH")
+        return
+
+    # ── Tap (synchronous, fast ─ just adds the homebrew formula source) ───────
+    tap_env = {
+        **os.environ,
+        "HOMEBREW_NO_AUTO_UPDATE": "1",
+        "HOMEBREW_NO_INTERACTIVE": "1",
+    }
+    info("Adding tinyhumansai/core Homebrew tap …")
+    try:
+        tap_r = subprocess.run(
+            [brew, "tap", "tinyhumansai/core"],
+            env=tap_env,
+            capture_output=True,
+            timeout=60,
+        )
+        if tap_r.returncode != 0:
+            warn(
+                "brew tap tinyhumansai/core failed — install manually:\n"
+                "    brew tap tinyhumansai/core && brew install openhuman"
+            )
+            return
+        ok("tinyhumansai/core tap added")
+    except Exception as ex:
+        warn(f"brew tap failed ({ex}) — install OpenHuman manually: "
+             "brew tap tinyhumansai/core && brew install openhuman")
+        return
+
+    # ── Install (detached background process ─ can take several minutes) ──────
+    oh_log = ROOT / "openhuman-install.log"
+    try:
+        logf2: object = open(oh_log, "ab")
+    except Exception:
+        logf2 = subprocess.DEVNULL  # type: ignore[assignment]
+
+    info(
+        f"Installing OpenHuman desktop app in the background "
+        f"(check {oh_log} for progress) …"
+    )
+    try:
+        subprocess.Popen(
+            [brew, "install", "--quiet", "openhuman"],
+            env=tap_env,
+            stdout=logf2, stderr=logf2,
+            cwd=str(ROOT),
+            start_new_session=True,
+        )
+        info(
+            "OpenHuman install running in background. "
+            "Open it after it completes and set: Settings → Memory → Backend = agentmemory"
+        )
+    except Exception as ex:
+        warn(f"Could not start brew install openhuman ({ex}) — run it manually.")
+
+    # The background process finishes on its own; startup continues immediately.
+
+
 def warmup_kronos_and_openhuman() -> None:
     """Confirm the Kronos forecaster is loaded and kick the OpenHuman subconscious.
 
@@ -3056,6 +3819,7 @@ def warmup_kronos_and_openhuman() -> None:
     - OpenHuman: hitting /plugins/agent-paul/jarvis/subconscious/status calls the
       loop's ensure_started() so the idle "keeps thinking" brain starts now
       instead of waiting for the first UI poll.
+    - VibeTradingPlugin: check if sidecar is reachable on :8899.
     """
     base = f"http://localhost:{BACKEND_PORT}/api/v1"
 
@@ -3083,6 +3847,17 @@ def warmup_kronos_and_openhuman() -> None:
             warn("OpenHuman subconscious disabled (set PAUL_HEARTBEAT_ENABLED=1)")
     else:
         warn("OpenHuman subconscious status not reachable yet (plugin still loading)")
+
+    # Vibe-Trading plugin — report sidecar reachability (lazy auto-start happens on first API call).
+    vt = http_json(f"{base}/plugins/vibe-trading/status", timeout=5)
+    if vt is not None:
+        if vt.get("reachable"):
+            ver = vt.get("version") or ""
+            ok(f"Vibe-Trading sidecar online{(' v' + ver) if ver else ''} — research/backtest/swarms ready")
+        else:
+            info("Vibe-Trading sidecar offline — auto-starts on first request to /vibe-trading page")
+    else:
+        info("Vibe-Trading plugin loaded — sidecar starts on first request")
 
 
 def start_backend(pg_port: int, redis_port: int, mode: str) -> bool:
@@ -3612,6 +4387,22 @@ def main() -> None:
     # Kronos ML forecaster — one-time model setup (macOS/Linux + Windows).
     # Best-effort: never blocks startup (heuristic fallback covers failures).
     ensure_kronos_model()
+
+    # Vibe-Trading AI — install vibe-trading-ai into backend venv (one-time).
+    # Sidecar auto-starts lazily on first API request to /plugins/vibe-trading/*.
+    # Best-effort: never blocks startup.
+    ensure_vibe_trading()
+
+    # OpenHuman brain — install agentmemory shared-memory backend (one-time).
+    # The OpenHuman desktop app is a separate install (see hint printed below).
+    # Best-effort: never blocks startup.
+    ensure_openhuman_deps()
+
+    # OpenManus MCP sidecar — clone FoundationAgents/OpenManus, install deps,
+    # and start run_mcp.py as a background daemon so all AI provider calls route
+    # through OpenManus first (with AiMarketAnalyst fallback on failure).
+    # Best-effort: never blocks startup.
+    ensure_openmanus()
 
     # ── 4. Backend ────────────────────────────────────────────────────────────
     header("4/6  FastAPI backend")

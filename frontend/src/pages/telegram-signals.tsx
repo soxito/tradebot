@@ -2646,6 +2646,98 @@ function ConnectAIView(props: {
   const [testingAll, setTestingAll] = useState(false)
   const [usage, setUsage] = useState<any>(null)
 
+  // ── "Apply All Recommended" modal state ─────────────────────────────────
+  interface RecommendedResult {
+    task: string
+    provider: string
+    model: string
+    presetKey: string
+    modelId: string
+    status: 'pending' | 'setting' | 'testing' | 'ok' | 'error' | 'missing'
+    error?: string
+  }
+  const RECOMMENDED_MODELS: Omit<RecommendedResult, 'status'>[] = [
+    { task: 'Market Analysis',  provider: 'NVIDIA NIM',           model: 'Nemotron Super 120B (frontier free)',  presetKey: 'nvidia',        modelId: 'nvidia/nemotron-3-super-120b-a12b' },
+    { task: 'News Context',     provider: 'GitHub Models',        model: 'GPT-4o (flagship, news synthesis)',    presetKey: 'github_models', modelId: 'gpt-4o' },
+    { task: 'Volume Analysis',  provider: 'Cerebras',             model: 'GPT-OSS 120B (wafer speed)',           presetKey: 'cerebras',      modelId: 'gpt-oss-120b' },
+    { task: 'Final Synthesis',  provider: 'NVIDIA NIM',           model: 'Nemotron Super 120B (frontier free)',  presetKey: 'nvidia',        modelId: 'nvidia/nemotron-3-super-120b-a12b' },
+    { task: 'News → Positions', provider: 'Gemini (AI Studio)',   model: 'Gemini 2.5 Flash (1M ctx, high quality)', presetKey: 'gemini', modelId: 'gemini-2.5-flash' },
+  ]
+  const [showRecommendedModal, setShowRecommendedModal] = useState(false)
+  const [recommendedResults, setRecommendedResults] = useState<RecommendedResult[]>([])
+  const [recommendedRunning, setRecommendedRunning] = useState(false)
+  const [recommendedDone, setRecommendedDone] = useState(false)
+  const [recommendedSaving, setRecommendedSaving] = useState(false)
+
+  const applyAllRecommended = async () => {
+    const initial: RecommendedResult[] = RECOMMENDED_MODELS.map(r => ({ ...r, status: 'pending' }))
+    setRecommendedResults(initial)
+    setShowRecommendedModal(true)
+    setRecommendedRunning(true)
+    setRecommendedDone(false)
+    setRecommendedSaving(false)
+
+    const updated = [...initial]
+    for (let i = 0; i < RECOMMENDED_MODELS.length; i++) {
+      const rec = RECOMMENDED_MODELS[i]
+      const found = providers.find(p => p.provider_key === rec.presetKey && p.enabled)
+      if (!found) {
+        updated[i] = { ...updated[i], status: 'missing', error: 'Provider not added — get free API key first' }
+        setRecommendedResults([...updated])
+        continue
+      }
+      // Step 1: set the recommended model
+      updated[i] = { ...updated[i], status: 'setting' }
+      setRecommendedResults([...updated])
+      try {
+        await apiClient.aiAnalyst.updateProvider(found.id, { default_model: rec.modelId })
+      } catch (e: unknown) {
+        updated[i] = { ...updated[i], status: 'error', error: `Set model failed: ${toErrorMessage(e)}` }
+        setRecommendedResults([...updated])
+        continue
+      }
+      // Step 2: test the provider with the new model
+      updated[i] = { ...updated[i], status: 'testing' }
+      setRecommendedResults([...updated])
+      try {
+        const res = await apiClient.aiAnalyst.testProvider(found.id)
+        const r = res.data as { status?: string; ok?: boolean; error?: string; last_error?: string }
+        const ok = r.status === 'ok' || r.ok === true
+        updated[i] = ok
+          ? { ...updated[i], status: 'ok' }
+          : { ...updated[i], status: 'error', error: r.last_error || r.error || 'Test failed' }
+      } catch (e: unknown) {
+        updated[i] = { ...updated[i], status: 'error', error: `Test request failed: ${toErrorMessage(e)}` }
+      }
+      setRecommendedResults([...updated])
+    }
+    setRecommendedRunning(false)
+    setRecommendedDone(true)
+    await onReload()
+  }
+
+  const saveRecommended = async () => {
+    setRecommendedSaving(true)
+    try {
+      // Re-apply only the successful ones (model already set; this call persists status)
+      for (const rec of recommendedResults) {
+        if (rec.status !== 'ok') continue
+        const found = providers.find(p => p.provider_key === rec.presetKey && p.enabled)
+        if (found) {
+          await apiClient.aiAnalyst.updateProvider(found.id, { default_model: rec.modelId, status: 'ok' })
+        }
+      }
+      await onReload()
+      setShowRecommendedModal(false)
+      onMessage('Recommended models saved and active ✓')
+    } catch (e: unknown) {
+      onError(toErrorMessage(e))
+    } finally {
+      setRecommendedSaving(false)
+    }
+  }
+
+
   const loadUsage = useCallback(async () => {
     try {
       const res = await apiClient.aiAnalyst.getAiUsage()
@@ -2803,6 +2895,200 @@ function ConnectAIView(props: {
           <li>Green ✓ means it's verified and live across the app. Add more for resilience.</li>
           <li>Every call is automatically compressed by the <strong className="text-emerald-300">headroom</strong> proxy — saving 60-95% tokens before they hit your provider's quota.</li>
         </ol>
+      </div>
+
+      {/* ── Recommended Setup modal ─────────────────────────────────────── */}
+      {showRecommendedModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm px-4">
+          <div className="bg-gray-900 border border-violet-500/40 rounded-xl shadow-2xl w-full max-w-lg p-6">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="font-bold text-white text-base flex items-center gap-2">
+                <span className="text-violet-300">⚡</span>
+                Applying Recommended Models
+              </h3>
+              {!recommendedRunning && (
+                <button
+                  onClick={() => setShowRecommendedModal(false)}
+                  className="text-gray-500 hover:text-gray-300 text-xl leading-none"
+                >×</button>
+              )}
+            </div>
+
+            <div className="space-y-2 mb-5">
+              {recommendedResults.map((r) => {
+                const icon = r.status === 'pending' ? '○'
+                  : r.status === 'setting' ? '⚙'
+                  : r.status === 'testing' ? '🔍'
+                  : r.status === 'ok'      ? '✅'
+                  : r.status === 'missing' ? '⚠️'
+                  : '❌'
+                const textColor = r.status === 'ok' ? 'text-emerald-400'
+                  : r.status === 'error'   ? 'text-red-400'
+                  : r.status === 'missing' ? 'text-amber-400'
+                  : 'text-gray-300'
+                const label = r.status === 'pending' ? 'Waiting…'
+                  : r.status === 'setting' ? `Setting model: ${r.modelId}…`
+                  : r.status === 'testing' ? 'Testing connection…'
+                  : r.status === 'ok'      ? `${r.modelId} — Live ✓`
+                  : r.status === 'missing' ? r.error!
+                  : r.error || 'Failed'
+                const spin = r.status === 'setting' || r.status === 'testing'
+                return (
+                  <div key={r.task} className="bg-gray-800/60 rounded-lg px-3 py-2.5 flex items-start gap-3">
+                    <span className={`text-sm mt-0.5 ${spin ? 'animate-pulse' : ''}`}>{icon}</span>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-semibold text-gray-300">{r.task}</span>
+                        <span className="text-[10px] text-gray-500">{r.provider}</span>
+                      </div>
+                      <div className={`text-xs mt-0.5 ${textColor} break-words`}>{label}</div>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+
+            {recommendedRunning && (
+              <div className="text-center text-xs text-gray-400 animate-pulse">Running — do not close this window…</div>
+            )}
+
+            {recommendedDone && (
+              <div className="flex gap-3">
+                <button
+                  onClick={() => setShowRecommendedModal(false)}
+                  className="flex-1 px-4 py-2 rounded-lg border border-gray-600 text-sm text-gray-300 hover:bg-gray-700 transition-colors"
+                >
+                  Close
+                </button>
+                <button
+                  onClick={saveRecommended}
+                  disabled={recommendedSaving || recommendedResults.every(r => r.status === 'missing' || r.status === 'error')}
+                  className="flex-1 px-4 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 disabled:opacity-40 disabled:cursor-not-allowed text-sm font-semibold text-white transition-colors"
+                >
+                  {recommendedSaving ? 'Saving…' : `Save ${recommendedResults.filter(r => r.status === 'ok').length} Recommended Models`}
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── Best AI Providers quick-setup guide ─────────────────────────── */}
+      <div className="bg-gradient-to-br from-violet-500/10 to-transparent border border-violet-500/30 rounded-lg p-5">
+        <div className="flex items-start justify-between gap-3 mb-1">
+          <h3 className="font-semibold text-white flex items-center gap-2">
+            <span className="text-violet-300">⚡</span>
+            Recommended Setup — Best Models for Each Task
+          </h3>
+          <button
+            onClick={applyAllRecommended}
+            className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-violet-600 hover:bg-violet-500 text-xs font-semibold text-white transition-colors whitespace-nowrap shadow-sm"
+            title="Set all recommended models on their providers, test each connection, then save"
+          >
+            ⚡ Apply All &amp; Test
+          </button>
+        </div>
+        <p className="text-xs text-gray-400 mb-4">
+          Each analysis role is routed to the model best-suited for that job. Add all five providers for full
+          Jarvis coverage. Every provider below is <strong className="text-emerald-300">free</strong> (with limits).
+          Click <strong className="text-violet-300">Apply All &amp; Test</strong> to set and verify every model in one shot.
+        </p>
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+          {[
+            {
+              task: 'Market Analysis',
+              provider: 'GitHub Models',
+              model: 'OpenAI o3 (strongest reasoning)',
+              why: 'OpenAI’s most powerful reasoning model — deep SMC analysis, bias reads, and market structure with your GitHub subscription',
+              signupUrl: 'https://github.com/settings/tokens',
+              presetKey: 'github_models',
+              color: 'green',
+            },
+            {
+              task: 'News Context',
+              provider: 'GitHub Models',
+              model: 'GPT-4o (flagship)',
+              why: 'OpenAI flagship — excellent news synthesis, market sentiment, and RAG-style summarization',
+              signupUrl: 'https://github.com/settings/tokens',
+              presetKey: 'github_models',
+              color: 'sky',
+            },
+            {
+              task: 'Volume Analysis',
+              provider: 'Cerebras',
+              model: 'GPT-OSS 120B (wafer speed)',
+              why: 'World’s fastest inference — wafer-speed quantitative buy/sell pressure analysis, no 12/day cap',
+              signupUrl: 'https://cloud.cerebras.ai/',
+              presetKey: 'cerebras',
+              color: 'purple',
+            },
+            {
+              task: 'Final Synthesis',
+              provider: 'NVIDIA NIM',
+              model: 'Nemotron Super 120B',
+              why: 'Frontier-class free model — deepest reasoning for decisive JARVIS narratives. Claude was removed from GitHub Models in July 2026.',
+              signupUrl: 'https://build.nvidia.com',
+              presetKey: 'nvidia',
+              color: 'orange',
+            },
+            {
+              task: 'News → Positions',
+              provider: 'Gemini (AI Studio)',
+              model: 'Gemini 3.1 Flash-Lite (1M, 500/day)',
+              why: '1M-token window maps many headlines to positions · 500 req/day free',
+              signupUrl: 'https://aistudio.google.com/apikey',
+              presetKey: 'gemini',
+              color: 'blue',
+            },
+          ].map((item) => {
+            const colorMap: Record<string, { border: string; badge: string; text: string }> = {
+              green:  { border: 'border-green-500/30',  badge: 'bg-green-500/10 text-green-300',  text: 'text-green-300' },
+              sky:    { border: 'border-sky-500/30',    badge: 'bg-sky-500/10 text-sky-300',      text: 'text-sky-300' },
+              purple: { border: 'border-purple-500/30', badge: 'bg-purple-500/10 text-purple-300',text: 'text-purple-300' },
+              orange: { border: 'border-orange-500/30', badge: 'bg-orange-500/10 text-orange-300',text: 'text-orange-300' },
+              blue:   { border: 'border-blue-500/30',   badge: 'bg-blue-500/10 text-blue-300',   text: 'text-blue-300' },
+            }
+            const c = colorMap[item.color] || colorMap.blue
+            const alreadyAdded = providers.some(p => p.provider_key === item.presetKey && p.enabled)
+            return (
+              <div key={item.task} className={`bg-gray-900/50 rounded-lg p-4 border ${c.border} flex flex-col gap-2`}>
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] font-semibold tracking-wide text-gray-400 uppercase">{item.task}</span>
+                  {alreadyAdded && (
+                    <span className="text-[10px] text-emerald-400 font-semibold">✓ connected</span>
+                  )}
+                </div>
+                <div className={`font-semibold text-sm ${c.text}`}>{item.provider}</div>
+                <div className="font-mono text-xs text-gray-300">{item.model}</div>
+                <div className="text-xs text-gray-500 leading-relaxed">{item.why}</div>
+                <div className="mt-auto flex gap-2">
+                  <a
+                    href={item.signupUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className={`flex-1 text-center px-3 py-1.5 rounded text-xs font-medium ${c.badge} hover:opacity-80 transition-opacity`}
+                  >
+                    Get free API key →
+                  </a>
+                  {!alreadyAdded && (
+                    <button
+                      onClick={() => {
+                        const preset = presets.find((p: AIPreset) => p.key === item.presetKey)
+                        if (preset) {
+                          // Switch to the add form with this preset pre-selected
+                          document.getElementById(`preset-select-${item.presetKey}`)?.click()
+                        }
+                      }}
+                      className="px-3 py-1.5 rounded text-xs font-medium bg-gray-700 text-gray-300 hover:bg-gray-600 transition-colors whitespace-nowrap"
+                    >
+                      Select ↓
+                    </button>
+                  )}
+                </div>
+              </div>
+            )
+          })}
+        </div>
       </div>
 
       {/* Overall token usage + remaining (free-tier guard) */}

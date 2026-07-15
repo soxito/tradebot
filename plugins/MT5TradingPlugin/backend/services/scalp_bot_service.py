@@ -315,91 +315,55 @@ async def _gather_scalp_intelligence(symbol: str, side: str) -> str:
 
 async def _ensemble_vote(symbol: str, side: str, prompt: str) -> Dict[str, Any]:
     """
-    Call ALL enabled AI providers in PARALLEL and use majority vote.
+    Route the ensemble AI gate through the shared AI router (db_chat).
+
+    Previously called all providers in parallel via _call_openai_compatible
+    directly — this bypassed the router and OpenManus integration.
+    Now routes through db_chat so OpenManus MCP is tried first (if enabled),
+    falling back to the priority-ordered provider pool on failure.
 
     Returns {"decision": "take"|"skip", "note": str, "votes": {provider: decision}}.
-    Fails open (take) when <2 providers respond.
     """
     try:
         from plugins.AiMarketAnalyst.backend.services.ai_router import (
-            get_enabled_providers, _call_openai_compatible,  # type: ignore
+            db_chat,  # type: ignore
         )
     except Exception:
         return {"decision": "take", "note": "ai_router_unavailable", "votes": {}}
 
     import json as _json
 
-    async with AsyncSessionLocal() as db:
-        providers = await get_enabled_providers(db)
-
-    if not providers:
-        return {"decision": "take", "note": "no_providers", "votes": {}}
-
     messages = [{"role": "user", "content": prompt}]
 
-    async def _query_one(p: Any) -> tuple[str, str, str]:
-        """Returns (provider_label, decision, note)."""
-        try:
-            content, _usage, _routed = await _call_openai_compatible(
-                base_url=p.base_url,
-                api_key=p.api_key,
-                model=p.default_model or "gpt-4o",
-                messages=messages,
-                temperature=0.1,
-                max_tokens=150,
-                json_mode=True,
-            )
-            parsed = _json.loads(content) if isinstance(content, str) else content
-            if isinstance(parsed, dict):
-                dec = str(parsed.get("decision", "take")).lower()
-                if dec not in ("take", "skip"):
-                    dec = "take"
-                note = str(parsed.get("note", ""))[:200]
-                return p.label, dec, note
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(f"[ScalpBot] ensemble vote {p.label}/{symbol}: {exc}")
-        return p.label, "take", "error_fallback"
-
-    # Fire all providers concurrently with a generous global timeout
-    tasks = [_query_one(p) for p in providers[:9]]  # cap at 9 providers
-    try:
-        results = await asyncio.wait_for(
-            asyncio.gather(*tasks, return_exceptions=True),
-            timeout=20.0,
+    async with AsyncSessionLocal() as db:
+        result = await db_chat(
+            db,
+            messages,
+            temperature=0.1,
+            max_tokens=200,
+            json_mode=True,
+            agent_name="scalp-ensemble-vote",
+            source="scalp-ensemble",
         )
-    except asyncio.TimeoutError:
-        results = []
 
-    votes: Dict[str, str] = {}
-    notes: List[str] = []
-    take_count = 0
-    skip_count = 0
-    for r in results:
-        if isinstance(r, Exception) or not isinstance(r, tuple):
-            continue
-        label, dec, note = r
-        votes[label] = dec
-        if dec == "take":
-            take_count += 1
-        else:
-            skip_count += 1
-            if note:
-                notes.append(f"{label}: {note}")
+    if not result.get("ok") or not result.get("content"):
+        logger.debug(f"[ScalpBot] ensemble vote failed for {symbol}/{side}")
+        return {"decision": "take", "note": "router_failed", "votes": {}}
 
-    total = take_count + skip_count
-    if total < 2:
-        # Not enough responses — fail open
-        return {"decision": "take", "note": f"ensemble_insufficient({total})", "votes": votes}
+    try:
+        content = result["content"]
+        parsed = _json.loads(content) if isinstance(content, str) else content
+        if isinstance(parsed, dict):
+            dec = str(parsed.get("decision", "take")).lower()
+            if dec not in ("take", "skip"):
+                dec = "take"
+            note = str(parsed.get("note", ""))[:200]
+            provider = result.get("provider") or result.get("routed_via", "unknown")
+            return {"decision": dec, "note": note, "votes": {provider: dec}}
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[ScalpBot] ensemble vote parse error {symbol}: {exc}")
 
-    # Majority vote: skip only when >50% say skip
-    skip_ratio = skip_count / total
-    final = "skip" if skip_ratio > 0.5 else "take"
-    summary = f"{take_count}✓/{skip_count}✗ of {total} AI models"
-    if final == "skip" and notes:
-        summary += " — " + notes[0]
-
-    logger.info(f"[ScalpBot] ensemble AI {symbol} {side.upper()}: {summary} → {final.upper()}")
-    return {"decision": final, "note": summary, "votes": votes}
+    return {"decision": "take", "note": "parse_error", "votes": {}}
 
 
 async def _store_scalp_outcome_to_brain(

@@ -200,6 +200,973 @@ def jarvis_learn_all_brains(
         logger.debug(f"[JARVIS brain] learn_all_brains scheduling skipped: {e}")
 
 
+# ── Multi-Model Brain Management Network ─────────────────────────────────────
+# ALL available enabled AI providers act as dedicated brain managers that run
+# CONCURRENTLY in the background after every JARVIS analysis.  No hardcoded
+# provider — the brain dynamically uses whatever providers you have configured
+# in the Connect AI tab.  Add a new provider there: auto-included next cycle.
+#
+#   slot 0  BRAIN CONSOLIDATOR
+#     Fuses all parallel task model outputs into a cross-model brain-map entry.
+#     "Models talking to each other": highest-priority provider reads what every
+#     task model said and synthesizes a single, high-importance brain entry.
+#
+#   slot 1  BRAIN INDEXER
+#     Extracts structured signal patterns (BIAS / KEY_LEVELS / SMC / STRENGTH)
+#     from the synthesized narrative into a searchable structured index.
+#
+#   slot 2  BRAIN CRITIC
+#     Adversarially challenges the consolidator output: finds missed risks,
+#     ignored counter-signals, and over-confidence.  Balances the brain view.
+#
+#   slot 3  BRAIN RESEARCHER
+#     Enriches analysis with macro context, correlated assets, historical
+#     precedents, and on-chain / funding / sentiment context.
+#
+#   slot 4  BRAIN NEWS ORGANISER
+#     Curates fresh market headlines into structured BULLISH / BEARISH /
+#     BREAKING / FOMO / MACRO / SENTIMENT briefings stored at importance 0.70.
+#
+# Communication flow (models talk to each other via the brain layer):
+#
+#   ┌──────────────────────────────────────────────────────────────┐
+#   │  TASK MODELS (analysis cycle)                                │
+#   │  o3 / NVIDIA / GPT-4o / Cerebras / Gemini / all providers  │
+#   │     ↓  produce: market, volume, news, synthesis outputs      │
+#   ├──────────────────────────────────────────────────────────────┤
+#   │  DYNAMIC MULTI-PROVIDER BRAIN NETWORK (all roles concurrent) │
+#   │  slot 0: CONSOLIDATOR  → fuses ALL task outputs (prio-1)    │
+#   │  slot 1: INDEXER       → extracts structured patterns        │
+#   │  slot 2: CRITIC        → adversarial review of slot-0 map   │
+#   │  slot 3: RESEARCHER    → macro/historical context note       │
+#   │  slot 4: NEWS ORGANISER→ market news briefing curation       │
+#   │                                                              │
+#   │  NEW provider in Connect AI → auto-included, no code change  │
+#   │  Pool wraps around: slots spread fairly if <5 providers      │
+#   ├──────────────────────────────────────────────────────────────┤
+#   │  NEXT ANALYSIS CYCLE  ← brain_recall_context()              │
+#   │     task models receive enriched context from prior brains   │
+#   └──────────────────────────────────────────────────────────────┘
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Dynamic Brain Role Pool ───────────────────────────────────────────────────
+# The brain network dynamically uses ALL available enabled AI providers.
+# Each brain role is assigned to a different provider from the pool using a
+# deterministic spread so every configured provider contributes to thinking:
+#
+#   slot 0 → brain_consolidator    (synthesize all task model outputs)
+#   slot 1 → brain_indexer         (extract structured signal patterns)
+#   slot 2 → brain_critic          (adversarial validation / challenge)
+#   slot 3 → brain_researcher      (deep macro + historical context)
+#   slot 4 → brain_news_organiser  (market news briefing curation)
+#
+# Adding a new AI provider in the Connect AI tab → it is automatically
+# included in the next brain cycle with zero code changes.
+# Pool wraps around: if only 2 providers are enabled, slots 0,1 each get
+# dedicated models, slots 2-4 reuse them in a fair round-robin manner.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_BRAIN_ROLE_SLOTS: Dict[str, int] = {
+    "brain_consolidator":  0,  # synthesis of all task outputs
+    "brain_indexer":       1,  # structured pattern extraction
+    "brain_critic":        2,  # adversarial review
+    "brain_researcher":    3,  # deep macro/historical context
+    "brain_news_organiser":4,  # news curation
+}
+
+
+async def _get_brain_pool(db) -> list:
+    """Return ALL available enabled providers ordered by priority.
+
+    Skips circuit-open and usage-capped providers so the brain always
+    uses working, headroom-positive providers.  The list is stable within
+    a request but may change between cycles as caps reset and providers
+    recover from circuit-breaker cooldown.
+    """
+    try:
+        from plugins.AiMarketAnalyst.backend.services.ai_router import (
+            get_enabled_providers, get_router_settings, _cb_open, _is_capped,
+        )
+        settings = await get_router_settings(db)
+        providers = await get_enabled_providers(db)
+        return [
+            p for p in providers
+            if p.api_key and p.base_url
+            and not _cb_open(p.id)
+            and not _is_capped(p, settings.reserve_pct)
+        ]  # already sorted priority asc, id asc
+    except Exception as e:
+        logger.debug(f"[JARVIS brain-pool] pool build failed: {e}")
+        return []
+
+
+async def _brain_call(
+    role: str,
+    messages: list,
+    db,
+    max_tokens: int = 400,
+    temperature: float = 0.28,
+) -> Optional[str]:
+    """Call a brain manager using dynamic provider assignment.
+
+    Each role is mapped to a slot index.  The provider at that slot in the
+    ordered pool handles the call.  If that provider fails, falls back to
+    db_chat() so the brain is NEVER blocked by a single model being down.
+    Returns the response text or None.  Never raises.
+    """
+    from datetime import datetime as _dt
+
+    slot = _BRAIN_ROLE_SLOTS.get(role, 0)
+
+    try:
+        pool = await _get_brain_pool(db)
+        if not pool:
+            # No providers available — brain is idle this cycle
+            return None
+
+        # Deterministic slot assignment (wrap-around for small pools)
+        provider = pool[slot % len(pool)]
+        model = provider.default_model or ""
+        if not model:
+            try:
+                from plugins.AiMarketAnalyst.backend.services.provider_presets import get_preset
+                key = (provider.label or "").lower().split()[0]
+                preset = get_preset(key)
+                model = (preset or {}).get("default_model", "") if preset else ""
+            except Exception:
+                pass
+        if not model:
+            logger.debug(f"[JARVIS brain-{role}] {provider.label!r} has no default model — skip")
+            return None
+
+        # ── Try targeted provider ─────────────────────────────────────────────
+        from plugins.AiMarketAnalyst.backend.services.ai_router import (
+            _call_openai_compatible, _reset_usage_windows, _cb_trip, get_router_settings,
+        )
+        from plugins.AiMarketAnalyst.backend.models import AIUsageRecord as _AIRecord
+
+        now = _dt.utcnow()
+        _reset_usage_windows(provider, now)
+        orig_chars = sum(len(str(m.get("content", ""))) for m in messages)
+
+        try:
+            content, usage, routed_via = await _call_openai_compatible(
+                base_url=provider.base_url,
+                api_key=provider.api_key,
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                json_mode=False,
+            )
+            provider.total_calls = (provider.total_calls or 0) + 1
+            provider.daily_calls = (provider.daily_calls or 0) + 1
+            provider.monthly_calls = (provider.monthly_calls or 0) + 1
+            provider.status = "ok"
+            provider.last_error = None
+            provider.last_model_used = routed_via or model
+            provider.last_tested_at = now
+            db.add(_AIRecord(
+                provider_id=provider.id, provider_label=provider.label,
+                agent_name=f"jarvis-brain-{role}", agent_role="jarvis",
+                model=routed_via or model, source="jarvis-brain",
+                prompt_tokens=usage["prompt_tokens"],
+                completion_tokens=usage["completion_tokens"],
+                total_tokens=usage["total_tokens"],
+                orig_chars=orig_chars, comp_chars=orig_chars, success=True,
+            ))
+            await db.commit()
+            logger.debug(
+                f"[JARVIS brain-{role}] {provider.label}/{model} "
+                f"(slot {slot}/{len(pool)} providers in pool)"
+            )
+            return content.strip() if content else None
+
+        except Exception as exc:
+            provider.total_errors = (provider.total_errors or 0) + 1
+            provider.status = "error"
+            provider.last_error = str(exc)[:300]
+            db.add(_AIRecord(
+                provider_id=provider.id, provider_label=provider.label,
+                agent_name=f"jarvis-brain-{role}", agent_role="jarvis",
+                model=model, source="jarvis-brain",
+                orig_chars=orig_chars, comp_chars=orig_chars, success=False,
+            ))
+            await db.commit()
+            _cb_trip(provider.id)
+            logger.debug(
+                f"[JARVIS brain-{role}] {provider.label!r} failed: {str(exc)[:120]} "
+                "→ falling back to db_chat"
+            )
+
+        # ── db_chat fallback: any available provider ──────────────────────────
+        from plugins.AiMarketAnalyst.backend.services.ai_router import db_chat
+        fallback = await db_chat(
+            db, messages, temperature=temperature, max_tokens=max_tokens,
+            agent_name=f"jarvis-brain-{role}-fallback", source="jarvis-brain",
+        )
+        if fallback.get("ok") and fallback.get("content"):
+            logger.debug(
+                f"[JARVIS brain-{role}] fallback succeeded via {fallback.get('provider')}"
+            )
+            return str(fallback["content"]).strip()
+
+    except Exception as e:
+        logger.debug(f"[JARVIS brain-{role}] call skipped: {e}")
+    return None
+
+
+async def _brain_consolidate_outputs(
+    task_outputs: Dict[str, str],
+    symbol: str,
+    db,
+) -> None:
+    """Brain Consolidator (Mistral): fuse all task model outputs into one entry.
+
+    Reads what every task model said about this symbol and synthesizes a
+    unified, high-importance brain-map entry.  This is how the task models
+    'talk to each other' — Mistral mediates their collective intelligence.
+    Fire-and-forget; never awaited directly by the analysis pipeline.
+    """
+    try:
+        task_labels = _JARVIS_TASK_LABELS  # noqa: F821 — defined later in same file
+        parts: List[str] = []
+        for task_key, text in task_outputs.items():
+            if text and len(text) > 30:
+                label = task_labels.get(task_key, task_key)
+                parts.append(f"[{label}]\n{text[:600]}")
+
+        if not parts:
+            return
+
+        combined = "\n\n".join(parts)
+        msgs = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a trading intelligence consolidator. Multiple specialized AI models "
+                    f"have analyzed {symbol or 'a financial instrument'} from different angles. "
+                    "Synthesize their collective outputs into ONE concise brain-map entry. "
+                    "Cover: (1) consensus directional bias, (2) key price levels, "
+                    "(3) critical risk factor, (4) any notable model disagreement. "
+                    "Write 3-5 tight sentences. No filler. Pure signal."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Synthesize these parallel AI analyses of {symbol or 'the market'} "
+                    f"(from {len(parts)} specialized models):\n\n{combined}"
+                ),
+            },
+        ]
+
+        summary = await _brain_call("brain_consolidator", msgs, db, max_tokens=360, temperature=0.22)
+        if summary:
+            model_names = ", ".join(
+                task_labels.get(t, t) for t in task_outputs.keys() if task_outputs.get(t)
+            )
+            jarvis_learn_all_brains(
+                action="brain_consolidation",
+                symbol=symbol,
+                summary=f"Cross-model brain map [{symbol or 'market'}]: {summary[:180]}",
+                detail=(
+                    f"BRAIN CONSOLIDATOR (multi-provider slot 0) fused {len(parts)} model outputs: "
+                    f"{model_names}.\n\nConsolidated brain map:\n{summary}"
+                ),
+                tags=["jarvis", "brain-consolidation", "cross-model-sync",
+                      symbol or "market"],
+                importance=0.85,   # elevated — cross-model synthesis is highest value
+                kind="insight",
+            )
+            logger.debug(
+                f"[JARVIS brain-consolidator] {symbol}: wrote {len(summary)}-char "
+                "cross-model brain map"
+            )
+    except Exception as e:
+        logger.debug(f"[JARVIS brain-consolidator] {symbol}: skipped: {e}")
+
+
+async def _brain_index_patterns(
+    symbol: str,
+    narrative: str,
+    db,
+) -> None:
+    """Brain Indexer (Gemma 4 via OpenRouter): extract structured signal patterns.
+
+    Reads the synthesized JARVIS narrative and produces a machine-readable
+    signal index (bias, levels, SMC pattern, setup) stored in the brain stores
+    for fast structured recall on the next analysis cycle.
+    Fire-and-forget; never awaited directly by the analysis pipeline.
+    """
+    if not narrative or len(narrative) < 50:
+        return
+    try:
+        msgs = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a signal pattern indexer for a trading brain system. "
+                    "Extract and structure the tradeable information from the analysis. "
+                    "Reply ONLY in this exact format (one value per line):\n"
+                    "BIAS: [bullish/bearish/neutral]\n"
+                    "KEY_LEVELS: [comma-separated key prices]\n"
+                    "SMC_PATTERN: [order block/FVG/BOS/CHoCH/liquidity sweep/none]\n"
+                    "SIGNAL_STRENGTH: [1-10]\n"
+                    "RISK_FACTOR: [single biggest risk in ≤10 words]\n"
+                    "TRADE_SETUP: [entry approach in one line]\n"
+                    "No explanation. No extra text. Just the 6 lines."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Index this {symbol or 'market'} analysis:\n\n{narrative[:900]}",
+            },
+        ]
+
+        pattern_index = await _brain_call(
+            "brain_indexer", msgs, db, max_tokens=180, temperature=0.08
+        )
+        if pattern_index:
+            jarvis_learn_all_brains(
+                action="brain_signal_index",
+                symbol=symbol,
+                summary=f"Signal index [{symbol or 'market'}]: {pattern_index[:120]}",
+                detail=(
+                    f"BRAIN INDEXER (multi-provider slot 1) structured signal patterns:\n\n{pattern_index}"
+                ),
+                tags=["jarvis", "brain-index", "signal-pattern", symbol or "market"],
+                importance=0.75,
+                kind="signal",
+            )
+            logger.debug(f"[JARVIS brain-indexer] {symbol}: wrote pattern index")
+    except Exception as e:
+        logger.debug(f"[JARVIS brain-indexer] {symbol}: skipped: {e}")
+
+
+async def _brain_recall_context(symbol: str, max_chars: int = 600) -> str:
+    """Pull recent brain consolidations AND news briefings for `symbol`.
+
+    Returns a formatted context string prepended to task model system prompts,
+    giving them:
+      - Prior cross-model consolidated brain maps (Mistral consolidator)
+      - Structured signal patterns (Mistral indexer)
+      - Latest organised market news briefings (Mistral news organiser)
+
+    Returns empty string when no relevant prior brain entries exist.
+    """
+    try:
+        from app.core.database import AsyncSessionLocal
+        from plugins.AgentPaulPlugin.backend.services import knowledge_base
+
+        async with AsyncSessionLocal() as db:
+            # Query 1: symbol-specific brain intelligence
+            rows_sym = await knowledge_base.search_knowledge(
+                db,
+                query=f"{symbol} consolidated brain signal bias news",
+                limit=6,
+            )
+            # Query 2: recent market news briefings (general + symbol-specific)
+            rows_news = await knowledge_base.search_knowledge(
+                db,
+                query="market news briefing BULLISH BEARISH BREAKING FOMO MACRO",
+                limit=4,
+            )
+
+        all_rows = list(rows_sym or []) + list(rows_news or [])
+        if not all_rows:
+            return ""
+
+        brain_parts: List[str] = []
+        news_parts: List[str] = []
+        consumed = 0
+
+        seen: set = set()
+        for row in all_rows:
+            content: str = (
+                row.get("content") if isinstance(row, dict) else getattr(row, "content", "")
+            ) or ""
+            key = content[:40]
+            if key in seen:
+                continue
+            seen.add(key)
+
+            is_brain = (
+                "brain_consolidat" in content.lower()
+                or "brain_signal" in content.lower()
+                or "cross-model" in content.lower()
+                or (symbol and symbol.upper() in content.upper() and "BRAIN" in content.upper())
+            )
+            is_news = (
+                "brain_news" in content.lower()
+                or "BULLISH:" in content
+                or "BEARISH:" in content
+                or "BREAKING:" in content
+                or "FOMO:" in content
+                or "MACRO:" in content
+                or "SENTIMENT:" in content
+            )
+
+            if is_brain and content:
+                brain_parts.append(content[:200])
+                consumed += 200
+            elif is_news and content:
+                news_parts.append(content[:220])
+                consumed += 220
+
+            if consumed >= max_chars:
+                break
+
+        sections: List[str] = []
+        if brain_parts:
+            sections.append("PRIOR INTELLIGENCE:\n" + "\n─\n".join(brain_parts[:2]))
+        if news_parts:
+            sections.append("LATEST MARKET NEWS (organised by JARVIS brain):\n" + "\n─\n".join(news_parts[:2]))
+
+        if not sections:
+            return ""
+
+        joined = "\n\n".join(sections)
+        return (
+            f"\n[JARVIS BRAIN MEMORY — context for {symbol}]\n"
+            f"{joined}\n"
+            f"[END BRAIN MEMORY]\n"
+        )
+    except Exception as e:
+        logger.debug(f"[JARVIS brain-recall] {symbol}: skipped: {e}")
+        return ""
+
+
+async def _brain_critique_analysis(
+    symbol: str,
+    consolidated_summary: str,
+    db,
+) -> None:
+    """Brain Critic (slot 2 provider): adversarially challenge the consolidated output.
+
+    A different provider from the consolidator challenges the brain map,
+    identifying over-confident claims, ignored counter-signals, and missed
+    risks.  Stored so JARVIS maintains a balanced perspective.
+    Fire-and-forget; never blocks the analysis pipeline.
+    """
+    if not consolidated_summary or len(consolidated_summary) < 50:
+        return
+    try:
+        msgs = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an adversarial trading critic embedded in JARVIS's brain. "
+                    "Your job is to CHALLENGE and find what was missed or overstated. "
+                    "Do NOT repeat what the analysis said. Instead: "
+                    "(1) Identify the biggest weakness or ignored risk, "
+                    "(2) Name one counter-scenario that invalidates the bias, "
+                    "(3) Flag any over-confidence or critical missing context. "
+                    "3-4 tight sentences. Pure critique, no filler."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Critically challenge this {symbol or 'market'} brain analysis:\n\n"
+                    f"{consolidated_summary[:800]}"
+                ),
+            },
+        ]
+        critique = await _brain_call(
+            "brain_critic", msgs, db, max_tokens=200, temperature=0.42
+        )
+        if critique:
+            jarvis_learn_all_brains(
+                action="brain_critique",
+                symbol=symbol,
+                summary=f"Brain critique [{symbol or 'market'}]: {critique[:160]}",
+                detail=(
+                    f"BRAIN CRITIC (multi-provider slot 2) adversarial review:\n\n{critique}"
+                ),
+                tags=["jarvis", "brain-critique", "adversarial", symbol or "market"],
+                importance=0.72,
+                kind="insight",
+            )
+            logger.debug(f"[JARVIS brain-critic] {symbol}: wrote adversarial critique")
+    except Exception as e:
+        logger.debug(f"[JARVIS brain-critic] {symbol}: skipped: {e}")
+
+
+async def _brain_deep_research(
+    symbol: str,
+    context_brief: str,
+    db,
+) -> None:
+    """Brain Researcher (slot 3 provider): deep macro + historical context note.
+
+    Uses a dedicated provider to enrich JARVIS's brain with:
+    - Macro/sector context for the asset
+    - Correlated assets showing similar or diverging patterns
+    - Historical precedent for the current setup
+    - On-chain / funding / sentiment enrichment
+
+    Stored at importance 0.73 so it enriches future analysis cycles.
+    Fire-and-forget.
+    """
+    if not symbol:
+        return
+    try:
+        msgs = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a deep-research specialist embedded in JARVIS's trading brain. "
+                    "Given a symbol and recent analysis context, produce a rich research note: "
+                    "(1) Macro/sector context affecting this asset right now, "
+                    "(2) Correlated assets (BTC dominance, DXY, S&P500, sector ETFs) "
+                    "showing similar or diverging patterns, "
+                    "(3) One key historical precedent for this setup, "
+                    "(4) On-chain / funding / whale / social sentiment context. "
+                    "3-5 tight sentences. Actionable context. No filler."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Research context for {symbol}:\n\n"
+                    f"{context_brief[:600] if context_brief else 'No prior context.'}"
+                ),
+            },
+        ]
+        research = await _brain_call(
+            "brain_researcher", msgs, db, max_tokens=280, temperature=0.35
+        )
+        if research:
+            jarvis_learn_all_brains(
+                action="brain_research",
+                symbol=symbol,
+                summary=f"Deep research [{symbol}]: {research[:160]}",
+                detail=(
+                    f"BRAIN RESEARCHER (multi-provider slot 3) contextual note:\n\n{research}"
+                ),
+                tags=["jarvis", "brain-research", "macro-context", symbol],
+                importance=0.73,
+                kind="insight",
+            )
+            logger.debug(f"[JARVIS brain-researcher] {symbol}: wrote research note")
+    except Exception as e:
+        logger.debug(f"[JARVIS brain-researcher] {symbol}: skipped: {e}")
+
+
+async def _brain_openhuman_sync(
+    symbol: str,
+    brain_summary: str,
+    db,
+) -> None:
+    """OpenHuman Brain Sync: update OpenHuman's cognitive state from the brain.
+
+    Writes the latest consolidated brain output to the OpenHuman plugin's
+    memory store so it can adapt JARVIS's tone and awareness to the current
+    market context (bullish/bearish/uncertain cognitive state).
+    Fire-and-forget; gracefully skips if OpenHumanPlugin is not installed.
+    """
+    if not brain_summary:
+        return
+    try:
+        from plugins.OpenHumanPlugin.backend.services.memory_sync_service import (
+            push_jarvis_brain_state,
+        )
+        await push_jarvis_brain_state(
+            symbol=symbol,
+            content=brain_summary[:800],
+        )
+        logger.debug(f"[JARVIS brain-openhuman] {symbol}: synced to OpenHuman brain")
+    except ImportError:
+        pass  # OpenHumanPlugin not installed — silent
+    except Exception as e:
+        logger.debug(f"[JARVIS brain-openhuman] {symbol}: skipped: {e}")
+
+
+def _fire_brain_managers(
+    task_outputs: Dict[str, str],
+    symbol: str,
+) -> None:
+    """Launch ALL brain managers concurrently after a full analysis cycle.
+
+    Uses ALL available enabled AI providers dynamically — each manager gets a
+    different provider slot so the brain leverages every configured model:
+
+    • brain_consolidator  (slot 0): fuses all task outputs → cross-model brain map
+    • brain_indexer       (slot 1): extracts structured signal patterns
+    • brain_critic        (slot 2): adversarial review of consolidator output
+    • brain_researcher    (slot 3): deep macro + historical context note
+    • OpenHuman sync      (post):   updates OpenHuman cognitive state
+
+    Adding a new AI provider in Connect AI tab → automatically included next cycle.
+    All managers run fire-and-forget — this function returns immediately.
+    """
+    synthesis_text = (
+        task_outputs.get("synthesis")
+        or task_outputs.get("market_analysis")
+        or ""
+    )
+    try:
+        loop = asyncio.get_running_loop()
+
+        async def _run_all_managers() -> None:
+            from app.core.database import AsyncSessionLocal
+
+            # Phase 1: consolidator + indexer run concurrently
+            # Each gets its OWN DB session to prevent SQLAlchemy interleaving.
+            async def _consolidate():
+                async with AsyncSessionLocal() as _db:
+                    await _brain_consolidate_outputs(task_outputs, symbol, _db)
+
+            async def _index():
+                async with AsyncSessionLocal() as _db:
+                    await _brain_index_patterns(symbol, synthesis_text, _db)
+
+            await asyncio.gather(_consolidate(), _index(), return_exceptions=True)
+
+            # Phase 2: critic + researcher + OpenHuman run on the synthesis text
+            # (They use the synthesis as input context, not the raw task map.)
+            async def _critique():
+                async with AsyncSessionLocal() as _db:
+                    await _brain_critique_analysis(symbol, synthesis_text, _db)
+
+            async def _research():
+                async with AsyncSessionLocal() as _db:
+                    await _brain_deep_research(symbol, synthesis_text, _db)
+
+            async def _openhuman():
+                async with AsyncSessionLocal() as _db:
+                    await _brain_openhuman_sync(symbol, synthesis_text, _db)
+
+            await asyncio.gather(
+                _critique(), _research(), _openhuman(), return_exceptions=True
+            )
+
+        loop.create_task(_run_all_managers())
+        logger.debug(
+            f"[JARVIS brain-network] {symbol}: launched 5 brain managers "
+            "(consolidator \u00b7 indexer \u00b7 critic \u00b7 researcher \u00b7 OpenHuman) "
+            "— ALL available providers auto-assigned across slots"
+        )
+    except Exception as e:
+        logger.debug(f"[JARVIS brain-network] {symbol}: manager launch skipped: {e}")
+
+
+# ── Brain News Collector ──────────────────────────────────────────────────────
+# Idle Mistral (open-mistral-nemo) continuously curates the latest market news
+# from all integrated sources (CoinMarketCap, Yahoo Finance, crypto RSS feeds,
+# sentiment DB, etc.) and organises them into structured briefings stored in
+# all three brain stores.
+#
+# News feed sources used:
+#   • Existing DB (sentiment/EnhancedSentimentService) — real-time article pool
+#   • CoinMarketCap news API (latest crypto news, market cap news)
+#   • Yahoo Finance RSS (stocks, macro, commodities)
+#   • CryptoPanic aggregator (crypto fear/greed, FOMO signals)
+#   • CoinDesk / CoinTelegraph RSS feeds
+#   • AlphaVantage market news (stocks, forex, crypto)
+#
+# Brain news entry format (stored in paul_knowledge):
+#   topic = "brain_news_briefing"
+#   kind  = "news"
+#   tags  = ["brain-news", category, symbol, source]
+#   importance = 0.70  (high — news context enriches JARVIS analysis)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_NEWS_SOURCES = [
+    # RSS feeds — format: (label, url, category)
+    ("CoinDesk",        "https://www.coindesk.com/arc/outboundfeeds/rss/",   "crypto"),
+    ("CoinTelegraph",   "https://cointelegraph.com/rss",                      "crypto"),
+    ("CryptoNews",      "https://cryptonews.com/news/feed/",                  "crypto"),
+    ("Yahoo Finance",   "https://finance.yahoo.com/news/rssindex",            "stocks"),
+    ("Reuters Finance", "https://feeds.reuters.com/reuters/businessNews",     "macro"),
+    ("Bloomberg Crypto","https://feeds.bloomberg.com/crypto/news.rss",        "crypto"),
+]
+
+# Track when news was last collected to avoid duplicate runs
+_brain_news_last_run: float = 0.0
+_BRAIN_NEWS_MIN_INTERVAL = 25 * 60  # minimum 25 minutes between runs
+
+
+async def _fetch_rss_news(label: str, url: str, max_items: int = 6) -> List[Dict[str, str]]:
+    """Fetch and parse an RSS feed, return list of {title, url, source, summary}."""
+    import aiohttp
+    import xml.etree.ElementTree as ET
+
+    articles: List[Dict[str, str]] = []
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
+            async with session.get(url, headers={"User-Agent": "JARVIS-Brain/1.0"}) as resp:
+                if resp.status != 200:
+                    return articles
+                text = await resp.text()
+        # Parse RSS/Atom
+        root = ET.fromstring(text)
+        ns_map = {"atom": "http://www.w3.org/2005/Atom"}
+        # Try RSS 2.0 format
+        items = root.findall(".//item")
+        if not items:
+            # Try Atom format
+            items = root.findall(".//atom:entry", ns_map)
+        for item in items[:max_items]:
+            title = (
+                item.findtext("title")
+                or item.findtext("atom:title", namespaces=ns_map)
+                or ""
+            ).strip()
+            link = (
+                item.findtext("link")
+                or (item.find("atom:link", ns_map).get("href") if item.find("atom:link", ns_map) is not None else "")
+                or ""
+            ).strip()
+            desc = (
+                item.findtext("description")
+                or item.findtext("summary")
+                or item.findtext("atom:summary", namespaces=ns_map)
+                or ""
+            ).strip()
+            if title:
+                articles.append({
+                    "title": title[:180],
+                    "url": link[:200],
+                    "source": label,
+                    "summary": desc[:300] if desc else "",
+                })
+    except Exception as e:
+        logger.debug(f"[JARVIS brain-news] RSS {label}: {e}")
+    return articles
+
+
+async def _fetch_coinmarketcap_news(max_items: int = 8) -> List[Dict[str, str]]:
+    """Fetch latest news from CoinMarketCap public content API."""
+    import aiohttp
+    articles: List[Dict[str, str]] = []
+    try:
+        url = "https://api.coinmarketcap.com/content/v3/news?start=1&limit=10"
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
+            async with session.get(url, headers={"User-Agent": "JARVIS-Brain/1.0"}) as resp:
+                if resp.status != 200:
+                    return articles
+                data = await resp.json()
+        items = data.get("data", {}).get("list") or data.get("data", [])
+        if not isinstance(items, list):
+            return articles
+        for item in items[:max_items]:
+            title = (item.get("title") or item.get("headline") or "").strip()
+            url_l = (item.get("url") or item.get("sourceUrl") or "").strip()
+            subtitle = (item.get("subtitle") or item.get("description") or "").strip()
+            if title:
+                articles.append({
+                    "title": title[:180],
+                    "url": url_l[:200],
+                    "source": "CoinMarketCap",
+                    "summary": subtitle[:300],
+                })
+    except Exception as e:
+        logger.debug(f"[JARVIS brain-news] CoinMarketCap: {e}")
+    return articles
+
+
+async def _fetch_cryptopanic_news(max_items: int = 8) -> List[Dict[str, str]]:
+    """Fetch FOMO and breaking crypto news from CryptoPanic public API."""
+    import aiohttp
+    articles: List[Dict[str, str]] = []
+    try:
+        url = "https://cryptopanic.com/api/v1/posts/?auth_token=free&public=true&kind=news"
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
+            async with session.get(url, headers={"User-Agent": "JARVIS-Brain/1.0"}) as resp:
+                if resp.status != 200:
+                    return articles
+                data = await resp.json()
+        for item in (data.get("results") or [])[:max_items]:
+            title = (item.get("title") or "").strip()
+            url_l = (item.get("url") or "").strip()
+            slug = item.get("slug", "")
+            votes = item.get("votes") or {}
+            # FOMO signal: high positive votes
+            fomo_score = votes.get("positive", 0) - votes.get("negative", 0)
+            if title:
+                articles.append({
+                    "title": title[:180],
+                    "url": url_l[:200],
+                    "source": "CryptoPanic",
+                    "summary": f"FOMO score: {fomo_score:+d}" if fomo_score != 0 else "",
+                    "fomo_score": str(fomo_score),
+                })
+    except Exception as e:
+        logger.debug(f"[JARVIS brain-news] CryptoPanic: {e}")
+    return articles
+
+
+async def _fetch_db_recent_news(limit: int = 15) -> List[Dict[str, str]]:
+    """Pull the most recent articles from the existing sentiment/news DB."""
+    articles: List[Dict[str, str]] = []
+    try:
+        from app.core.database import AsyncSessionLocal
+        from app.sentiment.enhanced_service import EnhancedSentimentService
+        async with AsyncSessionLocal() as db:
+            rows = await EnhancedSentimentService.get_articles(
+                db, hours=3, limit=limit
+            )
+        for r in rows:
+            title = (r.get("title") or "").strip()
+            if title:
+                articles.append({
+                    "title": title[:180],
+                    "url": (r.get("url") or "")[:200],
+                    "source": r.get("source", "DB"),
+                    "summary": (r.get("content") or "")[:250],
+                    "sentiment_label": r.get("sentiment_label") or "neutral",
+                    "symbol": r.get("symbol") or "",
+                })
+    except Exception as e:
+        logger.debug(f"[JARVIS brain-news] DB news: {e}")
+    return articles
+
+
+async def _brain_collect_and_organise_news(symbols: Optional[List[str]] = None) -> None:
+    """Brain News Collector: Idle Mistral gathers, organises, and stores market news.
+
+    Pulls from ALL integrated news sources concurrently:
+    - CoinMarketCap news API  (latest crypto market news)
+    - CryptoPanic             (FOMO signals, breaking news, sentiment)
+    - RSS feeds               (CoinDesk, CoinTelegraph, Yahoo Finance, Reuters)
+    - Internal sentiment DB   (articles already scraped and scored)
+
+    Mistral organises the raw headlines into structured briefings:
+    - BULLISH / BEARISH category
+    - Breaking news highlights
+    - FOMO and fear signals
+    - Macro market events
+
+    Briefings are stored in all three brain stores at importance=0.70 so JARVIS
+    reads them as market context during analysis.  Fire-and-forget — never blocks.
+    """
+    global _brain_news_last_run
+    import time
+    now = time.time()
+    if (now - _brain_news_last_run) < _BRAIN_NEWS_MIN_INTERVAL:
+        logger.debug("[JARVIS brain-news] skipped — ran recently")
+        return
+    _brain_news_last_run = now
+
+    try:
+        # ── 1. Fetch all sources concurrently ─────────────────────────────────
+        results = await asyncio.gather(
+            _fetch_coinmarketcap_news(max_items=8),
+            _fetch_cryptopanic_news(max_items=8),
+            _fetch_db_recent_news(limit=12),
+            *[_fetch_rss_news(lbl, url, max_items=5) for lbl, url, _ in _NEWS_SOURCES],
+            return_exceptions=True,
+        )
+
+        all_articles: List[Dict[str, str]] = []
+        for res in results:
+            if isinstance(res, list):
+                all_articles.extend(res)
+            # exceptions silently dropped — best-effort
+
+        if not all_articles:
+            logger.debug("[JARVIS brain-news] no articles collected from any source")
+            return
+
+        logger.debug(f"[JARVIS brain-news] collected {len(all_articles)} articles across all sources")
+
+        # ── 2. Deduplicate by title ──────────────────────────────────────────
+        seen_titles: set = set()
+        unique_articles: List[Dict[str, str]] = []
+        for a in all_articles:
+            key = a.get("title", "").lower()[:60]
+            if key not in seen_titles:
+                seen_titles.add(key)
+                unique_articles.append(a)
+
+        # ── 3. Build prompt for Mistral (organiser role) ─────────────────────
+        news_block = "\n".join(
+            f"[{a.get('source','?')}] {a.get('title','')} {('| '+a.get('summary',''))[:100] if a.get('summary') else ''}"
+            for a in unique_articles[:30]
+        )
+        symbols_note = f"Focus on: {', '.join(symbols)}" if symbols else "Cover all major assets."
+
+        msgs = [
+            {
+                "role": "system",
+                "content": (
+                    "You are JARVIS's Brain News Organiser. You receive raw market headlines "
+                    "from multiple sources and produce a structured briefing stored in JARVIS's "
+                    "long-term brain memory for use in future market analysis.\n\n"
+                    "Output format (EXACTLY this structure — no extra text):\n"
+                    "BREAKING: [1-2 biggest breaking news items if any]\n"
+                    "BULLISH: [top bullish signals — max 3 items]\n"
+                    "BEARISH: [top bearish signals — max 3 items]\n"
+                    "FOMO: [high-momentum / FOMO signals — max 2 items]\n"
+                    "MACRO: [macro / stock market / USD / Fed news — max 2 items]\n"
+                    "SENTIMENT: [overall market sentiment: BULLISH/BEARISH/NEUTRAL with 1-line reason]\n"
+                    "Keep each item to one line. Total output: max 15 lines. Pure signal, no filler."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"{symbols_note}\n\nLatest headlines ({len(unique_articles)} items):\n\n{news_block}",
+            },
+        ]
+
+        # ── 4. Call best available brain provider (news organiser role, dynamic) ──
+        from app.core.database import AsyncSessionLocal
+        async with AsyncSessionLocal() as db:
+            briefing = await _brain_call(
+                "brain_news_organiser", msgs, db,
+                max_tokens=400, temperature=0.18,
+            )
+
+        if not briefing:
+            logger.debug("[JARVIS brain-news] brain_news_organiser returned empty briefing")
+            return
+
+        # ── 5. Write structured briefing to all 3 brain stores ───────────────
+        symbol_tag = ",".join(symbols[:5]) if symbols else "market"
+        source_list = ", ".join(sorted({a.get("source", "?") for a in unique_articles}))
+        detail_full = (
+            f"BRAIN NEWS ORGANISER (multi-provider slot 4) — {len(unique_articles)} articles from: {source_list}\n\n"
+            f"{briefing}\n\n"
+            f"--- Sample headlines ---\n"
+            + "\n".join(f"• [{a.get('source','?')}] {a.get('title','')}" for a in unique_articles[:8])
+        )
+
+        jarvis_learn_all_brains(
+            action="brain_news_briefing",
+            symbol=symbol_tag,
+            summary=f"Market news briefing: {briefing[:180]}",
+            detail=detail_full[:1400],
+            tags=["jarvis", "brain-news", "market-briefing", symbol_tag],
+            importance=0.70,
+            kind="news",
+        )
+        logger.info(
+            f"[JARVIS brain-news] ✅ wrote organised briefing "
+            f"({len(unique_articles)} articles → {len(briefing)} char briefing)"
+        )
+
+    except Exception as e:
+        logger.debug(f"[JARVIS brain-news] collector error: {e}")
+
+
+def _fire_brain_news_collection(symbols: Optional[List[str]] = None) -> None:
+    """Fire-and-forget: launch the brain news collector in the background.
+    Called after every JARVIS analysis so the brain stays up-to-date.
+    Respects a minimum interval to avoid hammering news APIs.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_brain_collect_and_organise_news(symbols))
+        logger.debug("[JARVIS brain-news] news collection task launched")
+    except Exception as e:
+        logger.debug(f"[JARVIS brain-news] launch skipped: {e}")
+
+
+
+
+
 # ── Voice brain models ────────────────────────────────────────────────────────
 
 class VoiceProfile(BaseModel):
@@ -733,6 +1700,252 @@ async def download_extension(v: Optional[str] = None):
 
 
 # ── System resource stats (CPU / RAM) ─────────────────────────────────────────
+
+@router.get("/ai-task-status")
+async def get_ai_task_status():
+    """
+    Returns the current task-to-model routing map for the whole app.
+
+    Shows each Jarvis analysis task (market_analysis, news_context, volume_analysis,
+    synthesis, news_position), the preferred provider+model for each, and whether
+    that provider is currently enabled and healthy in the DB. Used by the Jarvis Room
+    AI Models panel and by the Connect AI tab quick-setup guide.
+    """
+    try:
+        from app.core.database import AsyncSessionLocal
+        from plugins.AiMarketAnalyst.backend.services.ai_router import (
+            get_enabled_providers, _cb_open,
+        )
+
+        async with AsyncSessionLocal() as db:
+            enabled_providers = await get_enabled_providers(db)
+
+        task_rows = []
+        for task, prefs in _JARVIS_TASK_MODELS.items():
+            # Walk the chain to find the first available + non-circuit-open provider
+            resolved_provider = None
+            resolved_model = None
+            resolved_frag = None
+            for frag, model in prefs:
+                candidate = next(
+                    (p for p in enabled_providers
+                     if frag.lower() in (p.label or "").lower()
+                     and not _cb_open(p.id)),
+                    None,
+                )
+                # Skip if provider is disabled, circuit-open, or known-error
+                if candidate and candidate.enabled and candidate.status != "error":
+                    resolved_provider = candidate
+                    resolved_model = model
+                    resolved_frag = frag
+                    break
+
+            # Primary (first in chain) is always shown as "preferred"
+            primary_frag  = prefs[0][0] if prefs else ""
+            primary_model = prefs[0][1] if prefs else ""
+            # Active is whichever is the first live provider in the chain
+            active = resolved_provider
+            cb_open = active and _cb_open(active.id)
+            task_rows.append({
+                "task": task,
+                "label": _JARVIS_TASK_LABELS.get(task, task),
+                # primary preference
+                "preferred_provider_fragment": primary_frag,
+                "preferred_model": primary_model,
+                # currently active (may differ if primary is rate-limited)
+                "active_provider_fragment": resolved_frag,
+                "active_model": resolved_model,
+                "using_fallback": resolved_frag != primary_frag if resolved_frag else False,
+                # status
+                "provider_configured": active is not None,
+                "provider_label": active.label if active else None,
+                "provider_enabled": bool(active and active.enabled),
+                "provider_status": active.status if active else "not_configured",
+                "circuit_open": bool(cb_open),
+                "last_error": (active.last_error or None) if active else None,
+                # full ordered chain for the UI
+                "fallback_chain": [
+                    {"provider_fragment": f, "model": m} for f, m in prefs
+                ],
+            })
+
+        # Also return all enabled providers for the UI
+        provider_rows = [
+            {
+                "id": p.id,
+                "label": p.label,
+                "provider_key": p.provider_key,
+                "enabled": p.enabled,
+                "status": p.status,
+                "priority": p.priority,
+                "default_model": p.default_model,
+                "last_tested_at": p.last_tested_at.isoformat() if p.last_tested_at else None,
+                "circuit_open": _cb_open(p.id),
+            }
+            for p in enabled_providers
+        ]
+
+        # ── Persist current routing config to all three brains (fire-and-forget) ──
+        # Captures the active task→model map so JARVIS memory always knows which
+        # AI is handling each task, including any fallback activations.
+        _routing_lines = []
+        for t in task_rows:
+            fb_flag = " [FALLBACK]" if t.get("using_fallback") else ""
+            _routing_lines.append(
+                f"{t['label']}: {t.get('provider_label','?')} / {t.get('active_model','?')}"
+                f"{fb_flag} (chain: {' → '.join(e['model'][:28] for e in t.get('fallback_chain',[]))})"
+            )
+        jarvis_learn_all_brains(
+            action="ai_task_routing",
+            summary="Current JARVIS AI task→model routing configuration",
+            detail="\n".join(_routing_lines),
+            tags=["jarvis", "ai-routing", "model-config", "task-models"],
+            importance=0.55,
+        )
+
+        return {
+            "ok": True,
+            "tasks": task_rows,
+            "providers": provider_rows,
+            "provider_count": len(enabled_providers),
+        }
+    except Exception as exc:
+        logger.warning(f"[JARVIS] ai-task-status error: {exc}")
+        # Return the static task map even when DB is unreachable
+        return {
+            "ok": False,
+            "tasks": [
+                {
+                    "task": task,
+                    "label": _JARVIS_TASK_LABELS.get(task, task),
+                    "preferred_provider_fragment": prefs[0][0] if prefs else "",
+                    "preferred_model": prefs[0][1] if prefs else "",
+                    "active_provider_fragment": None,
+                    "active_model": None,
+                    "using_fallback": False,
+                    "provider_configured": False,
+                    "provider_label": None,
+                    "provider_enabled": False,
+                    "provider_status": "unknown",
+                    "circuit_open": False,
+                    "last_error": None,
+                    "fallback_chain": [
+                        {"provider_fragment": f, "model": m} for f, m in prefs
+                    ],
+                }
+                for task, prefs in _JARVIS_TASK_MODELS.items()
+            ],
+            "providers": [],
+            "provider_count": 0,
+            "error": str(exc),
+        }
+
+
+@router.get("/brain-activity")
+async def get_brain_activity():
+    """Return recent brain manager activity for the JARVIS Room Brain Network panel.
+
+    Returns the last N brain entries (consolidations, signal indexes, news briefings)
+    from paul_knowledge so the frontend can display a live wiring feed.
+    Also returns brain manager metadata (model, last run time, entry counts).
+    """
+    try:
+        from datetime import datetime as _dt
+        from app.core.database import AsyncSessionLocal
+        from plugins.AgentPaulPlugin.backend.services import knowledge_base
+
+        async with AsyncSessionLocal() as db:
+            # Recent brain entries (all types)
+            rows = await knowledge_base.search_knowledge(
+                db,
+                query="brain_consolidation brain_signal_index brain_news_briefing jarvis brain",
+                limit=20,
+            )
+
+        # Categorise entries
+        consolidations, indexes, news_briefings, other = [], [], [], []
+        for r in rows:
+            topic = r.get("kind") or ""
+            content = r.get("content") or ""
+            title = r.get("title") or ""
+            ts = r.get("ts") or ""
+            entry = {
+                "title": title[:80] if title else content[:60],
+                "preview": content[:120],
+                "ts": ts,
+                "source": r.get("source") or "",
+            }
+            if "brain_consolidat" in content.lower() or "brain_consolidat" in title.lower():
+                consolidations.append(entry)
+            elif "brain_signal_index" in content.lower() or "brain_indexer" in content.lower():
+                indexes.append(entry)
+            elif "brain_news" in content.lower() or "news briefing" in content.lower() or r.get("kind") == "news":
+                news_briefings.append(entry)
+            else:
+                other.append(entry)
+
+        last_consolidation = consolidations[0]["ts"] if consolidations else None
+        last_index = indexes[0]["ts"] if indexes else None
+        last_news = news_briefings[0]["ts"] if news_briefings else None
+
+        return {
+            "ok": True,
+            "brain_managers": [
+                {
+                    "role": "brain_consolidator",
+                    "label": "Brain Consolidator",
+                    "model": "Mistral open-mistral-nemo",
+                    "provider": "Mistral",
+                    "description": "Fuses all task model outputs into cross-model brain maps",
+                    "last_run": last_consolidation,
+                    "entry_count": len(consolidations),
+                },
+                {
+                    "role": "brain_indexer",
+                    "label": "Brain Indexer",
+                    "model": "Mistral open-mistral-nemo",
+                    "provider": "Mistral",
+                    "description": "Extracts structured signal patterns (BIAS/LEVELS/SMC)",
+                    "last_run": last_index,
+                    "entry_count": len(indexes),
+                },
+                {
+                    "role": "brain_news_organiser",
+                    "label": "Brain News Organiser",
+                    "model": "Mistral open-mistral-nemo",
+                    "provider": "Mistral",
+                    "description": "Organises market news from CoinMarketCap, Yahoo, RSS feeds",
+                    "last_run": last_news,
+                    "entry_count": len(news_briefings),
+                    "news_sources": [lbl for lbl, _, _ in _NEWS_SOURCES] + ["CoinMarketCap", "CryptoPanic", "Sentiment DB"],
+                },
+            ],
+            "recent_activity": (consolidations + indexes + news_briefings)[:12],
+            "totals": {
+                "consolidations": len(consolidations),
+                "signal_indexes": len(indexes),
+                "news_briefings": len(news_briefings),
+                "total": len(rows),
+            },
+        }
+    except Exception as exc:
+        logger.debug(f"[JARVIS] brain-activity error: {exc}")
+        return {
+            "ok": False,
+            "brain_managers": [],
+            "recent_activity": [],
+            "totals": {"consolidations": 0, "signal_indexes": 0, "news_briefings": 0, "total": 0},
+            "error": str(exc),
+        }
+
+
+@router.post("/brain-news-collect")
+async def trigger_brain_news_collection():
+    """Manually trigger the brain news collector (idle Mistral fetches & organises news).
+    Also triggered automatically after every JARVIS analysis."""
+    _fire_brain_news_collection(None)
+    return {"ok": True, "message": "Brain news collection launched in background"}
+
 
 @router.get("/system-stats")
 async def get_system_stats():
@@ -1640,6 +2853,25 @@ async def _dispatch(cmd: str, ex: Optional[str]) -> CommandResult:  # noqa: C901
         symbol = m.group(1).upper()
         return await _position_status(symbol, ex)
 
+    # ── latest news / market update ────────────────────────────────────────────
+    # Catches: "what's the latest news", "market update", "what's happening",
+    # "any crypto news", "give me the news", "market overview", etc.
+    _NEWS_Q = re.compile(
+        r'(?:'
+        r'what(?:\'?s?\s+(?:the\s+)?(?:latest|happening|going\s+on|new(?:s)?))'
+        r'|(?:(?:give|show|tell)\s+(?:me\s+)?(?:the\s+)?(?:latest\s+)?news)'
+        r'|(?:(?:latest|recent|current|today(?:\'?s?)?|live|real[\s-]time)\s+'
+        r'(?:news|update|headlines|market))'
+        r'|(?:market\s+(?:update|overview|summary|news|brief))'
+        r'|(?:any\s+(?:news|updates?|headlines?))'
+        r'|(?:crypto\s+(?:news|update))'
+        r'|(?:what\s+is\s+(?:happening|going\s+on)\s+(?:in\s+)?(?:the\s+)?market)'
+        r')',
+        re.IGNORECASE,
+    )
+    if _NEWS_Q.search(cmd):
+        return await _handle_live_news_query(cmd)
+
     return CommandResult(
         ok=False, action="unknown",
         detail=f"Command not recognised: {cmd!r}",
@@ -1651,6 +2883,265 @@ async def _dispatch(cmd: str, ex: Optional[str]) -> CommandResult:  # noqa: C901
 
 def _err(action: str, msg: str) -> CommandResult:
     return CommandResult(ok=False, action=action, detail=msg, speech=msg)
+
+
+async def _fetch_live_prices_brief() -> str:
+    """Fetch BTC/ETH/SOL/BNB live prices for the news brief.
+
+    Tries three sources in order: Bitget SDK → CoinGecko → Binance.
+    Returns a formatted string with live prices, or a fallback message.
+    Always uses REAL prices — never training data.
+    Fetches ALL supported USDT pairs from each exchange, sorted by 24h volume,
+    so the AI sees the full market picture — not just 5 hardcoded symbols.
+    """
+    import httpx as _hx
+
+    lines: List[str] = []
+
+    # --- Bitget ccxt: fetch ALL active futures tickers at once ---
+    try:
+        connector = exchange_manager.get_exchange(SupportedExchange.BITGET)
+        if connector:
+            try:
+                # ccxt fetch_tickers() returns every listed market in one call
+                all_tickers = await connector.exchange.fetch_tickers()
+                # Keep only USDT-margined pairs, sort by quoteVolume desc
+                usdt_tickers = [
+                    (sym, t) for sym, t in all_tickers.items()
+                    if "/USDT" in sym
+                ]
+                usdt_tickers.sort(
+                    key=lambda x: float(x[1].get("quoteVolume") or 0), reverse=True
+                )
+                for sym, t in usdt_tickers[:80]:
+                    last = t.get("last") or t.get("close")
+                    chg  = t.get("percentage")
+                    if last:
+                        clean = sym.split(":")[0].replace("/", "")
+                        chg_str = f" ({float(chg):+.2f}%/24h)" if chg is not None else ""
+                        lines.append(f"  {clean}: ${float(last):,.4f}{chg_str}")
+            except Exception:
+                # ccxt bulk failed — fall back to individual SDK calls for key pairs
+                for sym in ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+                            "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT"]:
+                    try:
+                        t = await connector.get_futures_ticker(sym)
+                        d = t if not isinstance(t, dict) else t.get("data") or t
+                        if isinstance(d, list):
+                            d = d[0] if d else {}
+                        last = (d.get("lastPr") or d.get("last")
+                                or d.get("close") or d.get("markPrice"))
+                        chg  = d.get("change24h") or d.get("priceChangePercent") or ""
+                        if last:
+                            chg_str = f" ({float(chg)*100:+.2f}%/24h)" if chg else ""
+                            lines.append(f"  {sym}: ${float(last):,.4f}{chg_str}")
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    # --- Binance public: ALL USDT pairs sorted by 24h quoteVolume ---
+    if not lines:
+        try:
+            async with _hx.AsyncClient(timeout=8.0) as c:
+                r = await c.get("https://api.binance.com/api/v3/ticker/24hr")
+                tickers = r.json() if isinstance(r.json(), list) else []
+                # Filter to USDT spot pairs, sort by 24h volume
+                usdt = [
+                    t for t in tickers
+                    if isinstance(t, dict) and str(t.get("symbol", "")).endswith("USDT")
+                ]
+                usdt.sort(
+                    key=lambda x: float(x.get("quoteVolume") or 0), reverse=True
+                )
+                for t in usdt[:80]:
+                    sym = t.get("symbol", "")
+                    px  = t.get("lastPrice")
+                    chg = t.get("priceChangePercent")
+                    if sym and px:
+                        chg_str = f" ({float(chg):+.2f}%/24h)" if chg else ""
+                        lines.append(f"  {sym}: ${float(px):,.4f}{chg_str}")
+        except Exception:
+            pass
+
+    # --- CoinGecko: top 100 coins by market cap (final fallback) ---
+    if not lines:
+        try:
+            async with _hx.AsyncClient(timeout=8.0) as c:
+                r = await c.get(
+                    "https://api.coingecko.com/api/v3/coins/markets",
+                    params={
+                        "vs_currency": "usd",
+                        "order": "market_cap_desc",
+                        "per_page": 100,
+                        "page": 1,
+                        "sparkline": "false",
+                    },
+                )
+                for coin in (r.json() or []):
+                    sym = (coin.get("symbol") or "").upper() + "USDT"
+                    px  = coin.get("current_price")
+                    chg = coin.get("price_change_percentage_24h")
+                    if px:
+                        chg_str = f" ({float(chg):+.2f}%/24h)" if chg is not None else ""
+                        lines.append(f"  {sym}: ${float(px):,.4f}{chg_str}")
+        except Exception:
+            pass
+
+    if lines:
+        return f"LIVE PRICES — {len(lines)} pairs (fetched this second — use ONLY these, NEVER training data):\n" + "\n".join(lines)
+    return "LIVE PRICES: Unable to fetch right now — do NOT use training data prices."
+
+
+async def _fetch_live_news_brief() -> str:
+    """Fetch the latest market news from live sources for the news brief.
+
+    Pulls from: CryptoPanic (FOMO/breaking), CoinMarketCap, RSS feeds.
+    Returns a formatted block of real headlines.
+    """
+    import httpx as _hx
+    import xml.etree.ElementTree as ET
+
+    headlines: List[str] = []
+
+    # CryptoPanic (public, no auth needed)
+    try:
+        async with _hx.AsyncClient(timeout=6.0) as c:
+            r = await c.get(
+                "https://cryptopanic.com/api/v1/posts/?auth_token=free&public=true&kind=news",
+                headers={"User-Agent": "JARVIS/1.0"},
+            )
+            for item in (r.json().get("results") or [])[:6]:
+                title = (item.get("title") or "").strip()
+                if title:
+                    votes = item.get("votes") or {}
+                    fomo = votes.get("positive", 0) - votes.get("negative", 0)
+                    fomo_tag = f" [+{fomo}]" if fomo > 2 else ""
+                    headlines.append(f"[CryptoPanic]{fomo_tag} {title[:140]}")
+    except Exception:
+        pass
+
+    # CoinMarketCap news (public)
+    try:
+        async with _hx.AsyncClient(timeout=6.0) as c:
+            r = await c.get(
+                "https://api.coinmarketcap.com/content/v3/news?start=1&limit=6",
+                headers={"User-Agent": "JARVIS/1.0"},
+            )
+            data = r.json()
+            items = data.get("data", {}).get("list") or data.get("data", []) or []
+            for item in items[:5]:
+                title = (item.get("title") or item.get("headline") or "").strip()
+                if title:
+                    headlines.append(f"[CoinMarketCap] {title[:140]}")
+    except Exception:
+        pass
+
+    # RSS fallback (CoinDesk)
+    if len(headlines) < 4:
+        try:
+            async with _hx.AsyncClient(timeout=6.0) as c:
+                r = await c.get(
+                    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+                    headers={"User-Agent": "JARVIS/1.0"},
+                )
+                root = ET.fromstring(r.text)
+                for item in root.findall(".//item")[:6]:
+                    title = (item.findtext("title") or "").strip()
+                    if title:
+                        headlines.append(f"[CoinDesk] {title[:140]}")
+        except Exception:
+            pass
+
+    if headlines:
+        return "LIVE NEWS HEADLINES (just fetched from public APIs):\n" + "\n".join(
+            f"  - {h}" for h in headlines[:12]
+        )
+    return "LIVE NEWS: Unable to fetch right now."
+
+
+async def _handle_live_news_query(cmd: str) -> CommandResult:
+    """Handle 'latest news' / 'market update' queries with LIVE data only.
+
+    Fetches live prices AND live news before calling AI, so the AI CANNOT
+    hallucinate stale training-data prices or make up outdated headlines.
+
+    The live data brief is passed to the AI as the user message context, making
+    it impossible for the AI to substitute training data.
+    """
+    from datetime import datetime as _dt
+
+    # Fetch live data concurrently
+    prices_brief, news_brief = await asyncio.gather(
+        _fetch_live_prices_brief(),
+        _fetch_live_news_brief(),
+        return_exceptions=True,
+    )
+    if isinstance(prices_brief, Exception):
+        prices_brief = "LIVE PRICES: fetch failed."
+    if isinstance(news_brief, Exception):
+        news_brief = "LIVE NEWS: fetch failed."
+
+    now_str = _dt.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    data_brief = (
+        f"{prices_brief}\n\n"
+        f"{news_brief}\n\n"
+        f"[Data fetched at: {now_str}]\n\n"
+        "STRICT RULE: Use ONLY the prices and news above. "
+        "Your training data is months/years old and has WRONG prices. "
+        "Address the user as 'Sir'. Compose a concise market snapshot "
+        "(5-6 bullet points: crypto prices/moves, key news, macro context, "
+        "1 actionable insight). Keep under 150 words."
+    )
+
+    # Ask AI to compose the brief using the live data
+    from app.core.database import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as db:
+        from plugins.AiMarketAnalyst.backend.services.ai_router import db_chat
+        resp = await db_chat(
+            db,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are JARVIS, an elite trading analyst. "
+                        "You ONLY use the LIVE PRICES and NEWS provided — never training data. "
+                        "Training data has severely outdated prices (e.g. BTC at $27k when it is now much higher). "
+                        "If a price is not in the provided data, say you don't have a live feed for it. "
+                        "Compose a thorough, JARVIS-style market brief covering key price levels, "
+                        "notable news, market sentiment, and what traders should watch. "
+                        "Write at least 150 words. Never truncate mid-sentence. Address user as 'Sir'."
+                    ),
+                },
+                {"role": "user", "content": data_brief},
+            ],
+            temperature=0.35,
+            max_tokens=1200,
+            agent_name="jarvis-live-news",
+            source="jarvis-command",
+        )
+
+    if resp.get("ok") and resp.get("content"):
+        brief_text = str(resp["content"]).strip()
+    else:
+        # AI failed — compose from raw live data (no hallucination possible)
+        brief_text = f"Sir, here's the live market data as of {now_str}:\n\n{prices_brief}\n\n{news_brief}"
+
+    # Fire news collection to update brains
+    _fire_brain_news_collection()
+
+    return CommandResult(
+        ok=True,
+        action="market_news",
+        detail=brief_text,
+        speech=brief_text[:600],
+        order={
+            "prices_fetched": "live",
+            "news_fetched": "live",
+            "timestamp": now_str,
+        },
+    )
 
 
 async def _execute_order(
@@ -2043,42 +3534,274 @@ async def _find_open_position(symbol: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-async def _compose_ai_narrative(brief: str) -> Optional[str]:
-    """Ask the multi-provider AI router (OpenAI-preferred failover) to turn the raw
-    research brief into a natural, human, decisive analysis.  Returns None if no
-    AI provider is available so the caller falls back to the template."""
+# ── Task-specific model routing ──────────────────────────────────────────────
+# Each task maps to an ORDERED list of (provider_label_fragment, model_id) pairs.
+# _task_chat() tries each in sequence — skipping unavailable / rate-limited
+# providers — before falling back to the standard priority router.  This ensures
+# Jarvis always returns an answer even when any single provider is down.
+#
+# Task roles & rationale:
+#   REASONING-FIRST MODEL SELECTION POLICY
+#   ==========================================
+#   Primary = best accuracy/reasoning for the task (quality over speed)
+#   Secondary = best available fallback when primary is rate-limited or down
+#   Tertiary = last-resort fallback, always different provider family
+#
+#   market_analysis – deep technical + SMC bias read (needs frontier reasoning)
+#                     primary:   NVIDIA Nemotron 120B  (frontier free, no per-min cap)
+#                     secondary: GitHub o3             (OpenAI strongest reasoning; 1 req/60s cap)
+#                     tertiary:  Groq 120B MoE          (fast free fallback)
+#
+#   news_context    – RAG-optimised news summarisation (needs large context + retrieval quality)
+#                     primary:   GitHub GPT-4o          (OpenAI flagship, excellent news synthesis)
+#                     secondary: Cohere Command A       (256K ctx, RAG-tuned, best for news)
+#                     tertiary:  Gemini 2.5 Flash       (1M ctx, highest quality Gemini fallback)
+#
+#   volume_analysis – quantitative buy/sell pressure (needs speed + no rate-limit cap)
+#                     primary:   Cerebras gpt-oss-120B  (wafer speed, same quality as Groq 120B)
+#                     secondary: Groq 120B MoE           (same model, high daily quota)
+#                     tertiary:  NVIDIA Nemotron 120B   (frontier reasoning fallback)
+#
+#   synthesis       – final decisive JARVIS narrative (needs deepest reasoning + confident output)
+#                     primary:   NVIDIA Nemotron 120B  (frontier free, most reliable for synthesis)
+#                     secondary: GitHub o3              (OpenAI o3 – strongest reasoning when available)
+#                     tertiary:  Groq 120B MoE           (fast free fallback)
+#
+#   news_position   – map many headlines to many open positions (1M ctx REQUIRED)
+#                     primary:   Gemini 2.5 Flash       (1M ctx, highest quality available Gemini)
+#                     secondary: Cohere Command A       (256K ctx, RAG-quality fallback)
+#                     tertiary:  Gemini 3.1 Flash-Lite  (1M ctx, 500 req/day – quota fallback)
+
+_JARVIS_TASK_MODELS: Dict[str, list] = {
+    "market_analysis": [
+        ("nvidia",  "nvidia/nemotron-3-super-120b-a12b"),# frontier free reasoning – primary (no per-min cap)
+        ("github",  "o3"),                               # OpenAI o3 – strong reasoning fallback (1 req/min)
+        ("groq",    "openai/gpt-oss-120b"),              # fast 120B last-resort fallback
+    ],
+    "news_context": [
+        ("github",  "gpt-4o"),                           # GPT-4o – excellent news synthesis
+        ("cohere",  "command-a-03-2025"),                # RAG-tuned, 256K
+        ("gemini",  "gemini-2.5-flash"),                 # highest quality Gemini (1M)
+    ],
+    "volume_analysis": [
+        ("cerebras","gpt-oss-120b"),                     # wafer speed, no rate-limit cap
+        ("groq",    "openai/gpt-oss-120b"),              # same model, Groq fallback
+        ("nvidia",  "nvidia/nemotron-3-super-120b-a12b"),# frontier reasoning fallback
+    ],
+    "synthesis": [
+        ("nvidia",  "nvidia/nemotron-3-super-120b-a12b"),# frontier free – most reliable for synthesis
+        ("github",  "o3"),                               # OpenAI o3 – strongest reasoning (subscription)
+        ("groq",    "openai/gpt-oss-120b"),              # fast free fallback
+    ],
+    "news_position": [
+        ("gemini",  "gemini-2.5-flash"),                 # highest quality 1M Gemini
+        ("cohere",  "command-a-03-2025"),                # 256K RAG-quality fallback
+        ("gemini",  "gemini-3.1-flash-lite"),            # 1M lite, 500/day quota fallback
+    ],
+}
+
+# Human-readable labels for the task map (used by the Jarvis Room AI panel)
+_JARVIS_TASK_LABELS: Dict[str, str] = {
+    "market_analysis": "Market Analysis",
+    "news_context":    "News Context",
+    "volume_analysis": "Volume Analysis",
+    "synthesis":       "Final Synthesis",
+    "news_position":   "News → Positions",
+}
+
+
+async def _task_chat(
+    task: str,
+    db,
+    messages: list,
+    *,
+    temperature: float = 0.35,
+    max_tokens: int = 800,
+    json_mode: bool = False,
+    source: str = "jarvis",
+    brain_context: str = "",
+) -> Dict[str, Any]:
+    """Route an analysis call to the best available model for `task`.
+
+    Walks the ordered fallback chain in `_JARVIS_TASK_MODELS`, trying each
+    (provider, model) in sequence.  Only the targeted provider's circuit breaker
+    is touched on failure — other providers are never affected.  After exhausting
+    all preferences it falls back to the standard priority router so Jarvis always
+    returns an answer even when every preferred provider is rate-limited or down.
+
+    brain_context: optional prior intelligence recalled from the brain managers
+    (Mistral consolidator + Gemma indexer outputs from previous cycles).  When
+    provided it is injected as an additional system message so the task model
+    has memory of what prior cross-model analysis found for this symbol.
+    """
+    from plugins.AiMarketAnalyst.backend.services.ai_router import (
+        db_chat, call_targeted_provider,
+    )
+
+    agent = f"jarvis-{task.replace('_', '-')}"
+    prefs: list = _JARVIS_TASK_MODELS.get(task, [])
+    primary_frag  = prefs[0][0] if prefs else ""
+    primary_model = prefs[0][1] if prefs else ""
+
+    # Inject brain-manager context if available — task model gets memory of
+    # prior cross-model consolidated intelligence from Mistral/Gemma brain managers.
+    enriched_messages = list(messages)
+    if brain_context:
+        # Append brain memory as a final system message before the user turn
+        sys_insertion = {
+            "role": "system",
+            "content": brain_context,
+        }
+        # Insert just before the last user message to maximise relevance
+        last_user_idx = next(
+            (i for i in range(len(enriched_messages) - 1, -1, -1)
+             if enriched_messages[i].get("role") == "user"),
+            None,
+        )
+        if last_user_idx is not None:
+            enriched_messages.insert(last_user_idx, sys_insertion)
+        else:
+            enriched_messages.append(sys_insertion)
+
+    for idx, (pref_label, pref_model) in enumerate(prefs):
+        resp = await call_targeted_provider(
+            db,
+            provider_label_fragment=pref_label,
+            model=pref_model,
+            messages=enriched_messages,   # brain context already injected
+            temperature=temperature,
+            max_tokens=max_tokens,
+            json_mode=json_mode,
+            agent_name=agent,
+            source=source,
+        )
+        if resp.get("ok") and resp.get("content"):
+            routed = resp.get('routed_via') or pref_model
+            logger.debug(
+                f"[JARVIS task-chat] {task}: {resp.get('provider')} / {routed}"
+                + (" (brain-enriched)" if brain_context else "")
+            )
+            # Persist fallback activation to all brains so JARVIS memory tracks it
+            if idx > 0:
+                jarvis_learn_all_brains(
+                    action="ai_task_fallback",
+                    summary=(
+                        f"Task '{_JARVIS_TASK_LABELS.get(task, task)}' routed to fallback "
+                        f"[{pref_label}] {pref_model} (primary [{primary_frag}] {primary_model} unavailable)"
+                    ),
+                    detail=(
+                        f"Fallback chain position: {idx + 1}/{len(prefs)}. "
+                        f"Responding model: {routed}. "
+                        f"This is a quality-aware fallback — primary model was rate-limited or down."
+                    ),
+                    tags=["jarvis", "ai-routing", "fallback", task, pref_label],
+                    importance=0.5,
+                )
+            return resp
+        logger.debug(
+            f"[JARVIS task-chat] {task}: '{pref_label}/{pref_model}' "
+            f"unavailable ({resp.get('error', 'no content')}); trying next"
+        )
+
+    # All chain preferences exhausted — standard priority routing as final fallback
+    logger.debug(f"[JARVIS task-chat] {task}: all chain preferences failed; using standard routing")
+    jarvis_learn_all_brains(
+        action="ai_task_exhausted",
+        summary=f"Task '{_JARVIS_TASK_LABELS.get(task, task)}' exhausted all preferred models, using standard router",
+        detail=f"All {len(prefs)} preferred models in the chain were unavailable. Falling back to standard priority routing.",
+        tags=["jarvis", "ai-routing", "exhausted", task],
+        importance=0.45,
+    )
+    return await db_chat(
+        db,
+        enriched_messages,             # keep brain context even in fallback
+        temperature=temperature,
+        max_tokens=max_tokens,
+        json_mode=json_mode,
+        agent_name=agent,
+        source=source,
+    )
+
+
+async def _compose_ai_narrative(brief: str, symbol: str = "") -> Optional[str]:
+    """Turn the raw research brief into a natural, human, decisive analysis.
+
+    Routes to the market_analysis task model (GitHub o3 / NVIDIA Nemotron) first
+    for deep technical interpretation; falls back to synthesis (Groq 120B MoE),
+    then to the standard priority router when both are unavailable.
+
+    Brain-enriched: recalls prior Mistral/Gemma brain consolidations for `symbol`
+    and injects them as additional context so task models have memory of what
+    previous cross-model analysis found.
+
+    After producing the narrative, fires Mistral + Gemma brain managers to
+    consolidate and index the new findings — models talk to each other here.
+    Returns None if no AI provider responds so the caller can fall back to template.
+    """
     try:
         from app.core.database import AsyncSessionLocal
-        from plugins.AiMarketAnalyst.backend.services.ai_router import db_chat
+
+        # ── Recall prior brain intelligence for this symbol ──────────────────
+        # Brain managers (Mistral + Gemma) may have written consolidated entries
+        # from prior analyses — pull them to enrich the task model prompts.
+        brain_ctx = ""
+        if symbol:
+            try:
+                brain_ctx = await _brain_recall_context(symbol, max_chars=480)
+            except Exception:
+                brain_ctx = ""
+
+        msgs = [
+            {
+                "role": "system",
+                "content": (
+                    "You are JARVIS, an elite crypto trading analyst speaking to your "
+                    "principal (address him as 'Sir'). Write a thorough, confident, human "
+                    "analysis — never robotic or list-only. Weave the technicals, volume "
+                    "flow, the Sox ML forecast and the news/sentiment into one coherent, "
+                    "detailed read of the pair. Cover: (1) trend direction and key levels, "
+                    "(2) what the volume and order-flow tell you, (3) the Sox forecast "
+                    "alignment with price action, (4) news/sentiment impact, (5) a clear "
+                    "directional bias with specific entry zone, stop-loss and take-profit "
+                    "levels derived from the data you were given. "
+                    "If the brief says the user ALREADY HOLDS AN OPEN POSITION on this pair, "
+                    "add a dedicated 'Position:' section giving a direct recommendation — "
+                    "hold, add, reduce, close, or move the stop / take-profit — "
+                    "and say why, referencing his live PnL and liquidation price. "
+                    "Be specific with every number you were given. Do NOT invent data you "
+                    "were not given. Write at least 200 words and never truncate mid-sentence."
+                ),
+            },
+            {"role": "user", "content": brief},
+        ]
 
         async with AsyncSessionLocal() as db:
-            resp = await db_chat(
-                db,
-                [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are JARVIS, an elite crypto trading analyst speaking to your "
-                            "principal (address him as 'Sir'). Write a natural, confident, human "
-                            "analysis — never robotic or list-only. Weave the technicals, volume "
-                            "flow, the Sox ML forecast and the news/sentiment into one coherent "
-                            "read of the pair, then give a clear directional bias and the key risk. "
-                            "If the brief says the user ALREADY HOLDS AN OPEN POSITION on this pair, "
-                            "give a direct recommendation on that position — hold, add, reduce, close, "
-                            "or move the stop / take-profit — and say why, referencing his live PnL. "
-                            "Be specific with the numbers you were given. Do NOT invent data you "
-                            "were not given. Keep it to 4-8 tight sentences."
-                        ),
-                    },
-                    {"role": "user", "content": brief},
-                ],
-                temperature=0.4,
-                max_tokens=650,
-                agent_name="jarvis-deep-analysis",
-                source="jarvis",
+            # Task models receive brain context from prior Mistral/Gemma consolidations
+            resp = await _task_chat(
+                "market_analysis", db, msgs,
+                temperature=0.4, max_tokens=1800,
+                brain_context=brain_ctx,
             )
+            if not (resp.get("ok") and resp.get("content")):
+                resp = await _task_chat(
+                    "synthesis", db, msgs,
+                    temperature=0.4, max_tokens=1800,
+                    brain_context=brain_ctx,
+                )
             if resp.get("ok") and resp.get("content"):
-                return str(resp["content"]).strip()
+                narrative = str(resp["content"]).strip()
+                # ── Fire brain managers async (models talk to each other) ────
+                # Mistral consolidates + indexes the fresh narrative.
+                # ALSO triggers the news collector so brain stays current.
+                if symbol and narrative:
+                    _fire_brain_managers(
+                        {"market_analysis": brief, "synthesis": narrative},
+                        symbol,
+                    )
+                    # News collection: idle Mistral organises latest market news
+                    # into brain briefings for enriching future analyses
+                    _fire_brain_news_collection([symbol] if symbol else None)
+                return narrative
     except Exception as e:  # pragma: no cover
         logger.debug(f"[JARVIS] AI narrative skipped: {e}")
     return None
@@ -2470,7 +4193,7 @@ async def _analyze_symbol(symbol: str, original_cmd: str, ex_name: Optional[str]
         f"TP2 {tp2} (R:R {rr2}x)."
         + pos_brief
     )
-    narrative = await _compose_ai_narrative(brief)
+    narrative = await _compose_ai_narrative(brief, symbol=symbol)
 
     if narrative:
         levels_block = (
@@ -2493,6 +4216,28 @@ async def _analyze_symbol(symbol: str, original_cmd: str, ex_name: Optional[str]
         )
     except Exception:
         pass
+
+    # ── Brain network: fire idle managers to cross-pollinate learnings ───────
+    # If _compose_ai_narrative did NOT already fire brain managers (e.g. no AI
+    # response), fire them now with whatever data we have so Mistral and Gemma
+    # still learn from the technical brief + volume/news data.
+    if not narrative:
+        _fire_brain_managers(
+            {
+                "market_analysis": brief[:800] if brief else "",
+                "volume_analysis": (
+                    f"Volume: buy {volume_info['buy_pressure_pct']:.0f}% / "
+                    f"sell {volume_info['sell_pressure_pct']:.0f}%"
+                    if volume_info else ""
+                ),
+                "news_context": (
+                    f"News sentiment: {news_info['sentiment_label']} "
+                    f"({news_info['count']} headlines)"
+                    if news_info else ""
+                ),
+            },
+            symbol,
+        )
 
     return CommandResult(
         ok=True, action="analyze",
@@ -3032,28 +4777,30 @@ async def _analyze_positions_with_news(cmd: str) -> CommandResult:
     )
 
     # 5. Ask the AI router for a real qualitative analysis ──────────────────
+    # Routes to the news_position task model (Gemini Flash, 1M-token context)
+    # so large batches of headlines + multiple positions fit in one call.
     ai_detail: Optional[str] = None
     try:
         from app.core.database import AsyncSessionLocal
-        from plugins.AiMarketAnalyst.backend.services.ai_router import db_chat
 
         async with AsyncSessionLocal() as db:
-            resp = await db_chat(
+            resp = await _task_chat(
+                "news_position",
                 db,
                 [
                     {
                         "role": "system",
                         "content": (
                             "You are JARVIS, a sharp trading assistant. "
-                            "Give factual, direct analysis — no filler phrases."
+                            "Give factual, direct and thorough analysis — no filler phrases. "
+                            "Cover each position's alignment with current news, risk, and recommendation. "
+                            "Never truncate mid-sentence."
                         ),
                     },
                     {"role": "user", "content": prompt_body},
                 ],
-                max_tokens=700,
+                max_tokens=1600,
                 temperature=0.25,
-                agent_name="jarvis-news-position-analysis",
-                source="jarvis",
             )
             if resp.get("ok") and resp.get("content"):
                 ai_detail = str(resp["content"]).strip()
@@ -3066,6 +4813,12 @@ async def _analyze_positions_with_news(cmd: str) -> CommandResult:
         speech = (
             f"News impact analysis for your {n_pos} open position{'s' if n_pos > 1 else ''}, Sir. "
             + ai_detail[:480].replace("\n", " ")
+        )
+        # Fire brain managers with the news/position synthesis — idle Mistral + Gemma
+        # learn from every completed news_position analysis cycle too.
+        _fire_brain_managers(
+            {"news_position": ai_detail, "news_context": prompt_body[:500]},
+            symbol="portfolio",
         )
         return CommandResult(
             ok=True, action="news_position_analysis",

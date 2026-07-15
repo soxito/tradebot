@@ -83,9 +83,45 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Price tick loop failed to start: {e}")
 
+    # ngrok hybrid auto-start — only when explicitly enabled via config/DB
+    try:
+        from app.core.database import AsyncSessionLocal
+        from app.models.database import NgrokConfig
+        from sqlalchemy import select as _sql_select
+
+        async def _maybe_start_ngrok():
+            try:
+                async with AsyncSessionLocal() as _db:
+                    row = (await _db.execute(_sql_select(NgrokConfig).where(NgrokConfig.id == 1))).scalar_one_or_none()
+                    enable = (row.enable_on_start if row and row.enable_on_start is not None else settings.NGROK_AUTO_START)
+                    if not enable:
+                        return
+                    authtoken = (row.authtoken_override if row and row.authtoken_override else settings.NGROK_AUTHTOKEN)
+                    if not authtoken:
+                        logger.warning("ngrok auto-start enabled but NGROK_AUTHTOKEN is not set — skipping")
+                        return
+                    backend_addr = (row.backend_addr_override if row and row.backend_addr_override else settings.NGROK_BACKEND_ADDR)
+                    frontend_addr = (row.frontend_addr_override if row and row.frontend_addr_override else settings.NGROK_FRONTEND_ADDR)
+                    from app.services.ngrok_service import ngrok_service
+                    await ngrok_service.start(authtoken=authtoken, backend_addr=backend_addr, frontend_addr=frontend_addr)
+            except Exception as _ngrok_err:
+                logger.warning(f"ngrok auto-start failed (non-fatal): {_ngrok_err}")
+
+        await _maybe_start_ngrok()
+    except Exception as e:
+        logger.warning(f"ngrok startup check error (non-fatal): {e}")
+
     yield
-    
+
     # Shutdown logic here
+    # Stop ngrok tunnels gracefully
+    try:
+        from app.services.ngrok_service import ngrok_service as _ngrok
+        if _ngrok.status().get("state") == "running":
+            await _ngrok.stop()
+            logger.info("ngrok tunnels stopped")
+    except Exception:
+        pass
     stop_background_workers()
     try:
         from app.core.scheduler import stop_price_tick_loop

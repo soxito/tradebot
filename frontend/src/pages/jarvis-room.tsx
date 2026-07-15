@@ -989,6 +989,63 @@ export default function SoxRoom() {
     pull(); const id = setInterval(pull, 3000); return () => { alive = false; clearInterval(id) }
   }, [])
 
+  // ── Brain Network Status ─────────────────────────────────────────────────
+  interface BrainManager { role: string; label: string; model: string; provider: string; description: string; last_run: string | null; entry_count: number; news_sources?: string[] }
+  interface BrainActivity { title: string; preview: string; ts: string; source: string }
+  interface BrainActivityData { ok: boolean; brain_managers: BrainManager[]; recent_activity: BrainActivity[]; totals: { consolidations: number; signal_indexes: number; news_briefings: number; total: number } }
+  const [brainActivity, setBrainActivity] = useState<BrainActivityData | null>(null)
+  const [brainFlash, setBrainFlash] = useState(false)
+  const prevBrainTotal = useRef(0)
+
+  useEffect(() => {
+    let alive = true
+    const pull = async () => {
+      try {
+        const res = await (apiClient.jarvis as any).get('/jarvis/brain-activity').catch(() =>
+          fetch('/api/v1/jarvis/brain-activity').then(r => r.json()).then(d => ({ data: d }))
+        )
+        const d: BrainActivityData = res?.data || res
+        if (alive && d?.ok) {
+          const newTotal = d.totals?.total ?? 0
+          if (newTotal > prevBrainTotal.current) {
+            setBrainFlash(true)
+            setTimeout(() => setBrainFlash(false), 1800)
+          }
+          prevBrainTotal.current = newTotal
+          setBrainActivity(d)
+        }
+      } catch { /* best-effort */ }
+    }
+    pull(); const id = setInterval(pull, 12000); return () => { alive = false; clearInterval(id) }
+  }, [])
+
+  // ── AI Task Status (which model handles each analysis role) ──────────────
+  interface AiTaskRow {
+    task: string; label: string;
+    preferred_provider_fragment: string; preferred_model: string;
+    active_provider_fragment: string | null; active_model: string | null;
+    using_fallback: boolean;
+    provider_configured: boolean; provider_label: string | null;
+    provider_enabled: boolean; provider_status: string;
+    circuit_open: boolean; last_error: string | null;
+    fallback_chain: Array<{ provider_fragment: string; model: string }>;
+  }
+  const [aiTasks, setAiTasks] = useState<AiTaskRow[]>([])
+  const [aiProviderCount, setAiProviderCount] = useState(0)
+  useEffect(() => {
+    let alive = true
+    const pull = async () => {
+      try {
+        const res = await (apiClient.jarvis as any).aiTaskStatus()
+        if (alive && res.data?.tasks) {
+          setAiTasks(res.data.tasks as AiTaskRow[])
+          setAiProviderCount(res.data.provider_count ?? 0)
+        }
+      } catch { /* best-effort */ }
+    }
+    pull(); const id = setInterval(pull, 30000); return () => { alive = false; clearInterval(id) }
+  }, [])
+
   // ── Execute command ────────────────────────────────────────────────────────
   const runCommand = useCallback(async (command: string, exchange?: string) => {
     try {
@@ -1461,6 +1518,189 @@ export default function SoxRoom() {
             </div>
           )}
         </div>
+      </DraggablePanel>
+
+      {/* ═══ DRAGGABLE — AI MODELS ═══ */}
+      <DraggablePanel
+        id="sox-ai-models" title="AI MODELS · TASK ROUTING" defaultX={-344} defaultY={520} width={326}
+        color="rgba(167,139,250,0.30)"
+        onHeaderExtra={
+          <a
+            href="/telegram-signals"
+            style={{ background: 'rgba(167,139,250,0.14)', border: '1px solid rgba(167,139,250,0.4)', borderRadius: 7, color: '#c4b5fd', fontSize: 10, padding: '2px 8px', cursor: 'pointer', textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: 4 }}
+            title="Go to Connect AI to add providers"
+          >
+            + Add
+          </a>
+        }
+      >
+        {/* Provider count summary */}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+          <span style={{ fontSize: 9, color: '#c4b5fd', letterSpacing: '0.14em' }}>
+            ACTIVE PROVIDERS
+          </span>
+          <span style={{ fontSize: 11, color: aiProviderCount > 0 ? '#4ade80' : '#f87171', fontWeight: 700 }}>
+            {aiProviderCount > 0 ? `${aiProviderCount} connected` : 'none configured'}
+          </span>
+        </div>
+
+        {/* Task rows */}
+        {aiTasks.length === 0 ? (
+          <div style={{ fontSize: 11, color: '#475569', padding: '4px 2px' }}>Loading AI task map…</div>
+        ) : (
+          aiTasks.map((t) => {
+            const ok = t.provider_configured && t.provider_enabled && t.provider_status === 'ok' && !t.circuit_open
+            const warn = t.provider_configured && (!t.provider_enabled || t.circuit_open || t.provider_status !== 'ok')
+            const dot = ok ? '#4ade80' : warn ? '#f59e0b' : '#ef4444'
+            const dotLabel = ok ? 'live' : warn ? 'degraded' : 'offline'
+            // Show active model (may be a fallback) or preferred model
+            const displayModel = t.active_model || t.preferred_model
+            const modelShort = displayModel.split('/').pop() || displayModel
+            const chainCount = t.fallback_chain?.length ?? 1
+            return (
+              <div key={t.task} style={{ background: 'rgba(14,8,30,0.82)', border: `1px solid ${ok ? 'rgba(74,222,128,0.22)' : warn ? 'rgba(245,158,11,0.3)' : 'rgba(239,68,68,0.28)'}`, borderRadius: 10, padding: '8px 11px', marginBottom: 6 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ fontSize: 11, fontWeight: 700, color: '#e2e8f0' }}>{t.label}</span>
+                  <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 9 }}>
+                    {t.using_fallback && (
+                      <span style={{ background: 'rgba(245,158,11,0.18)', color: '#fbbf24', border: '1px solid rgba(245,158,11,0.4)', borderRadius: 4, padding: '1px 5px', fontSize: 8 }}>FALLBACK</span>
+                    )}
+                    <span style={{ width: 6, height: 6, borderRadius: '50%', background: dot, boxShadow: `0 0 6px ${dot}`, display: 'inline-block' }} />
+                    <span style={{ color: dot }}>{dotLabel}</span>
+                  </span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4, fontSize: 10 }}>
+                  <span style={{ color: '#64748b' }}>Provider</span>
+                  <span style={{ color: t.provider_label ? '#a5b4fc' : '#475569' }}>
+                    {t.provider_label || `looking for '${t.preferred_provider_fragment}'`}
+                  </span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 2, fontSize: 10 }}>
+                  <span style={{ color: '#64748b' }}>Model</span>
+                  <span style={{ color: '#cbd5e1', fontFamily: 'monospace', maxWidth: 170, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={displayModel}>{modelShort}</span>
+                </div>
+                {chainCount > 1 && (
+                  <div style={{ fontSize: 9, color: '#475569', marginTop: 3 }}>
+                    {chainCount} fallback options available
+                  </div>
+                )}
+                {t.last_error && (
+                  <div style={{ fontSize: 9, color: '#f87171', marginTop: 3 }}>
+                    {t.last_error.slice(0, 60)}{t.last_error.length > 60 ? '…' : ''}
+                  </div>
+                )}
+              </div>
+            )
+          })
+        )}
+
+        <div style={{ fontSize: 9, color: '#334155', marginTop: 4, textAlign: 'center' }}>
+          Add providers in <a href="/telegram-signals" style={{ color: '#7c3aed', textDecoration: 'underline' }}>Connect AI</a> tab · auto-refreshes every 30 s
+        </div>
+      </DraggablePanel>
+
+      {/* ═══ DRAGGABLE — BRAIN NETWORK ═══ */}
+      <DraggablePanel
+        id="sox-brain-network" title="🧠 BRAIN NETWORK · LIVE WIRING" defaultX={-344} defaultY={-80} width={326}
+        color="rgba(20,184,166,0.28)"
+        onHeaderExtra={
+          <span style={{
+            display: 'flex', alignItems: 'center', gap: 5,
+            background: brainFlash ? 'rgba(20,184,166,0.28)' : 'rgba(20,184,166,0.10)',
+            border: `1px solid ${brainFlash ? 'rgba(20,184,166,0.9)' : 'rgba(20,184,166,0.35)'}`,
+            borderRadius: 7, color: '#5eead4', fontSize: 9, padding: '2px 7px',
+            transition: 'all 0.4s ease',
+            boxShadow: brainFlash ? '0 0 12px rgba(20,184,166,0.7)' : 'none',
+          }}>
+            <span style={{
+              width: 6, height: 6, borderRadius: '50%',
+              background: brainFlash ? '#5eead4' : '#0d9488',
+              boxShadow: brainFlash ? '0 0 10px #5eead4' : 'none',
+              animation: brainFlash ? 'jarvis-pulse 0.4s ease-in-out 4' : 'none',
+            }} />
+            {brainFlash ? 'WIRING…' : `${brainActivity?.totals?.total ?? 0} entries`}
+          </span>
+        }
+      >
+        {/* Brain manager cards */}
+        {!brainActivity ? (
+          <div style={{ fontSize: 11, color: '#475569', padding: '4px 2px' }}>Connecting to brain network…</div>
+        ) : (
+          <>
+            {/* Summary bar */}
+            <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
+              {[
+                { label: 'Maps', val: brainActivity.totals.consolidations, color: '#a78bfa' },
+                { label: 'Index', val: brainActivity.totals.signal_indexes, color: '#38bdf8' },
+                { label: 'News', val: brainActivity.totals.news_briefings, color: '#34d399' },
+              ].map(m => (
+                <div key={m.label} style={{ flex: 1, background: 'rgba(14,8,30,0.82)', border: `1px solid rgba(${m.color === '#a78bfa' ? '167,139,250' : m.color === '#38bdf8' ? '56,189,248' : '52,211,153'},0.3)`, borderRadius: 8, padding: '5px 0', textAlign: 'center' }}>
+                  <div style={{ fontSize: 14, fontWeight: 800, color: m.color, fontFamily: 'monospace' }}>{m.val}</div>
+                  <div style={{ fontSize: 9, color: '#475569', marginTop: 1 }}>{m.label}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Brain manager rows */}
+            {brainActivity.brain_managers.map((bm) => {
+              const hasRun = !!bm.last_run
+              const roleColor = bm.role === 'brain_consolidator' ? '#a78bfa' : bm.role === 'brain_indexer' ? '#38bdf8' : '#34d399'
+              const shortTs = bm.last_run ? new Date(bm.last_run).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—'
+              return (
+                <div key={bm.role} style={{ background: 'rgba(14,8,30,0.82)', border: `1px solid ${hasRun ? `rgba(${bm.role === 'brain_consolidator' ? '167,139,250' : bm.role === 'brain_indexer' ? '56,189,248' : '52,211,153'},0.3)` : 'rgba(255,255,255,0.07)'}`, borderRadius: 10, padding: '8px 11px', marginBottom: 5 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <span style={{ fontSize: 11, fontWeight: 700, color: roleColor }}>{bm.label}</span>
+                    <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                      <span style={{ width: 5, height: 5, borderRadius: '50%', background: hasRun ? roleColor : '#334155', boxShadow: hasRun ? `0 0 6px ${roleColor}` : 'none' }} />
+                      <span style={{ fontSize: 9, color: hasRun ? roleColor : '#475569' }}>{hasRun ? 'active' : 'idle'}</span>
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 9, color: '#64748b', marginTop: 3 }}>{bm.description}</div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4, fontSize: 10 }}>
+                    <span style={{ color: '#475569' }}>Entries</span>
+                    <span style={{ color: '#94a3b8', fontFamily: 'monospace' }}>{bm.entry_count} · last {shortTs}</span>
+                  </div>
+                  {bm.news_sources && (
+                    <div style={{ fontSize: 8, color: '#475569', marginTop: 3 }}>
+                      Sources: {bm.news_sources.slice(0, 5).join(' · ')}{bm.news_sources.length > 5 ? ` +${bm.news_sources.length - 5}` : ''}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+
+            {/* Recent brain activity feed */}
+            {brainActivity.recent_activity.length > 0 && (
+              <div style={{ marginTop: 4 }}>
+                <div style={{ fontSize: 9, color: '#0d9488', letterSpacing: '0.12em', marginBottom: 5 }}>RECENT WIRING LOG</div>
+                <div style={{ maxHeight: 130, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 3 }}>
+                  {brainActivity.recent_activity.slice(0, 6).map((act, i) => {
+                    const isNews = act.source?.includes('news') || act.preview?.includes('BULLISH') || act.preview?.includes('BEARISH') || act.preview?.includes('BREAKING')
+                    const isCons = act.preview?.includes('cross-model') || act.preview?.includes('brain map')
+                    const dotC = isNews ? '#34d399' : isCons ? '#a78bfa' : '#38bdf8'
+                    return (
+                      <div key={i} style={{ display: 'flex', gap: 6, alignItems: 'flex-start', padding: '3px 5px', background: 'rgba(14,8,30,0.6)', borderRadius: 6, border: '1px solid rgba(255,255,255,0.05)' }}>
+                        <span style={{ width: 5, height: 5, borderRadius: '50%', background: dotC, marginTop: 3, flexShrink: 0, boxShadow: `0 0 4px ${dotC}` }} />
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 9, color: '#cbd5e1', lineHeight: 1.3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {act.title || act.preview}
+                          </div>
+                          <div style={{ fontSize: 8, color: '#334155', marginTop: 1 }}>
+                            {act.ts ? new Date(act.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : ''}
+                          </div>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+
+            <div style={{ fontSize: 9, color: '#334155', marginTop: 6, textAlign: 'center' }}>
+              Idle AI (Mistral) · auto-wires every 12 s · news every 25 min
+            </div>
+          </>
+        )}
       </DraggablePanel>
 
       {/* ── Volume alerts ── */}

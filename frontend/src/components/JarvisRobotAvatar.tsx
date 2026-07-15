@@ -14,6 +14,7 @@
  */
 import { useEffect, useRef, useState, useCallback } from 'react'
 import JarvisRobot, { RobotState, AvatarStyle } from './JarvisRobot'
+import OpenHumanMascot, { MascotMood } from './OpenHumanMascot'
 
 interface Props {
   state: RobotState
@@ -22,6 +23,16 @@ interface Props {
   onClick?: () => void
   size?: number
   extRobotActive?: boolean   // true when extension robot has taken over
+  useOpenHumanMascot?: boolean // use OpenHuman mascot instead of Three.js robot
+}
+
+// Map robot animation states → OpenHuman mascot moods
+const ROBOT_TO_MOOD: Record<RobotState, MascotMood> = {
+  idle:      'idle',
+  walking:   'idle',
+  listening: 'listening',
+  thinking:  'thinking',
+  talking:   'talking',
 }
 
 const POS_KEY = 'jarvis.robot.pos'
@@ -42,6 +53,7 @@ export default function JarvisRobotAvatar({
   onClick,
   size = 160,
   extRobotActive = false,
+  useOpenHumanMascot = false,
 }: Props) {
   const wrapRef = useRef<HTMLDivElement | null>(null)
   const holeRef = useRef<HTMLDivElement | null>(null)
@@ -301,12 +313,19 @@ export default function JarvisRobotAvatar({
         onPointerUp={onPointerUp}
         title="JARVIS — drag to move, click to chat"
       >
-        <JarvisRobot
-          state={displayState}
-          energy={energy}
-          avatarStyle={avatarStyle}
-          size={size}
-        />
+        {useOpenHumanMascot ? (
+          <OpenHumanMascot
+            mood={ROBOT_TO_MOOD[state] ?? 'idle'}
+            size={size}
+          />
+        ) : (
+          <JarvisRobot
+            state={displayState}
+            energy={energy}
+            avatarStyle={avatarStyle}
+            size={size}
+          />
+        )}
 
         {label && (
           <div style={{

@@ -42,6 +42,8 @@ import {
   Atom,
   Puzzle,
   Telescope,
+  Globe,
+  FlaskConical,
 } from 'lucide-react';
 
 const navItems = [
@@ -75,6 +77,9 @@ const navItems = [
   { href: '/history', label: 'Trade History', icon: History },
   { href: '/binary-engine', label: 'Binary Engine', icon: AudioWaveform },
   { href: '/jarvis-room', label: 'JARVIS Room', icon: Atom },
+  { href: '/vibe-trading', label: 'Vibe Trading', icon: FlaskConical },
+  { href: '/openhuman-hub', label: 'OpenHuman', icon: Atom },
+  { href: '/ngrok', label: 'Ngrok', icon: Globe },
   { href: '/settings', label: 'Settings', icon: Settings },
 ];
 

@@ -718,3 +718,21 @@ class CryptoPair(Base):
     created_at = Column(DateTime, default=_utcnow, nullable=False)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
     enriched_at = Column(DateTime, nullable=True)  # last CoinGecko profile enrich
+
+
+# ─── Ngrok Tunnel Config ───────────────────────────────────────────────────────
+
+
+class NgrokConfig(Base):
+    """Persistent ngrok configuration/overrides. Only ever one row (id=1)."""
+
+    __tablename__ = "ngrok_config"
+
+    id = Column(Integer, primary_key=True, default=1)
+    # Override env defaults; NULL means "use env value"
+    authtoken_override = Column(String, nullable=True)
+    backend_addr_override = Column(String, nullable=True)
+    frontend_addr_override = Column(String, nullable=True)
+    enable_on_start = Column(Boolean, nullable=True)  # NULL = honour env NGROK_AUTO_START
+    # Metadata
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)

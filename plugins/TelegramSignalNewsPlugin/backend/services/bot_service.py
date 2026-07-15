@@ -56,13 +56,30 @@ async def send_message(
     chat_id: str | int,
     text: str,
     parse_mode: str = "HTML",
+    reply_markup: dict | None = None,
 ) -> dict[str, Any]:
     """Send a text message to chat_id."""
-    return await _call("sendMessage", token, {
+    payload: dict[str, Any] = {
         "chat_id": chat_id,
         "text": text[:4096],  # Telegram limit
         "parse_mode": parse_mode,
-    })
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return await _call("sendMessage", token, payload)
+
+
+async def answer_callback_query(
+    token: str,
+    callback_query_id: str,
+    text: str | None = None,
+    show_alert: bool = False,
+) -> dict[str, Any]:
+    """Acknowledge a button press so Telegram removes the loading spinner."""
+    payload: dict[str, Any] = {"callback_query_id": callback_query_id, "show_alert": show_alert}
+    if text:
+        payload["text"] = text[:200]
+    return await _call("answerCallbackQuery", token, payload)
 
 
 async def get_webhook_info(token: str) -> dict[str, Any]:
@@ -135,4 +152,9 @@ JARVIS_COMMANDS: list[dict[str, str]] = [
     {"command": "tp",         "description": "Set take-profit — usage: /tp 0.025 BTCUSDT"},
     {"command": "sl",         "description": "Set stop-loss — usage: /sl 0.020 BTCUSDT"},
     {"command": "jarvis",     "description": "Free-form Jarvis command — usage: /jarvis <text>"},
+    # ── New integrated commands ──────────────────────────────────────────────
+    {"command": "forecast",   "description": "Kronos ML forecast + sniper entries — /forecast BTCUSDT [exchange] [1h]"},
+    {"command": "order",      "description": "Execute Kronos signal — /order [live] long BTCUSDT 100"},
+    {"command": "analyze",    "description": "Deep AI analysis (Kronos+news+position) — /analyze BTCUSDT"},
+    {"command": "mt5",        "description": "MT5 accounts/positions/scalp — /mt5 status|positions|scalp|close"},
 ]
