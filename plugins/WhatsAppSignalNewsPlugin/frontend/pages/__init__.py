@@ -1,0 +1,1 @@
+"""WhatsApp Plugin Frontend Pages."""

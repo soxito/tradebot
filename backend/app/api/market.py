@@ -28,6 +28,12 @@ import httpx
 from fastapi import APIRouter, Query
 from loguru import logger
 
+from app.exchanges.yahoo_provider import (
+    fetch_candles as yahoo_candles,
+    fetch_quote as yahoo_quote,
+    resolve_ticker,
+)
+
 router = APIRouter(prefix="/market", tags=["market"])
 
 # ── in-memory cache (simple TTL dict) ────────────────────────────────────────
@@ -213,6 +219,56 @@ async def market_overview():
     }
     _cache_set("overview", result)
     return result
+
+
+@router.get("/candles")
+async def market_candles(
+    symbol: str = Query(..., min_length=2, max_length=24),
+    timeframe: str = Query(default="H1"),
+    limit: int = Query(default=400, ge=10, le=1000),
+):
+    """
+    Broker-independent OHLCV for any FX pair, metal, index, commodity or crypto.
+
+    Chart fallback for the MT5 workspace: when the MT5 bridge has no history the
+    crypto-exchange fallback only covers crypto, so every other instrument drew
+    a blank chart.  Yahoo covers all of them from one source.
+
+    Returns ``{symbol, timeframe, source, candles: [{time, open, high, low,
+    close, volume}]}`` — an empty ``candles`` list means no source carries it.
+    """
+    candles = await yahoo_candles(symbol, timeframe, limit)
+    return {
+        "symbol": symbol.upper(),
+        "timeframe": timeframe.upper(),
+        "source": "yahoo" if candles else "none",
+        "ticker": resolve_ticker(symbol),
+        "candles": candles,
+    }
+
+
+@router.get("/price")
+async def market_price(
+    symbol: str = Query(..., min_length=2, max_length=24),
+):
+    """
+    Live quote for any FX pair, metal, index, commodity or crypto.
+
+    The chart's live line and forming bar poll a quote rather than candles, so a
+    chart drawn from Yahoo needs a Yahoo quote — the crypto-exchange ticker it
+    used to fall back to does not list GBPUSD, US30 or spot gold.
+
+    Returns ``{symbol, ticker, source, price}``; ``price`` is null when no
+    source carries the symbol.
+    """
+    quote = await yahoo_quote(symbol)
+    return {
+        "symbol": symbol.upper(),
+        "ticker": (quote or {}).get("ticker") or resolve_ticker(symbol),
+        "source": "yahoo" if quote else "none",
+        "price": (quote or {}).get("price"),
+        "time": (quote or {}).get("time"),
+    }
 
 
 @router.get("/history")

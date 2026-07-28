@@ -27,9 +27,12 @@ import {
   Crosshair, RefreshCw, Target, TrendingUp, TrendingDown, Activity,
   Zap, FlaskConical, ChevronRight, AlertTriangle, Brain, CheckCircle, X,
   Calculator, Maximize2, Minimize2, Settings, Wifi, Volume2, VolumeX, Loader2,
-  Eye, EyeOff, Layers,
+  Eye, EyeOff, Layers, ChevronDown, Search,
 } from 'lucide-react'
 import { formatTimeZA } from '@/utils/datetime'
+import {
+  searchPairs, groupPairs, normalizePair, stripBrokerSuffix, POPULAR_PAIRS,
+} from '@/constants/tradingPairs'
 import { getPriceSource, setPriceSource as savePriceSource, PRICE_SOURCE_OPTIONS } from '@/utils/priceSource'
 import { useJarvisSpeak } from '@/hooks/useJarvisSpeak'
 
@@ -50,6 +53,25 @@ interface SmcSignal {
   formed_index: number
   formed_time: number
   confluence: string[]
+  /** Numeric audit trail for `confidence` — see backend smc_scoring.py. */
+  score_breakdown?: {
+    total: number
+    raw_total: number
+    volume_confirmed: boolean
+    volume_data_available: boolean
+    /** Instrument publishes no volume at all — scored on structure alone. */
+    structure_only?: boolean
+    htf_blocked: boolean
+    by_family: Record<string, number>
+    factors: {
+      name: string
+      family: 'volume' | 'structure' | 'movement' | 'risk'
+      raw_value: number
+      normalized: number
+      weight: number
+      contribution: number
+    }[]
+  }
   tp1?: number
   tp2?: number
   tp3?: number
@@ -89,7 +111,15 @@ interface AiReview {
   risk_warning?: string
   top_pick_entry?: number | null
   provider?: string
+  provider_used?: string | null
   model?: string
+  /** 'primary' = healthiest provider answered, 'cascade' = a fallback provider
+   *  answered, 'deterministic' = no provider reachable, engine-only output. */
+  tier?: 'primary' | 'cascade' | 'deterministic'
+  /** True whenever the result did not come from the healthiest provider. */
+  is_degraded?: boolean
+  confidence?: number
+  latency_ms?: number
   rated_signals?: { entry: number; verdict: string; confidence: number; note: string }[]
 }
 
@@ -123,15 +153,45 @@ interface KronosOverlay {
   data: { time: number; value: number }[]
 }
 
+/**
+ * Volume evidence behind the Kronos call. Volume is a hard precondition on the
+ * backend: `direction: 'no_trade'` means it could not be resolved and no
+ * direction was inferred from price alone.
+ */
+interface KronosVolumeBlock {
+  status?: 'OK' | 'UNAVAILABLE' | 'STALE' | 'INSUFFICIENT'
+  volume_unit?: 'base' | 'tick' | 'futures' | 'unknown'
+  volume_24h?: number | null
+  volume_1h?: number | null
+  relative_volume?: number | null
+  regime?: 'DEAD' | 'NORMAL' | 'ELEVATED' | 'CLIMACTIC' | 'UNKNOWN'
+  divergence?: string
+  reversal_risk?: boolean
+  detail?: string
+}
+
 interface KronosBlock {
   engine?: string
-  direction?: 'up' | 'down' | 'flat'
+  direction?: 'up' | 'down' | 'flat' | 'no_trade'
   pct_change?: number
   confidence?: number
   target_price?: number
   summary?: string
+  decision?: 'OK' | 'LOW_CONFIDENCE' | 'NO_TRADE'
+  volume?: KronosVolumeBlock | null
+  rationale?: string[]
   overlays?: KronosOverlay[]
   markers?: { time: number; position: string; color: string; shape: string; text?: string }[]
+}
+
+/** Compact volume formatter — 1.23B / 45.6M / 789.0K. */
+const fmtVolCompact = (v?: number | null): string => {
+  if (v === null || v === undefined || Number.isNaN(v)) return 'n/a'
+  const abs = Math.abs(v)
+  if (abs >= 1e9) return `${(v / 1e9).toFixed(2)}B`
+  if (abs >= 1e6) return `${(v / 1e6).toFixed(2)}M`
+  if (abs >= 1e3) return `${(v / 1e3).toFixed(2)}K`
+  return v.toLocaleString(undefined, { maximumFractionDigits: 2 })
 }
 
 interface BacktestStats {
@@ -238,6 +298,10 @@ function loadLayerCfg(): Record<LayerKey, boolean> {
 }
 const TF_MINUTES: Record<string, number> = { M1: 1, M5: 5, M15: 15, M30: 30, H1: 60, H4: 240, D1: 1440, W1: 10080 }
 const MT5_TF_TO_EXCHANGE: Record<string, string> = { M1: '1m', M5: '5m', M15: '15m', M30: '30m', H1: '1h', H4: '4h', D1: '1d', W1: '1w' }
+/** Entry timeframe → the higher timeframe whose structural bias gates it.
+ *  Mirrors `_HTF_FOR` in the MT5 plugin router. H4 and above are their own
+ *  top-level context and are not gated further. */
+const HTF_FOR: Record<string, string> = { M1: 'M15', M5: 'H1', M15: 'H4', M30: 'H4', H1: 'H4' }
 /** Optimal candle count per timeframe — enough SMC structure without hitting backend 1000-bar limit. */
 const TF_CANDLE_COUNT: Record<string, number> = { M1: 1000, M5: 800, M15: 600, M30: 500, H1: 400, H4: 300, D1: 200, W1: 100 }
 const CRYPTO_EXCHANGES = new Set(['bitget', 'binance', 'bybit', 'okx', 'kucoin', 'coinbase', 'huobi', 'gate'])
@@ -426,11 +490,16 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
   const [symbol, setSymbol] = useState(defaultSymbol)
   const [symbolInput, setSymbolInput] = useState(defaultSymbol)
   const cfg0 = useRef<SniperCfg>(loadSniperCfg()).current  // read persisted config once
-  // ── Broker symbol search ──────────────────────────────────────────────────
-  const [symbolResults, setSymbolResults] = useState<{ symbol: string }[]>([])
+  // ── Symbol picker ─────────────────────────────────────────────────────────
+  // Broker symbols (live MT5 bridge) merged with the built-in instrument
+  // catalogue, so the picker still lists every FX pair when the bridge is
+  // unreachable and its symbol list comes back empty.
+  const [brokerResults, setBrokerResults] = useState<string[]>([])
   const [showSymbolResults, setShowSymbolResults] = useState(false)
   const [searchingSymbol, setSearchingSymbol] = useState(false)
+  const [highlightIdx, setHighlightIdx] = useState(0)
   const symbolSearchTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const symbolBoxRef = useRef<HTMLDivElement | null>(null)
   const [timeframe, setTimeframe] = useState(cfg0.timeframe ?? 'H1')
   const [minRR, setMinRR] = useState(cfg0.minRR ?? 2)
   const [maxLoss, setMaxLoss] = useState(cfg0.maxLoss ?? 15)        // hard max $ loss the user will accept
@@ -725,18 +794,27 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
     }
   }, [])
 
-  // ── Candle source (MT5 primary, exchange fallback when history is empty) ─────
+  // ── Candle source (Yahoo primary, exchange fallback, MT5 last) ──────────────
+  // Yahoo leads because it is the only source that is both accurate and
+  // universal for what this chart draws:
+  //   • the MT5 bridge's PriceHistoryEx returns *frozen* history on several
+  //     broker builds — the newest bar can be days or years old while the live
+  //     quote ticks fine, which drew stale candles under a correct live line;
+  //   • the crypto-exchange fallback only carries crypto, and its "mapping" for
+  //     everything else is a proxy token (XAUUSD→XAU/USDT is a *token*, not
+  //     spot gold), so its prices were wrong for every non-crypto instrument.
+  // Yahoo prices FX, metals, indices, energy and crypto from one real feed.
   const loadSourceCandles = useCallback(async (tf: string, count: number): Promise<{ candles: Candle[]; source: string }> => {
-    // 1) MT5 primary
+    // 1) Yahoo primary — covers every instrument this chart can show.
     try {
-      const res = await apiClient.mt5.getCandles(accountId, symbol, tf, count)
+      const res = await apiClient.getMarketCandles(symbol, tf, count)
       const raw: Candle[] = res.data?.candles ?? []
-      if (raw.length > 0) return { candles: raw, source: 'mt5' }
+      if (raw.length > 0) return { candles: raw, source: res.data?.source || 'yahoo' }
     } catch { /* fall through */ }
-    // 2) Exchange fallback — always try when MT5 returns nothing.
-    //    mapForExchange handles XAUUSD→XAU/USDT etc. safely.
-    //    If the symbol cannot be mapped or the exchange lacks it, the call
-    //    returns empty which is caught by the outer length check.
+    // 2) Exchange fallback — for crypto this is the venue the order actually
+    //    fills on, so it is the better series whenever Yahoo is unreachable.
+    //    mapForExchange handles XAUUSD→XAU/USDT etc.; an unmappable symbol just
+    //    returns empty and falls through.
     if (fallbackExchange) {
       try {
         const tfx = MT5_TF_TO_EXCHANGE[tf] ?? '1h'
@@ -748,6 +826,13 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
         if (raw.length > 0) return { candles: raw, source: fallbackExchange }
       } catch { /* fall through */ }
     }
+    // 3) MT5 bridge last — still the only source for broker-specific symbols
+    //    neither of the above lists, and correct when its history is fresh.
+    try {
+      const res = await apiClient.mt5.getCandles(accountId, symbol, tf, count)
+      const raw: Candle[] = res.data?.candles ?? []
+      if (raw.length > 0) return { candles: raw, source: 'mt5' }
+    } catch { /* fall through */ }
     return { candles: [], source: 'none' }
   }, [accountId, symbol, fallbackExchange])
 
@@ -767,9 +852,10 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
       lastHistTime.current = raw.length ? raw[raw.length - 1].time : 0
       liveBar.current = null  // reset forming bar for the new dataset
       setSourceLabel(source)
+      const noData = `No candle data for ${symbol} ${timeframe} — not on the market feed, the ${fallbackExchange || 'exchange'} fallback or the MT5 bridge. Check the symbol spelling.`
       const cs = candleSeries.current
       if (!chartMounted.current || !cs) {
-        if (raw.length === 0) setError('No candle data for this symbol/timeframe (MT5 history + fallback empty).')
+        if (raw.length === 0) setError(noData)
         return
       }
       if (raw.length > 0) {
@@ -788,23 +874,47 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
           }
         } catch { /* chart disposed between ref read and use */ }
       } else {
-        setError('No candle data for this symbol/timeframe (MT5 history + fallback empty).')
+        // Wipe the previous pair's candles — leaving them up makes a successful
+        // symbol switch look like it was ignored.
+        try { cs.setData([]) } catch { /* chart disposed */ }
+        setLivePrice(null)
+        setAnalysis(null)
+        setError(noData)
       }
     } catch (e: any) {
       setError(sniperApiErr(e))
     } finally {
       setLoading(false)
     }
-  }, [accountId, symbol, timeframe, loadSourceCandles])
+  }, [accountId, symbol, timeframe, fallbackExchange, loadSourceCandles])
 
   // ── SMC analysis (runs on whatever candles are currently displayed) ─────────
   const runAnalysis = useCallback(async () => {
     if (!accountId) return
     const raw = candlesRef.current
-    if (!raw || raw.length < 40) { setError('Not enough candle data to analyze (need >= 40 bars).'); return }
+    if (!raw || raw.length < 40) {
+      // With zero bars the candle loader already reported *why* the feed is
+      // empty — keep that message rather than replacing it with a vaguer one.
+      if (raw && raw.length > 0) {
+        setError(`Not enough ${symbol} ${timeframe} candles to analyze (${raw.length} bars, need ≥ 40).`)
+      }
+      return
+    }
     setAnalyzing(true)
     setPlaceMsg(null)
     try {
+      // Higher-timeframe context for the HTF gate. The backend rejects setups
+      // that oppose this bias, so entry timeframes at or below H1 fetch it.
+      // Best-effort: if the HTF series is unavailable the analysis runs ungated.
+      let htfCandles: Candle[] = []
+      const htfTf = HTF_FOR[timeframe]
+      if (htfTf) {
+        try {
+          const { candles } = await loadSourceCandles(htfTf, 300)
+          htfCandles = candles
+        } catch { /* HTF is an enhancement, never a dependency */ }
+      }
+
       const res = await apiClient.mt5.smcAnalyzeData({
         symbol, timeframe,
         // Reward-first defaults: min_rr is the floor (reward must beat risk) and
@@ -816,6 +926,7 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
         us_session_only: usSession,
         use_ai: useAI,
         candles: raw.map(c => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume ?? 0 })),
+        htf_candles: htfCandles.map(c => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume ?? 0 })),
       })
       const a: Analysis = res.data
       setAnalysis(a)
@@ -832,7 +943,7 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
     } finally {
       setAnalyzing(false)
     }
-  }, [accountId, symbol, timeframe, minRR, useAI, accountBalance, maxLoss, dailyTargetPct, usSession, riskPct, useCap, speakAsJarvis, voiceAnalysis])
+  }, [accountId, symbol, timeframe, minRR, useAI, accountBalance, maxLoss, dailyTargetPct, usSession, riskPct, useCap, speakAsJarvis, voiceAnalysis, loadSourceCandles])
 
   useEffect(() => {
     setLoading(true)
@@ -858,13 +969,15 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
   }, [minRR])
 
   // ── Live price polling (forming bar + live line + realtime P&L) ─────────────
-  // Source-aware: MT5-sourced symbols use the broker quote; exchange-sourced
-  // symbols (e.g. gold via Binance fallback) use the exchange ticker so the live
-  // line, forming bar and floating P&L keep ticking even when the broker is
-  // unreachable.
+  // The quote must come from whatever drew the candles, or the live line sits
+  // at a different price than the bars underneath it. Yahoo-sourced charts poll
+  // the Yahoo quote (the exchange ticker does not list FX, indices or spot
+  // metals at all); MT5-sourced ones use the broker quote; exchange-sourced
+  // ones use the exchange ticker.
   useEffect(() => {
     if (!accountId || loading || sourceLabel === 'none') return
     const isMt5 = sourceLabel === 'mt5'
+    const isYahoo = sourceLabel === 'yahoo'
     let cancelled = false
     let failStreak = 0
     let timeoutId: ReturnType<typeof setTimeout>
@@ -876,6 +989,11 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
         const res = await apiClient.mt5.getPrice(accountId, symbol)
         const { ask } = res.data as { bid: number; ask: number }
         return typeof ask === 'number' ? ask : null
+      }
+      if (isYahoo) {
+        const res = await apiClient.getMarketPrice(symbol)
+        const p = res.data?.price
+        return typeof p === 'number' && isFinite(p) ? p : null
       }
       // Exchange ticker — use the user-chosen price source (XAUUSD→XAU/USDT).
       const exSym = mapForExchange(symbol, priceSource)
@@ -1283,35 +1401,88 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
     }
   }
 
-  const applySymbol = (s: string) => {
-    const clean = s.trim().toUpperCase()
+  const applySymbol = useCallback((s: string) => {
+    const clean = normalizePair(s)
     if (!clean) return
     setSymbol(clean)
     setSymbolInput(clean)
     setShowSymbolResults(false)
     onSymbolChange?.(clean)
-  }
+  }, [onSymbolChange])
 
-  // Debounced broker symbol search (300ms) — fires when symbolInput changes
+  // Debounced broker symbol search (300ms). Purely additive — the built-in
+  // catalogue below always provides results, so an offline bridge (empty list
+  // or a 404/500) can never leave the picker with nothing to select.
   useEffect(() => {
     if (symbolSearchTimer.current) clearTimeout(symbolSearchTimer.current)
     const q = symbolInput.trim()
-    if (!q || q === symbol) { setSymbolResults([]); return }
     symbolSearchTimer.current = setTimeout(async () => {
       setSearchingSymbol(true)
       try {
         const res = await apiClient.mt5.scalp.searchSymbols(accountId, q)
-        setSymbolResults(res.data || [])
-        setShowSymbolResults(true)
+        const rows: { symbol: string }[] = Array.isArray(res.data) ? res.data : []
+        setBrokerResults(rows.map(r => (r?.symbol || '').toUpperCase()).filter(Boolean))
       } catch {
-        setSymbolResults([])
+        setBrokerResults([])
       } finally {
         setSearchingSymbol(false)
       }
     }, 300)
     return () => { if (symbolSearchTimer.current) clearTimeout(symbolSearchTimer.current) }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbolInput, accountId])
+
+  // While the box still holds the applied symbol the trader hasn't typed a
+  // query yet — show the whole catalogue so the dropdown is a browsable list,
+  // not a single row echoing the current pair.
+  const pairQuery = normalizePair(symbolInput) === normalizePair(symbol) ? '' : symbolInput
+
+  // Broker symbols first (those are what the account can actually trade), then
+  // catalogue pairs the broker list didn't already cover — matched on the
+  // suffix-stripped name so EURUSD.m doesn't duplicate EURUSD.
+  const pairOptions = useMemo(() => {
+    const q = normalizePair(pairQuery)
+    const brokerMatched = brokerResults.filter(s => !q || normalizePair(s).includes(q))
+    const covered = new Set(brokerMatched.map(stripBrokerSuffix))
+    const local = searchPairs(pairQuery, 200).filter(s => !covered.has(s))
+    return [...brokerMatched, ...local]
+  }, [brokerResults, pairQuery])
+
+  const pairSections = useMemo(() => groupPairs(pairOptions), [pairOptions])
+
+  useEffect(() => { setHighlightIdx(0) }, [symbolInput])
+
+  // Close the dropdown on an outside click (blur alone misses chip clicks).
+  useEffect(() => {
+    if (!showSymbolResults) return
+    const onDown = (e: MouseEvent) => {
+      if (symbolBoxRef.current && !symbolBoxRef.current.contains(e.target as Node)) {
+        setShowSymbolResults(false)
+      }
+    }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [showSymbolResults])
+
+  const onSymbolKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault()
+      if (!showSymbolResults) { setShowSymbolResults(true); return }
+      setHighlightIdx(i => {
+        const n = pairOptions.length
+        if (!n) return 0
+        return e.key === 'ArrowDown' ? (i + 1) % n : (i - 1 + n) % n
+      })
+      return
+    }
+    if (e.key === 'Enter') {
+      e.preventDefault()
+      // Enter picks the highlighted suggestion, or commits raw input when the
+      // trader typed a broker-specific symbol that isn't in any list.
+      applySymbol(showSymbolResults && pairOptions[highlightIdx] ? pairOptions[highlightIdx] : symbolInput)
+      return
+    }
+    if (e.key === 'Escape') setShowSymbolResults(false)
+  }
 
   const biasColor = analysis?.bias === 'bullish' ? 'text-green-400' : analysis?.bias === 'bearish' ? 'text-red-400' : 'text-gray-400'
   const ai = analysis?.ai
@@ -1324,30 +1495,68 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
         <div className="flex items-center gap-1.5 text-tradebot-accent font-semibold text-sm">
           <Crosshair className="w-4 h-4" /> SMC Sniper
         </div>
-        {/* ── Symbol search with broker dropdown ─────────────────────────── */}
-        <div className="relative flex items-center bg-gray-800 border border-gray-600 rounded-lg overflow-visible">
+        {/* ── Pair picker: type to search, or browse the full instrument list ── */}
+        <div ref={symbolBoxRef} className="relative flex items-center bg-gray-800 border border-gray-600 rounded-lg overflow-visible">
+          <Search className="w-3.5 h-3.5 text-gray-500 ml-2 shrink-0" />
           <input
             value={symbolInput}
             onChange={e => { setSymbolInput(e.target.value.toUpperCase()); setShowSymbolResults(true) }}
-            onFocus={() => symbolInput && symbolResults.length > 0 && setShowSymbolResults(true)}
-            onKeyDown={e => {
-              if (e.key === 'Enter') { applySymbol(symbolInput); setShowSymbolResults(false) }
-              if (e.key === 'Escape') setShowSymbolResults(false)
-            }}
+            onFocus={() => setShowSymbolResults(true)}
+            onKeyDown={onSymbolKeyDown}
             className="bg-transparent text-white text-sm px-2 py-1 w-28 focus:outline-none font-semibold"
-            placeholder="Symbol"
+            placeholder="Search pair…"
+            title="Search any pair — EURUSD, GBPJPY, XAUUSD, NAS100, BTCUSD…"
           />
           {searchingSymbol && <Loader2 className="w-3 h-3 text-gray-400 animate-spin mr-1 shrink-0" />}
-          <button onClick={() => { applySymbol(symbolInput); setShowSymbolResults(false) }} className="px-2 py-1 text-xs text-gray-400 hover:text-white">
-            <ChevronRight className="w-3 h-3" />
+          <button
+            onClick={() => setShowSymbolResults(v => !v)}
+            title="Browse all pairs"
+            className="px-2 py-1 text-xs text-gray-400 hover:text-white"
+          >
+            <ChevronDown className={`w-3.5 h-3.5 transition-transform ${showSymbolResults ? 'rotate-180' : ''}`} />
           </button>
-          {showSymbolResults && symbolResults.length > 0 && (
-            <div className="absolute top-full left-0 z-50 mt-1 w-52 max-h-56 overflow-y-auto rounded-lg bg-gray-900 border border-gray-700 shadow-xl">
-              {symbolResults.map(r => (
-                <button key={r.symbol} onMouseDown={e => { e.preventDefault(); applySymbol(r.symbol) }}
-                  className="w-full text-left px-3 py-2 text-sm text-gray-200 hover:bg-gray-800 font-medium">
-                  {r.symbol}
-                </button>
+          {showSymbolResults && (
+            <div className="absolute top-full left-0 z-50 mt-1 w-72 max-h-80 overflow-y-auto rounded-lg bg-gray-900 border border-gray-700 shadow-xl">
+              {/* Quick chips — the pairs traders switch between most */}
+              <div className="flex flex-wrap gap-1 p-2 border-b border-gray-800 sticky top-0 bg-gray-900 z-10">
+                {POPULAR_PAIRS.map(p => (
+                  <button key={p} onMouseDown={e => { e.preventDefault(); applySymbol(p) }}
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-semibold border transition-colors ${
+                      normalizePair(symbol) === p
+                        ? 'bg-tradebot-accent/25 border-tradebot-accent/50 text-tradebot-accent'
+                        : 'bg-gray-800 border-gray-700 text-gray-300 hover:text-white hover:border-gray-500'
+                    }`}>
+                    {p}
+                  </button>
+                ))}
+              </div>
+              {pairSections.length === 0 ? (
+                <div className="px-3 py-3 text-xs text-gray-500">
+                  No match for “{symbolInput}”. Press Enter to use it anyway.
+                </div>
+              ) : pairSections.map(section => (
+                <div key={section.label}>
+                  <div className="px-3 pt-2 pb-1 text-[10px] uppercase tracking-wide text-gray-500 font-semibold">
+                    {section.label}
+                  </div>
+                  {section.symbols.map(s => {
+                    const idx = pairOptions.indexOf(s)
+                    const active = idx === highlightIdx
+                    return (
+                      <button key={`${section.label}-${s}`}
+                        onMouseDown={e => { e.preventDefault(); applySymbol(s) }}
+                        onMouseEnter={() => idx >= 0 && setHighlightIdx(idx)}
+                        className={`w-full text-left px-3 py-1.5 text-sm font-medium flex items-center justify-between ${
+                          active ? 'bg-gray-800 text-white' : 'text-gray-200 hover:bg-gray-800'
+                        }`}>
+                        <span>{s}</span>
+                        {normalizePair(symbol) === normalizePair(s) && (
+                          <CheckCircle className="w-3 h-3 text-tradebot-accent" />
+                        )}
+                      </button>
+                    )
+                  })}
+                </div>
               ))}
             </div>
           )}
@@ -1607,11 +1816,53 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
               {analysis.kronos?.direction && (
                 <div className="flex items-center justify-between">
                   <span className="text-gray-400">Kronos AI</span>
-                  <span className={`font-mono ${analysis.kronos.direction === 'up' ? 'text-green-400' : analysis.kronos.direction === 'down' ? 'text-red-400' : 'text-yellow-400'}`}>
-                    {(analysis.kronos.pct_change ?? 0) >= 0 ? '+' : ''}{(analysis.kronos.pct_change ?? 0).toFixed(2)}% · {Math.round((analysis.kronos.confidence ?? 0) * 100)}%
-                    <span className="text-[10px] text-gray-500 ml-1">{analysis.kronos.engine === 'kronos' ? 'ML' : 'heur'}</span>
-                  </span>
+                  {analysis.kronos.direction === 'no_trade' ? (
+                    <span className="font-mono text-amber-400" title={analysis.kronos.volume?.detail || analysis.kronos.summary}>
+                      NO TRADE
+                      <span className="text-[10px] text-gray-500 ml-1">volume unresolved</span>
+                    </span>
+                  ) : (
+                    <span className={`font-mono ${analysis.kronos.direction === 'up' ? 'text-green-400' : analysis.kronos.direction === 'down' ? 'text-red-400' : 'text-yellow-400'}`}>
+                      {(analysis.kronos.pct_change ?? 0) >= 0 ? '+' : ''}{(analysis.kronos.pct_change ?? 0).toFixed(2)}% · {Math.round((analysis.kronos.confidence ?? 0) * 100)}%
+                      <span className="text-[10px] text-gray-500 ml-1">{analysis.kronos.engine === 'kronos' ? 'ML' : 'heur'}</span>
+                    </span>
+                  )}
                 </div>
+              )}
+              {/* Volume evidence behind the Kronos call — the precondition it
+                  was gated on. Rendered when the backend passes it through. */}
+              {analysis.kronos?.volume && (
+                <>
+                  <div className="flex items-center justify-between">
+                    <span className="text-gray-400">
+                      Volume {analysis.kronos.volume.volume_unit === 'tick' ? '(tick)'
+                        : analysis.kronos.volume.volume_unit === 'futures' ? '(CME)' : ''}
+                    </span>
+                    <span className="text-gray-200 font-mono text-[11px]">
+                      24h {fmtVolCompact(analysis.kronos.volume.volume_24h)} · 1h {fmtVolCompact(analysis.kronos.volume.volume_1h)}
+                      {analysis.kronos.volume.relative_volume != null && ` · ×${analysis.kronos.volume.relative_volume.toFixed(2)}`}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-gray-400">Vol regime</span>
+                    <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-semibold ${
+                      analysis.kronos.volume.regime === 'CLIMACTIC' ? 'bg-amber-900/40 text-amber-400'
+                      : analysis.kronos.volume.regime === 'ELEVATED' ? 'bg-green-900/40 text-green-400'
+                      : analysis.kronos.volume.regime === 'DEAD' ? 'bg-gray-800 text-gray-400'
+                      : 'bg-blue-900/40 text-blue-400'
+                    }`}>
+                      {analysis.kronos.volume.regime ?? 'UNKNOWN'}
+                      {analysis.kronos.volume.divergence
+                        && analysis.kronos.volume.divergence !== 'NEUTRAL'
+                        && ` · ${analysis.kronos.volume.divergence.replace('_', ' ').toLowerCase()}`}
+                    </span>
+                  </div>
+                  {analysis.kronos.volume.reversal_risk && (
+                    <div className="text-[10px] text-amber-400">
+                      ⚠ Climactic volume confirming the opposite move — reversal risk.
+                    </div>
+                  )}
+                </>
               )}
               <div className="flex items-center justify-between"><span className="text-gray-400">Last</span><span className="text-gray-200 font-mono">{analysis.last_price}</span></div>
               <div className="flex items-center justify-between"><span className="text-gray-400">Source</span><span className={`text-[10px] px-1.5 py-0.5 rounded-full font-semibold ${sourceLabel === 'mt5' ? 'bg-green-900/40 text-green-400' : sourceLabel === 'none' ? 'bg-red-900/40 text-red-400' : 'bg-yellow-900/40 text-yellow-400'}`}>{sourceLabel === 'mt5' ? 'MT5 LIVE' : sourceLabel.toUpperCase()}</span></div>
@@ -1620,19 +1871,41 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
 
           {/* AI review */}
           {ai && (
-            <div className={`rounded-lg p-2.5 text-xs border ${ai.available ? 'bg-violet-900/15 border-violet-700/30' : 'bg-gray-800/40 border-gray-700/40'}`}>
-              <div className="flex items-center gap-1.5 font-semibold text-violet-300 mb-1">
+            <div className={`rounded-lg p-2.5 text-xs border ${
+              ai.tier === 'deterministic'
+                ? 'bg-amber-900/15 border-amber-700/30'
+                : ai.available ? 'bg-violet-900/15 border-violet-700/30' : 'bg-gray-800/40 border-gray-700/40'
+            }`}>
+              <div className="flex items-center gap-1.5 font-semibold text-violet-300 mb-1 flex-wrap">
                 <Brain className="w-3.5 h-3.5" /> AI Review
-                {ai.available && ai.provider && <span className="text-[10px] text-gray-500 font-normal">({ai.provider})</span>}
+                {(ai.provider_used ?? ai.provider) && <span className="text-[10px] text-gray-500 font-normal">({ai.provider_used ?? ai.provider})</span>}
+                {ai.tier && (
+                  <span
+                    title={
+                      ai.tier === 'primary' ? 'Answered by the healthiest provider'
+                        : ai.tier === 'cascade' ? 'Primary provider failed — a fallback provider answered'
+                        : 'No AI provider reachable — deterministic SMC engine output'
+                    }
+                    className={`text-[10px] px-1.5 py-0.5 rounded-full font-semibold ${
+                      ai.tier === 'primary' ? 'bg-green-900/40 text-green-400'
+                        : ai.tier === 'cascade' ? 'bg-yellow-900/40 text-yellow-400'
+                        : 'bg-amber-900/40 text-amber-300'
+                    }`}
+                  >
+                    {ai.tier === 'deterministic' ? 'ENGINE ONLY' : ai.tier.toUpperCase()}
+                  </span>
+                )}
+                {ai.is_degraded && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded-full font-semibold bg-orange-900/40 text-orange-300" title={ai.reason ?? 'Degraded analysis path'}>
+                    DEGRADED
+                  </span>
+                )}
               </div>
-              {ai.available ? (
-                <div className="space-y-1 text-gray-300">
-                  {ai.market_read && <p>{ai.market_read}</p>}
-                  {ai.risk_warning && <p className="text-amber-300/90 flex items-start gap-1"><AlertTriangle className="w-3 h-3 mt-0.5 shrink-0" />{ai.risk_warning}</p>}
-                </div>
-              ) : (
-                <p className="text-gray-500">{ai.reason ?? 'AI unavailable'}</p>
-              )}
+              <div className="space-y-1 text-gray-300">
+                {ai.market_read && <p>{ai.market_read}</p>}
+                {ai.risk_warning && <p className="text-amber-300/90 flex items-start gap-1"><AlertTriangle className="w-3 h-3 mt-0.5 shrink-0" />{ai.risk_warning}</p>}
+                {!ai.market_read && !ai.risk_warning && <p className="text-gray-500">{ai.reason ?? 'AI unavailable'}</p>}
+              </div>
             </div>
           )}
 
@@ -1787,6 +2060,16 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
                             ⚡ false break
                           </span>
                         )}
+                        {/* This instrument publishes no volume, so the setup was
+                            never volume-confirmed — a weaker claim than the rest. */}
+                        {s.score_breakdown?.structure_only && (
+                          <span
+                            className="text-[9px] px-1.5 py-0.5 rounded-full bg-sky-500/20 text-sky-300 font-semibold"
+                            title="No volume feed for this instrument — scored on structure, movement and risk only. Not volume-confirmed."
+                          >
+                            structure-only
+                          </span>
+                        )}
                         <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-tradebot-accent/20 text-tradebot-accent font-semibold">
                           {(s.confidence * 100).toFixed(0)}% · RR {s.rr}
                         </span>
@@ -1857,6 +2140,37 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
                         )
                       })}
                     </div>
+                    {/* Numeric score attribution — which factors produced this
+                        confidence and by how much. Sorted by |contribution|. */}
+                    {s.score_breakdown?.factors?.length ? (
+                      <details className="mt-1.5 text-[10px]">
+                        <summary className="cursor-pointer text-gray-400 hover:text-gray-200 select-none">
+                          Score {s.score_breakdown.total.toFixed(2)} — factor breakdown
+                          {s.score_breakdown.volume_confirmed === false && (
+                            <span className="ml-1 text-amber-400">(volume unconfirmed)</span>
+                          )}
+                        </summary>
+                        <div className="mt-1 space-y-0.5 font-mono">
+                          {[...s.score_breakdown.factors]
+                            .sort((a, b) => Math.abs(b.contribution) - Math.abs(a.contribution))
+                            .filter(f => Math.abs(f.contribution) >= 0.001)
+                            .map(f => (
+                              <div key={f.name} className="flex items-center justify-between gap-2">
+                                <span className="text-gray-400 truncate" title={`${f.family} · raw ${f.raw_value}`}>
+                                  {f.name.replace(/_/g, ' ')}
+                                </span>
+                                <span className={f.contribution >= 0 ? 'text-green-400' : 'text-red-400'}>
+                                  {f.contribution >= 0 ? '+' : ''}{f.contribution.toFixed(3)}
+                                </span>
+                              </div>
+                            ))}
+                          <div className="flex items-center justify-between gap-2 border-t border-gray-700/60 pt-0.5 mt-0.5 text-gray-300">
+                            <span>total</span>
+                            <span>{s.score_breakdown.raw_total.toFixed(3)}</span>
+                          </div>
+                        </div>
+                      </details>
+                    ) : null}
                     {aiRate && (
                       <div className={`mt-1.5 text-[10px] ${aiRate.verdict === 'take' ? 'text-green-400' : aiRate.verdict === 'skip' ? 'text-red-400' : 'text-amber-400'}`}>
                         <span className="flex items-center gap-1 font-semibold">

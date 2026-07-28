@@ -34,6 +34,9 @@ aiohttp==3.11.16
 requests==2.32.3
 feedparser==6.0.11
 
+# WhatsApp Integration (OpenWA)
+openwa-sdk==1.1.1
+
 # Data Processing
 pandas==2.2.3
 numpy==2.2.4

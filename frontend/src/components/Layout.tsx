@@ -4,11 +4,14 @@ import dynamic from 'next/dynamic';
 import { useTradeStore } from '@/store/useTradeStore';
 import ConnectionStatus from '@/components/ConnectionStatus';
 import { useRealtimeNotifications } from '@/services/notifications';
+import { useState } from 'react';
 
 // PAUL JARVIS — lazy-loaded so it never blocks the main bundle, no SSR needed
 const PaulChat = dynamic(() => import('@/components/PaulChat'), { ssr: false })
 // Extension install prompt — detects the browser & offers the voice extension
 const ExtensionInstallPrompt = dynamic(() => import('@/components/ExtensionInstallPrompt'), { ssr: false })
+// Error boundary for JARVIS components
+const ErrorBoundary = dynamic(() => import('@/components/ErrorBoundary').then(m => ({ default: m.ErrorBoundary })), { ssr: false })
 import {
   LayoutDashboard,
   LineChart,
@@ -42,11 +45,21 @@ import {
   Atom,
   Puzzle,
   Telescope,
+  CalendarClock,
   Globe,
   FlaskConical,
+  Smartphone,
+  ChevronDown,
 } from 'lucide-react';
 
-const navItems = [
+interface NavItem {
+  href: string
+  label: string
+  icon: React.ComponentType<{ className?: string }>
+  children?: NavItem[]
+}
+
+const navItems: NavItem[] = [
   { href: '/', label: 'Dashboard', icon: LayoutDashboard },
   { href: '/trading', label: 'Trading', icon: LineChart },
   { href: '/futures', label: 'Futures', icon: Layers },
@@ -68,6 +81,7 @@ const navItems = [
   { href: '/intelligence', label: 'Intelligence', icon: Network },
   { href: '/vault', label: 'Vault', icon: BookOpen },
   { href: '/insights', label: 'Insights', icon: BookOpen },
+  { href: '/research', label: 'Research & Calendar', icon: CalendarClock },
   { href: '/mt5-live', label: 'MT5 Live', icon: Monitor },
   { href: '/mt5-replay', label: 'MT5 Replay', icon: Rewind },
   { href: '/mt5-copy-sim', label: 'MT5 Copy Sim', icon: Copy },
@@ -80,7 +94,14 @@ const navItems = [
   { href: '/vibe-trading', label: 'Vibe Trading', icon: FlaskConical },
   { href: '/openhuman-hub', label: 'OpenHuman', icon: Atom },
   { href: '/ngrok', label: 'Ngrok', icon: Globe },
-  { href: '/settings', label: 'Settings', icon: Settings },
+  {
+    href: '/settings',
+    label: 'Settings',
+    icon: Settings,
+    children: [
+      { href: '/whatsapp', label: 'WhatsApp', icon: Smartphone },
+    ],
+  },
 ];
 
 export default function Layout({ children }: { children: React.ReactNode }) {
@@ -116,6 +137,49 @@ export default function Layout({ children }: { children: React.ReactNode }) {
                 ? router.pathname === '/'
                 : router.pathname === item.href || router.pathname.startsWith(`${item.href}/`);
             const Icon = item.icon;
+
+            if (item.children && item.children.length > 0) {
+              return (
+                <div key={item.href}>
+                  <Link
+                    href={item.href}
+                    className={`flex items-center gap-3 mx-2 px-3 py-2.5 rounded-lg text-sm transition-colors ${
+                      isActive
+                        ? 'bg-tradebot-accent/15 text-tradebot-accent font-semibold'
+                        : 'text-gray-400 hover:text-white hover:bg-gray-800/60'
+                    }`}
+                    title={sidebarOpen ? undefined : item.label}
+                  >
+                    <Icon className="w-5 h-5 shrink-0" />
+                    {sidebarOpen && <span className="whitespace-nowrap">{item.label}</span>}
+                    {sidebarOpen && <ChevronDown className="w-4 h-4 ml-auto opacity-50" />}
+                  </Link>
+                  {sidebarOpen && (
+                    <div className="ml-2 mt-1 space-y-1">
+                      {item.children.map((child) => {
+                        const childActive =
+                          router.pathname === child.href || router.pathname.startsWith(`${child.href}/`);
+                        const ChildIcon = child.icon;
+                        return (
+                          <Link
+                            key={child.href}
+                            href={child.href}
+                            className={`flex items-center gap-3 mx-2 px-3 py-2 rounded-lg text-sm transition-colors ${
+                              childActive
+                                ? 'bg-tradebot-accent/15 text-tradebot-accent font-semibold'
+                                : 'text-gray-500 hover:text-white hover:bg-gray-800/60'
+                            }`}
+                          >
+                            <ChildIcon className="w-4 h-4 shrink-0" />
+                            <span className="whitespace-nowrap">{child.label}</span>
+                          </Link>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              );
+            }
 
             return (
               <Link
@@ -190,7 +254,9 @@ export default function Layout({ children }: { children: React.ReactNode }) {
       </div>
 
       {/* PAUL JARVIS — global floating assistant (available on every page) */}
-      <PaulChat />
+      <ErrorBoundary fallback={<div className="fixed bottom-4 left-1/2 -translate-x-1/2 text-red-400 text-xs font-mono">JARVIS unavailable</div>}>
+        <PaulChat />
+      </ErrorBoundary>
 
       {/* Browser extension install prompt (auto-hides when extension connects) */}
       <ExtensionInstallPrompt />

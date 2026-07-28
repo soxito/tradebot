@@ -56,6 +56,11 @@
   let listening    = false
   let restartTimer = null
   let manuallyStopped = false
+  // True once this page is going away (unload / bfcache) or has been hidden.
+  // Every restart path checks it: `rec.stop()` fires onend, and onend is where
+  // the auto-restart lives, so without this a teardown *creates* a recogniser
+  // that outlives the page with the microphone still hot.
+  let pageGone = false
   let restartDelay = 500  // exponential back-off starting value (ms)
   // ── Speech-start health tracking (extension-side watchdog) ─────────────────
   // Chrome sometimes accepts rec.start() but never fires onstart inside a content
@@ -171,10 +176,28 @@
   let conversationEndTimer = null
   // Shared command-capture state (module scope so the Web Speech path AND the
   // Firefox Deepgram fallback path drive the SAME wake/conversation logic).
+  //
+  // `awaitingCommand` is the extension's ONLY honest answer to "is a user
+  // utterance being captured right now?", and it is deliberately NOT the same
+  // thing as `listening`. `listening` means the recogniser is ARMED — its
+  // resting state, true continuously and in total silence for as long as voice
+  // is enabled. The page needs the former for its mic indicator and for its own
+  // re-arm guards; it used to be handed the latter, which pinned it on
+  // "Listening…" forever with nobody speaking. Reported to the page as
+  // `capturing`, and never written directly — always through setAwaiting().
   let awaitingCommand = false
   let commandBuffer   = ''
   let commandTimer    = null
   let dispatchTimer   = null
+
+  // Single writer for awaitingCommand: flips the flag and tells the page, so the
+  // page's view can never drift from ours.
+  function setAwaiting(v) {
+    const next = !!v
+    if (next === awaitingCommand) return
+    awaitingCommand = next
+    try { status() } catch { /* status() is defined below; safe once running */ }
+  }
   // ── Voice frequency analyser (shared for panel + popup relay) ─────────────
   let freqCtx = null
   let freqAnalyser = null
@@ -297,7 +320,11 @@
   function status(extra = {}) {
     toPage({
       type: 'status',
+      // "the recogniser is ARMED" — decides mic ownership, nothing else.
       listening,
+      // "a user utterance is being captured RIGHT NOW" — the only thing the page
+      // may drive its mic indicator and its re-arm guards from.
+      capturing: !!(listening && awaitingCommand),
       enabled: !!settings.enabled,
       speechSupported: VOICE_SUPPORTED,
       voiceReady: VOICE_SUPPORTED && !!settings.enabled && !voiceFailed,
@@ -316,6 +343,7 @@
       // recognition is truly running — never while the extension is merely
       // connected/enabled but stuck before onstart ("Starting…").
       listening: !!listening,
+      capturing: !!(listening && awaitingCommand),
     })
   }
   // Re-publish voice readiness to the page (DOM attr + status message). Called
@@ -353,6 +381,11 @@
     // Abort any active Deepgram clip recording (Firefox path)
     fxAbort()
     fxSpeaking = false
+    // JARVIS is about to talk, so no user utterance is being captured. Say so —
+    // this transition used to be silent, leaving the page's last-known state
+    // stuck at "capturing" for the whole reply and beyond.
+    setAwaiting(false)
+    status()
   }
 
   function speakNow(text) {
@@ -981,16 +1014,16 @@
       if (voiceOK && hasWake(transcript) && !isSelfEcho(transcript)) {
         toPage({ type: 'interrupt' })
         pageSpeaking = false
-        awaitingCommand = true
+        setAwaiting(true)
         commandBuffer   = stripWake(transcript)
         toPage({ type: 'wake' })
         badge('▶', '#06b6d4')
         clearTimeout(commandTimer)
         if (isFinal && commandBuffer.length > 2) {
-          dispatchCommand(commandBuffer); awaitingCommand = false; commandBuffer = ''; badge('●', '#22c55e')
+          dispatchCommand(commandBuffer); setAwaiting(false); commandBuffer = ''; badge('●', '#22c55e')
         } else {
           commandTimer = setTimeout(() => {
-            escalateDeepgram('wake_no_command'); awaitingCommand = false; commandBuffer = ''; badge('●', '#22c55e')
+            escalateDeepgram('wake_no_command'); setAwaiting(false); commandBuffer = ''; badge('●', '#22c55e')
           }, 7000)
         }
       }
@@ -1006,16 +1039,16 @@
       const woke          = isFinal && hasWake(transcript)
       const convoFollowUp = isFinal && inConversation && !hasWake(transcript) && transcript.trim().length > 2
       if (woke || convoFollowUp) {
-        awaitingCommand = true
+        setAwaiting(true)
         commandBuffer   = woke ? stripWake(transcript) : transcript.trim()
         if (woke) { notify('JARVIS', 'Listening for your command…'); toPage({ type: 'wake' }) }
         badge('▶', '#06b6d4')
         clearTimeout(commandTimer)
         if (commandBuffer.length > 2) {
-          dispatchCommand(commandBuffer); awaitingCommand = false; commandBuffer = ''; badge('●', '#22c55e')
+          dispatchCommand(commandBuffer); setAwaiting(false); commandBuffer = ''; badge('●', '#22c55e')
         } else {
           commandTimer = setTimeout(() => {
-            escalateDeepgram('wake_no_command'); awaitingCommand = false; commandBuffer = ''; badge('●', '#22c55e')
+            escalateDeepgram('wake_no_command'); setAwaiting(false); commandBuffer = ''; badge('●', '#22c55e')
           }, 7000)
         }
       }
@@ -1026,14 +1059,14 @@
         clearTimeout(dispatchTimer)
         commandBuffer = (commandBuffer + ' ' + piece).trim()
         clearTimeout(commandTimer)
-        dispatchCommand(commandBuffer); awaitingCommand = false; commandBuffer = ''; badge('●', '#22c55e')
+        dispatchCommand(commandBuffer); setAwaiting(false); commandBuffer = ''; badge('●', '#22c55e')
       } else if (piece) {
         const snapshot = (commandBuffer + ' ' + piece).trim()
         clearTimeout(dispatchTimer)
         dispatchTimer = setTimeout(() => {
           if (awaitingCommand && snapshot.length > 2) {
             clearTimeout(commandTimer)
-            dispatchCommand(snapshot); awaitingCommand = false; commandBuffer = ''; badge('●', '#22c55e')
+            dispatchCommand(snapshot); setAwaiting(false); commandBuffer = ''; badge('●', '#22c55e')
           }
         }, 600)
       }
@@ -1062,7 +1095,7 @@
       // Slow background retry: if the engine recovers we reclaim voice cleanly.
       clearTimeout(restartTimer)
       restartTimer = setTimeout(() => {
-        if (!settings.enabled || manuallyStopped) return
+        if (pageGone || !settings.enabled || manuallyStopped) return
         voiceFailed = false
         consecutiveFailures = 0
         startRecognition()
@@ -1073,16 +1106,21 @@
 
   // ── Speech recognition lifecycle ──────────────────────────────────────────
   function startRecognition() {
+    if (pageGone) return   // page unloading / hidden — never re-open the mic
     if (!SR) {
       // No Web Speech API (Firefox) — fall back to the Deepgram listen loop so
       // wake-word + commands still work. The mic/analyser is started separately.
       console.warn(TAG, 'Web Speech API not available — using Deepgram fallback (Firefox).')
-      listening = false
+      // The Deepgram loop IS the armed recogniser on this path, so `listening`
+      // must say so honestly rather than being reported true by a literal in the
+      // status call below while the variable stayed false — a claim nothing ever
+      // retracted, which latched the page's indicator permanently.
+      listening = !!settings.enabled
       startFirefoxListen()
       // Advertise voice as READY (Deepgram engine) so the page cedes the mic and
       // shows the assistant as listening, exactly like the Web Speech path.
       try { document.documentElement.setAttribute('data-jarvis-ext-voice', '1') } catch { /* noop */ }
-      status({ engine: 'deepgram', speechSupported: true, voiceReady: !!settings.enabled, listening: true })
+      status({ engine: 'deepgram', speechSupported: true, voiceReady: !!settings.enabled })
       badge('◐', '#a855f7')
       return
     }
@@ -1195,16 +1233,25 @@
     // ── onend ─────────────────────────────────────────────────────────────────
     rec.onend = () => {
       try {
+        // A superseded or detached recogniser must not speak for the live one and
+        // must not restart itself — that is how one microphone ends up with two
+        // recognisers on it, only the newest of which anything can stop.
+        if (recognition !== rec) return
         clearTimeout(dispatchTimer)
         clearTimeout(startWatchdog); startWatchdog = null
         listening = false
+        // The utterance (if any) died with the recogniser.
+        setAwaiting(false)
         // Ended without ever reaching onstart → count it as a start failure so we
         // can eventually cede the mic to the page instead of restart-looping.
         if (!recStartedOk) handleStartFailure('onend-before-start')
         status()
-        if (settings.enabled && !manuallyStopped && !voiceFailed) {
+        if (settings.enabled && !manuallyStopped && !voiceFailed && !pageGone) {
           clearTimeout(restartTimer)
-          restartTimer = setTimeout(() => { if (settings.enabled && !listening) startRecognition() }, restartDelay)
+          restartTimer = setTimeout(() => {
+            if (pageGone) return
+            if (!pageGone && settings.enabled && !listening) startRecognition()
+          }, restartDelay)
         } else if (!voiceFailed) {
           badge('', '#64748b')
         }
@@ -1224,7 +1271,7 @@
         handleStartFailure('no-onstart')
         if (!voiceFailed && settings.enabled && !manuallyStopped) {
           clearTimeout(restartTimer)
-          restartTimer = setTimeout(() => { if (settings.enabled && !listening) startRecognition() }, restartDelay)
+          restartTimer = setTimeout(() => { if (!pageGone && settings.enabled && !listening) startRecognition() }, restartDelay)
         }
       }
     }, 2500)
@@ -1237,7 +1284,7 @@
       handleStartFailure('start-throw')
       if (!voiceFailed && settings.enabled && !manuallyStopped) {
         clearTimeout(restartTimer)
-        restartTimer = setTimeout(() => { if (settings.enabled && !listening) startRecognition() }, Math.max(restartDelay, 800))
+        restartTimer = setTimeout(() => { if (!pageGone && settings.enabled && !listening) startRecognition() }, Math.max(restartDelay, 800))
       }
     }
   }
@@ -1246,14 +1293,76 @@
     manuallyStopped = true
     clearTimeout(restartTimer)
     clearTimeout(startWatchdog); startWatchdog = null
+    clearTimeout(commandTimer)
+    clearTimeout(dispatchTimer)
     recStartedOk = false
-    try { if (recognition) { recognition.onend = null; recognition.stop() } } catch { /* noop */ }
+    // Detach every handler before stopping: stop() fires onend, and onend is the
+    // restart path. Nulling onerror/onresult too means a recogniser that is on
+    // its way out can neither restart nor deliver a stale transcript.
+    try {
+      if (recognition) {
+        recognition.onend = null; recognition.onerror = null; recognition.onresult = null; recognition.onstart = null
+        recognition.stop()
+        if (recognition.abort) recognition.abort()
+      }
+    } catch { /* noop */ }
     recognition = null
     if (fxActive) stopFirefoxListen()  // also stop the Firefox Deepgram loop
     listening   = false
+    setAwaiting(false)
+    commandBuffer = ''
     badge('', '#64748b')
     status()
   }
+
+  // ── Guaranteed teardown ───────────────────────────────────────────────────
+  // The content script had no unload handling at all: navigating away abandoned
+  // a live recogniser mid-flight and left the page's last-known state stuck at
+  // listening/capturing. A hidden tab is a pause (the user comes back); unload
+  // and bfcache are final. Either way the page is told, explicitly, that nothing
+  // is being captured — a surface that only ever hears "true" never goes idle.
+  function teardownVoice(final) {
+    pageGone = true
+    clearTimeout(restartTimer)
+    clearTimeout(startWatchdog); startWatchdog = null
+    clearTimeout(commandTimer)
+    clearTimeout(dispatchTimer)
+    try {
+      if (recognition) {
+        recognition.onend = null; recognition.onerror = null; recognition.onresult = null; recognition.onstart = null
+        recognition.stop()
+        if (recognition.abort) recognition.abort()
+      }
+    } catch { /* noop */ }
+    recognition = null
+    recStartedOk = false
+    if (fxActive) { try { stopFirefoxListen() } catch { /* noop */ } }
+    try { stopFreqAnalyser() } catch { /* noop */ }
+    try { window.speechSynthesis && window.speechSynthesis.cancel() } catch { /* noop */ }
+    listening = false
+    awaitingCommand = false
+    commandBuffer = ''
+    pageSpeaking = false
+    pageSpeakingSetAt = 0
+    if (!final) status()   // on a real unload the page is gone; don't bother
+  }
+
+  function resumeVoice() {
+    if (!pageGone) return
+    pageGone = false
+    if (settings.enabled && !manuallyStopped) {
+      startRecognition()
+      try { initFreqAnalyser() } catch { /* noop */ }
+    }
+    status()
+  }
+
+  window.addEventListener('pagehide', () => teardownVoice(true))
+  window.addEventListener('beforeunload', () => teardownVoice(true))
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') teardownVoice(false)
+    else resumeVoice()
+  })
 
   // ── Page → Extension message handler ──────────────────────────────────────
   window.addEventListener('message', (event) => {
@@ -1321,7 +1430,7 @@
               if (settings.enabled && !listening) {
                 manuallyStopped = false
                 clearTimeout(restartTimer)
-                restartTimer = setTimeout(() => { if (settings.enabled && !listening) startRecognition() }, 150)
+                restartTimer = setTimeout(() => { if (!pageGone && settings.enabled && !listening) startRecognition() }, 150)
               }
             } else {
               stopRecognition()
@@ -1333,7 +1442,7 @@
             if (inConversation) enterConversation()
             manuallyStopped = false
             clearTimeout(restartTimer)
-            restartTimer = setTimeout(() => { if (settings.enabled && !listening) startRecognition() }, 350)
+            restartTimer = setTimeout(() => { if (!pageGone && settings.enabled && !listening) startRecognition() }, 350)
           }
           break
 
@@ -1488,7 +1597,7 @@
           initFreqAnalyser()
           // Re-arm on first user gesture in case the browser blocked autostart
           const arm = () => {
-            if (settings.enabled && !listening) startRecognition()
+            if (!pageGone && settings.enabled && !listening) startRecognition()
             if (settings.enabled && !freqCtx) initFreqAnalyser()
           }
           window.addEventListener('pointerdown', arm, { once: true, passive: true })

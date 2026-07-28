@@ -379,6 +379,10 @@ class MT5SmcSignal(BaseModel):
     # ── Kronos ML fusion (optional; populated when a forecast is available) ──
     kronos_aligned: Optional[bool] = None   # True=agrees, False=opposes, None=n/a
     fusion_score: Optional[float] = None     # 0..1 blended SMC + Kronos quality
+    # Numeric audit trail for `confidence`: which factors contributed and by how
+    # much, plus the volume-confirmation and HTF-gate outcomes.
+    # See services/smc_scoring.py.
+    score_breakdown: Dict[str, Any] = {}
 
 
 class MT5SmcZone(BaseModel):
@@ -393,6 +397,8 @@ class MT5SmcAnalyzeResponse(BaseModel):
     symbol: str
     timeframe: str
     bias: Optional[str] = None
+    # Higher-timeframe structural bias used to gate entries (None = not supplied).
+    htf_bias: Optional[str] = None
     last_price: Optional[float] = None
     atr: Optional[float] = None
     atr_pct: Optional[float] = None
@@ -409,6 +415,12 @@ class MT5SmcAnalyzeResponse(BaseModel):
     ai: Optional[Dict[str, Any]] = None
     kronos: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+    # Analysis-router provenance: which provider answered, at which tier
+    # ("primary" | "cascade" | "deterministic"), and whether the result came
+    # from anything other than the healthiest provider.
+    provider_used: Optional[str] = None
+    tier: Optional[str] = None
+    is_degraded: bool = False
 
 
 class MT5BacktestRequest(BaseModel):
@@ -469,6 +481,10 @@ class MT5SmcAnalyzeDataRequest(BaseModel):
     daily_profit_target_pct: float = Field(default=0.0, ge=0.0, le=1000.0)
     us_session_only: bool = Field(default=False)
     candles: List[MT5CandleInput] = Field(default_factory=list)
+    # Optional higher-timeframe series for the same instrument. When supplied,
+    # its structural bias GATES entries exactly as on GET /strategy/analyze —
+    # without it this source-agnostic path would silently skip HTF alignment.
+    htf_candles: List[MT5CandleInput] = Field(default_factory=list)
 
 
 class MT5BacktestDataRequest(BaseModel):

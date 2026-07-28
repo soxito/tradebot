@@ -19,6 +19,8 @@ from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from plugins.AiMarketAnalyst.backend.services.ai_router import db_chat
+from plugins.AiMarketAnalyst.backend.services import analysis_router
+from plugins.MT5TradingPlugin.backend.services import smc_floor, smc_memory
 
 
 _SYSTEM_PROMPT = (
@@ -28,6 +30,12 @@ _SYSTEM_PROMPT = (
     "resting limit-entry setups produced by a deterministic engine. "
     "Your role: review and rate each setup for sniper-quality, low-drawdown entries. "
     "Do NOT invent or adjust price levels. "
+    "You are also given `similar_past_setups`: the closest historical setups on "
+    "this instrument by factor profile, each with its REALISED result (R multiple, "
+    "MFE, MAE, exit reason), and `realised_performance` aggregating this "
+    "instrument's actual win rate and average R. These are measured outcomes, not "
+    "forecasts. Weight your verdicts by them: if near-identical setups have "
+    "historically lost, say so in the note and rate accordingly. "
     "Respond with STRICT JSON only, no prose, matching this schema exactly:\n"
     '{"bias_comment": str, "market_read": str, '
     '"rated_signals": [{"entry": number, "verdict": "take"|"skip"|"watch", '
@@ -98,9 +106,20 @@ def _validate(raw: Any, valid_entries: List[float]) -> Optional[Dict[str, Any]]:
     except (TypeError, ValueError):
         top_val = None
 
+    market_read = str(raw.get("market_read", "")).strip()[:600]
+    bias_comment = str(raw.get("bias_comment", "")).strip()[:400]
+
+    # Substance check. A model that answers `{}`, or that rates none of the real
+    # engine entries, has told us nothing — reject so the router cascades to the
+    # next provider instead of surfacing an empty panel as a success.
+    if not rated_out and valid_entries:
+        return None
+    if not market_read and not bias_comment:
+        return None
+
     return {
-        "bias_comment": str(raw.get("bias_comment", ""))[:400],
-        "market_read": str(raw.get("market_read", ""))[:600],
+        "bias_comment": bias_comment,
+        "market_read": market_read,
         "rated_signals": rated_out,
         "top_pick_entry": top_val,
         "risk_warning": str(raw.get("risk_warning", ""))[:300],
@@ -124,6 +143,7 @@ async def ai_review(
     timeframe: str,
     analysis: Dict[str, Any],
     kronos_forecast: Optional[Dict[str, Any]] = None,
+    market: str = "mt5",
 ) -> Dict[str, Any]:
     """
     Ask the DB-backed AI router to review the SMC engine's analysis.
@@ -140,8 +160,13 @@ async def ai_review(
     signals = analysis.get("signals", [])
     valid_entries = [float(s["entry"]) for s in signals if "entry" in s]
 
-    if not signals:
-        return {"available": False, "reason": "No setups to review"}
+    # No setups (or the engine could not analyse at all) still gets a complete,
+    # valid block explaining why — never an empty AI panel.
+    if not signals or analysis.get("error"):
+        return smc_floor.build(
+            analysis,
+            reason=analysis.get("error") or "no candidate setups to review",
+        )
 
     # Sox ML K-line forecast (supplied by the router from the chart's candles).
     kronos_fc = None
@@ -162,10 +187,37 @@ async def ai_review(
     except Exception:
         pass
 
+    # ── Grounded history ─────────────────────────────────────────────────────
+    # For the top candidate, pull the closest historical setups by factor
+    # profile along with what they actually returned, plus this instrument's
+    # realised performance. These are measured results, not opinions — they let
+    # the model reason from what happened rather than from priors.
+    prior_setups: List[Dict[str, Any]] = []
+    realised: Dict[str, Any] = {}
+    try:
+        top = signals[0]
+        prior_setups = await smc_memory.similar_setups(
+            db,
+            market=market,
+            symbol=symbol,
+            side=top.get("side", ""),
+            factors=smc_memory.factor_vector(top.get("score_breakdown")),
+            limit=3,
+        )
+        realised = await smc_memory.outcome_summary(
+            db, market=market, symbol=symbol, side=top.get("side")
+        )
+    except Exception as exc:  # noqa: BLE001 — history is an enhancement
+        logger.debug(f"[MT5/SMC-AI] prior-setup recall skipped: {exc}")
+
     context = {
         "symbol": symbol,
         "timeframe": timeframe,
         "bias": analysis.get("bias"),
+        "htf_bias": analysis.get("htf_bias"),
+        # Realised outcomes of the most similar prior setups on this instrument.
+        "similar_past_setups": prior_setups,
+        "realised_performance": realised,
         "last_price": analysis.get("last_price"),
         "atr": analysis.get("atr"),
         "atr_pct": analysis.get("atr_pct"),
@@ -198,33 +250,40 @@ async def ai_review(
         {"role": "user", "content": json.dumps(context, separators=(",", ":"))},
     ]
 
+    # Tier 1/2: health-ranked provider cascade with a 12 s hard cap per attempt.
+    # A schema-invalid response is rejected by `validator` and cascades to the
+    # next provider rather than surfacing as a failure.
     try:
-        result = await db_chat(
+        result = await analysis_router.analyze_with_cascade(
             db,
             messages,
+            validator=lambda raw: _validate(raw, valid_entries),
             temperature=0.15,
             max_tokens=900,
             json_mode=True,
-            agent_name="smc_sniper",
-            agent_role="market_analyst",
-            source="smc_sniper",
         )
-    except Exception as exc:
-        logger.warning(f"[MT5/SMC-AI] db_chat failed: {exc}")
-        return {"available": False, "reason": f"AI call failed: {exc}"}
+    except Exception as exc:  # noqa: BLE001 — the cascade must never propagate
+        logger.warning(f"[MT5/SMC-AI] cascade raised unexpectedly: {exc}")
+        result = {"ok": False, "errors": [str(exc)]}
 
     if not result.get("ok"):
-        return {"available": False, "reason": result.get("error", "All providers failed")}
+        # Tier 3: deterministic floor. Always a complete, valid block.
+        reason = "; ".join(result.get("errors") or ["all providers failed"])[:200]
+        logger.warning(f"[MT5/SMC-AI] falling back to deterministic floor: {reason}")
+        return smc_floor.build(analysis, reason=reason)
 
-    validated = _validate(result.get("content"), valid_entries)
-    if validated is None:
-        logger.warning("[MT5/SMC-AI] AI returned unparseable output: %s",
-                       str(result.get("content", ""))[:200])
-        return {"available": False, "reason": "AI returned malformed JSON"}
+    validated: Dict[str, Any] = dict(result["content"])
+    rated = validated.get("rated_signals") or []
+    top_conf = max((float(r.get("confidence") or 0.0) for r in rated), default=0.0)
 
     validated["available"] = True
-    validated["provider"] = result.get("provider")
+    validated["provider"] = result.get("provider_used")
+    validated["provider_used"] = result.get("provider_used")
     validated["model"] = result.get("model")
+    validated["tier"] = result.get("tier")
+    validated["confidence"] = round(top_conf, 3)
+    validated["is_degraded"] = result.get("tier") != analysis_router.TIER_PRIMARY
+    validated["latency_ms"] = result.get("latency_ms")
     return validated
 
 
@@ -331,32 +390,9 @@ async def ai_backtest_review(
 
 
 # ── Economic Calendar helper ──────────────────────────────────────────────────
-# Fetches upcoming high-impact economic events (CPI, interest rates, NFP, GDP,
-# PMI, etc.) that are relevant for the instrument being analysed.
-# Used by the AI review + scalp gate so models can factor in scheduled risk.
-
-_ECO_CURRENCY_MAP: Dict[str, List[str]] = {
-    "XAUUSD": ["USD", "XAU"],
-    "XAGUSD": ["USD", "XAG"],
-    "EURUSD": ["EUR", "USD"],
-    "GBPUSD": ["GBP", "USD"],
-    "USDJPY": ["USD", "JPY"],
-    "USDCHF": ["USD", "CHF"],
-    "AUDUSD": ["AUD", "USD"],
-    "NZDUSD": ["NZD", "USD"],
-    "USDCAD": ["USD", "CAD"],
-    "US30":   ["USD"],
-    "NAS100": ["USD"],
-    "SP500":  ["USD"],
-    "USOIL":  ["USD"],
-    "UKOIL":  ["USD"],
-}
-
-_HIGH_IMPACT_KEYWORDS = (
-    "interest rate", "cpi", "inflation", "gdp", "nfp", "non-farm",
-    "unemployment", "fomc", "federal reserve", "ecb", "boe", "rba",
-    "pmi", "retail sales", "trade balance", "pce", "core cpi",
-)
+# Symbol-scoped view over the shared calendar window. The window itself (fetch,
+# two-week horizon, cache) lives in ``economic_calendar`` so the /research page,
+# the agent reminder and this prompt all read one fetch instead of three.
 
 
 async def fetch_economic_events(symbol: str, lookback_hours: int = 48,
@@ -368,55 +404,42 @@ async def fetch_economic_events(symbol: str, lookback_hours: int = 48,
     Results are sorted nearest-first and limited to 10 to stay token-efficient
     for the AI context window.  Always fails gracefully — never raises.
     """
-    currencies = _ECO_CURRENCY_MAP.get(
-        (symbol or "").upper().replace("/", ""),
-        [(symbol or "").upper()[:3], (symbol or "").upper()[3:6]],
-    )
+    from plugins.MT5TradingPlugin.backend.services import economic_calendar as eco
+
+    key = (symbol or "").upper().replace("/", "")
+    currencies = eco.ECO_CURRENCY_MAP.get(key, [key[:3], key[3:6]])
+
     try:
-        import httpx  # type: ignore
-        now = datetime.now(timezone.utc)
-        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            resp = await client.get(url, headers={"User-Agent": "TradeBot/1.0"})
-            resp.raise_for_status()
-            events: List[Dict[str, Any]] = resp.json()
-    except Exception as e:
-        logger.debug(f"[economic_events] fetch failed: {e}")
+        window = await eco.fetch_calendar_window()
+    except Exception as e:  # noqa: BLE001 — scheduled risk is advisory, never fatal
+        logger.debug(f"[economic_events] window unavailable: {e}")
         return []
 
-    out: List[Dict[str, Any]] = []
-    for ev in events:
-        try:
-            currency = str(ev.get("country", ev.get("currency", ""))).upper()
-            if currency not in currencies:
-                continue
-            impact = str(ev.get("impact", ev.get("type", ""))).lower()
-            if "high" not in impact:
-                continue
-            title = str(ev.get("title", ev.get("name", ""))).lower()
-            if not any(kw in title for kw in _HIGH_IMPACT_KEYWORDS):
-                continue
-            # Parse event time
-            date_str = str(ev.get("date", ev.get("time", "")))
-            try:
-                ev_time = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-            except (ValueError, AttributeError):
-                continue
-            delta_h = (ev_time - now).total_seconds() / 3600.0
-            if delta_h < -lookback_hours or delta_h > lookahead_hours:
-                continue
-            out.append({
-                "title":    ev.get("title") or ev.get("name", ""),
-                "currency": currency,
-                "impact":   "high",
-                "time_utc": ev_time.strftime("%Y-%m-%d %H:%M"),
-                "hours_away": round(delta_h, 1),
-                "forecast": ev.get("forecast"),
-                "previous": ev.get("previous"),
-                "actual":   ev.get("actual"),
-            })
-        except Exception:
-            continue
+    events = eco.query_calendar(
+        window,
+        currencies=currencies,
+        impact="high",
+        days=max(1, lookahead_hours // 24 + 1),
+        lookback_hours=lookback_hours,
+    )
 
+    # The title-keyword narrowing this caller has always applied on top of the
+    # impact filter. The calendar page deliberately does not — it shows every
+    # high-impact event — but the AI context stays token-tight.
+    out = [
+        {
+            "title":      e["title"],
+            "currency":   e["currency"],
+            "impact":     "high",
+            "time_utc":   e["time_utc"],
+            "hours_away": e["hours_away"],
+            "forecast":   e["forecast"],
+            "previous":   e["previous"],
+            "actual":     e["actual"],
+        }
+        for e in events
+        if eco.matches_high_impact_keyword(e["title"])
+        and -lookback_hours <= e["hours_away"] <= lookahead_hours
+    ]
     out.sort(key=lambda x: abs(x["hours_away"]))
     return out[:10]

@@ -91,3 +91,83 @@ the camera can *see* the user's lips moving, self-transcription becomes
 4. **Identity-check the interrupt path too.** Barge-in is a privileged action;
    an enrolled profile with an unmatched face (a stranger on camera) must not be
    able to silence or command JARVIS.
+
+---
+
+# Part 2 — The mic stuck on "Listening…" (2026-07-27)
+
+**Area:** `frontend/src/components/PaulChat.tsx`, `jarvis-extension/content.js`,
+`frontend/src/pages/jarvis-room.tsx`
+
+## The Problem
+
+With nobody speaking, the mic indicator sat on "Listening…" forever and the
+JARVIS Room orb glowed `listening` permanently — while JARVIS was, in fact,
+**deaf**. This had been "fixed" at least four times (`917fe8b`, `ce08983`,
+`d636f38`, `dd05e70`, `b2b2152`) and came back every time, because every one of
+those fixes improved *when audio is accepted* or *who owns the mic* and none of
+them touched the state variable itself.
+
+## Root Cause
+
+`listening` was one boolean with **two writers that meant different things by
+it**, plus recognisers with **no disposal guard**.
+
+1. **Dual ownership.** The page wrote `listening` to mean *"my dictation
+   recogniser is capturing a user utterance"* — transient, per-utterance. The
+   extension wrote it, via `setListening(!!d.listening)` in PaulChat's `status`
+   handler, to mean *"my recogniser process is armed"* — which is the
+   extension's **permanent idle state** (`content.js` sets `listening = true` in
+   `rec.onstart` and restarts on every `onend`). Enable the extension and the
+   page latched `true` forever.
+
+2. **The latch also caused the deafness.** `listeningRef` is the guard on *every*
+   in-page recogniser re-arm path. Stuck `true` meant the fallback recogniser was
+   permanently suppressed — so the UI said "listening" precisely because nothing
+   was.
+
+3. **Teardown resurrected the recogniser.** `rec.stop()` **fires `onend`**, and
+   `onend` is where the auto-restart lives. Every teardown path called a bare
+   `stop()`, so unmount/route-change *created* a fresh recogniser 400–600 ms
+   later that nothing held a reference to and nothing could ever stop.
+
+4. **Two recognisers, one tracked.** The wake effect depended on `startWake`, a
+   `useCallback` that changes identity on ordinary re-renders. Each re-run
+   stopped the old recogniser (→ zombie restart) and started another. `wakeRef`
+   held only the newest. StrictMode's double mount hit this every time.
+
+## The Invariants (never break these)
+
+> **1. `listening` means "a user utterance is being captured RIGHT NOW" — never
+> "a recogniser is armed".** An armed recogniser waiting in silence is the
+> resting state. These are two different facts and they need two different
+> fields. The extension reports them separately: `listening` (armed → decides mic
+> ownership only) and `capturing` (an utterance → the only thing the page's
+> indicator and re-arm guards may read).
+
+> **2. One writer.** All writes go through `markCapturing(on, owner)`. A claim is
+> released only by the surface that made it, or by the reconciler.
+
+> **3. Stopping a recogniser is not tearing it down.** `stop()` fires `onend`,
+> and `onend` restarts. Detach the handlers *first* (`detachRecognizer`) or the
+> teardown becomes a restart. Every restart path also checks `voiceDisposedRef`.
+
+> **4. Every state a surface renders must be retractable.** A consumer that only
+> ever hears "true" latches. PaulChat broadcasts an explicit idle on every
+> teardown; the Room drops to idle on tab-hide on its own.
+
+## Why It Cannot Regress The Same Way
+
+`frontend/src/hooks/__tests__/useDeepgramAgent.listeningLifecycle.test.tsx`
+pins all four invariants and was verified to **fail** when each defect is
+re-introduced — the extension-armed write, the missing disposal guards, and the
+`startWake` dependency churn. A reconciler (`CAPTURE_STALE_MS`) is the backstop,
+never the fix: a capture claim not backed by a live recogniser or a recent
+refresh is dropped.
+
+## Relationship to Part 1
+
+Part 1's camera gate decides **whether a transcript is accepted**. Part 2 decides
+**whether a recogniser exists and what the UI says about it**. They are
+independent — which is exactly why four rounds of Part-1-style hardening never
+touched this bug.

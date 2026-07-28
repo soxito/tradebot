@@ -696,6 +696,7 @@ class TelegramSignalMonitor:
             get_updates,
             send_message,
             answer_callback_query,
+            sync_bot_commands,
         )
         from plugins.TelegramSignalNewsPlugin.backend.services.command_service import (
             parse_and_execute,
@@ -706,6 +707,7 @@ class TelegramSignalMonitor:
         logger.info("🤖 Bot polling loop running")
 
         offset: int | None = None
+        commands_synced_for: str | None = None  # token the / menu was pushed for
 
         while True:
             try:
@@ -730,6 +732,11 @@ class TelegramSignalMonitor:
                     allowed = list(cfg_row.allowed_chat_ids_json or [])
                     if cfg_row.last_update_id is not None:
                         offset = cfg_row.last_update_id + 1
+
+                # Push the / menu once per token so it always matches the code.
+                if commands_synced_for != token:
+                    if await sync_bot_commands(token):
+                        commands_synced_for = token
 
                 resp = await get_updates(token, offset=offset, timeout=2)
                 if not resp.get("ok"):

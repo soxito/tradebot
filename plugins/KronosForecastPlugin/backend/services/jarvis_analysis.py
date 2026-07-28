@@ -36,9 +36,15 @@ _SYSTEM_PROMPT = (
     "(3) TARGET vs CURRENT PRICE — analyse the distance to the target, discuss "
     "what achieving or missing it implies for the broader trend, and note any key "
     "support/resistance levels in the band range; "
-    "(4) MARKET CONTEXT — for crypto, explain how the market-cap size and rank "
-    "shape liquidity risk, whether 24h volume supports the move, and how these "
-    "factors strengthen or weaken conviction in the forecast; "
+    "(4) VOLUME EVIDENCE — you are given a resolved VOLUME GATE. Quote its "
+    "numbers exactly: rolling 24h volume, the last completed 1h volume, the "
+    "relative volume vs the 24h hourly mean, the regime "
+    "(DEAD/NORMAL/ELEVATED/CLIMACTIC) and the price-volume divergence. Explain "
+    "what they mean for this move — rising price on rising relative volume is "
+    "trend continuation, rising price on falling relative volume is exhaustion, "
+    "and climactic volume against the move is reversal risk. For crypto also "
+    "cover how market-cap size and rank shape liquidity risk. Never invent a "
+    "volume number that is not in the input; "
     "(5) ACTIONABLE TAKEAWAY — give one specific, risk-aware recommendation with "
     "a clear entry rationale, stop-loss zone, and take-profit target derived from "
     "the forecast numbers. "
@@ -153,6 +159,33 @@ def _build_user_prompt(
         ]
     if band_lo is not None and band_hi is not None:
         lines.append(f"End-of-horizon p10-p90 band: {band_lo:.6g} to {band_hi:.6g}")
+    vol = resp.volume
+    if vol is not None:
+        lines += ["", "VOLUME GATE (this forecast is conditioned on it):",
+                  f"  Status: {vol.status}  |  Source: {vol.source} ({vol.volume_unit} volume)"]
+        if vol.status == "OK":
+            lines += [
+                f"  Rolling 24h volume: {vol.volume_24h:,.4g}",
+                f"  Last completed 1h volume: {vol.volume_1h:,.4g} "
+                f"(24h hourly mean {vol.hourly_mean_24h:,.4g})",
+                f"  Relative volume: x{vol.relative_volume:.2f}"
+                + (f"  |  z-score {vol.z_score:+.2f}" if vol.z_score is not None else ""),
+                f"  Regime: {vol.regime}  |  Divergence: {vol.divergence} "
+                f"over {vol.divergence_bars}h",
+            ]
+            if vol.reversal_risk:
+                lines.append("  REVERSAL RISK: climactic volume is confirming the opposite move.")
+        else:
+            lines.append(f"  {vol.detail}")
+    if sig and sig.rationale:
+        lines += ["", "Why this direction was chosen:"] + [f"  - {r}" for r in sig.rationale]
+    if resp.decision != "OK":
+        lines += [
+            "",
+            f"DECISION: {resp.decision}. Do NOT recommend an entry. Explain to the "
+            "trader exactly which volume precondition failed and what would have to "
+            "change before a trade is justified.",
+        ]
     if market:
         lines += [
             "",
@@ -415,6 +448,23 @@ def _fallback_analysis(
     sig = resp.signal
     if not sig:
         return f"No Kronos forecast is available for {resp.symbol} on {resp.timeframe}."
+    vol = resp.volume
+
+    # Volume failed its precondition → the only honest summary is why.
+    if resp.decision == "NO_TRADE":
+        parts = [
+            f"NO_TRADE on {resp.symbol} ({resp.timeframe}). Volume is a hard "
+            f"precondition for a Kronos direction call and it is "
+            f"{(vol.status.lower() if vol else 'unavailable')}.",
+        ]
+        if vol and vol.detail:
+            parts.append(vol.detail)
+        parts.append(
+            "No direction has been inferred from price alone. Re-run once a full "
+            "rolling 24 hours of volume is available for this symbol."
+        )
+        return " ".join(parts)
+
     band_lo = resp.lower_band[-1].value if resp.lower_band else None
     band_hi = resp.upper_band[-1].value if resp.upper_band else None
     parts = [
@@ -423,6 +473,23 @@ def _fallback_analysis(
         f"targeting {sig.target_price:.6g} from {resp.anchor_price:.6g} at "
         f"{sig.confidence * 100:.0f}% confidence.",
     ]
+    if vol and vol.status == "OK":
+        parts.append(
+            f"Volume backs this read: 24h {_fmt_usd(vol.volume_24h)} equivalent, last "
+            f"completed hour {vol.volume_1h:,.4g} vs an hourly mean of "
+            f"{vol.hourly_mean_24h:,.4g} (×{vol.relative_volume:.2f}) — a "
+            f"{vol.regime} regime with {vol.divergence} price/volume behaviour."
+        )
+        if vol.reversal_risk:
+            parts.append(
+                "Reversal risk: climactic volume is confirming the opposite move, so "
+                "the confidence has been cut accordingly."
+            )
+    if resp.decision == "LOW_CONFIDENCE":
+        parts.append(
+            "This sits below the tradeable confidence floor once volume is factored "
+            "in — treat it as information, not an entry."
+        )
     if band_lo is not None and band_hi is not None:
         parts.append(
             f"The p10–p90 band ({band_lo:.6g}–{band_hi:.6g}) frames the uncertainty; "
@@ -448,6 +515,14 @@ def _fallback_position_advice(
     if not position or not resp.signal:
         return None
     sig = resp.signal
+    if resp.decision == "NO_TRADE":
+        vol = resp.volume
+        return (
+            f"Volume context is {(vol.status.lower() if vol else 'unavailable')} for "
+            f"{resp.symbol}, so there is no forecast to judge your {position.side} "
+            f"({position.pnl:+.2f}%) against. Manage it on your own stop until volume "
+            f"data returns — no direction is being inferred from price alone."
+        )
     aligned = (
         (position.side == "long" and sig.direction == "up")
         or (position.side == "short" and sig.direction == "down")
@@ -497,6 +572,26 @@ async def analyze_forecast(
     it to the knowledge brain."""
     market = await _market_context(resp.symbol)
     position = await _open_position(resp.exchange, resp.symbol)
+
+    # Volume gate: a refused forecast gets a deterministic explanation, not an
+    # LLM narration that could talk itself into a direction we did not compute.
+    if resp.decision == "NO_TRADE":
+        vol = resp.volume
+        analysis = _fallback_analysis(resp, market, position)
+        return JarvisAnalysisResponse(
+            exchange=resp.exchange, symbol=resp.symbol, timeframe=resp.timeframe,
+            engine=resp.engine, analysis=analysis,
+            spoken=(resp.signal.summary if resp.signal
+                    else f"No trade on {resp.symbol} — volume unavailable."),
+            signal=resp.signal, market=market, position=position,
+            position_advice=_fallback_position_advice(resp, position),
+            volume=vol, decision="NO_TRADE", learned=False, provider=None,
+            note=(
+                f"NO_TRADE — volume is {(vol.status.lower() if vol else 'unavailable')} "
+                f"for {resp.symbol}; no direction was inferred."
+            ),
+        )
+
     analysis, provider, err = await _run_llm(_build_user_prompt(resp, market, position))
 
     note: Optional[str] = None
@@ -531,6 +626,8 @@ async def analyze_forecast(
         market=market,
         position=position,
         position_advice=position_advice,
+        volume=resp.volume,
+        decision=resp.decision,
         learned=learned,
         provider=provider,
         note=note,

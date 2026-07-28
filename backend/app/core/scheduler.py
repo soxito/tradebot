@@ -1137,3 +1137,44 @@ def get_price_tick_status() -> dict:
         "started_at": _price_tick_started_at,
         "last_run": _price_tick_last_run,
     }
+
+
+# ── SMC Background Research Loop ───────────────────────────
+# Pulls the economic calendar, news feeds and sentiment on a timer and writes
+# the findings into the three memories. Uses IDLE AI providers only — never the
+# provider currently serving /mt5-live analysis — so live latency is untouched.
+# The loop itself lives in the MT5 plugin; these are the standard start/stop/
+# status controls so it is managed exactly like every other worker here.
+
+def start_research_loop(interval: int = 900):
+    """Start the SMC background research loop (default: every 15 min)."""
+    try:
+        from plugins.MT5TradingPlugin.backend.services.research_loop import (
+            start_research_loop as _start,
+        )
+    except Exception as e:  # noqa: BLE001 — plugin may be absent in a trimmed deploy
+        logger.warning(f"Research loop unavailable: {e}")
+        return False
+    return _start(interval)
+
+
+def stop_research_loop():
+    """Stop the SMC background research loop."""
+    try:
+        from plugins.MT5TradingPlugin.backend.services.research_loop import (
+            stop_research_loop as _stop,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    return _stop()
+
+
+def get_research_loop_status() -> dict:
+    """Return the current state of the SMC background research loop."""
+    try:
+        from plugins.MT5TradingPlugin.backend.services.research_loop import (
+            get_research_loop_status as _status,
+        )
+    except Exception:  # noqa: BLE001
+        return {"running": False, "available": False}
+    return _status()

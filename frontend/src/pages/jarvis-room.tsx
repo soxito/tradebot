@@ -19,8 +19,27 @@ import Head from 'next/head'
 import { useRouter } from 'next/router'
 import { apiClient } from '@/services/api'
 import { useAdaptiveQuality } from '@/hooks/useAdaptiveQuality'
-import { PerfProfile, PerfTier, PERF_PROFILES } from '@/utils/devicePerformance'
+import { PerfProfile, PerfTier, PERF_PROFILES, detectStaticProfile } from '@/utils/devicePerformance'
 import { supportsOffscreenCanvas } from '@/utils/workerSupport'
+import {
+  createVariantScene,
+  gfxFromProfile,
+  prefersReducedMotion,
+  type VariantSceneHandle,
+} from '@/three/variantScene'
+import {
+  DEFAULT_ORB_VARIANT,
+  DEFAULT_ROBOT_VARIANT,
+  ORB_VARIANT_KEY,
+  ROBOT_VARIANT_KEY,
+  VARIANT_EVENT,
+  VARIANT_LIST,
+  readVariant,
+  writeVariant,
+  type VariantId,
+} from '@/three/robotVariants'
+
+const JarvisRobot = dynamic(() => import('@/components/JarvisRobot'), { ssr: false })
 
 const PaulChat = dynamic(() => import('@/components/PaulChat'), { ssr: false })
 const TradingViewWidget = dynamic(() => import('@/components/TradingViewWidget'), { ssr: false })
@@ -125,20 +144,58 @@ const STATE_TARGETS: Record<SoxState, { energy: number; gold: number; wave: numb
 //   LISTENING — sharp concentric sonar rings + outer frame rings + cloud
 //   ALL states — outer nebula cloud halo (counter-rotating layers, 300 particles)
 function useSoxOrb(
-  canvasRef: React.RefObject<HTMLCanvasElement | null>,
+  mountRef: React.RefObject<HTMLDivElement | null>,
   stateRef:  React.MutableRefObject<SoxState>,
-  qualityRef?: React.MutableRefObject<PerfProfile>,
+  qualityRef: React.MutableRefObject<PerfProfile> | undefined,
+  variant: VariantId,
+  energyRef: React.MutableRefObject<number>,
 ) {
   const rafRef = useRef<number>(0)
+  const workerRef = useRef<Worker | null>(null)
+  const sceneRef = useRef<VariantSceneHandle | null>(null)
+  // Read at build time only — the effect below deliberately runs once, because
+  // an OffscreenCanvas can be transferred exactly once. Switching looks after
+  // that goes through `setVariant`, not a rebuild.
+  const variantRef = useRef<VariantId>(variant)
+  useEffect(() => { variantRef.current = variant }, [variant])
+
+  // Hot-swap the look on whichever render path is live.
+  useEffect(() => {
+    const w = workerRef.current
+    if (w) { try { w.postMessage({ type: 'variant', variant }) } catch { /* noop */ } }
+    sceneRef.current?.setVariant(variant)
+  }, [variant])
 
   useEffect(() => {
-    const canvas = canvasRef.current
-    if (!canvas) return
+    const mount = mountRef.current
+    if (!mount) return
+
+    // The canvas is created here rather than in JSX, and thrown away with the
+    // effect. transferControlToOffscreen is a one-way door: a canvas that has
+    // been handed to a worker can never hand back a 2D or WebGL context, so a
+    // single long-lived element would hard-crash the page the second time this
+    // effect ran (a dev double-invoke, a fast refresh, or a remount).
+    const canvas = document.createElement('canvas')
+    canvas.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;display:block;transform:translateZ(0);backface-visibility:hidden'
+    mount.appendChild(canvas)
+    const cleanupCanvas = () => { try { mount.removeChild(canvas) } catch { /* already gone */ } }
+
+    const readW = () => mount.clientWidth || window.innerWidth
+    const readH = () => mount.clientHeight || window.innerHeight
+    const profile = qualityRef?.current ?? PERF_PROFILES.high
+    // The WebGL orb takes its quality from the machine's *static* ceiling, not
+    // from the adaptive profile. useAdaptiveQuality deliberately starts every
+    // session at the lowest tier and earns its way up over several seconds —
+    // fine for the 2D painter, which re-reads the profile every frame, but the
+    // WebGL build resolves step counts and the post chain once at construction.
+    // Seeding it from the live ref would permanently pin the orb to low.
+    const orbGfx = gfxFromProfile(detectStaticProfile(), 'orb')
+    const reduced = prefersReducedMotion()
 
     // ── Off-thread render path: OffscreenCanvas + Web Worker ──────────────────
-    // Moves the ~980-particle animation off the main thread so the room loads
-    // fast and stays responsive. Falls through to the main-thread loop below
-    // when the browser lacks OffscreenCanvas support (e.g. older Safari).
+    // Moves the whole animation off the main thread so the room loads fast and
+    // stays responsive. Falls through to the main-thread paths below when the
+    // browser lacks OffscreenCanvas support (e.g. older Safari).
     if (supportsOffscreenCanvas(canvas)) {
       let worker: Worker | null = null
       try {
@@ -148,8 +205,6 @@ function useSoxOrb(
       }
       if (worker) {
         const w = worker
-        const readW = () => canvas.clientWidth || window.innerWidth
-        const readH = () => canvas.clientHeight || window.innerHeight
         let offscreen: OffscreenCanvas | null = null
         try {
           offscreen = canvas.transferControlToOffscreen()
@@ -157,14 +212,18 @@ function useSoxOrb(
           offscreen = null
         }
         if (offscreen) {
+          workerRef.current = w
           w.postMessage({
             type: 'init',
             canvas: offscreen,
             cssW: readW(),
             cssH: readH(),
             deviceDpr: window.devicePixelRatio || 1,
-            profile: qualityRef?.current ?? PERF_PROFILES.high,
+            profile,
             state: stateRef.current,
+            variant: variantRef.current,
+            gfx: orbGfx,
+            reducedMotion: reduced,
           }, [offscreen])
 
           const onResize = () => w.postMessage({
@@ -174,17 +233,20 @@ function useSoxOrb(
           window.addEventListener('resize', onResize)
           document.addEventListener('visibilitychange', onVisibility)
 
-          // Forward state + quality-tier changes to the worker. Both transition
-          // infrequently, so a light 150 ms poll (no main-thread rAF or canvas
-          // work) keeps the orb in sync at near-zero cost; the worker's own lerp
-          // smooths the visual transition.
+          // Forward state, voice envelope and quality-tier changes. State and
+          // tier transition infrequently, so a light 150 ms poll (no main-thread
+          // rAF or canvas work) keeps the orb in sync at near-zero cost; the
+          // worker's own smoothing covers the gaps between samples.
           let lastState = stateRef.current
-          let lastTier: PerfTier = (qualityRef?.current ?? PERF_PROFILES.high).tier
+          let lastTier: PerfTier = profile.tier
+          let lastEnergy = -1
           const sync = window.setInterval(() => {
             const s = stateRef.current
             if (s !== lastState) { lastState = s; w.postMessage({ type: 'state', state: s }) }
             const prof = qualityRef?.current
             if (prof && prof.tier !== lastTier) { lastTier = prof.tier; w.postMessage({ type: 'quality', profile: prof }) }
+            const en = energyRef.current
+            if (Math.abs(en - lastEnergy) > 0.02) { lastEnergy = en; w.postMessage({ type: 'energy', energy: en }) }
           }, 150)
 
           return () => {
@@ -193,16 +255,48 @@ function useSoxOrb(
             document.removeEventListener('visibilitychange', onVisibility)
             try { w.postMessage({ type: 'stop' }) } catch { /* noop */ }
             w.terminate()
+            workerRef.current = null
+            cleanupCanvas()
           }
         }
-        // Transfer failed → drop the worker and use the main-thread path.
+        // Transfer failed → drop the worker and use a main-thread path.
         w.terminate()
       }
     }
 
-    // ── Main-thread fallback (no OffscreenCanvas) ─────────────────────────────
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return
+    // ── Main-thread WebGL path (no OffscreenCanvas, but WebGL is fine) ────────
+    {
+      const handle = createVariantScene({
+        canvas,
+        mode: 'orb',
+        variant: variantRef.current,
+        width: readW(),
+        height: readH(),
+        dpr: window.devicePixelRatio || 1,
+        gfx: orbGfx,
+        reducedMotion: reduced,
+        getState: () => ({ state: stateRef.current, energy: energyRef.current, px: 0, py: 0 }),
+      })
+      if (handle) {
+        sceneRef.current = handle
+        const onResize = () => handle.setSize(readW(), readH())
+        const onVisibility = () => handle.setHidden(document.hidden)
+        window.addEventListener('resize', onResize)
+        document.addEventListener('visibilitychange', onVisibility)
+        return () => {
+          window.removeEventListener('resize', onResize)
+          document.removeEventListener('visibilitychange', onVisibility)
+          handle.dispose()
+          sceneRef.current = null
+          cleanupCanvas()
+        }
+      }
+    }
+
+    // ── Last resort: the original 2D particle painter ─────────────────────────
+    let ctx: CanvasRenderingContext2D | null = null
+    try { ctx = canvas.getContext('2d') } catch { ctx = null }
+    if (!ctx) { cleanupCanvas(); return }
 
     const q0 = qualityRef?.current ?? PERF_PROFILES.high
     let W = 0, H = 0, DPR = Math.min(window.devicePixelRatio || 1, q0.dprCap)
@@ -564,6 +658,15 @@ function useSoxOrb(
       const glowC = goldMix > 0.52
         ? mixRGB([220, 130, 40], ORANGE, Math.min(1, (goldMix - 0.52) / 0.48))
         : mixRGB([88, 148, 235], [165, 210, 255], coreMix)
+        // 9a. BLOOM HALO — a wide, very soft falloff behind the core. Without it the
+        // nucleus ends abruptly and leaves a dead gap between the core and the
+        // particle cloud; the halo bridges them and gives the orb visible depth.
+        const halo = ctx.createRadialGradient(cx, cy, R * 0.18, cx, cy, R * 1.02)
+        halo.addColorStop(0,    `rgba(${glowC[0]},${glowC[1]},${glowC[2]},${(0.16 + coreMix * 0.12).toFixed(3)})`)
+        halo.addColorStop(0.55, `rgba(${glowC[0]},${glowC[1]},${glowC[2]},${(0.05 + coreMix * 0.04).toFixed(3)})`)
+        halo.addColorStop(1,    'rgba(0,0,0,0)')
+        ctx.fillStyle = halo; ctx.beginPath(); ctx.arc(cx, cy, R * 1.02, 0, Math.PI * 2); ctx.fill()
+
       const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, R * 0.64)
       g.addColorStop(0,    `rgba(${glowC[0]},${glowC[1]},${glowC[2]},${(0.42 + coreMix * 0.40).toFixed(3)})`)
       g.addColorStop(0.45, 'rgba(50,110,210,0.07)')
@@ -578,10 +681,29 @@ function useSoxOrb(
       ng.addColorStop(0.7, `rgba(${nc[0]},${nc[1]},${nc[2]},${(0.20 + coreMix * 0.22).toFixed(3)})`)
       ng.addColorStop(1,   'rgba(0,0,0,0)')
       ctx.fillStyle = ng; ctx.beginPath(); ctx.arc(cx, cy, R * 0.24, 0, Math.PI * 2); ctx.fill()
+
+        // 9b. IRIS — a segmented ring just outside the nucleus, counter-rotating
+        // against the particle cloud. Reads as a machined aperture and gives the eye
+        // a hard edge to lock onto against all the soft gradients.
+        {
+          const segs = 12
+          const rot  = -(t * 0.010) % (Math.PI * 2)
+          const ir   = R * 0.335
+          ctx.lineWidth   = 1.6
+          ctx.strokeStyle = `rgba(${nc[0]},${nc[1]},${nc[2]},${(0.30 + coreMix * 0.34).toFixed(3)})`
+          for (let i = 0; i < segs; i++) {
+            const a0 = rot + (i / segs) * Math.PI * 2
+            ctx.beginPath(); ctx.arc(cx, cy, ir, a0, a0 + (Math.PI * 2 / segs) * 0.62); ctx.stroke()
+          }
+        }
     }
     draw()
 
-    return () => { cancelAnimationFrame(rafRef.current); window.removeEventListener('resize', resize) }
+    return () => {
+      cancelAnimationFrame(rafRef.current)
+      window.removeEventListener('resize', resize)
+      cleanupCanvas()
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 }
@@ -849,7 +971,9 @@ function GoalsTodosPanel({ sessionKey }: { sessionKey: string }) {
 // ── Main page ─────────────────────────────────────────────────────────────────
 export default function SoxRoom() {
   const router    = useRouter()
-  const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  // Host for the orb canvas. The canvas itself is created and destroyed by
+  // useSoxOrb — see the note there about transferControlToOffscreen.
+  const orbMountRef = useRef<HTMLDivElement | null>(null)
 
   // Adaptive graphics — auto-scales the orb & robot to the machine's specs
   // (e.g. Apple M2 8GB → high, M2 Pro 16GB → ultra) and downgrades live if
@@ -859,7 +983,58 @@ export default function SoxRoom() {
   // S.O.X live state
   const stateRef = useRef<SoxState>('idle')
   const [soxState, setSoxState] = useState<SoxState>('idle')
-  useSoxOrb(canvasRef, stateRef, gfxProfileRef)
+
+  // ── Look selection ─────────────────────────────────────────────────────────
+  // Both start on the SSR default and are replaced with the persisted choice
+  // after mount, so the server and the first client render agree.
+  const [robotVariant, setRobotVariant] = useState<VariantId>(DEFAULT_ROBOT_VARIANT)
+  const [orbVariant, setOrbVariant] = useState<VariantId>(DEFAULT_ORB_VARIANT)
+  useEffect(() => {
+    setRobotVariant(readVariant(ROBOT_VARIANT_KEY, DEFAULT_ROBOT_VARIANT))
+    setOrbVariant(readVariant(ORB_VARIANT_KEY, DEFAULT_ORB_VARIANT))
+  }, [])
+
+  const pickRobotVariant = useCallback((v: VariantId) => {
+    setRobotVariant(v)
+    writeVariant(ROBOT_VARIANT_KEY, v)
+    // Any JarvisRobot mounted elsewhere (the roaming avatar) swaps in step.
+    try {
+      window.dispatchEvent(new CustomEvent(VARIANT_EVENT, { detail: { kind: 'robot', variant: v } }))
+    } catch { /* noop */ }
+  }, [])
+  const pickOrbVariant = useCallback((v: VariantId) => {
+    setOrbVariant(v)
+    writeVariant(ORB_VARIANT_KEY, v)
+  }, [])
+
+  // ── Voice envelope ─────────────────────────────────────────────────────────
+  // The room has no microphone of its own — the audio pipeline lives in
+  // PaulChat — so the amplitude that drives the emissive geometry is
+  // reconstructed from the broadcast voice-activity state. It is a real
+  // envelope with attack and decay, just derived from "is speech happening"
+  // rather than from samples.
+  const energyRef = useRef(0)
+  const [robotEnergy, setRobotEnergy] = useState(0)
+  useEffect(() => {
+    let alive = true
+    const id = window.setInterval(() => {
+      if (!alive) return
+      const s = stateRef.current
+      const t = performance.now() / 1000
+      const target =
+        s === 'talking'   ? 0.45 + Math.abs(Math.sin(t * 5.1)) * 0.35 + Math.abs(Math.sin(t * 11.3)) * 0.18
+        : s === 'listening' ? 0.18 + Math.abs(Math.sin(t * 2.3)) * 0.2
+        : s === 'thinking'  ? 0.22 + Math.abs(Math.sin(t * 7.7)) * 0.12
+        : 0.05 + Math.abs(Math.sin(t * 0.8)) * 0.04
+      // Attack faster than decay, the way a real envelope follower behaves.
+      const k = target > energyRef.current ? 0.45 : 0.12
+      energyRef.current += (target - energyRef.current) * k
+      setRobotEnergy(prev => (Math.abs(prev - energyRef.current) > 0.05 ? energyRef.current : prev))
+    }, 60)
+    return () => { alive = false; clearInterval(id) }
+  }, [])
+
+  useSoxOrb(orbMountRef, stateRef, gfxProfileRef, orbVariant, energyRef)
 
   useEffect(() => {
     const sp = { v: false }, th = { v: false }, li = { v: false }, idle = { v: false }
@@ -874,7 +1049,19 @@ export default function SoxRoom() {
       if (d.type === 'speak-status')    { sp.v = !!d.speaking;   recompute() }
       if (d.type === 'jarvis-activity') { li.v = !!d.listening; th.v = !!d.thinking; recompute() }
     }
+    // The room has no microphone — it renders whatever the voice pipeline last
+    // told it, so it latches on the final value it heard. PaulChat broadcasts an
+    // explicit idle on every teardown, and this is the room's own half of that
+    // contract: a hidden tab has nothing to show, so it drops back to idle
+    // instead of leaving the orb glowing "listening" at a page nobody is looking
+    // at (and still glowing when they come back).
+    const onVisibility = () => {
+      if (document.visibilityState !== 'hidden') return
+      sp.v = false; th.v = false; li.v = false
+      recompute()
+    }
     window.addEventListener('message', onMsg)
+    document.addEventListener('visibilitychange', onVisibility)
     // Idle-worker poll — when JARVIS is researching a goal in the background,
     // the orb glows 'thinking' even while the user is quiet.
     let idleAlive = true
@@ -883,7 +1070,12 @@ export default function SoxRoom() {
     }
     pollIdle()
     const idleTimer = setInterval(pollIdle, 6000)
-    return () => { idleAlive = false; clearInterval(idleTimer); window.removeEventListener('message', onMsg) }
+    return () => {
+      idleAlive = false
+      clearInterval(idleTimer)
+      window.removeEventListener('message', onMsg)
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
   }, [])
 
   // ── Widgets ───────────────────────────────────────────────────────────────
@@ -1193,10 +1385,10 @@ export default function SoxRoom() {
         animation: 'sox-scan 8s linear infinite',
       }} />
 
-      {/* ── Canvas orb ── */}
-      <canvas ref={canvasRef} style={{
-        position: 'fixed', inset: 0, zIndex: 1, width: '100%', height: '100%', display: 'block',
-        transform: 'translateZ(0)', willChange: 'transform', backfaceVisibility: 'hidden',
+      {/* ── Orb ── */}
+      <div ref={orbMountRef} style={{
+        position: 'fixed', inset: 0, zIndex: 1, pointerEvents: 'none',
+        willChange: 'transform',
       }} />
 
       {/* ── Rotating reticle rings (4) with tick marks ── */}
@@ -1277,6 +1469,71 @@ export default function SoxRoom() {
       >
         &larr; Back to App
       </button>
+
+      {/* ── S.O.X avatar — the selected robot look, driven by the room state ── */}
+      <div style={{
+        // Parked just clear of the left panel stack, low enough to leave the
+        // centred state readout at 68% unobstructed.
+        position: 'fixed', left: 296, bottom: 6, zIndex: 12,
+        pointerEvents: 'none',
+        filter: 'drop-shadow(0 18px 46px rgba(0,0,0,0.65))',
+      }}>
+        <JarvisRobot
+          state={soxState}
+          energy={robotEnergy}
+          variant={robotVariant}
+          size={264}
+        />
+      </div>
+
+      {/* ═══ VISUAL SYSTEM SWITCHER ═══
+          Rendered after mount only: the active look comes from localStorage,
+          so drawing it during SSR would mismatch the first client render. */}
+      {mounted && (
+        <div style={{
+          position: 'fixed', left: 16, bottom: 44, zIndex: 16, width: 268,
+          fontFamily: 'monospace',
+          background: 'rgba(3,7,17,0.92)', border: '1px solid rgba(45,226,197,0.30)',
+          borderRadius: 10, backdropFilter: 'blur(16px)',
+          boxShadow: '0 10px 40px rgba(0,0,0,0.55)',
+          padding: '9px 11px 11px',
+        }}>
+          <div style={{ fontSize: 9, letterSpacing: '0.16em', color: '#7df3dd', marginBottom: 8 }}>
+            VISUAL SYSTEM
+          </div>
+          {([
+            { key: 'robot' as const, label: 'ROBOT', active: robotVariant, pick: pickRobotVariant },
+            { key: 'orb' as const,   label: 'ORB',   active: orbVariant,   pick: pickOrbVariant },
+          ]).map(row => (
+            <div key={row.key} style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 5 }}>
+              <span style={{ fontSize: 9, color: '#5fa8c9', width: 34, letterSpacing: '0.1em' }}>{row.label}</span>
+              {VARIANT_LIST.map(v => {
+                const hex = `#${v.palette.key.toString(16).padStart(6, '0')}`
+                const on = row.active === v.id
+                return (
+                  <button
+                    key={v.id}
+                    onClick={() => row.pick(v.id)}
+                    title={v.description}
+                    style={{
+                      flex: 1, cursor: 'pointer', fontFamily: 'monospace',
+                      fontSize: 10, fontWeight: on ? 700 : 400, padding: '5px 0',
+                      borderRadius: 7, letterSpacing: '0.04em',
+                      background: on ? `${hex}28` : 'rgba(255,255,255,0.04)',
+                      border: `1px solid ${on ? hex : 'rgba(255,255,255,0.10)'}`,
+                      color: on ? hex : '#64748b',
+                      boxShadow: on ? `0 0 12px ${hex}55` : 'none',
+                      transition: 'all 0.2s',
+                    }}
+                  >
+                    {v.label}
+                  </button>
+                )
+              })}
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* ═══ DRAGGABLE — LIVE MARKETS ═══ */}
       <DraggablePanel

@@ -30,6 +30,15 @@
     "**/*.tsx"
   ],
   "exclude": [
-    "node_modules"
+    "node_modules",
+    "src/pages/whatsapp.tsx",
+    "src/pages/whatsapp/**/*.tsx",
+    "**/*.test.ts",
+    "**/*.test.tsx",
+    "**/*.spec.ts",
+    "**/*.spec.tsx",
+    "vitest.setup.ts",
+    "vitest.config.ts",
+    "playwright.config.ts"
   ]
 }

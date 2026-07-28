@@ -178,6 +178,9 @@ class Settings(BaseSettings):
     AUTO_START_POSITION_MONITOR_LOOP: bool = False
     AUTO_START_SNIPER_LOOP: bool = False
     AUTO_START_PUMP_MONITOR_LOOP: bool = False
+    # SMC background research (economic calendar + news + sentiment). Uses only
+    # IDLE AI providers — never the one serving live /mt5-live analysis.
+    AUTO_START_RESEARCH_LOOP: bool = True
     # Crypto-pair catalog (names + market cap/volume) sync loop. Enabled by
     # default and also started at API boot so JARVIS always has coin names.
     AUTO_START_PAIR_CATALOG_SYNC_LOOP: bool = True
@@ -191,6 +194,7 @@ class Settings(BaseSettings):
     SNIPER_LOOP_INTERVAL_SECONDS: int = 60
     PUMP_MONITOR_LOOP_INTERVAL_SECONDS: int = 120
     PUMP_MONITOR_PUMPED_RETENTION_HOURS: int = 24
+    RESEARCH_LOOP_INTERVAL_SECONDS: int = 900  # 15 min — free news feeds
 
     # Realtime price-tick fan-out (SSE). Broadcasts live prices for symbols with
     # open positions / active signals to all stream subscribers, replacing

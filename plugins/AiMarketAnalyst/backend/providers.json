@@ -1,6 +1,22 @@
 {
   "providers": [
     {
+      "id": "nvidia",
+      "label": "NVIDIA",
+      "type": "openai_compatible",
+      "api_key_env": "NVIDIA_API_KEY",
+      "base_url": "https://integrate.api.nvidia.com/v1",
+      "models": [
+        "nvidia/nemotron-3-ultra-550b-a55b",
+        "nvidia/nemotron-4-340b-instruct"
+      ],
+      "rate_limits": {
+        "minute": 30
+      },
+      "weight": 1.0,
+      "enabled": true
+    },
+    {
       "id": "openai",
       "label": "OpenAI",
       "type": "openai",

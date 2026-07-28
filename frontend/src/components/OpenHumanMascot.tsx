@@ -15,7 +15,7 @@
  *   onClick  — click callback
  *   className
  */
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useRef } from 'react'
 
 export type MascotMood = 'idle' | 'thinking' | 'listening' | 'talking' | 'dreaming' | 'surprised'
 
@@ -25,6 +25,11 @@ interface Props {
   onClick?: () => void
   className?: string
   showLabel?: boolean
+  /**
+   * Hide the mascot. Drops the glow/shadow and stops the animation loop, so a
+   * hidden mascot leaves nothing behind and costs nothing to keep mounted.
+   */
+  hidden?: boolean
 }
 
 // Colour palette per mood
@@ -42,52 +47,140 @@ const LABEL: Record<MascotMood, string> = {
   talking: 'Speaking…', dreaming: 'Dreaming…', surprised: '!',
 }
 
+const MOUTH_PATHS = [
+  'M 52 78 Q 60 82 68 78',
+  'M 52 78 Q 60 84 68 78',
+  'M 52 78 Q 60 86 68 78',
+  'M 52 78 Q 60 84 68 78',
+]
+const MOUTH_REST = 'M 52 78 Q 60 83 68 78'
+// Vertical centre of the eyes in the 120×120 design space — blinks scale about
+// this line so the lids close toward the middle of the eye, not the top.
+const EYE_CY = 56
+
 export default function OpenHumanMascot({
   mood = 'idle',
   size = 120,
   onClick,
   className = '',
   showLabel = false,
+  hidden = false,
 }: Props) {
   const pal = PALETTE[mood]
   const scale = size / 120  // base design is 120px
-  const [talkFrame, setTalkFrame] = useState(0)
-  const [bobY, setBobY] = useState(0)
-  const rafRef = useRef<number>(0)
-  const t = useRef(0)
 
-  // Continuous animation loop driving the bob & talk mouth
+  const svgRef      = useRef<SVGSVGElement | null>(null)
+  const eyeGroupRef = useRef<SVGGElement | null>(null)
+  const mouthRef    = useRef<SVGPathElement | null>(null)
+  const shadowRef   = useRef<HTMLDivElement | null>(null)
+  const rafRef      = useRef<number>(0)
+  const moodRef     = useRef<MascotMood>(mood)
+  useEffect(() => { moodRef.current = mood }, [mood])
+
+  // Blink schedule, kept in refs so it survives across mood changes — a blink
+  // that restarted every time the mood changed would cluster unnaturally. The
+  // first one is randomised so two mascots on screen never blink in lockstep.
+  const nextBlinkRef = useRef(600 + Math.random() * 2600)
+  const blinkStartRef = useRef(0)
+
+  /**
+   * Animation loop.
+   *
+   * Everything is written straight to the DOM rather than through React state.
+   * The previous version called setState on every animation frame, re-rendering
+   * this whole subtree ~60×/second on every page in the app — for a decorative
+   * mascot. Direct writes give the same motion at no render cost.
+   */
   useEffect(() => {
+    if (hidden) return
+    let start = 0
     const tick = (ts: number) => {
-      t.current = ts
-      // Bob (all moods have a gentle vertical oscillation)
-      const speed = mood === 'dreaming' ? 0.0008 : mood === 'talking' ? 0.003 : 0.0015
-      setBobY(Math.sin(ts * speed) * 4)
-      // Talk mouth oscillation
-      if (mood === 'talking') {
-        setTalkFrame(Math.floor((ts / 120) % 4))
-      }
       rafRef.current = requestAnimationFrame(tick)
+      if (!start) start = ts
+      const ms = ts - start
+      const m = moodRef.current
+
+      // ── Float ────────────────────────────────────────────────────────────
+      // Three non-harmonic components so the path never visibly repeats; a
+      // single sine reads as a mechanical bounce rather than hovering.
+      const rate = m === 'dreaming' ? 0.55 : m === 'talking' ? 1.7 : 1
+      const s = ms / 1000
+      const bobY =
+        Math.sin(s * 1.15 * rate) * 3.2 +
+        Math.sin(s * 0.71 * rate) * 1.5 +
+        Math.sin(s * 0.43 * rate) * 0.8
+      // Bank gently into the drift, and hold the thinking head-tilt.
+      const tilt = Math.sin(s * 0.53 * rate) * 2.2 + (m === 'thinking' ? -6 : 0)
+      const svg = svgRef.current
+      if (svg) svg.style.transform = `translateY(${bobY.toFixed(2)}px) rotate(${tilt.toFixed(2)}deg)`
+
+      // Ground shadow tracks the float height — shrinking and fading as the
+      // mascot rises is the cue that actually sells "floating" rather than
+      // "sliding around".
+      const sh = shadowRef.current
+      if (sh) {
+        const lift = bobY / 5.5                    // −1..1
+        sh.style.transform = `translateX(-50%) scale(${(1 - lift * 0.22).toFixed(3)})`
+        sh.style.opacity = Math.max(0, 0.28 - lift * 0.10).toFixed(3)
+      }
+
+      // ── Blink ────────────────────────────────────────────────────────────
+      // Only while at rest: a person mid-sentence or concentrating blinks far
+      // less, and blinking through the "dreaming" closed-eye pose is nonsense.
+      const canBlink = m === 'idle' || m === 'listening'
+      const eyes = eyeGroupRef.current
+      if (eyes) {
+        let open = 1
+        if (canBlink) {
+          if (!blinkStartRef.current && ms > nextBlinkRef.current) blinkStartRef.current = ms
+          if (blinkStartRef.current) {
+            const into = ms - blinkStartRef.current
+            const CLOSE = 60, OPEN = 110    // lids shut faster than they open
+            open = into < CLOSE
+              ? 1 - into / CLOSE
+              : Math.min(1, (into - CLOSE) / OPEN)
+            if (into > CLOSE + OPEN) {
+              blinkStartRef.current = 0
+              // Irregular spacing, with the occasional quick double-blink.
+              nextBlinkRef.current = ms + 1400 + Math.random() * 3600
+            }
+          }
+        } else {
+          blinkStartRef.current = 0
+          nextBlinkRef.current = ms + 1400 + Math.random() * 3600
+        }
+        const k = Math.max(0.04, open)
+        const eyeY = m === 'thinking' ? 3 : 0
+        eyes.setAttribute(
+          'transform',
+          `translate(0 ${eyeY}) translate(0 ${EYE_CY}) scale(1 ${k.toFixed(3)}) translate(0 ${-EYE_CY})`,
+        )
+      }
+
+      // ── Mouth (talking) ──────────────────────────────────────────────────
+      const mouth = mouthRef.current
+      if (mouth) {
+        mouth.setAttribute('d', m === 'talking'
+          ? MOUTH_PATHS[Math.floor((ms / 120) % 4)]
+          : MOUTH_REST)
+      }
     }
     rafRef.current = requestAnimationFrame(tick)
     return () => cancelAnimationFrame(rafRef.current)
-  }, [mood])
-
-  const mouthPaths: Record<number, string> = {
-    0: 'M 52 78 Q 60 82 68 78',
-    1: 'M 52 78 Q 60 84 68 78',
-    2: 'M 52 78 Q 60 86 68 78',
-    3: 'M 52 78 Q 60 84 68 78',
-  }
-  const mouthPath = mood === 'talking' ? mouthPaths[talkFrame] : 'M 52 78 Q 60 83 68 78'
+  }, [hidden])
 
   const eyeScale = mood === 'surprised' ? 1.4 : mood === 'dreaming' ? 0.6 : 1.0
-  const eyeY = mood === 'thinking' ? 3 : 0
 
   return (
     <div
       className={`relative select-none ${className}`}
-      style={{ width: size, height: size + (showLabel ? 18 : 0) }}
+      style={{
+        width: size,
+        height: size + (showLabel ? 18 : 0),
+        // Nothing of a hidden mascot may remain — including its glow.
+        visibility: hidden ? 'hidden' : 'visible',
+        pointerEvents: hidden ? 'none' : undefined,
+      }}
       onClick={onClick}
     >
       {/* Outer glow ring */}
@@ -100,16 +193,41 @@ export default function OpenHumanMascot({
         }}
       />
 
+      {/* Ground pool — sized and faded in the animation loop against the float
+          height. It is tinted with the mood colour rather than drawn black:
+          the app's surfaces are near-black, so a dark shadow would be
+          invisible, whereas a pool of the mascot's own light reads clearly as
+          something glowing *above* a surface. */}
+      <div
+        ref={shadowRef}
+        aria-hidden
+        style={{
+          position: 'absolute',
+          left: '50%',
+          bottom: showLabel ? 14 : -4,
+          width: size * 0.5,
+          height: size * 0.12,
+          transform: 'translateX(-50%)',
+          borderRadius: '50%',
+          background: `radial-gradient(ellipse at center, ${pal.glow} 0%, ${pal.ring}55 45%, transparent 72%)`,
+          filter: 'blur(4px)',
+          pointerEvents: 'none',
+          transition: 'background 0.4s ease',
+        }}
+      />
+
       {/* SVG character */}
       <svg
+        ref={svgRef}
         viewBox="0 0 120 120"
         width={size}
         height={size}
         style={{
           display: 'block',
-          transform: `translateY(${bobY}px) rotate(${mood === 'thinking' ? -6 : 0}deg)`,
-          transition: 'transform 0.5s ease',
-          filter: `drop-shadow(0 0 ${8 * scale}px ${pal.glow})`,
+          position: 'relative',
+          // No glow while hidden — a drop-shadow on an invisible element still
+          // paints, leaving a coloured smudge where the mascot used to be.
+          filter: hidden ? 'none' : `drop-shadow(0 0 ${8 * scale}px ${pal.glow})`,
         }}
       >
         <defs>
@@ -166,8 +284,9 @@ export default function OpenHumanMascot({
           </>
         )}
 
-        {/* Eyes */}
-        <g transform={`translate(0,${eyeY})`} style={{ transition: 'transform 0.3s ease' }}>
+        {/* Eyes — the group transform (position + blink squash) is written by
+            the animation loop, so it carries no React-managed transform here. */}
+        <g ref={eyeGroupRef}>
           {/* Left eye */}
           <ellipse
             cx="50" cy="56"
@@ -208,14 +327,14 @@ export default function OpenHumanMascot({
           </>
         )}
 
-        {/* Mouth */}
+        {/* Mouth — `d` is driven by the animation loop. */}
         <path
-          d={mouthPath}
+          ref={mouthRef}
+          d={MOUTH_REST}
           stroke={pal.glow}
           strokeWidth="2.5"
           fill="none"
           strokeLinecap="round"
-          style={{ transition: 'd 0.05s linear' }}
         />
 
         {/* Circuit patterns on head */}

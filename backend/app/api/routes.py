@@ -21,6 +21,20 @@ from app.api.vision import router as vision_router
 from app.api.market import router as market_router
 from app.api.stream import router as stream_router
 from app.api.ngrok import router as ngrok_router
+from app.api.research import router as research_router
+
+# WhatsApp Plugin - loaded via plugin system
+# Fallback import if plugin system doesn't load it
+import sys
+import os
+PLUGIN_ROOT = os.path.join(os.path.dirname(__file__), "../../../")
+sys.path.insert(0, PLUGIN_ROOT)
+
+try:
+    from plugins.WhatsAppSignalNewsPlugin.backend.router import router as whatsapp_router
+    HAS_WHATSAPP = True
+except ImportError:
+    HAS_WHATSAPP = False
 
 api_router = APIRouter()
 
@@ -44,6 +58,10 @@ api_router.include_router(vision_router)
 api_router.include_router(market_router)
 api_router.include_router(stream_router)
 api_router.include_router(ngrok_router)
+api_router.include_router(research_router)
+
+if HAS_WHATSAPP:
+    api_router.include_router(whatsapp_router)
 
 
 @api_router.get("/status")
@@ -58,5 +76,6 @@ async def api_status():
             "signals": "ready",
             "trading": "ready",
             "strategy_lab": "ready",
+            "whatsapp": "ready" if HAS_WHATSAPP else "not_available",
         }
     }

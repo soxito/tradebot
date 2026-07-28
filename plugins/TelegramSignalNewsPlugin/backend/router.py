@@ -1140,6 +1140,7 @@ from plugins.TelegramSignalNewsPlugin.backend.services.bot_service import (
     set_webhook as bot_set_webhook,
     delete_webhook as bot_delete_webhook,
     set_my_commands,
+    sync_bot_commands,
     JARVIS_COMMANDS,
 )
 
@@ -1269,6 +1270,9 @@ async def bot_set_webhook_endpoint(
         cfg.webhook_secret = payload.secret_token
     cfg.polling_enabled = False  # webhook and polling are mutually exclusive
     await db.commit()
+
+    # Keep the / menu in step with the code (best-effort — never fails the call).
+    await sync_bot_commands(token)
 
     return TelegramBotWebhookResponse(ok=True, url=payload.url)
 
@@ -1403,6 +1407,8 @@ async def bot_set_polling(
     await db.commit()
 
     if payload.enabled:
+        # Keep the / menu in step with the code (best-effort).
+        await sync_bot_commands(token)
         signal_monitor.start_bot_polling(AsyncSessionLocal)
     else:
         signal_monitor.stop_bot_polling()

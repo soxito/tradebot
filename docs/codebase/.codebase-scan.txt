@@ -1,0 +1,445 @@
+
+=== DIRECTORY TREE (max depth 3, source files only) ===
+.DS_Store
+.backend.pid
+.claude
+.claude/settings.local.json
+.copilot
+.copilot/settings.json
+.db-mode
+.env
+.env.docker
+.env.example
+.env.local
+.frontend.pid
+.github
+.github/.DS_Store
+.github/agents
+.github/agents/architect.agent.md
+.github/agents/asterisk-engineer.agent.md
+.github/agents/claude-analysis-analyze-code-quality.agent.md
+.github/agents/claude-analysis-code-analyzer.agent.md
+.github/agents/claude-analysis-code-review-analyze-code-quality.agent.md
+.github/agents/claude-architecture-arch-system-design.agent.md
+.github/agents/claude-architecture-system-design-arch-system-design.agent.md
+.github/agents/claude-browser-browser-agent.agent.md
+.github/agents/claude-consensus-byzantine-coordinator.agent.md
+.github/agents/claude-consensus-crdt-synchronizer.agent.md
+.github/agents/claude-consensus-gossip-coordinator.agent.md
+.github/agents/claude-consensus-performance-benchmarker.agent.md
+.github/agents/claude-consensus-quorum-manager.agent.md
+.github/agents/claude-consensus-raft-manager.agent.md
+.github/agents/claude-consensus-security-manager.agent.md
+.github/agents/claude-core-coder.agent.md
+.github/agents/claude-core-planner.agent.md
+.github/agents/claude-core-researcher.agent.md
+.github/agents/claude-core-reviewer.agent.md
+.github/agents/claude-core-tester.agent.md
+.github/agents/claude-custom-test-long-runner.agent.md
+.github/agents/claude-data-data-ml-model.agent.md
+.github/agents/claude-data-ml-data-ml-model.agent.md
+.github/agents/claude-development-backend-dev-backend-api.agent.md
+.github/agents/claude-development-dev-backend-api.agent.md
+.github/agents/claude-devops-ci-cd-ops-cicd-github.agent.md
+.github/agents/claude-devops-ops-cicd-github.agent.md
+.github/agents/claude-documentation-api-docs-docs-api-openapi.agent.md
+.github/agents/claude-documentation-docs-api-openapi.agent.md
+.github/agents/claude-flow-nexus-app-store.agent.md
+.github/agents/claude-flow-nexus-authentication.agent.md
+.github/agents/claude-flow-nexus-challenges.agent.md
+.github/agents/claude-flow-nexus-neural-network.agent.md
+.github/agents/claude-flow-nexus-payments.agent.md
+.github/agents/claude-flow-nexus-sandbox.agent.md
+.github/agents/claude-flow-nexus-swarm.agent.md
+.github/agents/claude-flow-nexus-user-tools.agent.md
+.github/agents/claude-flow-nexus-workflow.agent.md
+.github/agents/claude-github-code-review-swarm.agent.md
+.github/agents/claude-github-github-modes.agent.md
+.github/agents/claude-github-issue-tracker.agent.md
+.github/agents/claude-github-multi-repo-swarm.agent.md
+.github/agents/claude-github-pr-manager.agent.md
+.github/agents/claude-github-project-board-sync.agent.md
+.github/agents/claude-github-release-manager.agent.md
+.github/agents/claude-github-release-swarm.agent.md
+.github/agents/claude-github-repo-architect.agent.md
+.github/agents/claude-github-swarm-issue.agent.md
+.github/agents/claude-github-swarm-pr.agent.md
+.github/agents/claude-github-sync-coordinator.agent.md
+.github/agents/claude-github-workflow-automation.agent.md
+.github/agents/claude-goal-agent.agent.md
+.github/agents/claude-goal-goal-planner.agent.md
+.github/agents/claude-optimization-benchmark-suite.agent.md
+.github/agents/claude-optimization-load-balancer.agent.md
+.github/agents/claude-optimization-performance-monitor.agent.md
+.github/agents/claude-optimization-resource-allocator.agent.md
+.github/agents/claude-optimization-topology-optimizer.agent.md
+.github/agents/claude-payments-agentic-payments.agent.md
+.github/agents/claude-sona-sona-learning-optimizer.agent.md
+.github/agents/claude-sparc-architecture.agent.md
+.github/agents/claude-sparc-pseudocode.agent.md
+.github/agents/claude-sparc-refinement.agent.md
+.github/agents/claude-sparc-specification.agent.md
+.github/agents/claude-specialized-mobile-spec-mobile-react-native.agent.md
+.github/agents/claude-specialized-spec-mobile-react-native.agent.md
+.github/agents/claude-sublinear-consensus-coordinator.agent.md
+.github/agents/claude-sublinear-matrix-optimizer.agent.md
+.github/agents/claude-sublinear-pagerank-analyzer.agent.md
+.github/agents/claude-sublinear-performance-optimizer.agent.md
+.github/agents/claude-sublinear-trading-predictor.agent.md
+.github/agents/claude-swarm-adaptive-coordinator.agent.md
+.github/agents/claude-swarm-hierarchical-coordinator.agent.md
+.github/agents/claude-swarm-mesh-coordinator.agent.md
+.github/agents/claude-templates-automation-smart-agent.agent.md
+.github/agents/claude-templates-base-template-generator.agent.md
+.github/agents/claude-templates-coordinator-swarm-init.agent.md
+.github/agents/claude-templates-github-pr-manager.agent.md
+.github/agents/claude-templates-implementer-sparc-coder.agent.md
+.github/agents/claude-templates-memory-coordinator.agent.md
+.github/agents/claude-templates-orchestrator-task.agent.md
+.github/agents/claude-templates-performance-analyzer.agent.md
+.github/agents/claude-templates-sparc-coordinator.agent.md
+.github/agents/claude-testing-production-validator.agent.md
+.github/agents/claude-testing-tdd-london-swarm.agent.md
+.github/agents/claude-v3-adr-architect.agent.md
+.github/agents/claude-v3-aidefence-guardian.agent.md
+.github/agents/claude-v3-claims-authorizer.agent.md
+.github/agents/claude-v3-collective-intelligence-coordinator.agent.md
+.github/agents/claude-v3-ddd-domain-expert.agent.md
+.github/agents/claude-v3-injection-analyst.agent.md
+.github/agents/claude-v3-memory-specialist.agent.md
+.github/agents/claude-v3-performance-engineer.agent.md
+.github/agents/claude-v3-pii-detector.agent.md
+.github/agents/claude-v3-reasoningbank-learner.agent.md
+.github/agents/claude-v3-security-architect-aidefence.agent.md
+.github/agents/claude-v3-security-architect.agent.md
+.github/agents/claude-v3-security-auditor.agent.md
+.github/agents/claude-v3-sparc-orchestrator.agent.md
+.github/agents/claude-v3-swarm-memory-manager.agent.md
+.github/agents/claude-v3-v3-integration-architect.agent.md
+.github/agents/gis-engineer.agent.md
+.github/agents/python-developer.agent.md
+.github/agents/security-expert.agent.md
+.github/agents/tradebot.agent.md
+.github/agents/ui-designer.agent.md
+.github/copilot-instructions.md
+.github/instructions
+.github/instructions/plugin-conventions.instructions.md
+.github/prompts
+.github/prompts/.DS_Store
+.github/prompts/ai-analyst-build.prompt.md
+.github/prompts/chart-overlay-build.prompt.md
+.github/prompts/mt5-plugin-build.prompt.md
+.github/prompts/plugin-scan.prompt.md
+.github/prompts/ui-ux-pro-max
+.github/prompts/ui-ux-pro-max/.DS_Store
+.github/prompts/ui-ux-pro-max/PROMPT.md
+.github/prompts/ui-ux-pro-max/data
+.github/prompts/ui-ux-pro-max/scripts
+.github/skills
+.github/skills/.DS_Store
+.github/skills/tradebot-plugin-builder
+.github/skills/tradebot-plugin-builder/SKILL.md
+.github/skills/ui-ux-pro-max
+.github/skills/ui-ux-pro-max/SKILL.md
+.github/workflows
+.github/workflows/ci.yml
+.gitignore
+.graphifyignore
+.gstack
+.gstack/browse-audit.jsonl
+.gstack/browse-console.log
+.gstack/browse-network.log
+.idea
+.idea/.gitignore
+.idea/inspectionProfiles
+.idea/inspectionProfiles/Project_Default.xml
+.idea/material_theme_project_new.xml
+.idea/modules.xml
+.idea/php.xml
+.idea/tradebot.iml
+.idea/vcs.xml
+.idea/workspace.xml
+.junie
+.junie/plans
+.junie/plans/fix-brain-layout-restore-offset.md
+.junie/plans/fix-deepgram-agent-503-and-profile.md
+.junie/plans/jarvis-bare-name-wake.md
+.junie/plans/jarvis-deepgram-cost-aware-fallback.md
+.junie/plans/jarvis-hands-free-upgrade.md
+.junie/plans/jarvis-pair-catalog-and-voice.md
+.junie/plans/jarvis-sniper-chat-and-voice-gate.md
+.pytest_cache
+.pytest_cache/.gitignore
+.pytest_cache/CACHEDIR.TAG
+.pytest_cache/README.md
+.pytest_cache/v
+.pytest_cache/v/cache
+.pytest_cache/v/cache/lastfailed
+.pytest_cache/v/cache/nodeids
+.pytest_cache/v/cache/stepwise
+.vscode
+.vscode/launch.json
+.vscode/settings.json
+CHANGELOG.md
+CORS_TEST.md
+FINAL_ROUTING_FIX.md
+FIXES.md
+FIX_401_ERRORS.md
+IMPLEMENTATION_SUMMARY.md
+JARVIS_FIX_COMPLETE.md
+JARVIS_FIX_README.md
+PHASE_6_COMPLETE.md
+QUICKREF.md
+QUICK_REFERENCE.txt
+QUICK_STATUS.txt
+README.md
+ROUTING_FIX_APPLIED.md
+RR_ANALYSIS_COMPLETE.md
+STATUS.md
+STATUS.txt
+TESTING.md
+TOKEN_COMPRESSION.md
+WALLET_BALANCE.md
+
+=== STACK DETECTION (manifest files) ===
+No recognized manifest files found in project root.
+
+=== ENTRY POINTS ===
+No common entry points found. Check 'main' or 'scripts.start' in manifest files above.
+
+=== LINTING AND FORMATTING CONFIG ===
+No linting or formatting config files found in project root.
+
+=== ENVIRONMENT VARIABLE TEMPLATES ===
+--- .env.example ---
+# Application Configuration
+ENVIRONMENT=development
+DEBUG=true
+SECRET_KEY=change-me-in-production-to-a-secure-random-string
+
+# Database
+DATABASE_URL=postgresql+asyncpg://tradebot:tradebot_password@postgres:5432/tradebot
+
+# Redis
+REDIS_URL=redis://redis:6379/0
+
+# CORS Origins (comma-separated)
+CORS_ORIGINS=http://localhost:3000,http://localhost:8080
+
+# ============================================
+# EXCHANGE API KEYS
+# ============================================
+# NEVER commit real API keys to version control!
+# Use testnet/sandbox keys for development
+
+# Binance
+BINANCE_API_KEY=
+BINANCE_API_SECRET=
+
+# Bitget
+BITGET_API_KEY=
+BITGET_API_SECRET=
+BITGET_PASSPHRASE=
+
+# Bybit
+BYBIT_API_KEY=
+BYBIT_API_SECRET=
+
+# OKX
+OKX_API_KEY=
+OKX_API_SECRET=
+OKX_PASSPHRASE=
+
+# KuCoin
+KUCOIN_API_KEY=
+KUCOIN_API_SECRET=
+KUCOIN_PASSPHRASE=
+
+# Coinbase
+COINBASE_API_KEY=
+COINBASE_API_SECRET=
+
+# ============================================
+# NEWS & SENTIMENT API KEYS
+# ============================================
+
+# CoinGecko (optional - free tier available)
+COINGECKO_API_KEY=
+
+# CoinMarketCap (optional - free tier available)
+COINMARKETCAP_API_KEY=
+
+# CryptoPanic (optional - free tier available)
+CRYPTOPANIC_API_KEY=
+
+# Twitter/X (optional - requires approval)
+TWITTER_BEARER_TOKEN=
+
+# Reddit (optional - free tier available)
+REDDIT_CLIENT_ID=
+REDDIT_CLIENT_SECRET=
+
+# ============================================
+# TRADINGVIEW WEBHOOK
+# ============================================
+TRADINGVIEW_WEBHOOK_SECRET=change-me-to-secure-webhook-secret
+
+# ============================================
+# MONITORING & ALERTS
+# ============================================
+
+# Telegram alerts (optional)
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+
+
+[TRUNCATED] Showing first 80 of 168 lines.
+
+=== TODO / FIXME / HACK (production code only, test dirs excluded) ===
+frontend/src/pages/jarvis-room.tsx:691: const TODO_COLS: { key: string; label: string }[] = [
+frontend/src/pages/jarvis-room.tsx:803: {TODO_COLS.map(col => (
+frontend/src/pages/jarvis-room.tsx:1344: {/* ═══ DRAGGABLE — GOALS & TODOS ═══ */}
+frontend/src/pages/jarvis-room.tsx:1346: id="sox-goals" title="GOALS &amp; TODOS" defaultX={-360} defaultY={430} width={342}
+plugins/MT5TradingPlugin/backend/router.py:151: password_encrypted=data.password,  # TODO: encrypt at rest
+plugins/AgentPaulPlugin/backend/models.py:342: PAUL_TODO_STATUSES = (
+plugins/AgentPaulPlugin/backend/models.py:346: PAUL_TODO_STATUS_ALIASES = {"backlog": "todo"}
+plugins/AgentPaulPlugin/backend/services/goals_todos.py:26: PAUL_TODO_STATUSES, PAUL_TODO_STATUS_ALIASES,
+plugins/AgentPaulPlugin/backend/services/goals_todos.py:30: _TODO_STATUSES = set(PAUL_TODO_STATUSES)
+plugins/AgentPaulPlugin/backend/services/goals_todos.py:39: raw = PAUL_TODO_STATUS_ALIASES.get(raw, raw)
+plugins/AgentPaulPlugin/backend/services/goals_todos.py:40: return raw if raw in _TODO_STATUSES else default
+backend/app/trading/decision.py:165: # TODO: Query open positions
+backend/.venv313/lib/python3.13/site-packages/typing_extensions.py:3319: # TODO: Use inspect.VALUE here, and make the annotations lazily evaluated
+backend/.venv313/lib/python3.13/site-packages/packaging/tags.py:559: # TODO: Need to care about 32-bit PPC for ppc64 through 10.2?
+backend/.venv313/lib/python3.13/site-packages/packaging/metadata.py:205: # TODO: The spec doesn't say anything about if the keys should be
+backend/.venv313/lib/python3.13/site-packages/packaging/metadata.py:869: description: _Validator[str | None] = _Validator()  # TODO 2.1: can be in body
+backend/.venv313/lib/python3.13/site-packages/packaging/version.py:423: # TODO: remove "no cover" when Python 3.9 is dropped.
+backend/.venv313/lib/python3.13/site-packages/packaging/requirements.py:48: # TODO: Can we test whether something is contained within a requirement?
+backend/.venv313/lib/python3.13/site-packages/packaging/requirements.py:51: # TODO: Can we normalize the name and extra name?
+backend/.venv313/lib/python3.13/site-packages/aiohttp/web_response.py:59: # TODO(py311): Convert to StrEnum for wider use
+backend/.venv313/lib/python3.13/site-packages/aiohttp/web_response.py:286: # TODO: do we need domain/path here?
+backend/.venv313/lib/python3.13/site-packages/aiohttp/web_exceptions.py:211: # FIXME: this should include a date or etag header
+backend/.venv313/lib/python3.13/site-packages/aiohttp/streams.py:272: # TODO: size is ignored, remove the param later
+backend/.venv313/lib/python3.13/site-packages/aiohttp/streams.py:424: # TODO: should be `if` instead of `while`
+backend/.venv313/lib/python3.13/site-packages/aiohttp/streams.py:436: # TODO: should be `if` instead of `while`
+backend/.venv313/lib/python3.13/site-packages/aiohttp/streams.py:600: # TODO add async def readuntil
+backend/.venv313/lib/python3.13/site-packages/aiohttp/web_urldispatcher.py:403: # TODO: implement all abstract methods
+backend/.venv313/lib/python3.13/site-packages/aiohttp/web_urldispatcher.py:544: # TODO: impl missing abstract methods
+backend/.venv313/lib/python3.13/site-packages/aiohttp/web_urldispatcher.py:618: # TODO cache file content
+backend/.venv313/lib/python3.13/site-packages/aiohttp/client_proto.py:87: with suppress(Exception):  # FIXME: log this somehow?
+backend/.venv313/lib/python3.13/site-packages/aiohttp/client_proto.py:156: # TODO: actual types are:
+backend/.venv313/lib/python3.13/site-packages/aiohttp/client_reqrep.py:323: # FIXME: session is None in tests only, need to fix tests
+backend/.venv313/lib/python3.13/site-packages/aiohttp/client_reqrep.py:885: # TODO: Fix session=None in tests (see ClientRequest.__init__).
+backend/.venv313/lib/python3.13/site-packages/aiohttp/formdata.py:168: # FIXME cgi.FieldStorage doesn't likes body parts with
+backend/.venv313/lib/python3.13/site-packages/aiohttp/helpers.py:258: # TODO(PY311): username = login or account
+backend/.venv313/lib/python3.13/site-packages/aiohttp/helpers.py:264: # TODO(PY311): Remove this, as password will be empty string
+backend/.venv313/lib/python3.13/site-packages/pyasn1/codec/der/decoder.py:23: # TODO: prohibit non-canonical encoding
+backend/.venv313/lib/python3.13/site-packages/pyasn1/codec/der/encoder.py:34: # TODO: move out of sorting key function
+backend/.venv313/lib/python3.13/site-packages/pyasn1/codec/der/encoder.py:41: # TODO: support nested CHOICE ordering
+backend/.venv313/lib/python3.13/site-packages/pyasn1/codec/cer/decoder.py:51: # TODO: prohibit non-canonical encoding
+backend/.venv313/lib/python3.13/site-packages/pyasn1/codec/ber/decoder.py:56: raise error.PyAsn1Error('SingleItemDecoder not implemented for %s' % (tagSet,))  # TODO: Seems more like an NotImplementedError?
+backend/.venv313/lib/python3.13/site-packages/pyasn1/codec/ber/decoder.py:66: raise error.PyAsn1Error('Indefinite length mode decoder not implemented for %s' % (tagSet,)) # TODO: Seems more like an NotImplementedError?
+backend/.venv313/lib/python3.13/site-packages/pyasn1/codec/ber/decoder.py:1372: # TODO: Seems not to be tested
+backend/.venv313/lib/python3.13/site-packages/pyasn1/codec/ber/decoder.py:1421: yield chunk  # TODO: Weird
+backend/.venv313/lib/python3.13/site-packages/pyasn1/codec/ber/encoder.py:189: # TODO: try to avoid ASN.1 schema instantiation
+backend/.venv313/lib/python3.13/site-packages/pyasn1/codec/ber/encoder.py:557: # TODO: handling three flavors of input is too much -- split over codecs
+backend/.venv313/lib/python3.13/site-packages/pyasn1/type/constraint.py:85: # TODO: fix possible comparison of set vs scalars here
+backend/.venv313/lib/python3.13/site-packages/pyasn1/type/constraint.py:747: # TODO:
+backend/.venv313/lib/python3.13/site-packages/pyasn1/type/univ.py:1724: # TODO: remove when Py2.5 support is gone
+backend/.venv313/lib/python3.13/site-packages/pyasn1/type/univ.py:1952: # TODO: we should wrap componentType with UnnamedType to carry
+backend/.venv313/lib/python3.13/site-packages/aiodns/__init__.py:81: ) -> None:  # TODO(PY311): Use Unpack for kwargs.
+backend/.venv313/lib/python3.13/site-packages/h11/_readers.py:186: # XX FIXME: we discard chunk extensions. Does anyone care?
+backend/.venv313/lib/python3.13/site-packages/h11/_writers.py:54: # XX FIXME: could at least make an effort to pull out the status message
+backend/.venv313/lib/python3.13/site-packages/h11/_events.py:310: # XX FIXME: "A recipient MUST ignore (or consider as an error) any fields that
+backend/.venv313/lib/python3.13/site-packages/ecdsa/keys.py:1079: # TODO parse attributes or validate publickey
+backend/.venv313/lib/python3.13/site-packages/ecdsa/keys.py:1204: # TODO: "BEGIN ECPARAMETERS"
+backend/.venv313/lib/python3.13/site-packages/mako/lexer.py:257: # TODO: no coverage here
+backend/.venv313/lib/python3.13/site-packages/mako/parsetree.py:207: # TODO: make the "filter" shortcut list configurable at parse/gen time
+backend/.venv313/lib/python3.13/site-packages/mako/codegen.py:951: # TODO: we can put namespace-specific checks here, such
+backend/.venv313/lib/python3.13/site-packages/mako/codegen.py:993: # TODO: figure out best way to specify
+
+=== GIT RECENT COMMITS (last 20) ===
+b2b2152 Major Update
+072ec7c Patch 2.012
+849b62b MT5 DETECT
+b25c680 MT5 Issue
+b040b11 Performance
+5d56e79 Performance
+1df4cb9 MT5 UPDATE
+00f3091 Mt5 server
+e106292 MT5 fix
+15e8a40 Fix mt5 account
+8356559 core fix
+a8d7228 fix kronos
+bbedd09 fix major mt5
+6f56798 scalp ai
+e1671af api fix
+3858e4f MT5ScalpBotPanel update
+5c6c9a3 MT5 Scalp and Redis setup
+f39e8fc Kronos Install and Redis
+8f26c29 Update tradebot_telegram.session-journal
+7003c58 auto config
+
+=== HIGH-CHURN FILES (last 90 days, top 20) ===
+  33 start.py
+  18 backend/app/api/jarvis.py
+  16 frontend/src/services/api.ts
+  16 jarvis-extension/manifest.json
+  14 plugins/MT5TradingPlugin/backend/router.py
+  12 frontend/src/components/PaulChat.tsx
+  12 frontend/src/pages/mt5-live.tsx
+  12 jarvis-extension/content.js
+  11 frontend/public/jarvis-extension.zip
+  10 backend/app/core/config.py
+  10 backend/requirements.txt
+   9 jarvis-extension/popup.js
+   8 frontend/src/pages/jarvis-room.tsx
+   8 plugins/MT5TradingPlugin/backend/services/scalp_bot_service.py
+   8 jarvis-extension/background.js
+   6 backend/app/api/routes.py
+   6 frontend/src/components/Layout.tsx
+   6 frontend/src/utils/devicePerformance.ts
+   6 plugins/MT5TradingPlugin/backend/schemas.py
+   5 backend/app/main.py
+
+=== MONOREPO SIGNALS ===
+No monorepo signals detected.
+
+=== CODE METRICS ===
+Total files scanned: 8490
+Total lines of code: 2999419
+
+Files by language:
+  Python: 6327
+  Other: 1903
+  C Header: 138
+  TypeScript/React: 61
+  TypeScript: 26
+  C++: 16
+  JavaScript: 10
+  C: 9
+
+Top 10 largest files:
+backend/logs/tradebot.2026-07-06_22-52-37_016661.log: 9765.6KB
+backend/logs/tradebot.2026-07-08_06-03-20_343951.log: 9765.6KB
+backend/logs/tradebot.2026-07-12_04-57-25_099360.log: 9765.6KB
+backend/logs/tradebot.2026-07-05_21-40-23_686428.log: 9765.6KB
+backend/logs/tradebot.2026-06-28_21-32-27_043703.log: 9765.5KB
+backend/logs/tradebot.2026-07-15_18-28-18_886713.log: 9765.5KB
+backend/logs/tradebot.2026-07-09_11-20-46_290834.log: 9765.5KB
+backend/logs/tradebot.2026-07-06_12-25-13_473150.log: 9765.5KB
+backend/logs/tradebot.2026-07-09_18-55-47_192896.log: 9765.5KB
+backend/logs/tradebot.2026-07-08_03-56-36_877619.log: 9765.4KB
+
+=== CI/CD PIPELINES ===
+CI/CD: GitHub Actions
+
+=== CONTAINERS & ORCHESTRATION ===
+Orchestration: Docker Compose found
+
+=== SECURITY & COMPLIANCE ===
+No security configs detected.
+
+=== PERFORMANCE & TESTING ===
+No performance testing configs detected.
+
+=== SCAN COMPLETE ===

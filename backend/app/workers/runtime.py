@@ -10,6 +10,7 @@ from app.core.scheduler import (
     start_pair_catalog_sync_loop,
     start_position_monitor,
     start_pump_monitor_loop,
+    start_research_loop,
     start_scheduler,
     start_sniper_loop,
     stop_auto_trade_loop,
@@ -17,6 +18,7 @@ from app.core.scheduler import (
     stop_pair_catalog_sync_loop,
     stop_position_monitor,
     stop_pump_monitor_loop,
+    stop_research_loop,
     stop_scheduler,
     stop_sniper_loop,
 )
@@ -88,6 +90,13 @@ def start_background_workers(allow_in_api: bool = False) -> dict[str, bool]:
     else:
         started["pair_catalog_sync_loop"] = False
 
+    if settings.AUTO_START_RESEARCH_LOOP:
+        started["research_loop"] = start_research_loop(
+            settings.RESEARCH_LOOP_INTERVAL_SECONDS
+        )
+    else:
+        started["research_loop"] = False
+
     return started
 
 
@@ -100,3 +109,4 @@ def stop_background_workers() -> None:
     stop_sniper_loop()
     stop_pump_monitor_loop()
     stop_pair_catalog_sync_loop()
+    stop_research_loop()

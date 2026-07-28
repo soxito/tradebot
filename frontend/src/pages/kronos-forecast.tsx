@@ -6,10 +6,14 @@ import {
   Volume2, Settings2, Cpu, AlertTriangle,
   BrainCircuit, Sparkles, CheckCircle2, Loader2, Wallet,
   Search, ChevronDown, Database, Download,
-  Crosshair, Zap, Check, X, Rocket, ShieldAlert, ChevronRight,
+  Crosshair, Zap, Check, X, Rocket, ShieldAlert, ChevronRight, Ban,
 } from 'lucide-react';
 import { apiClient } from '@/services/api';
 import { useKronosForecast } from '@/hooks/useKronosForecast';
+import type {
+  KronosDecision, KronosDirection, KronosVolumeContext, KronosVolumeRegime,
+} from '@/hooks/useKronosForecast';
+import { VolumeEvidence, fmtVol } from '@/components/KronosForecastCard';
 import { useJarvisSpeak } from '@/hooks/useJarvisSpeak';
 
 // Chart is client-only (lightweight-charts touches window)
@@ -80,6 +84,8 @@ interface JarvisAnalysis {
   market?: MarketCapInfo | null;
   position?: PositionInfo | null;
   position_advice?: string | null;
+  volume?: KronosVolumeContext | null;
+  decision?: KronosDecision;
   learned: boolean;
   provider?: string | null;
   note?: string | null;
@@ -111,6 +117,12 @@ interface SniperSignal {
   confidence: number;
   leverage: number;
   reasons: string[];
+  // Volume evidence carried on every emitted entry.
+  volume_24h?: number | null;
+  volume_1h?: number | null;
+  relative_volume?: number | null;
+  volume_regime?: KronosVolumeRegime;
+  volume_divergence?: string;
 }
 
 interface SniperSignalsResponse {
@@ -119,10 +131,13 @@ interface SniperSignalsResponse {
   timeframe: string;
   engine: string;
   anchor_price: number;
-  direction: 'up' | 'down' | 'flat';
+  direction: KronosDirection;
   pct_change: number;
   confidence: number;
   signals: SniperSignal[];
+  volume?: KronosVolumeContext | null;
+  decision?: KronosDecision;
+  rationale?: string[];
   note?: string | null;
 }
 
@@ -582,9 +597,11 @@ export default function KronosForecastPage() {
 
   const sig = data?.signal;
   const dirColor = sig?.direction === 'up' ? 'text-green-400'
-    : sig?.direction === 'down' ? 'text-red-400' : 'text-yellow-400';
+    : sig?.direction === 'down' ? 'text-red-400'
+    : sig?.direction === 'no_trade' ? 'text-amber-400' : 'text-yellow-400';
   const DirIcon = sig?.direction === 'up' ? TrendingUp
-    : sig?.direction === 'down' ? TrendingDown : Minus;
+    : sig?.direction === 'down' ? TrendingDown
+    : sig?.direction === 'no_trade' ? Ban : Minus;
 
   return (
     <>
@@ -892,26 +909,62 @@ export default function KronosForecastPage() {
 
               {sig ? (
                 <>
-                  <div className={`flex items-center gap-2 text-2xl font-bold ${dirColor}`}>
-                    <DirIcon className="w-6 h-6" />
-                    {sig.pct_change >= 0 ? '+' : ''}{sig.pct_change.toFixed(2)}%
-                  </div>
-                  <p className="text-xs text-gray-400 mt-1 capitalize">{sig.direction} over next {predLen}×{timeframe}</p>
+                  {data?.decision === 'NO_TRADE' ? (
+                    <div className="flex items-center gap-2 text-xl font-bold text-amber-400">
+                      <Ban className="w-6 h-6" /> NO TRADE
+                    </div>
+                  ) : (
+                    <>
+                      <div className={`flex items-center gap-2 text-2xl font-bold ${dirColor}`}>
+                        <DirIcon className="w-6 h-6" />
+                        {sig.pct_change >= 0 ? '+' : ''}{sig.pct_change.toFixed(2)}%
+                      </div>
+                      <p className="text-xs text-gray-400 mt-1 capitalize">{sig.direction} over next {predLen}×{timeframe}</p>
+                    </>
+                  )}
 
                   <div className="mt-4 space-y-2 text-sm">
-                    <Row label="Target price" value={sig.target_price.toPrecision(6)} />
+                    {data?.decision !== 'NO_TRADE' && (
+                      <>
+                        <Row label="Target price" value={sig.target_price.toPrecision(6)} />
+                        <Row label="Confidence" value={`${Math.round(sig.confidence * 100)}%`} />
+                      </>
+                    )}
                     <Row label="Current price" value={sig.anchor_price.toPrecision(6)} />
-                    <Row label="Confidence" value={`${Math.round(sig.confidence * 100)}%`} />
                     <Row label="Engine" value={data?.engine ?? '—'} />
+                    <Row label="Decision" value={data?.decision ?? 'OK'} />
                   </div>
 
                   {/* Confidence bar */}
-                  <div className="mt-3 h-2 rounded-full bg-gray-800 overflow-hidden">
-                    <div
-                      className="h-full bg-purple-500"
-                      style={{ width: `${Math.round(sig.confidence * 100)}%` }}
-                    />
+                  {data?.decision !== 'NO_TRADE' && (
+                    <div className="mt-3 h-2 rounded-full bg-gray-800 overflow-hidden">
+                      <div
+                        className={`h-full ${data?.decision === 'LOW_CONFIDENCE' ? 'bg-amber-500' : 'bg-purple-500'}`}
+                        style={{ width: `${Math.round(sig.confidence * 100)}%` }}
+                      />
+                    </div>
+                  )}
+
+                  {/* Volume evidence — the precondition this call was gated on */}
+                  <div className="mt-3">
+                    <VolumeEvidence volume={data?.volume} />
                   </div>
+
+                  {/* Why the direction was chosen */}
+                  {sig.rationale?.length > 0 && (
+                    <div className="mt-3">
+                      <h3 className="text-[11px] font-semibold text-gray-400 uppercase tracking-wide mb-1">
+                        Why this call
+                      </h3>
+                      <ul className="space-y-1">
+                        {sig.rationale.map((r, i) => (
+                          <li key={i} className="text-[11px] text-gray-400 leading-snug flex gap-1.5">
+                            <span className="text-purple-400 shrink-0">•</span>{r}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
                 </>
               ) : (
                 <p className="text-sm text-gray-500">{loading ? 'Forecasting…' : 'No forecast yet.'}</p>
@@ -1275,9 +1328,22 @@ function SniperPanel({
       ) : !hasForecast ? (
         <p className="text-sm text-gray-500 py-4">Run a forecast to generate sniper entries.</p>
       ) : signals.length === 0 ? (
-        <div className="flex items-start gap-2 bg-yellow-500/10 border border-yellow-500/30 rounded-lg px-3 py-2.5 text-xs text-yellow-300">
-          <Minus className="w-4 h-4 mt-0.5 shrink-0" />
-          {sniper?.note || 'Kronos sees no directional edge right now — no high-conviction entry. Try another timeframe.'}
+        <div className="space-y-2">
+          <div
+            className={`flex items-start gap-2 border rounded-lg px-3 py-2.5 text-xs ${
+              sniper?.decision === 'NO_TRADE'
+                ? 'bg-amber-500/10 border-amber-500/30 text-amber-300'
+                : 'bg-yellow-500/10 border-yellow-500/30 text-yellow-300'
+            }`}
+          >
+            {sniper?.decision === 'NO_TRADE'
+              ? <Ban className="w-4 h-4 mt-0.5 shrink-0" />
+              : <Minus className="w-4 h-4 mt-0.5 shrink-0" />}
+            {sniper?.note || 'Kronos sees no directional edge right now — no high-conviction entry. Try another timeframe.'}
+          </div>
+          {/* Show the volume evidence even when nothing is tradeable — it is the
+              reason there is no entry. */}
+          <VolumeEvidence volume={sniper?.volume} />
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
@@ -1328,6 +1394,34 @@ function SniperPanel({
                     Stretch target (TP2): <span className="text-emerald-300 tabular-nums">{fmtPx(s.take_profit_2)}</span>
                   </div>
                 )}
+
+                {/* Volume evidence — required on every emitted entry */}
+                <div className="flex flex-wrap items-center gap-1.5 mb-2.5 text-[10px]">
+                  <span className="rounded px-1.5 py-0.5 bg-gray-800 text-gray-300 tabular-nums">
+                    24h vol <span className="text-white">{fmtVol(s.volume_24h)}</span>
+                  </span>
+                  <span className="rounded px-1.5 py-0.5 bg-gray-800 text-gray-300 tabular-nums">
+                    1h vol <span className="text-white">{fmtVol(s.volume_1h)}</span>
+                  </span>
+                  <span className="rounded px-1.5 py-0.5 bg-gray-800 text-gray-300 tabular-nums">
+                    rel <span className="text-white">
+                      {s.relative_volume != null ? `×${s.relative_volume.toFixed(2)}` : 'n/a'}
+                    </span>
+                  </span>
+                  <span className={`rounded px-1.5 py-0.5 border font-semibold ${
+                    s.volume_regime === 'CLIMACTIC' ? 'bg-amber-500/15 text-amber-300 border-amber-700/40'
+                    : s.volume_regime === 'ELEVATED' ? 'bg-emerald-500/15 text-emerald-300 border-emerald-700/40'
+                    : s.volume_regime === 'DEAD' ? 'bg-gray-500/15 text-gray-400 border-gray-600/40'
+                    : 'bg-blue-500/15 text-blue-300 border-blue-700/40'
+                  }`}>
+                    {s.volume_regime ?? 'UNKNOWN'}
+                  </span>
+                  {s.volume_divergence && s.volume_divergence !== 'NEUTRAL' && s.volume_divergence !== 'UNKNOWN' && (
+                    <span className="rounded px-1.5 py-0.5 bg-gray-800 text-gray-300">
+                      {s.volume_divergence.replace('_', ' ').toLowerCase()}
+                    </span>
+                  )}
+                </div>
 
                 {/* Reasons */}
                 <ul className="space-y-1 mb-3">

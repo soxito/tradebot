@@ -15,11 +15,14 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import JarvisRobot, { RobotState, AvatarStyle } from './JarvisRobot'
 import OpenHumanMascot, { MascotMood } from './OpenHumanMascot'
+import type { VariantId } from '@/three/robotVariants'
 
 interface Props {
   state: RobotState
   energy?: number
   avatarStyle?: AvatarStyle
+  /** Force a look. Omit to follow the persisted `jarvis.robotVariant`. */
+  variant?: VariantId
   onClick?: () => void
   size?: number
   extRobotActive?: boolean   // true when extension robot has taken over
@@ -50,6 +53,7 @@ export default function JarvisRobotAvatar({
   state,
   energy = 0,
   avatarStyle = 'cyan',
+  variant,
   onClick,
   size = 160,
   extRobotActive = false,
@@ -68,6 +72,18 @@ export default function JarvisRobotAvatar({
   // Vanish state
   const [vanished, setVanished] = useState(false)
   const vanishedRef = useRef(false)
+
+  // Whether the 3D scene itself should stop drawing. It trails `vanished` on
+  // the way out so the robot fades with its shadow rather than popping off
+  // mid-fade, and leads it on the way back in so the first visible frame is
+  // already drawn. FADE_MS must match the wrapper's opacity transition.
+  const FADE_MS = 600
+  const [sceneHidden, setSceneHidden] = useState(false)
+  useEffect(() => {
+    if (!vanished) { setSceneHidden(false); return }
+    const t = setTimeout(() => setSceneHidden(true), FADE_MS)
+    return () => clearTimeout(t)
+  }, [vanished])
   const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const vanishAnimRef = useRef<HTMLDivElement | null>(null)
 
@@ -84,25 +100,82 @@ export default function JarvisRobotAvatar({
     emitRobotLock(extRobotActive)
   }, [extRobotActive])
 
-  // ── Initial position (saved or default) ─────────────────────────────────────
+  // ── Bottom-RIGHT corner positioning ────────────────────────────────────────
+  // The robot used to roam the centre 80% of the viewport, which walked it
+  // straight through the middle of the dashboard and parked it on top of the
+  // balance cards. A floating assistant belongs in the periphery, so the roam is
+  // now a short band hugging the bottom-right corner — it still wanders, just
+  // not across what you are reading.
+  const BOTTOM_MARGIN = 40   // clear of the viewport bottom
+  const CHAT_BTN_CLEARANCE = 88  // the 52px chat button + its 20px inset + gap
+  const ROAM_BAND = 200      // how far along the bottom edge it may wander
+
+  // Right-most left-edge the robot may occupy: keeps it clear of the chat button.
+  const roamMaxX = () => Math.max(
+    8,
+    (typeof window !== 'undefined' ? window.innerWidth : 1920) - size - CHAT_BTN_CLEARANCE,
+  )
+  const roamMinX = () => Math.max(8, roamMaxX() - ROAM_BAND)
+
+  // Fixed Y position (bottom edge)
+  const Y_FIXED = typeof window !== 'undefined'
+    ? window.innerHeight - size - BOTTOM_MARGIN
+    : 0
+
+  // Home = bottom-right corner, just left of the floating chat button.
+  const homePos = () => ({
+    x: roamMaxX(),
+    y: (typeof window !== 'undefined' ? window.innerHeight : 1080) - size - BOTTOM_MARGIN,
+  })
+
+  // ── Initial position (saved, clamped into the corner band, else home) ───────
   const [pos, setPos] = useState<{ x: number; y: number }>(() => {
     if (typeof window === 'undefined') return { x: 0, y: 0 }
     try {
       const saved = JSON.parse(localStorage.getItem(POS_KEY) || 'null')
-      if (saved && typeof saved.x === 'number') return saved
+      // A position saved under the old centre-roaming behaviour would drop the
+      // robot back into the middle of the page on every load, so bring any
+      // stale value into the current band instead of trusting it blindly.
+      if (saved && typeof saved.x === 'number' && typeof saved.y === 'number') {
+        return {
+          x: Math.min(Math.max(roamMinX(), saved.x), roamMaxX()),
+          y: Math.min(Math.max(0, saved.y), window.innerHeight - size),
+        }
+      }
     } catch { /* noop */ }
-    return { x: window.innerWidth - size - 36, y: window.innerHeight - size - 120 }
+    return homePos()
   })
 
   useEffect(() => { posRef.current = pos }, [pos])
 
-  // ── Pick a new random roam target ──────────────────────────────────────────
+  // ── Handle window resize: keep robot in the bottom-right corner ─────────────
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const onResize = () => {
+      const { x: newX, y: newY } = homePos()
+      posRef.current = { x: newX, y: newY }
+      if (wrapRef.current) {
+        wrapRef.current.style.transform = `translate(${newX}px, ${newY}px)`
+      }
+      setPos({ x: newX, y: newY })
+    }
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [size])
+
+  // ── Pick a new roam target inside the bottom-right corner band ─────────────
   const pickTarget = useCallback(() => {
     if (typeof window === 'undefined') return
+    const minX = roamMinX()
+    const maxX = roamMaxX()
+    // Small vertical wobble only (±15px)
+    const yVariance = 15
     targetRef.current = {
-      x: Math.floor(Math.random() * (window.innerWidth  - size - 16)) + 8,
-      y: Math.floor(Math.random() * (window.innerHeight - size - 16)) + 8,
+      x: Math.floor(Math.random() * Math.max(1, maxX - minX)) + minX,
+      y: Y_FIXED + (Math.random() - 0.5) * yVariance * 2,
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [size])
 
   // ── Roam timer: pick new target every ROAM_INTERVAL_MS ─────────────────────
@@ -135,9 +208,14 @@ export default function JarvisRobotAvatar({
         if (dist > 2) {
           const nx = x + (dx / dist) * WALK_SPEED
           const ny = y + (dy / dist) * WALK_SPEED
+          // Clamp X to the bottom-right corner band, Y to the bottom strip
+          const minX = roamMinX()
+          const maxX = roamMaxX()
+          const minY = Y_FIXED - 15
+          const maxY = Y_FIXED + 15
           posRef.current = {
-            x: Math.min(Math.max(8, nx), window.innerWidth  - size - 8),
-            y: Math.min(Math.max(8, ny), window.innerHeight - size - 8),
+            x: Math.min(Math.max(minX, nx), maxX),
+            y: Math.min(Math.max(minY, ny), maxY),
           }
         }
       }
@@ -150,36 +228,75 @@ export default function JarvisRobotAvatar({
 
     tick()
     return () => cancelAnimationFrame(raf)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [size])
 
-  // ── Vanish idle timer: reset on any non-idle state ──────────────────────────
+  // ── Summon: bring the robot back from the hole ─────────────────────────────
+  // Every route back to visibility goes through here. It used to be inlined in
+  // the wake-word listener only, which made the Easter egg a ONE-WAY DOOR: with
+  // no microphone (denied, disabled, or an unsupported browser) nothing could
+  // ever fire a wake event, so the robot stayed gone for the rest of the session
+  // and the glowing hole sat on top of the page forever.
+  const summon = useCallback(() => {
+    if (!vanishedRef.current) return
+    vanishedRef.current = false
+    setVanished(false)
+    if (typeof window === 'undefined') return
+    // Re-emerge at the bottom-right home position.
+    posRef.current = homePos()
+    setPos(posRef.current)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [size])
+  const summonRef = useRef(summon)
+  summonRef.current = summon
+
+  // ── Vanish idle timer ─────────────────────────────────────────────────────
+  // Re-armed by BOTH the voice state and real user activity. Watching `state`
+  // alone meant "idle" was measured purely in voice terms, so someone actively
+  // clicking around the dashboard with the mic off still lost the robot after
+  // 90 seconds — the single most confusing way for it to look broken.
+  const armVanishTimer = useCallback(() => {
+    if (idleTimerRef.current) clearTimeout(idleTimerRef.current)
+    idleTimerRef.current = setTimeout(() => {
+      if (stateRef.current === 'idle' || stateRef.current === 'walking') {
+        vanishedRef.current = true
+        setVanished(true)
+      }
+    }, VANISH_IDLE_MS)
+  }, [])
+  const armVanishTimerRef = useRef(armVanishTimer)
+  armVanishTimerRef.current = armVanishTimer
+
   useEffect(() => {
     if (state !== 'idle' && state !== 'walking') {
-      // Active — reset vanish timer
+      // Active — cancel the countdown and come back if we were hiding.
       if (idleTimerRef.current) clearTimeout(idleTimerRef.current)
-      // If we were vanished, come back immediately
-      if (vanishedRef.current) {
-        vanishedRef.current = false
-        setVanished(false)
-      }
+      summonRef.current()
     } else {
-      // Idle/walking — start vanish countdown
-      if (idleTimerRef.current) clearTimeout(idleTimerRef.current)
-      idleTimerRef.current = setTimeout(() => {
-        if (stateRef.current === 'idle' || stateRef.current === 'walking') {
-          triggerVanish()
-        }
-      }, VANISH_IDLE_MS)
+      armVanishTimerRef.current()
     }
     return () => { if (idleTimerRef.current) clearTimeout(idleTimerRef.current) }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state])
 
-  // ── Vanish: robot digs a glowing hole and disappears ───────────────────────
-  function triggerVanish() {
-    vanishedRef.current = true
-    setVanished(true)
-  }
+  // Any real interaction with the page counts as "the user is still here".
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const onActivity = () => {
+      // Only re-arm while visible: activity must not silently cancel a vanish
+      // that has already happened (the user summons that back deliberately).
+      if (vanishedRef.current) return
+      armVanishTimerRef.current()
+    }
+    const opts = { passive: true } as const
+    window.addEventListener('pointerdown', onActivity, opts)
+    window.addEventListener('keydown', onActivity, opts)
+    window.addEventListener('scroll', onActivity, opts)
+    return () => {
+      window.removeEventListener('pointerdown', onActivity)
+      window.removeEventListener('keydown', onActivity)
+      window.removeEventListener('scroll', onActivity)
+    }
+  }, [])
 
   // ── Listen for "Jarvis" shout to re-emerge ──────────────────────────────────
   // The extension/page will fire a window event when the wake word is detected
@@ -187,15 +304,7 @@ export default function JarvisRobotAvatar({
     const handleWake = (e: Event) => {
       const ev = e as CustomEvent
       if (ev.detail?.type === 'wake' || ev.detail?.wakeWord === 'jarvis') {
-        if (vanishedRef.current) {
-          vanishedRef.current = false
-          setVanished(false)
-          // Walk back from a random edge
-          posRef.current = {
-            x: Math.random() < 0.5 ? 8 : window.innerWidth - size - 8,
-            y: Math.random() * (window.innerHeight - size - 16) + 8,
-          }
-        }
+        summonRef.current()
       }
     }
 
@@ -231,8 +340,12 @@ export default function JarvisRobotAvatar({
   const onPointerMove = useCallback((e: React.PointerEvent) => {
     const d = dragRef.current
     if (!d.active) return
-    const nx = Math.min(Math.max(8, e.clientX - d.offX), window.innerWidth  - size - 8)
-    const ny = Math.min(Math.max(8, e.clientY - d.offY), window.innerHeight - size - 8)
+    const w = typeof window !== 'undefined' ? window.innerWidth : 1920
+    const nx = Math.min(Math.max(8, e.clientX - d.offX), w - size - 8)
+    // Constrain Y to bottom strip (120px from bottom ± 30px variance)
+    const h = typeof window !== 'undefined' ? window.innerHeight : 1080
+    const fixedY = h - size - BOTTOM_MARGIN
+    const ny = Math.min(Math.max(fixedY - 30, e.clientY - d.offY), fixedY + 30)
     if (Math.abs(nx - posRef.current.x) > 2 || Math.abs(ny - posRef.current.y) > 2) d.moved = true
     posRef.current = { x: nx, y: ny }
     if (wrapRef.current) wrapRef.current.style.transform = `translate(${nx}px, ${ny}px)`
@@ -274,8 +387,21 @@ export default function JarvisRobotAvatar({
     animation: 'jarvis-hole-pulse 1.2s ease-in-out infinite alternate',
     opacity: vanished ? 1 : 0,
     transition: 'opacity 0.4s',
-    pointerEvents: 'none',
+    // Clickable: the hole is the visible affordance for a robot that is hiding,
+    // and clicking the thing it left behind is the obvious way to ask for it
+    // back. It was pointer-events:none, which — with the wake word as the only
+    // other route — is what made the disappearance permanent without a mic.
+    pointerEvents: vanished ? 'auto' : 'none',
+    cursor: vanished ? 'pointer' : 'default',
   }
+
+  // Keep the summon hint on screen. Anchored under a robot that already sits a
+  // fixed margin from the bottom, `y + size + 24` lands past the viewport edge
+  // and the text renders clipped in half.
+  const hintTop = Math.min(
+    posRef.current.y + size + 24,
+    (typeof window !== 'undefined' ? window.innerHeight : 1080) - 18,
+  )
 
   return (
     <>
@@ -291,8 +417,36 @@ export default function JarvisRobotAvatar({
         }
       `}</style>
 
-      {/* Glowing hole portal */}
-      {vanished && <div style={holeStyle} />}
+      {/* Glowing hole portal + summon hint. Both live outside the robot wrapper
+          because that wrapper is faded and visibility:hidden while vanished —
+          anything nested inside it is invisible exactly when this needs to show. */}
+      {vanished && (
+        <div
+          style={holeStyle}
+          onClick={summon}
+          role="button"
+          tabIndex={0}
+          aria-label="Summon JARVIS"
+          onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') summon() }}
+          title="Click to summon JARVIS"
+        />
+      )}
+      {vanished && (
+        <div
+          onClick={summon}
+          style={{
+            position: 'fixed',
+            left: posRef.current.x + size / 2,
+            top:  hintTop,
+            transform: 'translateX(-50%)',
+            color: '#06b6d4', fontSize: 9, whiteSpace: 'nowrap', opacity: 0.7,
+            fontFamily: 'monospace', pointerEvents: 'auto', cursor: 'pointer',
+            zIndex: 2147483599,
+          }}
+        >
+          Click or say &quot;Jarvis&quot; to summon
+        </div>
+      )}
 
       {/* Robot wrapper */}
       <div
@@ -303,9 +457,21 @@ export default function JarvisRobotAvatar({
           zIndex: 2147483600,
           width: size, height: size,
           cursor: 'grab', touchAction: 'none',
-          filter: 'drop-shadow(0 12px 32px rgba(0,0,0,.55))',
+          // No drop-shadow while hidden: the shadow is cast by the wrapper, so
+          // leaving it on paints a dark blur where the robot used to be. The
+          // 3D scene's own contact shadow is removed in step via `hidden`.
+          filter: vanished ? 'none' : 'drop-shadow(0 12px 32px rgba(0,0,0,.55))',
           opacity: vanished ? 0 : 1,
-          transition: 'opacity 0.6s',
+          // Once hidden the wrapper must stop swallowing clicks — it is a
+          // size×size invisible box sitting above the page.
+          pointerEvents: vanished ? 'none' : 'auto',
+          visibility: vanished ? 'hidden' : 'visible',
+          // Delay the visibility flip until the fade-out finishes, but apply it
+          // instantly on the way back in so the robot is not invisible for the
+          // first 600 ms of its return.
+          transition: vanished
+            ? `opacity ${FADE_MS}ms, visibility 0s linear ${FADE_MS}ms`
+            : `opacity ${FADE_MS}ms, visibility 0s`,
           animation: !vanished && state !== 'idle' ? 'jarvis-emerge 0.5s ease-out' : undefined,
         }}
         onPointerDown={onPointerDown}
@@ -317,13 +483,16 @@ export default function JarvisRobotAvatar({
           <OpenHumanMascot
             mood={ROBOT_TO_MOOD[state] ?? 'idle'}
             size={size}
+            hidden={sceneHidden}
           />
         ) : (
           <JarvisRobot
             state={displayState}
             energy={energy}
             avatarStyle={avatarStyle}
+            variant={variant}
             size={size}
+            hidden={sceneHidden}
           />
         )}
 
@@ -341,16 +510,6 @@ export default function JarvisRobotAvatar({
           </div>
         )}
 
-        {/* Vanish hint while robot is active */}
-        {vanished && (
-          <div style={{
-            position: 'absolute', bottom: -28, left: '50%', transform: 'translateX(-50%)',
-            color: '#06b6d4', fontSize: 9, whiteSpace: 'nowrap', opacity: 0.7,
-            fontFamily: 'monospace', pointerEvents: 'none',
-          }}>
-            Say "Jarvis" to summon
-          </div>
-        )}
       </div>
     </>
   )

@@ -1,0 +1,31 @@
+{
+  "name": "WhatsApp Signal & News Plugin",
+  "slug": "whatsapp",
+  "version": "1.0.0",
+  "description": "WhatsApp channel ingestion for trading signals and market news via OpenWA Gateway. Real-time webhooks, signal parsing, sniper auto-trade.",
+  "author": "TradeBot",
+  "requires": { "python": ">=3.12", "tradebot": ">=0.1.0" },
+  "service_provider": "backend.router",
+  "provides": {
+    "routes": ["backend/router.py"],
+    "models": ["backend/models.py"],
+    "migrations": ["backend/migrations/"],
+    "pages": ["frontend/pages/"],
+    "scheduled_jobs": ["whatsapp_webhook_processor"]
+  },
+  "permissions": [
+    "whatsapp.sessions.manage",
+    "whatsapp.channels.manage",
+    "whatsapp.messages.view",
+    "whatsapp.sniper.trade"
+  ],
+  "settings_keys": [
+    "whatsapp.openwa_base_url",
+    "whatsapp.openwa_api_key",
+    "whatsapp.default_session_name",
+    "whatsapp.webhook_secret",
+    "whatsapp.poll_interval_seconds",
+    "whatsapp.enable_llm_fallback",
+    "whatsapp.llm_model"
+  ]
+}

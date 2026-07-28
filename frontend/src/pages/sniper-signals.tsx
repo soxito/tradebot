@@ -348,6 +348,9 @@ export default function SniperSignalsPage() {
                   {/* Expanded Details */}
                   {expanded && (
                     <div className="border-t border-gray-700/50 p-4 space-y-4">
+                      {/* Volume-gated Kronos forecast: shows the 24h/1h volume,
+                          relative volume, regime and why the direction was
+                          chosen — or NO_TRADE when volume can't be resolved. */}
                       <KronosForecastCard symbol={sig.symbol} timeframe="15m" predLen={16} />
                       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                         {/* Entry Decision */}

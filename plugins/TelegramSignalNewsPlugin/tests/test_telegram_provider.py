@@ -206,15 +206,19 @@ async def test_telethon_list_subscribed_channels_scans_all_dialogs(monkeypatch: 
 
     class FakeClient:
         last_limit: int | None = -1
+        connected = False
+        disconnected = False
 
         def __init__(self, *_args, **_kwargs):
             pass
 
-        async def __aenter__(self):
-            return self
+        # _connected_client() drives the client explicitly so the session lock
+        # can serialise Telethon's SQLite access — not via `async with client`.
+        async def connect(self):
+            FakeClient.connected = True
 
-        async def __aexit__(self, _exc_type, _exc, _tb):
-            return None
+        async def disconnect(self):
+            FakeClient.disconnected = True
 
         def iter_dialogs(self, limit=None):
             FakeClient.last_limit = limit
@@ -237,6 +241,8 @@ async def test_telethon_list_subscribed_channels_scans_all_dialogs(monkeypatch: 
     assert FakeClient.last_limit is None
     assert len(rows) == 200
     assert any(row.handle.lower() == "@bullfrogcrypto" for row in rows)
+    # The session must be opened and always released back to the lock.
+    assert FakeClient.connected and FakeClient.disconnected
 
 
 def test_parse_core_methods_html_extracts_unique_names():

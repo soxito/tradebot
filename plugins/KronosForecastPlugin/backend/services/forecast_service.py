@@ -29,10 +29,11 @@ from app.exchanges.manager import exchange_manager, SupportedExchange
 
 from plugins.KronosForecastPlugin.backend.config import kronos_config
 from plugins.KronosForecastPlugin.backend.services.kronos_engine import kronos_engine
+from plugins.KronosForecastPlugin.backend.services import volume_context as volctx
 from plugins.KronosForecastPlugin.backend.schemas import (
     ForecastResponse, ForecastCandle, BandPoint, ForecastSignal,
     OverlaySeries, OverlayLinePoint, OverlayMarker, ForecastStatus,
-    SniperSignal, SniperSignalsResponse,
+    SniperSignal, SniperSignalsResponse, VolumeContext,
 )
 
 # ── timeframe helpers ───────────────────────────────────────────
@@ -51,17 +52,85 @@ def _tf_seconds(timeframe: str) -> int:
 # ── OHLCV fetch (reuse core exchange manager + forex/metals fallback) ───────
 
 def _is_forex(symbol: str) -> bool:
-    """Return True if the symbol should be fetched via the forex provider."""
+    """True for non-crypto instruments (FX, metals, indices, energy) — the ones
+    the crypto connectors cannot price and that need the Yahoo/forex providers.
+
+    ``forex_provider`` only knows seven majors plus gold/silver, so Yahoo's
+    resolver is consulted too: it covers every FX cross, index and commodity in
+    ``yahoo_provider.YAHOO_TICKERS``. Yahoo's ``-USD`` spellings are its *crypto*
+    tickers and are deliberately excluded — crypto stays on the exchange
+    connectors, which carry deeper history and real traded volume.
+    """
     try:
         from app.exchanges.forex_provider import is_forex_symbol
-        return is_forex_symbol(symbol)
+        if is_forex_symbol(symbol):
+            return True
+    except Exception:
+        pass
+    try:
+        from app.exchanges import yahoo_provider
+        ticker = yahoo_provider.resolve_ticker(symbol)
+        return bool(ticker) and not ticker.endswith("-USD")
     except Exception:
         return False
 
 
+#: ccxt timeframe → the MT5-style timeframe ``yahoo_provider`` speaks. Anything
+#: absent here (3m, 2h, 6h, 12h, 3d) has no Yahoo bar and falls back.
+_YF_TIMEFRAME: Dict[str, str] = {
+    "1m": "M1", "5m": "M5", "15m": "M15", "30m": "M30",
+    "1h": "H1", "4h": "H4", "1d": "D1", "1w": "W1",
+}
+
+
+async def _fetch_yahoo_ohlcv(symbol: str, timeframe: str, limit: int) -> List[list]:
+    """Fetch intraday OHLCV for an FX / metal / index symbol from Yahoo.
+
+    This is the only source in the repo that puts **real volume** on a spot FX
+    series: spot FX is OTC and has no consolidated tape, so every spot feed
+    (Yahoo's own ``GBPUSD=X`` included) prints zero. ``yahoo_provider`` borrows
+    the matching CME currency future's contract volume (GBP → ``6B=F``) and
+    matches it bar-for-bar, which is the standard published proxy for FX flow.
+
+    Indices need no such join — they resolve straight to their own future
+    (US30 → ``YM=F``), so price and volume arrive on the same bars.
+
+    Returns ccxt-compatible rows ``[timestamp_ms, open, high, low, close, volume]``.
+    """
+    tf = _YF_TIMEFRAME.get((timeframe or "").strip().lower())
+    if tf is None:
+        return []
+    try:
+        from app.exchanges import yahoo_provider
+        bars = await yahoo_provider.fetch_candles(symbol, tf, limit)
+    except Exception as exc:
+        logger.warning(f"[Kronos] Yahoo OHLCV failed for {symbol} {timeframe}: {exc}")
+        return []
+    rows: List[list] = []
+    for b in bars:
+        try:
+            vol = b.get("volume")
+            rows.append([
+                int(b["time"]) * 1000,
+                float(b["open"]), float(b["high"]), float(b["low"]), float(b["close"]),
+                float(vol) if vol is not None else 0.0,
+            ])
+        except (KeyError, TypeError, ValueError):
+            continue
+    if rows:
+        logger.info(
+            f"[Kronos] Yahoo OHLCV {symbol} {timeframe}: {len(rows)} bars, "
+            f"{sum(1 for r in rows if r[5] > 0)} carrying volume"
+        )
+    return rows
+
+
 async def _fetch_forex_ohlcv(symbol: str, timeframe: str, limit: int) -> List[list]:
-    """Fetch OHLCV for forex/metals from the forex_provider (Yahoo Finance / CoinGecko).
+    """Fetch OHLCV for forex/metals from the forex_provider (Frankfurter / CoinGecko).
     Returns ccxt-compatible rows: [timestamp_ms, open, high, low, close, volume].
+
+    Price-only fallback: Frankfurter is *daily* and hard-codes ``0.0`` volume, so
+    this never backs the volume gate — see ``_fetch_volume_ohlcv``.
     """
     try:
         from app.exchanges.forex_provider import fetch_ohlcv as forex_fetch_ohlcv
@@ -146,8 +215,15 @@ async def _fetch_public_ccxt_ohlcv(symbol: str, timeframe: str, limit: int) -> L
 
 
 async def _fetch_ohlcv(exchange: str, symbol: str, timeframe: str, limit: int) -> List[list]:
-    # Route forex / metals through the dedicated provider first.
+    # Route forex / metals / indices to Yahoo first: it serves the requested
+    # intraday timeframe *and* carries CME contract volume. forex_provider is
+    # only a price fallback — Frankfurter answers every timeframe with daily
+    # bars at 0.0 volume, which used to make a "1h" FX forecast silently run on
+    # daily candles and then fail the volume gate outright.
     if _is_forex(symbol):
+        rows = await _fetch_yahoo_ohlcv(symbol, timeframe, limit)
+        if rows and len(rows) >= 5:
+            return rows
         rows = await _fetch_forex_ohlcv(symbol, timeframe, limit)
         if rows:
             return rows
@@ -211,6 +287,28 @@ def _rows_to_frame(rows: List[list]) -> Tuple[pd.DataFrame, pd.Series]:
     return df, pd.Series(ts)
 
 
+def _historical_candles(rows: List[list], symbol: str) -> List[ForecastCandle]:
+    """History as ForecastCandles so the frontend can draw the series itself.
+
+    Populated for forex/metals where the exchange has no data; empty for crypto
+    (the frontend fetches crypto OHLCV directly for better resolution).
+    """
+    if not _is_forex(symbol):
+        return []
+    out: List[ForecastCandle] = []
+    for r in rows:
+        try:
+            out.append(ForecastCandle(
+                time=int(r[0] / 1000),
+                open=float(r[1]), high=float(r[2]),
+                low=float(r[3]), close=float(r[4]),
+                volume=float(r[5]) if len(r) > 5 else 0.0,
+            ))
+        except Exception:
+            pass
+    return out
+
+
 def _future_timestamps(last_unix: int, step: int, n: int) -> Tuple[pd.Series, List[int]]:
     unix = [last_unix + step * (i + 1) for i in range(n)]
     dt = pd.Series([datetime.fromtimestamp(u, tz=timezone.utc).replace(tzinfo=None) for u in unix])
@@ -253,22 +351,30 @@ def _aggregate(
     return forecast, upper, lower
 
 
-def _direction_confidence(
+#: Below this predicted move the paths are not saying anything directional.
+_FLAT_PCT = 0.15
+
+
+def _model_direction(
     paths: List[pd.DataFrame], anchor: float, horizon: int
-) -> Tuple[str, float, float, float]:
-    """Return (direction, pct_change, confidence, target_price)."""
+) -> Tuple[str, float, float, float, float]:
+    """Return (direction, pct_change, target_price, agreement, dispersion).
+
+    This is the model's own read, before any volume adjustment. ``agreement`` is
+    the fraction of sampled paths finishing on the same side as the mean move;
+    ``dispersion`` is the std of the final closes as a fraction of the anchor.
+    """
     finals = np.array([float(p["close"].to_numpy()[: horizon][-1]) for p in paths])
     target = float(finals.mean())
     pct = (target - anchor) / anchor * 100.0 if anchor else 0.0
 
-    if pct > 0.15:
+    if pct > _FLAT_PCT:
         direction = "up"
-    elif pct < -0.15:
+    elif pct < -_FLAT_PCT:
         direction = "down"
     else:
         direction = "flat"
 
-    # Agreement: fraction of sample paths ending on the same side as the mean move
     if direction == "up":
         agree = float((finals > anchor).mean())
     elif direction == "down":
@@ -276,10 +382,63 @@ def _direction_confidence(
     else:
         agree = float((np.abs(finals - anchor) / anchor < 0.0015).mean()) if anchor else 0.5
 
-    # Dispersion penalty: wider spread (relative to price) => lower confidence
-    spread = float(finals.std() / anchor) if anchor else 0.0
-    confidence = max(0.0, min(1.0, 0.6 * agree + 0.4 * max(0.0, 1.0 - spread * 40)))
-    return direction, pct, confidence, target
+    dispersion = float(finals.std() / anchor) if anchor else 0.0
+    return direction, pct, target, agree, dispersion
+
+
+def _volume_gated_signal(
+    paths: List[pd.DataFrame],
+    anchor: float,
+    horizon: int,
+    ctx: VolumeContext,
+    *,
+    symbol: str,
+    horizon_label: str,
+) -> ForecastSignal:
+    """Build the forecast signal *after* the volume gate.
+
+    When ``ctx`` is not OK the direction is reported as ``no_trade`` with zero
+    confidence — a direction is never inferred from price alone. Otherwise the
+    confidence is the documented deterministic product of the model's agreement/
+    dispersion and the volume regime + divergence weights (see
+    ``volume_context.score_confidence``).
+    """
+    direction, pct, target, agree, dispersion = _model_direction(paths, anchor, horizon)
+
+    if ctx.status != "OK":
+        rationale = volctx.direction_rationale(
+            direction, ctx, agreement=agree, dispersion=dispersion,
+            confidence=0.0, decision="NO_TRADE",
+        )
+        return ForecastSignal(
+            direction="no_trade", pct_change=0.0, confidence=0.0,
+            target_price=anchor, anchor_price=anchor, decision="NO_TRADE",
+            summary=(
+                f"NO_TRADE on {symbol} — volume context is {ctx.status.lower()} "
+                f"({ctx.detail}). No direction inferred."
+            ),
+            rationale=rationale,
+        )
+
+    confidence = volctx.score_confidence(direction, agree, dispersion, ctx)
+    decision = volctx.decide(confidence, ctx)
+    rationale = volctx.direction_rationale(
+        direction, ctx, agreement=agree, dispersion=dispersion,
+        confidence=confidence, decision=decision,
+    )
+    arrow = "▲" if direction == "up" else ("▼" if direction == "down" else "→")
+    summary = (
+        f"Kronos projects {symbol} {direction} {arrow} {pct:+.2f}% over the next "
+        f"{horizon_label} (target {target:.6g}, {int(confidence * 100)}% confidence) "
+        f"on {ctx.regime} volume ×{ctx.relative_volume:.2f}."
+    )
+    if decision == "LOW_CONFIDENCE":
+        summary += " Below the tradeable confidence floor — no entry."
+    return ForecastSignal(
+        direction=direction, pct_change=round(pct, 4), confidence=round(confidence, 3),
+        target_price=target, anchor_price=anchor, summary=summary,
+        decision=decision, rationale=rationale,
+    )
 
 
 # ── heuristic fallback (no model) ───────────────────────────────
@@ -339,6 +498,93 @@ def _heuristic_note(reason: Optional[str] = None) -> str:
         base = f"Heuristic forecast — Kronos unavailable ({err})."
     from plugins.KronosForecastPlugin.backend.services.kronos_engine import kronos_setup_command
     return base + f" Run: {kronos_setup_command()}"
+
+
+# ── volume gate ─────────────────────────────────────────────────────────────
+
+def _volume_unit(exchange: str, symbol: str = "") -> str:
+    """What the ``volume`` column actually counts for this source.
+
+    * ``tick``    — MT5 brokers report *tick* volume (price updates), not traded
+                    contracts; label it honestly rather than passing it off as
+                    traded size.
+    * ``futures`` — spot FX / metals / indices, where the number is the matching
+                    CME contract's volume borrowed by ``yahoo_provider``. It is
+                    unambiguous because ``_fetch_volume_ohlcv`` admits no other
+                    source for these symbols.
+    * ``base``    — an exchange's own base-asset traded volume (crypto).
+    """
+    if (exchange or "").strip().lower() == "mt5":
+        return "tick"
+    if symbol and _is_forex(symbol):
+        return "futures"
+    return "base"
+
+
+async def _fetch_volume_ohlcv(
+    exchange: str, symbol: str, timeframe: str, limit: int
+) -> List[list]:
+    """OHLCV for the *volume* gate — the price connectors minus the forex
+    fallbacks, which carry no volume of this symbol's own.
+
+    For FX / metals / indices this is Yahoo alone. Frankfurter hard-codes ``0.0``
+    and CoinGecko's PAXG proxy measures a *token*, not the metal; letting either
+    back the gate would either refuse every forecast or mislabel another
+    instrument's activity as this one's. Neither is evidence, so neither is used.
+    """
+    if _is_forex(symbol):
+        return await _fetch_yahoo_ohlcv(symbol, timeframe, limit)
+    return await _fetch_ohlcv(exchange, symbol, timeframe, limit)
+
+
+async def _resolve_volume(
+    exchange: str, symbol: str, timeframe: str, rows: Optional[List[list]],
+) -> VolumeContext:
+    """Resolve the volume gate for a forecast, reusing the rows already fetched
+    and falling back to a dedicated 1h fetch through the same connectors."""
+
+    async def _fetch(sym: str, tf: str, limit: int) -> List[list]:
+        return await _fetch_volume_ohlcv(exchange, sym, tf, limit)
+
+    return await volctx.resolve_volume_context(
+        symbol=symbol, timeframe=timeframe, rows=rows, fetcher=_fetch,
+        volume_unit=_volume_unit(exchange, symbol),
+    )
+
+
+def _no_trade_response(
+    *, exchange: str, symbol: str, timeframe: str, engine: str, model_name: str,
+    lookback: int, pred_len: int, samples: int, anchor_time: int, anchor_price: float,
+    ctx: VolumeContext, candles: Optional[List[ForecastCandle]] = None,
+) -> ForecastResponse:
+    """A forecast that was refused because volume could not be established.
+
+    Carries the volume evidence and the reason, and deliberately carries no
+    predicted candles, bands, overlays or direction — there is nothing to show.
+    """
+    signal = ForecastSignal(
+        direction="no_trade", pct_change=0.0, confidence=0.0,
+        target_price=anchor_price, anchor_price=anchor_price, decision="NO_TRADE",
+        summary=(
+            f"NO_TRADE on {symbol} ({timeframe}) — volume context is "
+            f"{ctx.status.lower()}. {ctx.detail}"
+        ),
+        rationale=volctx.direction_rationale(
+            "flat", ctx, agreement=0.0, dispersion=0.0, confidence=0.0,
+            decision="NO_TRADE",
+        ),
+    )
+    return ForecastResponse(
+        exchange=exchange, symbol=symbol, timeframe=timeframe, engine=engine,
+        model_name=model_name, lookback=lookback, pred_len=pred_len, samples=samples,
+        anchor_time=anchor_time, anchor_price=anchor_price,
+        signal=signal, volume=ctx, decision="NO_TRADE",
+        candles=candles or [],
+        note=(
+            f"No forecast issued: volume is a hard precondition and it is "
+            f"{ctx.status.lower()} for {symbol}. {ctx.detail}"
+        ),
+    )
 
 
 def _build_overlays(
@@ -434,7 +680,7 @@ async def run_forecast(
         return ForecastResponse(
             exchange=exchange, symbol=symbol, timeframe=timeframe, engine="unavailable",
             model_name=active_model_name, lookback=lookback, pred_len=pred_len,
-            samples=samples, anchor_time=0, anchor_price=0.0,
+            samples=samples, anchor_time=0, anchor_price=0.0, decision="NO_TRADE",
             note=f"No OHLCV data for {symbol} ({timeframe}) on any connected exchange — check the symbol or try another timeframe.",
         )
 
@@ -443,6 +689,20 @@ async def run_forecast(
     anchor_unix = int(rows[-1][0] / 1000)
     step = _tf_seconds(timeframe)
     y_ts, future_unix = _future_timestamps(anchor_unix, step, pred_len)
+
+    # ── Volume gate: resolved BEFORE inference. No forecast is emitted without
+    # it, and there is no silent fallback to a price-only prediction. ──────────
+    vol_ctx = await _resolve_volume(exchange, symbol, timeframe, rows)
+    if vol_ctx.status != "OK":
+        logger.info(
+            f"[Kronos] NO_TRADE {symbol} {timeframe} — volume {vol_ctx.status}: {vol_ctx.detail}"
+        )
+        return _no_trade_response(
+            exchange=exchange, symbol=symbol, timeframe=timeframe, engine="unavailable",
+            model_name=active_model_name, lookback=lookback, pred_len=pred_len,
+            samples=samples, anchor_time=anchor_unix, anchor_price=anchor_price,
+            ctx=vol_ctx, candles=_historical_candles(rows, symbol),
+        )
 
     loop = asyncio.get_event_loop()
     engine = "kronos"
@@ -479,41 +739,22 @@ async def run_forecast(
         paths = _heuristic_paths(df, pred_len, samples)
 
     forecast, upper, lower = _aggregate(paths, future_unix)
-    direction, pct, confidence, target = _direction_confidence(paths, anchor_price, pred_len)
-    overlays, markers = _build_overlays(forecast, upper, lower, anchor_unix, anchor_price, direction)
-
     horizon_label = f"{pred_len}×{timeframe}"
-    arrow = "▲" if direction == "up" else ("▼" if direction == "down" else "→")
-    summary = (
-        f"Kronos projects {symbol} {direction} {arrow} {pct:+.2f}% over the next {horizon_label} "
-        f"(target {target:.6g}, {int(confidence * 100)}% confidence)."
+    signal = _volume_gated_signal(
+        paths, anchor_price, pred_len, vol_ctx,
+        symbol=symbol, horizon_label=horizon_label,
     )
-    signal = ForecastSignal(
-        direction=direction, pct_change=round(pct, 4), confidence=round(confidence, 3),
-        target_price=target, anchor_price=anchor_price, summary=summary,
+    overlays, markers = _build_overlays(
+        forecast, upper, lower, anchor_unix, anchor_price, signal.direction
     )
-
-    # Convert historical rows to ForecastCandle objects so the frontend can draw
-    # them when the exchange has no data (forex/metals).
-    historical_candles: List[ForecastCandle] = []
-    if _is_forex(symbol):
-        for r in rows:
-            try:
-                historical_candles.append(ForecastCandle(
-                    time=int(r[0] / 1000),
-                    open=float(r[1]), high=float(r[2]),
-                    low=float(r[3]),  close=float(r[4]),
-                    volume=float(r[5]) if len(r) > 5 else 0.0,
-                ))
-            except Exception:
-                pass
 
     resp = ForecastResponse(
         exchange=exchange, symbol=symbol, timeframe=timeframe, engine=engine,
         model_name=active_model_name, lookback=lookback, pred_len=pred_len,
         samples=samples, anchor_time=anchor_unix, anchor_price=anchor_price,
         forecast=forecast, upper_band=upper, lower_band=lower, signal=signal,
-        overlays=overlays, markers=markers, candles=historical_candles,
+        overlays=overlays, markers=markers, candles=_historical_candles(rows, symbol),
+        volume=vol_ctx, decision=signal.decision,
         note=None if engine == "kronos" else _heuristic_note(heuristic_reason),
     )
 
@@ -571,6 +812,11 @@ async def forecast_from_rows(
     Kronos on the exact series they display — so it works for ANY symbol,
     including instruments not listed on a crypto exchange (XAUUSD, indices, FX).
     Returns ``None`` if there isn't enough data.
+
+    Volume is a hard precondition here too: when the supplied rows cannot
+    establish a volume context, a NO_TRADE response is returned rather than a
+    price-only forecast. MT5 rows carry the broker's *tick* volume, which is
+    labelled as such in the returned context.
     """
     if not rows or len(rows) < 5:
         return None
@@ -584,6 +830,31 @@ async def forecast_from_rows(
     anchor_unix = int(rows[-1][0] / 1000)
     step = _tf_seconds(timeframe)
     y_ts, future_unix = _future_timestamps(anchor_unix, step, pred_len)
+
+    # ── Volume gate (before inference) ───────────────────────────────────────
+    # The caller's rows are the only guaranteed source here (MT5 symbols are not
+    # listed on the crypto connectors), so the exchange refetch is only offered
+    # for symbols the connectors can actually price.
+    _fetcher = None
+    if exchange != "mt5":
+        async def _fetcher(sym: str, tf: str, limit: int) -> List[list]:  # noqa: F811
+            return await _fetch_volume_ohlcv(exchange, sym, tf, limit)
+
+    vol_ctx = await volctx.resolve_volume_context(
+        symbol=symbol, timeframe=timeframe, rows=rows, fetcher=_fetcher,
+        volume_unit=_volume_unit(exchange, symbol),
+    )
+    if vol_ctx.status != "OK":
+        logger.info(
+            f"[Kronos] NO_TRADE {symbol} {timeframe} (rows) — volume "
+            f"{vol_ctx.status}: {vol_ctx.detail}"
+        )
+        return _no_trade_response(
+            exchange=exchange, symbol=symbol, timeframe=timeframe, engine="unavailable",
+            model_name=kronos_config.model_name, lookback=len(rows), pred_len=pred_len,
+            samples=samples, anchor_time=anchor_unix, anchor_price=anchor_price,
+            ctx=vol_ctx,
+        )
 
     loop = asyncio.get_event_loop()
     engine = "kronos"
@@ -605,17 +876,13 @@ async def forecast_from_rows(
         paths = _heuristic_paths(df, pred_len, samples)
 
     forecast, upper, lower = _aggregate(paths, future_unix)
-    direction, pct, confidence, target = _direction_confidence(paths, anchor_price, pred_len)
-    overlays, markers = _build_overlays(forecast, upper, lower, anchor_unix, anchor_price, direction)
     horizon_label = f"{pred_len}\u00d7{timeframe}"
-    arrow = "\u25b2" if direction == "up" else ("\u25bc" if direction == "down" else "\u2192")
-    summary = (
-        f"Kronos projects {symbol} {direction} {arrow} {pct:+.2f}% over the next {horizon_label} "
-        f"(target {target:.6g}, {int(confidence * 100)}% confidence)."
+    signal = _volume_gated_signal(
+        paths, anchor_price, pred_len, vol_ctx,
+        symbol=symbol, horizon_label=horizon_label,
     )
-    signal = ForecastSignal(
-        direction=direction, pct_change=round(pct, 4), confidence=round(confidence, 3),
-        target_price=target, anchor_price=anchor_price, summary=summary,
+    overlays, markers = _build_overlays(
+        forecast, upper, lower, anchor_unix, anchor_price, signal.direction
     )
     return ForecastResponse(
         exchange=exchange, symbol=symbol, timeframe=timeframe, engine=engine,
@@ -623,6 +890,7 @@ async def forecast_from_rows(
         samples=samples, anchor_time=anchor_unix, anchor_price=anchor_price,
         forecast=forecast, upper_band=upper, lower_band=lower, signal=signal,
         overlays=overlays, markers=markers,
+        volume=vol_ctx, decision=signal.decision,
         note=None if engine == "kronos" else _heuristic_note(),
     )
 
@@ -735,6 +1003,20 @@ def _available_margin(accounts: Optional[List[dict]], margin_coin: str = "USDT")
     return best
 
 
+def is_order_placeable(symbol: str) -> bool:
+    """True when an entry for ``symbol`` can actually be sent to an exchange.
+
+    FX, metals, indices and energy are *forecastable* — Kronos reads them from
+    Yahoo with CME contract volume — but the crypto connectors list none of
+    them, so a sniper entry on one is analysis, never an executable order.
+
+    Any surface that renders an execute button (the Telegram sniper keyboard,
+    the sniper panel) must gate on this: emitting a "LIVE $5" button for GBP/USD
+    offers an order Bitget cannot fill.
+    """
+    return not _is_forex(symbol)
+
+
 async def get_pair_tradability(exchange: str, symbol: str) -> dict:
     """Live account context for placing an order on a pair: openable margin,
     max leverage, contract min size/precision, any existing position, and the
@@ -750,7 +1032,7 @@ async def get_pair_tradability(exchange: str, symbol: str) -> dict:
         "current_position": None, "max_open_margin": 0.0, "max_open_notional": 0.0,
         "note": None,
     }
-    if _is_forex(symbol):
+    if not is_order_placeable(symbol):
         result["note"] = "Order placement is only available for crypto USDT futures pairs."
         return result
 
@@ -831,9 +1113,21 @@ def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = N
     pair — sniper entries use it directly so the suggestion matches the highest
     leverage Bitget allows for the symbol. When it is unavailable the leverage
     falls back to a conservative confidence-scaled value.
+
+    Volume is a hard precondition: no entry is emitted unless the forecast's
+    volume context resolved OK and the gated confidence cleared the tradeable
+    floor. Every emitted entry carries the volume numbers and the reason the
+    direction was chosen.
     """
     sig = resp.signal
     if sig is None or not resp.forecast:
+        return []
+
+    # ── Volume gate ──────────────────────────────────────────────────────────
+    vol = resp.volume
+    if vol is None or vol.status != "OK":
+        return []
+    if sig.decision != "OK":
         return []
 
     anchor = float(resp.anchor_price)
@@ -841,6 +1135,14 @@ def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = N
         return []
     direction = sig.direction
     conf = float(sig.confidence)
+    volume_reasons = volctx.volume_evidence_lines(vol)
+    volume_fields = dict(
+        volume_24h=vol.volume_24h,
+        volume_1h=vol.volume_1h,
+        relative_volume=vol.relative_volume,
+        volume_regime=vol.regime,
+        volume_divergence=vol.divergence,
+    )
 
     lows = [b.value for b in resp.lower_band] or [c.low for c in resp.forecast]
     highs = [b.value for b in resp.upper_band] or [c.high for c in resp.forecast]
@@ -891,11 +1193,13 @@ def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = N
                 reasons.append(
                     f"Limit at {_fmt_price(entry)} waits for a dip to the near-term p10 for a better entry."
                 )
+            reasons.extend(volume_reasons)
+            reasons.extend(sig.rationale)
             signals.append(SniperSignal(
                 id=f"{resp.symbol}-long-{kind}", side="long", order_kind=kind, label=label,
                 entry=round(entry, 8), stop_loss=round(sl, 8), take_profit_1=round(tp1, 8),
                 take_profit_2=round(tp2, 8), risk_reward=rr, confidence=round(conf, 3),
-                leverage=leverage, reasons=reasons,
+                leverage=leverage, reasons=reasons, **volume_fields,
             ))
 
     elif direction == "down":
@@ -922,11 +1226,13 @@ def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = N
                 reasons.append(
                     f"Limit at {_fmt_price(entry)} waits for a bounce to the near-term p90 for a better short."
                 )
+            reasons.extend(volume_reasons)
+            reasons.extend(sig.rationale)
             signals.append(SniperSignal(
                 id=f"{resp.symbol}-short-{kind}", side="short", order_kind=kind, label=label,
                 entry=round(entry, 8), stop_loss=round(sl, 8), take_profit_1=round(tp1, 8),
                 take_profit_2=round(tp2, 8), risk_reward=rr, confidence=round(conf, 3),
-                leverage=leverage, reasons=reasons,
+                leverage=leverage, reasons=reasons, **volume_fields,
             ))
 
     return signals
@@ -935,13 +1241,32 @@ def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = N
 async def generate_sniper_signals(
     exchange: str, symbol: str, timeframe: str = "1h", **kwargs
 ) -> SniperSignalsResponse:
-    """Run (cached) a forecast and derive executable sniper entries from it."""
+    """Run (cached) a forecast and derive executable sniper entries from it.
+
+    Volume-gated end to end: when the forecast came back NO_TRADE (volume
+    unavailable/stale/insufficient) no entries are built and the reason is
+    returned instead.
+    """
     resp = await run_forecast_cached(exchange, symbol, timeframe, **kwargs)
     max_lev = await _max_leverage(exchange, symbol)
     signals = build_sniper_signals(resp, max_leverage=max_lev)
+    sig = resp.signal
     note = None
     if not signals:
-        if resp.signal and resp.signal.direction == "flat":
+        if resp.decision == "NO_TRADE":
+            note = (
+                f"NO_TRADE — volume is a hard precondition for a sniper entry and it "
+                f"is {(resp.volume.status.lower() if resp.volume else 'unavailable')} "
+                f"for {resp.symbol}. "
+                + (resp.volume.detail if resp.volume else "")
+            )
+        elif resp.decision == "LOW_CONFIDENCE":
+            note = (
+                f"LOW_CONFIDENCE — the volume-adjusted confidence "
+                f"({(sig.confidence if sig else 0.0):.2f}) is under the "
+                f"{volctx.MIN_TRADEABLE_CONFIDENCE:.2f} tradeable floor. No entry emitted."
+            )
+        elif sig and sig.direction == "flat":
             note = (
                 "Kronos sees no directional edge (flat forecast) — no high-conviction "
                 "sniper entry. Wait for a clearer signal or a different timeframe."
@@ -952,8 +1277,12 @@ async def generate_sniper_signals(
         exchange=resp.exchange, symbol=resp.symbol, timeframe=resp.timeframe,
         engine=resp.engine,
         anchor_price=resp.anchor_price,
-        direction=(resp.signal.direction if resp.signal else "flat"),
-        pct_change=(resp.signal.pct_change if resp.signal else 0.0),
-        confidence=(resp.signal.confidence if resp.signal else 0.0),
-        signals=signals, note=note,
+        direction=(sig.direction if sig else "flat"),
+        pct_change=(sig.pct_change if sig else 0.0),
+        confidence=(sig.confidence if sig else 0.0),
+        signals=signals,
+        volume=resp.volume,
+        decision=resp.decision,
+        rationale=(sig.rationale if sig else []),
+        note=note,
     )

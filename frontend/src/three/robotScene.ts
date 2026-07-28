@@ -36,6 +36,16 @@ export interface RobotSceneOptions {
 
 export interface RobotSceneHandle {
   setSize(size: number): void
+  /**
+   * Hide or show the whole robot, including its ground shadow.
+   *
+   * Fading the canvas element alone is not enough: the contact shadow is drawn
+   * *into* the canvas, so during (and after) a CSS fade it reads as a dark
+   * smudge sitting on the page with no robot above it. Hiding at the scene
+   * level removes the shadow with the body, and pauses rendering while hidden
+   * so an invisible avatar stops costing GPU time.
+   */
+  setHidden(hidden: boolean): void
   dispose(): void
 }
 
@@ -91,7 +101,11 @@ export function createRobotScene(opts: RobotSceneOptions): RobotSceneHandle | nu
   // ── Materials ────────────────────────────────────────────────────────────────
   const metalMat = new THREE.MeshStandardMaterial({
     color: theme.metal, metalness: 0.92, roughness: 0.28,
-  })
+    // Iridescent sheen for premium cyborg look
+    iridescence: 0.3,
+    iridescenceIOR: 1.3,
+    iridescenceThicknessRange: [100, 400],
+  } as any)
   const darkMat = new THREE.MeshStandardMaterial({
     color: theme.dark, metalness: 0.85, roughness: 0.4,
   })
@@ -107,10 +121,23 @@ export function createRobotScene(opts: RobotSceneOptions): RobotSceneHandle | nu
     color: 0x020408, metalness: 0.95, roughness: 0.1,
     emissive: theme.glow, emissiveIntensity: 0.18,
     transparent: true, opacity: 0.92,
-  })
+    // Subsurface scattering hint
+    transmission: 0.1,
+    thickness: 0.5,
+    attenuationColor: new THREE.Color(theme.glow),
+    attenuationDistance: 2,
+  } as any)
   const jointMat = new THREE.MeshStandardMaterial({
     color: 0x111827, metalness: 0.9, roughness: 0.3,
   })
+
+  // Track cloned materials for proper disposal
+  const clonedMaterials: THREE.Material[] = []
+
+  function trackMat(mat: THREE.Material): THREE.Material {
+    clonedMaterials.push(mat)
+    return mat
+  }
 
   // ── Robot root group ─────────────────────────────────────────────────────────
   const robot = new THREE.Group()
@@ -150,7 +177,10 @@ export function createRobotScene(opts: RobotSceneOptions): RobotSceneHandle | nu
   footL.position.set(0, -0.78, 0.08)
   shinGroupL.add(footL)
   // Foot glow strip
-  const footGlowL = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.03, 0.5), glowMat.clone())
+  const footGlowL = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.03, 0.5), trackMat(new THREE.MeshStandardMaterial({
+    color: glowMat.color, emissive: glowMat.emissive, emissiveIntensity: glowMat.emissiveIntensity,
+    metalness: glowMat.metalness, roughness: glowMat.roughness,
+  })))
   footGlowL.position.set(0, -0.74, 0.08)
   shinGroupL.add(footGlowL)
 
@@ -158,18 +188,18 @@ export function createRobotScene(opts: RobotSceneOptions): RobotSceneHandle | nu
   const legR = new THREE.Group()
   legR.position.set(0.45, -0.14, 0)
   hipGroup.add(legR)
-  const thighR = thighL.clone()
+  const thighR = new THREE.Mesh(thighL.geometry, trackMat(thighL.material as THREE.Material))
   legR.add(thighR)
-  const kneeR = kneeL.clone()
+  const kneeR = new THREE.Mesh(kneeL.geometry, trackMat(kneeL.material as THREE.Material))
   legR.add(kneeR)
   const shinGroupR = new THREE.Group()
   shinGroupR.position.y = -0.8
   legR.add(shinGroupR)
-  const shinR = shinL.clone()
+  const shinR = new THREE.Mesh(shinL.geometry, trackMat(shinL.material as THREE.Material))
   shinGroupR.add(shinR)
-  const footR = footL.clone()
+  const footR = new THREE.Mesh(footL.geometry, trackMat(footL.material as THREE.Material))
   shinGroupR.add(footR)
-  const footGlowR = footGlowL.clone()
+  const footGlowR = new THREE.Mesh(footGlowL.geometry, trackMat(footGlowL.material as THREE.Material))
   shinGroupR.add(footGlowR)
 
   // ── TORSO ────────────────────────────────────────────────────────────────────
@@ -191,7 +221,10 @@ export function createRobotScene(opts: RobotSceneOptions): RobotSceneHandle | nu
   const coreOuter = new THREE.Mesh(new THREE.TorusGeometry(0.2, 0.04, 16, 48), accentMat)
   coreOuter.position.set(0, 0.1, 0.38)
   torsoGroup.add(coreOuter)
-  const coreInner = new THREE.Mesh(new THREE.CircleGeometry(0.15, 32), glowMat.clone())
+  const coreInner = new THREE.Mesh(new THREE.CircleGeometry(0.15, 32), trackMat(new THREE.MeshStandardMaterial({
+    color: glowMat.color, emissive: glowMat.emissive, emissiveIntensity: glowMat.emissiveIntensity,
+    metalness: glowMat.metalness, roughness: glowMat.roughness,
+  })))
   coreInner.position.set(0, 0.1, 0.405)
   torsoGroup.add(coreInner)
   const coreGlowMat = coreInner.material as THREE.MeshStandardMaterial
@@ -202,7 +235,7 @@ export function createRobotScene(opts: RobotSceneOptions): RobotSceneHandle | nu
   shoulderL.scale.set(1, 0.85, 0.9)
   shoulderL.position.set(-0.82, 0.52, 0)
   torsoGroup.add(shoulderL)
-  const shoulderR = shoulderL.clone()
+  const shoulderR = new THREE.Mesh(shoulderGeo, trackMat(accentMat))
   shoulderR.position.x = 0.82
   torsoGroup.add(shoulderR)
 
@@ -253,19 +286,22 @@ export function createRobotScene(opts: RobotSceneOptions): RobotSceneHandle | nu
   const armGroupR = new THREE.Group()
   armGroupR.position.set(0.85, 0.52, 0)
   robot.add(armGroupR)
-  const upperArmR = upperArmL.clone()
+  const upperArmR = new THREE.Mesh(upperArmL.geometry, trackMat(upperArmL.material as THREE.Material))
   armGroupR.add(upperArmR)
-  const elbowR = elbowL.clone()
+  const elbowR = new THREE.Mesh(elbowL.geometry, trackMat(elbowL.material as THREE.Material))
   armGroupR.add(elbowR)
   const foreGroupR = new THREE.Group()
   foreGroupR.position.y = -0.72
   armGroupR.add(foreGroupR)
-  const foreArmR = foreArmL.clone()
+  const foreArmR = new THREE.Mesh(foreArmL.geometry, trackMat(foreArmL.material as THREE.Material))
   foreGroupR.add(foreArmR)
-  const handR = handL.clone()
+  const handR = new THREE.Mesh(handL.geometry, trackMat(handL.material as THREE.Material))
   foreGroupR.add(handR)
   for (let f = 0; f < 3; f++) {
-    const fg = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.1, 0.03), glowMat.clone())
+    const fg = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.1, 0.03), trackMat(new THREE.MeshStandardMaterial({
+      color: glowMat.color, emissive: glowMat.emissive, emissiveIntensity: glowMat.emissiveIntensity,
+      metalness: glowMat.metalness, roughness: glowMat.roughness,
+    })))
     fg.position.set(-0.06 + f * 0.06, -0.77, 0.07)
     foreGroupR.add(fg)
   }
@@ -299,7 +335,8 @@ export function createRobotScene(opts: RobotSceneOptions): RobotSceneHandle | nu
   earL.rotation.z = Math.PI / 2
   earL.position.set(-0.62, 0, 0)
   headGroup.add(earL)
-  const earR = earL.clone()
+  const earR = new THREE.Mesh(earGeo, trackMat(accentMat))
+  earR.rotation.z = Math.PI / 2
   earR.position.x = 0.62
   headGroup.add(earR)
   // Ear glow rings
@@ -307,8 +344,9 @@ export function createRobotScene(opts: RobotSceneOptions): RobotSceneHandle | nu
   earRingL.position.set(-0.67, 0, 0)
   earRingL.rotation.y = Math.PI / 2
   headGroup.add(earRingL)
-  const earRingR = earRingL.clone()
+  const earRingR = new THREE.Mesh(new THREE.TorusGeometry(0.08, 0.02, 10, 24), trackMat(glowMat))
   earRingR.position.x = 0.67
+  earRingR.rotation.y = Math.PI / 2
   headGroup.add(earRingR)
 
   // Top crest + antenna
@@ -318,7 +356,10 @@ export function createRobotScene(opts: RobotSceneOptions): RobotSceneHandle | nu
   const antennaStalk = new THREE.Mesh(new THREE.CylinderGeometry(0.022, 0.035, 0.42, 12), metalMat)
   antennaStalk.position.set(0, 0.82, 0)
   headGroup.add(antennaStalk)
-  const antennaTip = new THREE.Mesh(new THREE.SphereGeometry(0.07, 20, 20), glowMat.clone())
+  const antennaTip = new THREE.Mesh(new THREE.SphereGeometry(0.07, 20, 20), trackMat(new THREE.MeshStandardMaterial({
+    color: glowMat.color, emissive: glowMat.emissive, emissiveIntensity: glowMat.emissiveIntensity,
+    metalness: glowMat.metalness, roughness: glowMat.roughness,
+  })))
   antennaTip.position.set(0, 1.05, 0)
   headGroup.add(antennaTip)
   const antennaTipMat = antennaTip.material as THREE.MeshStandardMaterial
@@ -332,7 +373,11 @@ export function createRobotScene(opts: RobotSceneOptions): RobotSceneHandle | nu
   visor.scale.set(1.05, 1, 1.12)
   headGroup.add(visor)
 
-  // Eyes — glowing behind visor
+  // Eyes — glowing behind visor.
+  //
+  // A blink is rendered by squashing the eye vertically as well as dimming it,
+  // because dimming alone reads as a light being switched off rather than as an
+  // eyelid closing. The two are driven together in the animation loop.
   const eyeGeo = new THREE.SphereGeometry(0.1, 24, 24)
   const eyeLMat = glowMat.clone() as THREE.MeshStandardMaterial
   const eyeRMat = glowMat.clone() as THREE.MeshStandardMaterial
@@ -383,6 +428,20 @@ export function createRobotScene(opts: RobotSceneOptions): RobotSceneHandle | nu
   pulseRing.position.y = 1.08
   robot.add(pulseRing)
 
+  // ── ENERGY AURA (core) ─────────────────────────────────────────────────────────
+  const auraGeo = new THREE.RingGeometry(0.4, 0.45, 32)
+  const auraMat = new THREE.MeshBasicMaterial({
+    color: theme.glow,
+    transparent: true,
+    opacity: 0,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  })
+  const aura = new THREE.Mesh(auraGeo, auraMat)
+  aura.rotation.x = -Math.PI / 2
+  aura.position.y = 0.1
+  torsoGroup.add(aura)
+
   // ── GROUND SHADOW ────────────────────────────────────────────────────────────
   const shadowMat = new THREE.MeshBasicMaterial({
     color: 0x000000, transparent: true, opacity: 0.25, side: THREE.DoubleSide,
@@ -400,8 +459,22 @@ export function createRobotScene(opts: RobotSceneOptions): RobotSceneHandle | nu
   let lastRender = 0
   const robotFrameMs = 1000 / gfx.fpsTarget   // throttle to the device's tier
 
+  // New visual polish state
+  let breathingScale = 0
+  let weightShift = 0
+  let antennaBounce = 0
+  let prevState: RobotState = 'idle'
+  let energyAuraScale = 1
+  let energyAuraOpacity = 0
+
+  // Hidden state — see RobotSceneHandle.setHidden.
+  let hidden = false
+
   const animate = () => {
     raf = requestAnimationFrame(animate)
+    // Nothing to draw while hidden. The canvas was cleared once on the way in,
+    // so it stays transparent — shadow included — at no ongoing GPU cost.
+    if (hidden) return
     const nowMs = (typeof performance !== 'undefined' ? performance.now() : Date.now())
     if (nowMs - lastRender < robotFrameMs) return
     lastRender = nowMs
@@ -411,52 +484,71 @@ export function createRobotScene(opts: RobotSceneOptions): RobotSceneHandle | nu
     const st = live.state
     const en = Math.min(1, Math.max(0, live.energy))
 
-    // ── Determine walking vs standing ───────────────────────────────────────
-    const isWalking = st === 'idle' || st === 'walking'
-    const walkFreq = 2.2
+    // ── HOVER ────────────────────────────────────────────────────────────────
+    // The avatar floats rather than walks. Its drift is built from several
+    // sine waves at deliberately non-harmonic frequencies (1.00 / 0.63 / 0.41),
+    // so the combined path never visibly repeats — a single sine reads as a
+    // mechanical bounce, which is what gives away a "floating" object as fake.
+    const isHovering = st === 'idle' || st === 'walking'
+    // Breathing continues in every state; a body that goes perfectly still
+    // between animations looks switched off.
+    breathingScale = THREE.MathUtils.lerp(breathingScale, 0.015, 0.02)
+    chest.scale.y = 1 + breathingScale * Math.sin(t * 0.5)
 
-    // ── BODY BOB & SWAY (walking) ────────────────────────────────────────────
-    if (isWalking) {
-      robot.position.y = Math.sin(t * walkFreq * 2) * 0.045 - 0.05
-      torsoGroup.rotation.z = Math.sin(t * walkFreq) * 0.04
-      torsoGroup.rotation.y = Math.sin(t * walkFreq * 0.5) * 0.06
+    // Height above the resting line — reused below to drive the contact shadow.
+    let hoverHeight: number
+    if (isHovering) {
+      hoverHeight =
+        Math.sin(t * 1.00) * 0.10 +
+        Math.sin(t * 0.63) * 0.05 +
+        Math.sin(t * 0.41) * 0.03
+      robot.position.y = hoverHeight
+      // Bank slightly into the drift, as something actually holding itself up
+      // against gravity would, and yaw very slowly.
+      torsoGroup.rotation.z = Math.sin(t * 0.63) * 0.045
+      torsoGroup.rotation.y = Math.sin(t * 0.29) * 0.09
+      robot.rotation.x = Math.sin(t * 0.47) * 0.035
+      hipGroup.rotation.z = Math.sin(t * 0.37) * 0.03
     } else {
-      // Non-walking: gentle idle breathing
-      robot.position.y = Math.sin(t * 1.1) * 0.025
-      torsoGroup.rotation.z = Math.sin(t * 0.8) * 0.012
-      torsoGroup.rotation.y = 0
+      // Attentive states hold station: a tighter, slower hover so the robot
+      // reads as focused rather than drifting.
+      hoverHeight = Math.sin(t * 0.9) * 0.035
+      robot.position.y = hoverHeight
+      weightShift = THREE.MathUtils.lerp(weightShift, Math.sin(t * 0.3) * 0.02, 0.01)
+      hipGroup.rotation.z = weightShift
+      torsoGroup.rotation.z = THREE.MathUtils.lerp(torsoGroup.rotation.z, Math.sin(t * 0.8) * 0.012, 0.05)
+      torsoGroup.rotation.y = THREE.MathUtils.lerp(torsoGroup.rotation.y, 0, 0.05)
+      robot.rotation.x = THREE.MathUtils.lerp(robot.rotation.x, 0, 0.05)
     }
 
-    // ── LEG WALK CYCLE ───────────────────────────────────────────────────────
-    if (isWalking) {
-      const legSwing = 0.45
-      const kneeFlexMax = 0.52
-      // Left leg: thigh forward when t*walkFreq is at phase 0
-      const phL = t * walkFreq
-      const phR = phL + Math.PI
-      legL.rotation.x = Math.sin(phL) * legSwing
-      legR.rotation.x = Math.sin(phR) * legSwing
-      // Knee flex: bend when leg is behind
-      shinGroupL.rotation.x = Math.max(0, -Math.sin(phL)) * kneeFlexMax
-      shinGroupR.rotation.x = Math.max(0, -Math.sin(phR)) * kneeFlexMax
-      // Foot angle compensation
-      footL.rotation.x = 0.1 + shinGroupL.rotation.x * 0.5
-      footR.rotation.x = 0.1 + shinGroupR.rotation.x * 0.5
-    } else {
-      legL.rotation.x = THREE.MathUtils.lerp(legL.rotation.x, 0, 0.12)
-      legR.rotation.x = THREE.MathUtils.lerp(legR.rotation.x, 0, 0.12)
-      shinGroupL.rotation.x = THREE.MathUtils.lerp(shinGroupL.rotation.x, 0, 0.12)
-      shinGroupR.rotation.x = THREE.MathUtils.lerp(shinGroupR.rotation.x, 0, 0.12)
+    // ── LEGS (hanging) ───────────────────────────────────────────────────────
+    // With nothing to stand on the legs hang and trail, swinging a little out
+    // of phase with the body so they feel carried by the hover rather than
+    // driven by it.
+    {
+      const trailL = Math.sin(t * 0.63 - 0.6) * 0.09
+      const trailR = Math.sin(t * 0.63 - 0.9) * 0.09
+      legL.rotation.x = THREE.MathUtils.lerp(legL.rotation.x, 0.10 + trailL, 0.06)
+      legR.rotation.x = THREE.MathUtils.lerp(legR.rotation.x, 0.10 + trailR, 0.06)
+      // A relaxed knee is never locked straight.
+      shinGroupL.rotation.x = THREE.MathUtils.lerp(shinGroupL.rotation.x, 0.20 - trailL * 0.5, 0.06)
+      shinGroupR.rotation.x = THREE.MathUtils.lerp(shinGroupR.rotation.x, 0.22 - trailR * 0.5, 0.06)
+      // Toes point down under their own weight.
+      footL.rotation.x = THREE.MathUtils.lerp(footL.rotation.x, -0.28, 0.06)
+      footR.rotation.x = THREE.MathUtils.lerp(footR.rotation.x, -0.30, 0.06)
     }
 
-    // ── ARM SWING (walk) / GESTURE (talking) ────────────────────────────────
-    if (isWalking) {
-      const armSwing = 0.38
-      const phL = t * walkFreq + Math.PI // arms swing opposite to same-side leg
-      armGroupL.rotation.x = Math.sin(phL) * armSwing
-      armGroupR.rotation.x = Math.sin(phL + Math.PI) * armSwing
-      foreGroupL.rotation.x = Math.max(0, Math.sin(phL)) * 0.4
-      foreGroupR.rotation.x = Math.max(0, Math.sin(phL + Math.PI)) * 0.4
+    // ── ARM DRIFT (hover) / GESTURE (talking) ───────────────────────────────
+    if (isHovering) {
+      // Arms drift and settle rather than swinging — no stride to counterweight.
+      const driftL = Math.sin(t * 0.55) * 0.10
+      const driftR = Math.sin(t * 0.55 + 0.7) * 0.10
+      armGroupL.rotation.x = THREE.MathUtils.lerp(armGroupL.rotation.x, 0.06 + driftL, 0.05)
+      armGroupR.rotation.x = THREE.MathUtils.lerp(armGroupR.rotation.x, 0.06 + driftR, 0.05)
+      armGroupL.rotation.z = THREE.MathUtils.lerp(armGroupL.rotation.z, -0.09 + driftL * 0.3, 0.05)
+      armGroupR.rotation.z = THREE.MathUtils.lerp(armGroupR.rotation.z,  0.09 - driftR * 0.3, 0.05)
+      foreGroupL.rotation.x = THREE.MathUtils.lerp(foreGroupL.rotation.x, 0.22 + driftL * 0.5, 0.05)
+      foreGroupR.rotation.x = THREE.MathUtils.lerp(foreGroupR.rotation.x, 0.24 + driftR * 0.5, 0.05)
     } else if (st === 'talking') {
       // Subtle gesturing arms
       armGroupL.rotation.x = Math.sin(t * 1.6) * 0.18 - 0.1
@@ -480,11 +572,23 @@ export function createRobotScene(opts: RobotSceneOptions): RobotSceneHandle | nu
       armGroupR.rotation.z = THREE.MathUtils.lerp(armGroupR.rotation.z, 0.05, 0.06)
     }
 
+    // ── CONTACT SHADOW ───────────────────────────────────────────────────────
+    // The strongest cue that something is floating is its shadow: it shrinks,
+    // softens and fades as the object rises. Without this the robot reads as
+    // sliding on the ground no matter how it moves.
+    {
+      const lift = THREE.MathUtils.clamp(hoverHeight / 0.18, -1, 1)   // −1..1
+      const s = 1 - lift * 0.22
+      shadowDisc.scale.set(s, s, 1)
+      shadowMat.opacity = 0.25 - lift * 0.09
+    }
+
     // ── HEAD ANIMATION ───────────────────────────────────────────────────────
-    if (isWalking) {
-      // Head bobs slightly, counter-rotates torso sway
-      headGroup.rotation.y = -torsoGroup.rotation.y * 0.4 + Math.sin(t * 0.7) * 0.05
-      headGroup.rotation.x = Math.sin(t * 2.2 * 2) * 0.02
+    if (isHovering) {
+      // Head leads the drift a little and counter-rotates the torso's yaw, so
+      // the robot looks like it is steering rather than being pushed around.
+      headGroup.rotation.y = -torsoGroup.rotation.y * 0.4 + Math.sin(t * 0.43) * 0.07
+      headGroup.rotation.x = Math.sin(t * 0.61) * 0.035
     } else if (st === 'listening') {
       headGroup.rotation.y = Math.sin(t * 0.8) * 0.12
       headGroup.rotation.x = THREE.MathUtils.lerp(headGroup.rotation.x, 0.12, 0.05)
@@ -500,14 +604,37 @@ export function createRobotScene(opts: RobotSceneOptions): RobotSceneHandle | nu
     }
 
     // ── BLINK ────────────────────────────────────────────────────────────────
+    // Idle is when a blink actually reads as "alive", so the robot blinks most
+    // there and much less while working — a person mid-sentence or concentrating
+    // blinks noticeably less than one waiting quietly.
     blink += dt
-    const blinking = blink > nextBlink && blink < nextBlink + 0.12
-    const blinkIntensity = blinking ? 0 : 1
-    if (blink > nextBlink + 0.18) {
-      blink = 0
-      nextBlink = 2.5 + Math.random() * 4
+    const idleish = st === 'idle' || st === 'walking'
+    // Closing is faster than opening, as a real eyelid is: a linear
+    // open-and-shut looks mechanical.
+    const CLOSE_S = 0.055
+    const OPEN_S  = 0.11
+    const into = blink - nextBlink
+    let lidClosed = 0                                    // 0 = open, 1 = shut
+    if (into >= 0) {
+      lidClosed = into < CLOSE_S
+        ? into / CLOSE_S
+        : Math.max(0, 1 - (into - CLOSE_S) / OPEN_S)
     }
-    eyeLMat.emissiveIntensity = blinkIntensity * (st === 'thinking' ? (0.6 + Math.random() * 0.4) : 1.8)
+    if (into > CLOSE_S + OPEN_S) {
+      blink = 0
+      // Humans blink irregularly; a fixed cadence is the tell that this is a
+      // loop. Occasional double-blinks (the short end of the range) help too.
+      nextBlink = idleish ? 1.6 + Math.random() * 3.4 : 4 + Math.random() * 5
+    }
+
+    // Squash the eye toward the lid line and dim it in step, so it looks like a
+    // lid coming down rather than a lamp being switched off.
+    const eyeOpen = 1 - lidClosed
+    const eyeScaleY = Math.max(0.06, eyeOpen)
+    eyeL.scale.y = eyeScaleY
+    eyeR.scale.y = eyeScaleY
+    const baseGlow = st === 'thinking' ? (0.6 + Math.random() * 0.4) : 1.8
+    eyeLMat.emissiveIntensity = baseGlow * eyeOpen
     eyeRMat.emissiveIntensity = eyeLMat.emissiveIntensity
 
     // ── MOUTH BARS (talking) ─────────────────────────────────────────────────
@@ -558,11 +685,32 @@ export function createRobotScene(opts: RobotSceneOptions): RobotSceneHandle | nu
     }
 
     // ── ANTENNA TIP ──────────────────────────────────────────────────────────
+    // Bounce on state change
+    if (st !== prevState) {
+      antennaBounce = 1.0
+    }
+    antennaBounce = THREE.MathUtils.lerp(antennaBounce, 0, 0.15)
+    const bounceOffset = antennaBounce * 0.15
+    
     antennaTipMat.emissiveIntensity = st === 'listening'
-      ? 2.5 + Math.sin(t * 4) * 0.5
+      ? 2.5 + Math.sin(t * 4) * 0.5 + bounceOffset
       : st === 'thinking'
-      ? 1.8 + Math.sin(t * 8) * 0.8
-      : 1.0 + Math.sin(t * 2) * 0.3
+      ? 1.8 + Math.sin(t * 8) * 0.8 + bounceOffset
+      : 1.0 + Math.sin(t * 2) * 0.3 + bounceOffset
+    // Bounce position
+    antennaTip.position.y = 1.05 + bounceOffset
+    prevState = st
+
+    // ── ENERGY AURA (core) ───────────────────────────────────────────────────
+    // Expanding ring at core when energy is high
+    if (aura) {
+      const targetAuraOp = en > 0.7 ? 0.5 : en > 0.4 ? 0.2 : 0.05
+      energyAuraOpacity = THREE.MathUtils.lerp(energyAuraOpacity, targetAuraOp, 0.05)
+      const targetAuraScale = 1 + en * 1.5
+      energyAuraScale = THREE.MathUtils.lerp(energyAuraScale, targetAuraScale, 0.05)
+      aura.material.opacity = energyAuraOpacity
+      aura.scale.setScalar(energyAuraScale)
+    }
 
     // ── RIM LIGHT PULSE ──────────────────────────────────────────────────────
     rimLight.intensity = st === 'talking'
@@ -581,6 +729,20 @@ export function createRobotScene(opts: RobotSceneOptions): RobotSceneHandle | nu
   return {
     setSize(newSize: number) {
       renderer.setSize(newSize, newSize, false)
+    },
+    setHidden(next: boolean) {
+      if (next === hidden) return
+      hidden = next
+      if (hidden) {
+        // Clear to fully transparent so the last drawn frame — body *and*
+        // contact shadow — is gone immediately rather than lingering as a
+        // dark patch under an invisible robot.
+        renderer.clear(true, true, true)
+      } else {
+        // Reset the frame clock so the first visible frame draws at once
+        // instead of waiting out a stale throttle interval.
+        lastRender = 0
+      }
     },
     dispose() {
       cancelAnimationFrame(raf)

@@ -178,6 +178,7 @@ async def jarvis_forecast(
         exchange, _normalize_symbol(symbol), timeframe, pred_len=pred_len,
     )
     sig = resp.signal
+    vol = resp.volume
     return {
         "symbol": resp.symbol,
         "timeframe": resp.timeframe,
@@ -187,6 +188,11 @@ async def jarvis_forecast(
         "confidence": sig.confidence if sig else 0.0,
         "target_price": sig.target_price if sig else resp.anchor_price,
         "spoken": sig.summary if sig else f"No forecast available for {resp.symbol}.",
+        # Volume evidence + why the direction was chosen — a forecast is never
+        # shown without it (see services/volume_context.py).
+        "decision": resp.decision,
+        "volume": vol.model_dump() if vol else None,
+        "rationale": sig.rationale if sig else [],
     }
 
 

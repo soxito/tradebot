@@ -181,6 +181,7 @@ async def _handle_start(_args: str, _db: AsyncSession) -> tuple[str, str]:
         "/portfolio — Total PnL &amp; equity",
         "/signals — Latest channel signals",
         "/sniper — Sniper auto-trade status",
+        "/sniper XAUUSD 1h — MT5 SMC sniper analysis (1m|5m|15m|30m|1h|4h|1d)",
         "/monitor start|stop — Signal monitor control",
         "",
         "🔮 <b>Kronos Forecast &amp; Order Execution</b>",
@@ -304,8 +305,14 @@ async def _handle_signals(_args: str, db: AsyncSession) -> tuple[str, str]:
         return f"❌ Signals fetch failed: {exc}", "HTML"
 
 
-async def _handle_sniper(_args: str, db: AsyncSession) -> tuple[str, str]:
-    """Sniper auto-trade status."""
+async def _handle_sniper(args: str, db: AsyncSession) -> tuple[str, str]:
+    """Sniper auto-trade status, or MT5 SMC analysis when a symbol is supplied.
+
+      /sniper                — rug-pull sniper auto-trade status (legacy)
+      /sniper XAUUSD 1h      — MT5 SMC sniper analysis (same as the /mt5-live page)
+    """
+    if args.strip():
+        return await _sniper_smc(args, db)
     try:
         from plugins.TelegramSignalNewsPlugin.backend.services.sniper_service import (
             get_or_create_settings as get_sniper_settings,
@@ -334,6 +341,243 @@ async def _handle_sniper(_args: str, db: AsyncSession) -> tuple[str, str]:
         return "\n".join(lines), "HTML"
     except Exception as exc:  # noqa: BLE001
         return f"❌ Sniper status failed: {exc}", "HTML"
+
+
+# ── MT5 SMC sniper analysis (/sniper XAUUSD 1h) ───────────────────────────────
+
+# User-friendly timeframe → MT5 code.  Both "1h" and "h1" spellings accepted.
+_SNIPER_TIMEFRAMES = {
+    "1m": "M1", "m1": "M1",
+    "5m": "M5", "m5": "M5",
+    "15m": "M15", "m15": "M15",
+    "30m": "M30", "m30": "M30",
+    "1h": "H1", "h1": "H1",
+    "4h": "H4", "h4": "H4",
+    "1d": "D1", "d1": "D1",
+}
+_SNIPER_TF_HELP = "1m, 5m, 15m, 30m, 1h, 4h, 1d"
+
+# Telegram hard-caps a message at 4096 chars; stay clear of the edge.
+_SNIPER_MAX_LEN = 3900
+
+
+def _sniper_usage(problem: str = "") -> str:
+    head = f"❓ {problem}\n" if problem else "❓ "
+    return (
+        f"{head}Usage: <code>/sniper &lt;SYMBOL&gt; [TIMEFRAME]</code>\n"
+        "Example: <code>/sniper XAUUSD 1h</code>\n"
+        f"Timeframes: <code>{_SNIPER_TF_HELP}</code>\n"
+        "<code>/sniper</code> with no arguments shows auto-trade status."
+    )
+
+
+def _norm_mt5_sym(symbol: str) -> str:
+    """MT5 symbols are plain upper-case tickers: xauusd → XAUUSD."""
+    return symbol.strip().upper()
+
+
+def _parse_sniper_args(args: str) -> tuple[str | None, str | None, str | None]:
+    """Parse ``<SYMBOL> [TIMEFRAME]`` → ``(symbol, timeframe, error_text)``."""
+    tokens = args.split()
+    if not tokens:
+        return None, None, _sniper_usage()
+    symbol = _norm_mt5_sym(tokens[0])
+    if not symbol:
+        return None, None, _sniper_usage()
+    if len(tokens) < 2:
+        return symbol, "H1", None
+    timeframe = _SNIPER_TIMEFRAMES.get(tokens[1].strip().lower())
+    if not timeframe:
+        return None, None, _sniper_usage(f"Unknown timeframe <code>{_esc(tokens[1])}</code>.")
+    return symbol, timeframe, None
+
+
+async def _sniper_smc(args: str, db: AsyncSession) -> tuple[str, str]:
+    """Run the SMC sniper analysis the /mt5-live page renders, in-process."""
+    symbol, timeframe, err = _parse_sniper_args(args)
+    if err:
+        return err, "HTML"
+
+    try:
+        from sqlalchemy import select as _sel
+        from plugins.MT5TradingPlugin.backend.models import MT5Account
+
+        account = (await db.execute(_sel(MT5Account).limit(1))).scalars().first()
+        if not account:
+            return (
+                "❌ No MT5 account connected — connect one before running "
+                "<code>/sniper &lt;SYMBOL&gt;</code>."
+            ), "HTML"
+
+        # Same code path the /mt5-live page hits over HTTP.  Every query param is
+        # passed explicitly because the FastAPI Query() defaults are not usable
+        # when the endpoint is awaited directly.
+        from plugins.MT5TradingPlugin.backend.router import smc_analyze
+
+        resp = await smc_analyze(
+            account_id=account.id,
+            symbol=symbol,
+            timeframe=timeframe,
+            count=400,
+            min_rr=1.5,
+            max_rr=3.0,
+            sl_buffer_atr=1.0,
+            min_confidence=0.6,
+            use_ai=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"❌ Sniper analysis failed: {exc}", "HTML"
+
+    return _fmt_sniper_analysis(resp), "HTML"
+
+
+def _esc(text: Any) -> str:
+    """Minimal HTML escape for model- or broker-supplied text."""
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _clip(text: str, limit: int) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _fmt_sniper_analysis(resp: Any) -> str:
+    """Render an ``MT5SmcAnalyzeResponse`` as an HTML Telegram message."""
+    def g(key: str, default: Any = None) -> Any:
+        return getattr(resp, key, default)
+
+    symbol = _esc(g("symbol", "?"))
+    timeframe = _esc(g("timeframe", "?"))
+    if g("error"):
+        return f"❌ <b>{symbol}</b> {timeframe}: {_esc(g('error'))}"
+
+    bias = str(g("bias") or "neutral").lower()
+    bias_icon = {"bullish": "🟢", "bearish": "🔴"}.get(bias, "⚪")
+    lines = [f"🎯 <b>SMC Sniper — {symbol} {timeframe}</b>", ""]
+
+    last_price = g("last_price")
+    lines.append(f"{bias_icon} Bias: <b>{bias.upper()}</b>  Momentum: {_esc(g('momentum') or '—')}")
+    if last_price is not None:
+        atr, atr_pct = g("atr"), g("atr_pct")
+        atr_txt = f"  ATR: <code>{_fmt_p(atr)}</code> ({atr_pct}%)" if atr else ""
+        lines.append(f"Price: <code>{_fmt_p(last_price)}</code>{atr_txt}")
+    rsi, vol_z = g("rsi"), g("volume_z")
+    if rsi is not None or vol_z is not None:
+        lines.append(f"RSI: {rsi if rsi is not None else '—'}  Vol-Z: {vol_z if vol_z is not None else '—'}")
+
+    # Premium / discount relative to the dealing-range equilibrium.
+    rng, eq = g("range") or {}, g("equilibrium")
+    if rng:
+        lines.append(f"Range: <code>{_fmt_p(rng.get('low', 0))}</code> – <code>{_fmt_p(rng.get('high', 0))}</code>")
+    if eq is not None:
+        zone = "—"
+        if last_price is not None:
+            zone = "PREMIUM 🔺" if last_price > eq else ("DISCOUNT 🔻" if last_price < eq else "EQUILIBRIUM")
+        lines.append(f"Equilibrium: <code>{_fmt_p(eq)}</code>  → <b>{zone}</b>")
+
+    events = g("structure_events") or []
+    if events:
+        arrow = {"bullish": "↑", "bearish": "↓"}
+        recent = ", ".join(
+            f"{_esc(e.get('type', '?'))}{arrow.get(e.get('direction'), '')}" for e in events[-3:]
+        )
+        lines.append(f"Structure: {recent}")
+
+    zones = g("zones") or []
+    obs = sum(1 for z in zones if "ob" in str(getattr(z, "kind", "")).lower())
+    fvgs = sum(1 for z in zones if "fvg" in str(getattr(z, "kind", "")).lower())
+    if zones:
+        lines.append(f"Zones: <b>{obs}</b> order blocks · <b>{fvgs}</b> FVGs")
+
+    liq = g("liquidity") or {}
+    bsl, ssl = (liq.get("buyside") or [])[-3:], (liq.get("sellside") or [])[-3:]
+    if bsl or ssl:
+        lines.append(
+            f"Liquidity: BSL {', '.join(_fmt_p(p) for p in bsl) or '—'}"
+            f" | SSL {', '.join(_fmt_p(p) for p in ssl) or '—'}"
+        )
+
+    # ── Ranked limit setups (top 3) ───────────────────────────────────────────
+    signals = g("signals") or []
+    lines.append("")
+    if not signals:
+        lines.append("📭 <b>No qualifying setups</b> at the current confidence floor.")
+    else:
+        lines.append(f"📌 <b>Top Setups</b> ({min(3, len(signals))} of {len(signals)})")
+        for i, s in enumerate(signals[:3], start=1):
+            def sg(key: str, default: Any = None) -> Any:
+                return getattr(s, key, default)
+            side = str(sg("side", "")).lower()
+            side_icon = "🟢" if side == "buy" else "🔴"
+            conf = float(sg("confidence", 0.0) or 0.0)
+            lines.append(
+                f"{i}. {side_icon} <b>{_esc(str(sg('order_type', side)).upper())}</b> "
+                f"@ <code>{_fmt_p(sg('entry', 0.0))}</code>"
+            )
+            lines.append(
+                f"   SL <code>{_fmt_p(sg('stop_loss', 0.0))}</code>  "
+                f"TP <code>{_fmt_p(sg('take_profit', 0.0))}</code>  "
+                f"R:R <b>{sg('rr', 0.0)}</b>  Conf <b>{conf * 100:.0f}%</b>"
+            )
+            aligned = sg("kronos_aligned")
+            tag = "✅ aligned" if aligned else ("⚠️ opposed" if aligned is False else "· n/a")
+            fusion = sg("fusion_score")
+            lines.append(
+                f"   {_esc(sg('zone_kind', '—'))} · fusion "
+                f"{fusion if fusion is not None else '—'} {tag}"
+            )
+
+    # ── Kronos ML fusion ──────────────────────────────────────────────────────
+    k = g("kronos")
+    lines.append("")
+    if isinstance(k, dict) and k.get("direction"):
+        kconf = float(k.get("confidence") or 0.0)
+        lines.append(
+            f"🔮 <b>Kronos</b> — {_esc(str(k.get('direction')).upper())}  "
+            f"conf <b>{kconf * 100:.0f}%</b>  Δ {k.get('pct_change')}%"
+        )
+        if k.get("target_price") is not None:
+            lines.append(
+                f"   Target <code>{_fmt_p(k['target_price'])}</code> · "
+                f"engine <code>{_esc(k.get('engine') or '—')}</code>"
+            )
+        if k.get("summary"):
+            lines.append(f"   <i>{_esc(_clip(k['summary'], 180))}</i>")
+    else:
+        lines.append("🔮 <b>Kronos</b> — no forecast available")
+
+    # ── AI review ─────────────────────────────────────────────────────────────
+    ai = g("ai")
+    lines.append("")
+    if isinstance(ai, dict) and ai.get("available"):
+        lines.append(
+            f"🧠 <b>AI Review</b> <code>{_esc(ai.get('provider') or '—')}"
+            f"/{_esc(ai.get('model') or '—')}</code>"
+        )
+        if ai.get("bias_comment"):
+            lines.append(f"<i>{_esc(_clip(ai['bias_comment'], 300))}</i>")
+        if ai.get("market_read"):
+            lines.append(_esc(_clip(ai["market_read"], 500)))
+        top_pick = ai.get("top_pick_entry")
+        if top_pick is not None:
+            lines.append(f"⭐ Top pick: <code>{_fmt_p(top_pick)}</code>")
+        for r in (ai.get("rated_signals") or [])[:3]:
+            verdict = str(r.get("verdict", "watch")).lower()
+            icon = {"take": "✅", "skip": "🚫"}.get(verdict, "👀")
+            lines.append(
+                f"{icon} <code>{_fmt_p(r.get('entry', 0.0))}</code> {verdict.upper()} — "
+                f"{_esc(_clip(r.get('note', ''), 140))}"
+            )
+        if ai.get("risk_warning"):
+            lines.append(f"⚠️ {_esc(_clip(ai['risk_warning'], 240))}")
+    else:
+        reason = ai.get("reason") if isinstance(ai, dict) else None
+        lines.append(f"🧠 <b>AI Review</b> — unavailable{f': {_esc(reason)}' if reason else ''}")
+
+    text = "\n".join(lines)
+    if len(text) > _SNIPER_MAX_LEN:
+        text = text[: _SNIPER_MAX_LEN - 1].rstrip() + "…"
+    return text
 
 
 async def _handle_monitor(args: str, _db: AsyncSession) -> tuple[str, str]:
@@ -657,6 +901,36 @@ def _fmt_p(v: float) -> str:
     return f"{v:.6g}"
 
 
+#: Timeframes Kronos accepts. Used to tell a timeframe argument from an exchange
+#: one, so the two can be given in either order.
+_TIMEFRAMES = frozenset({
+    "1m", "3m", "5m", "15m", "30m",
+    "1h", "2h", "4h", "6h", "12h", "1d", "3d", "1w",
+})
+
+
+def _parse_exchange_timeframe(
+    tokens: list[str], *, default_exchange: str = "bitget", default_tf: str = "1h",
+) -> tuple[str, str]:
+    """Split trailing `/forecast` arguments into (exchange, timeframe).
+
+    Both are optional and order-independent, because the documented positional
+    form ate the common case: `/forecast GBPUSD 4h` read "4h" as the *exchange*
+    and silently forecast the default 1h instead. A token that names a timeframe
+    is one; anything else is the exchange.
+    """
+    exchange, timeframe = default_exchange, default_tf
+    for tok in tokens:
+        t = tok.lower().strip()
+        if not t:
+            continue
+        if t in _TIMEFRAMES:
+            timeframe = t
+        else:
+            exchange = t
+    return exchange, timeframe
+
+
 # ── Kronos Forecast ───────────────────────────────────────────────────────────
 
 async def _handle_forecast(args: str, db: AsyncSession) -> tuple[str, str, dict | None]:
@@ -673,8 +947,7 @@ async def _handle_forecast(args: str, db: AsyncSession) -> tuple[str, str, dict 
         ), "HTML", None
 
     raw_sym = tokens[0]
-    exchange = tokens[1].lower() if len(tokens) > 1 else "bitget"
-    timeframe = tokens[2].lower() if len(tokens) > 2 else "1h"
+    exchange, timeframe = _parse_exchange_timeframe(tokens[1:])
     symbol = _norm_sym(raw_sym)
 
     try:
@@ -781,8 +1054,24 @@ async def _handle_forecast(args: str, db: AsyncSession) -> tuple[str, str, dict 
     # ── Sniper entries ─────────────────────────────────────────────────────────
     inline_keyboard: list[list[dict]] = []
 
+    # FX, metals and indices forecast fine (Yahoo prices them and CME volume
+    # backs the gate) but Bitget lists none of them, so their entries are
+    # analysis only — rendering an execute button would offer an unfillable
+    # order. See KronosForecastPlugin.forecast_service.is_order_placeable.
+    try:
+        from plugins.KronosForecastPlugin.backend.services.forecast_service import (
+            is_order_placeable,
+        )
+        placeable = is_order_placeable(symbol)
+    except Exception:  # noqa: BLE001 — never break the forecast over this
+        placeable = True
+
     if signals:
-        lines += ["", "⚡ <b>Sniper Entries</b>  (tap a button to execute)"]
+        header = (
+            "⚡ <b>Sniper Entries</b>  (tap a button to execute)" if placeable
+            else "⚡ <b>Sniper Entries</b>  (analysis only — see note below)"
+        )
+        lines += ["", header]
         for i, s in enumerate(signals[:4], 1):
             side_emoji = "🟢 LONG" if s.side == "long" else "🔴 SHORT"
             kind_label = "Market" if s.order_kind == "market" else "Limit"
@@ -794,6 +1083,9 @@ async def _handle_forecast(args: str, db: AsyncSession) -> tuple[str, str, dict 
                 f"  SL <code>{sl_str}</code>  TP1 <code>{tp_str}</code>"
                 f"  R:R {s.risk_reward}  {s.leverage}x"
             )
+
+            if not placeable:
+                continue
 
             # Inline keyboard — Row 1: quick $5 execute (paper + live)
             cb_base = f"cq_order:{s.side}:{s.order_kind}:{symbol}:5"
@@ -812,6 +1104,14 @@ async def _handle_forecast(args: str, db: AsyncSession) -> tuple[str, str, dict 
                 "callback_data": f"cq_custom_order:{s.side}:{s.order_kind}:{symbol}",
             }
             inline_keyboard.append([paper_btn, live_btn, custom_btn])
+
+        if not placeable:
+            lines.append("")
+            lines.append(
+                f"ℹ️ <i>{symbol} is not listed on {exchange} — these levels are "
+                f"analysis only. Place the trade with your FX/CFD broker "
+                f"(e.g. MT5).</i>"
+            )
     else:
         lines.append("")
         lines.append("ℹ️ No sniper entries — try a different timeframe.")
@@ -882,6 +1182,26 @@ async def _handle_order(args: str, db: AsyncSession) -> tuple[str, str]:
 
     symbol = _norm_sym(raw_sym)
     compact = symbol.replace("/", "")
+
+    # ── Tradability guard ─────────────────────────────────────────────────────
+    # Kronos forecasts FX, metals and indices, so a sniper entry can legitimately
+    # exist for GBP/USD — but no crypto connector lists it. Refuse here rather
+    # than sizing a position and firing an order the exchange cannot fill. This
+    # is the single choke point: typed /order and every inline button land here.
+    try:
+        from plugins.KronosForecastPlugin.backend.services.forecast_service import (
+            is_order_placeable,
+        )
+        if not is_order_placeable(symbol):
+            return (
+                f"🚫 <b>{symbol} cannot be ordered here.</b>\n"
+                f"{exchange} lists crypto USDT futures only — FX, metals and "
+                f"indices are forecast-only.\n\n"
+                f"Use <code>/forecast {raw_sym}</code> for the levels and place "
+                f"the trade with your FX/CFD broker."
+            ), "HTML"
+    except ImportError:
+        pass  # plugin missing is reported by the call below
 
     # ── Get sniper signals to find entry/SL/TP ────────────────────────────────
     try:

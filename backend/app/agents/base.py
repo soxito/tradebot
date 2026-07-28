@@ -88,7 +88,40 @@ def _get_client() -> "AsyncOpenAI":
     api_key = os.getenv("OPENAI_API_KEY", "")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not set")
-    return AsyncOpenAI(api_key=api_key)
+    
+    # Check if we should route through headroom proxy for NVIDIA/OpenAI models
+    headroom_proxy = os.getenv("HEADROOM_PROXY_URL")
+    headroom_target = os.getenv("HEADROOM_OPENAI_BASE_URL", "")
+    
+    # Use proxy if:
+    # 1. Headroom proxy is configured AND
+    # 2. Either the target API is NVIDIA/OpenAI, OR the API key is an NVIDIA key (nvapi-)
+    use_proxy = (
+        headroom_proxy 
+        and (
+            "nvidia" in headroom_target.lower() 
+            or "openai" in headroom_target.lower()
+            or api_key.startswith("nvapi-")
+        )
+    )
+    
+    if use_proxy:
+        # Use Cloudflare Workers format endpoint for headroom proxy
+        proxy_base = f"{headroom_proxy.rstrip('/')}/p/tradebot/v1"
+        logger.info(f"[BaseAgent] Routing NVIDIA/OpenAI calls through headroom proxy: {proxy_base}")
+        
+        # IMPORTANT: OpenAI Python client reads OPENAI_BASE_URL from env even when base_url is passed!
+        # Temporarily unset it to ensure our explicit base_url is used.
+        original_base_url = os.environ.get("OPENAI_BASE_URL")
+        if original_base_url:
+            del os.environ["OPENAI_BASE_URL"]
+        try:
+            return AsyncOpenAI(api_key=api_key, base_url=proxy_base)
+        finally:
+            if original_base_url:
+                os.environ["OPENAI_BASE_URL"] = original_base_url
+    
+    return AsyncOpenAI(api_key=api_key, base_url=headroom_target or "https://api.openai.com/v1")
 
 
 class BaseAgent:

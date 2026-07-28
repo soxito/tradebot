@@ -28,6 +28,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
+from plugins.MT5TradingPlugin.backend.services import smc_scoring
+
 
 # ── Data structures ────────────────────────────────────────────────────────────
 
@@ -97,6 +99,9 @@ class Signal:
     sl_pips: float = 0.0      # |entry-SL| / pip_size
     tp_pips: float = 0.0      # |TP-entry| / pip_size
     pip_value: float = 0.0    # account-currency value of 1 pip at `lot`
+    # Numeric audit trail for `confidence` — which factors contributed and by
+    # how much. See services/smc_scoring.py.
+    score_breakdown: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -592,6 +597,9 @@ class SMCStrategyEngine:
         daily_profit_target_pct: float = 0.0,  # daily profit goal as % of balance (0=off)
         us_session_only: bool = False,    # only take setups formed in the US session
         require_structure: bool = True,   # require OB/FVG + BOS/CHoCH/strong-weak backing
+        # Learned factor weights from realised outcomes (Phase 3). None = the
+        # defaults in smc_scoring.DEFAULT_WEIGHTS.
+        factor_weights: Optional[Dict[str, float]] = None,
     ) -> None:
         self.swing_left = swing_left
         self.swing_right = swing_right
@@ -616,6 +624,7 @@ class SMCStrategyEngine:
         self.daily_profit_target_pct = daily_profit_target_pct
         self.us_session_only = us_session_only
         self.require_structure = require_structure
+        self.factor_weights = factor_weights
         # Higher daily target → more aggressive: surface more setups and relax the
         # confidence gate so more entries are generated to chase the target.
         # (50% → selective/3 signals … 1000% → aggressive/14 signals.)
@@ -963,45 +972,44 @@ class SMCStrategyEngine:
         if rej_wick >= 0.55:
             confluence.append("rejection_wick")
 
-        # ── Confidence formula ────────────────────────────────────────────────
-        base_count = min(len(confluence) / 10.0, 1.0) * 0.40
-        rr_bonus         = min((rr - self.min_rr) / 4.0, 0.18)
+        # ── Deterministic factor scoring ──────────────────────────────────────
+        # Confidence is a weighted sum of measured volume / structure / movement
+        # / risk factors, each with a numeric raw value and contribution. See
+        # services/smc_scoring.py for the factor definitions and weights.
+        breakdown = smc_scoring.score_signal(
+            side=side,
+            zone_index=zone.index,
+            zone_kind=zone.kind,
+            zone_top=zone.top,
+            zone_bottom=zone.bottom,
+            entry=entry,
+            rr=rr,
+            min_rr=self.min_rr,
+            max_rr=self.max_rr,
+            candles=prim.get("_candles", []),
+            atr=atr,
+            bias=prim["bias"],
+            events=prim.get("events", []),
+            sweeps=sweeps,
+            equilibrium=equilibrium,
+            range_low=lo,
+            range_high=hi,
+            choch_index=choch_index,
+            htf_bias=prim.get("htf_bias"),
+            weights=self.factor_weights,
+        )
 
-        # Named bonuses (additive, non-overlapping intent)
-        fvg_bonus        = 0.08 if "fair_value_gap"         in confluence else 0.0
-        fvg_zone_bonus   = 0.10 if ("fvg_in_discount"       in confluence or
-                                     "fvg_in_premium"        in confluence) else 0.0
-        ob_zone_bonus    = 0.06 if ("ob_in_discount"         in confluence or
-                                     "ob_in_premium"         in confluence) else 0.0
-        struct_bonus     = 0.10 if "structure_aligned"       in confluence else 0.0
-        deep_bonus       = 0.05 if ("deep_discount"          in confluence or
-                                     "deep_premium"          in confluence) else 0.0
-        choch_bonus      = 0.08 if "choch_reversal"          in confluence else 0.0
-        post_choch_bonus = 0.10 if "post_choch_zone"         in confluence else 0.0
-        multi_zone_bonus = 0.08 if ("multi_zone_discount"    in confluence or
-                                     "multi_zone_premium"    in confluence) else 0.0
-        choch_sl_bonus   = 0.04 if ("choch_protected_low"    in confluence or
-                                     "choch_protected_high"  in confluence) else 0.0
-        ob_struct_bonus  = 0.04 if "ob_structure_confluence" in confluence else 0.0
-        extreme_bonus    = 0.08 if ("at_weak_low"            in confluence or
-                                     "at_strong_high"        in confluence) else 0.0
-        bos_bonus        = 0.06 if "bos_continuation"         in confluence else 0.0
-        # False-breakout / sweep bonuses — these are the highest-quality setups
-        sweep_bonus      = 0.10 if ("sweep_of_lows"          in confluence or
-                                     "sweep_of_highs"         in confluence) else 0.0
-        wick_zone_bonus  = 0.08 if "wicked_into_zone"         in confluence else 0.0
-        fb_bonus         = 0.10 if "strong_false_breakout"    in confluence else (
-                           0.05 if "possible_false_breakout"  in confluence else 0.0)
-        rej_bonus        = 0.06 if "rejection_wick"           in confluence else 0.0
+        # Hard gate 1: no signal fires without volume confirmation. The
+        # zone-forming candle must have traded above its rolling mean, and any
+        # break of structure in this direction must itself be volume-confirmed.
+        if not breakdown.volume_confirmed:
+            return None
 
-        confidence = round(min(
-            base_count + rr_bonus + fvg_bonus + fvg_zone_bonus + ob_zone_bonus +
-            struct_bonus + deep_bonus + choch_bonus + post_choch_bonus +
-            multi_zone_bonus + choch_sl_bonus + ob_struct_bonus +
-            extreme_bonus + bos_bonus + sweep_bonus + wick_zone_bonus +
-            fb_bonus + rej_bonus + 0.10,
-            0.98
-        ), 2)
+        # Hard gate 2: a higher-timeframe bias that opposes this trade blocks it.
+        if breakdown.htf_blocked:
+            return None
+
+        confidence = round(breakdown.total, 2)
 
         # ── Human-readable reason ─────────────────────────────────────────────
         factors: List[str] = []
@@ -1054,7 +1062,12 @@ class SMCStrategyEngine:
         # Join factors; capitalise only the very first word so CHoCH / FVG
         # abbreviations in the middle of the string are preserved as-is.
         joined = ", ".join(factors)
-        reason = f"{joined[0].upper()}{joined[1:]}; RR {rr:.1f}"
+        # Narrative tags first, then the numeric factor attribution so the score
+        # is always explainable from the same string.
+        reason = (
+            f"{joined[0].upper()}{joined[1:]}; RR {rr:.1f}; "
+            f"{smc_scoring.describe(breakdown)}"
+        )
 
         # ── Balance-aware position sizing ─────────────────────────────────────
         lot, risk_amount = self._position_size(entry, stop, self.account_balance)
@@ -1121,16 +1134,41 @@ class SMCStrategyEngine:
             contract_size=self.contract_size,
             sl_points=sl_points, tp_points=tp_points,
             sl_pips=sl_pips, tp_pips=tp_pips, pip_value=pip_value,
+            score_breakdown=breakdown.to_dict(),
         )
+
+    # -- higher-timeframe bias --------------------------------------------------
+
+    def _htf_bias(self, htf_candles: Optional[List[Candle]]) -> Optional[str]:
+        """Structural bias of the higher timeframe, or None when unavailable.
+
+        Reuses the same swing + BOS/CHoCH detection as the entry timeframe so
+        the two reads are computed identically.
+        """
+        if not htf_candles or len(htf_candles) < 40:
+            return None
+        swings = _swings(htf_candles, self.swing_left, self.swing_right)
+        bias, _events = _structure_bias(htf_candles, swings)
+        return bias if bias in ("bullish", "bearish") else None
 
     # -- public: live analysis --------------------------------------------------
 
-    def analyze(self, candles: List[Candle]) -> Dict[str, Any]:
-        """Produce drawable zones + currently-valid pending sniper limit setups."""
+    def analyze(
+        self,
+        candles: List[Candle],
+        htf_candles: Optional[List[Candle]] = None,
+    ) -> Dict[str, Any]:
+        """Produce drawable zones + currently-valid pending sniper limit setups.
+
+        ``htf_candles`` are higher-timeframe bars for the same instrument. When
+        supplied, their structural bias GATES entries: a setup whose direction
+        opposes the HTF bias is rejected outright rather than merely penalised.
+        """
         if len(candles) < 40:
             return {"error": "Not enough candles (need >= 40)", "signals": [], "zones": []}
 
         prim = self._primitives(candles)
+        prim["htf_bias"] = self._htf_bias(htf_candles)
         atr = prim["atr"]
         last_price = candles[-1].close
         bias = prim["bias"]
@@ -1295,6 +1333,7 @@ class SMCStrategyEngine:
 
         return {
             "bias": bias,
+            "htf_bias": prim.get("htf_bias"),
             "last_price": round(last_price, 6),
             "atr": round(atr, 6),
             "atr_pct": round(atr_pct, 3),

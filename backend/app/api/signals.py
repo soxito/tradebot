@@ -1120,6 +1120,112 @@ async def get_smc_signals(
     return {"signals": signals, "count": len(signals)}
 
 
+# ── Crypto SMC sniper (shares every module with the MT5 path) ────────────────
+# This endpoint runs the SAME SMCStrategyEngine, the SAME smc_scoring factor
+# model, the SAME three-tier analysis router + deterministic floor, and the SAME
+# learning loop as /plugins/mt5/strategy/analyze — only the candle source
+# differs (ccxt instead of the MT5 bridge). Nothing is forked.
+#
+# The PineScript-based /smc/generate above is deliberately left untouched.
+
+#: Entry timeframe -> the higher timeframe whose bias gates it (ccxt notation).
+_CRYPTO_HTF_FOR = {"1m": "15m", "5m": "1h", "15m": "4h", "30m": "4h", "1h": "4h"}
+
+
+async def _crypto_candles(exchange: str, symbol: str, timeframe: str, limit: int):
+    """Fetch ccxt candles and adapt them to the SMC engine's Candle type."""
+    from app.api.exchanges import get_ohlcv
+    from plugins.MT5TradingPlugin.backend.services.smc_strategy import (
+        candles_from_payload,
+    )
+
+    payload = await get_ohlcv(
+        exchange=SupportedExchange(exchange), symbol=symbol,
+        timeframe=timeframe, limit=limit,
+    )
+    rows = (payload or {}).get("data") or []
+    return candles_from_payload(rows)
+
+
+@router.get("/smc/analyze")
+async def crypto_smc_analyze(
+    symbol: str,
+    exchange: str = "bitget",
+    timeframe: str = "1h",
+    count: int = 400,
+    min_rr: float = 1.5,
+    max_rr: float = 3.0,
+    sl_buffer_atr: float = 1.0,
+    min_confidence: float = 0.6,
+    use_ai: bool = True,
+    db: AsyncSession = Depends(get_db),
+):
+    """Smart Money Concepts sniper analysis for a crypto pair.
+
+    Same never-fail contract as the MT5 endpoint: the response always carries a
+    complete `ai` block. When every provider is unreachable the deterministic
+    SMC floor answers, so this can never return empty, null, or an error.
+    """
+    from plugins.MT5TradingPlugin.backend.services import smc_floor, smc_memory
+    from plugins.MT5TradingPlugin.backend.services.smc_ai import ai_review
+    from plugins.MT5TradingPlugin.backend.services.smc_strategy import (
+        SMCStrategyEngine,
+        contract_size_for_symbol,
+    )
+
+    try:
+        candles = await _crypto_candles(exchange, symbol, timeframe, count)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[crypto/SMC] candle fetch failed for {symbol}: {exc}")
+        candles = []
+
+    # Higher-timeframe gate — same rule as MT5, optional and non-blocking.
+    htf_candles = None
+    htf_tf = _CRYPTO_HTF_FOR.get(timeframe.lower())
+    if htf_tf:
+        try:
+            htf_candles = await _crypto_candles(exchange, symbol, htf_tf, 300)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[crypto/SMC] HTF {htf_tf} skipped for {symbol}: {exc}")
+
+    weights = await smc_memory.learned_weights(db, market="crypto", symbol=symbol)
+    engine = SMCStrategyEngine(
+        min_rr=min_rr, max_rr=max_rr, sl_buffer_atr=sl_buffer_atr,
+        min_confidence=min_confidence, symbol=symbol,
+        contract_size=contract_size_for_symbol(symbol),
+        factor_weights=weights,
+    )
+    analysis = engine.analyze(candles, htf_candles=htf_candles)
+
+    if use_ai:
+        try:
+            ai_block = await ai_review(
+                db=db, symbol=symbol, timeframe=timeframe,
+                analysis=analysis, market="crypto",
+            )
+        except Exception as exc:  # noqa: BLE001 — last line of defence
+            logger.warning(f"[crypto/SMC] AI review raised, using floor: {exc}")
+            ai_block = smc_floor.build(analysis, reason=str(exc)[:200])
+    else:
+        ai_block = smc_floor.build(analysis, reason="AI review disabled by request")
+
+    await smc_memory.record_analysis(
+        db, market="crypto", symbol=symbol, timeframe=timeframe,
+        analysis=analysis, ai_block=ai_block,
+    )
+
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "exchange": exchange,
+        "ai": ai_block,
+        "provider_used": ai_block.get("provider_used"),
+        "tier": ai_block.get("tier"),
+        "is_degraded": bool(ai_block.get("is_degraded")),
+        **analysis,
+    }
+
+
 @router.get("/smc/overview")
 async def get_smc_overview(
     symbol: Optional[str] = None,

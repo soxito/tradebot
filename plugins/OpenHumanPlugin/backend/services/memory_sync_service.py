@@ -120,3 +120,81 @@ async def sync_recent_forecasts(symbols: Optional[List[str]] = None) -> Dict[str
             logger.debug(f"[MemorySync] forecast sync failed for {sym}: {exc}")
             failed += 1
     return {"synced": synced, "failed": failed}
+
+
+async def compile_strategies_from_research(
+    symbols: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Compile strategy proposals from the shared research memory.
+
+    This is the OpenHuman consumer side of the agent bus. It reads findings the
+    background research loop already collected and stored — it does NOT call an
+    AI provider itself. That is the point of the shared-memory design: research
+    is done once, by idle providers, and every agent consumes the same result
+    instead of each re-asking a model the same question.
+
+    Each proposal is published back to JARVIS on the typed bus and mirrored into
+    OpenHuman's agentmemory. A proposal built only from speculative findings is
+    tagged ``speculative`` and must not gate a trade signal on its own.
+
+    Best-effort — never raises.
+    """
+    proposals: List[Dict[str, Any]] = []
+    try:
+        from app.core.database import AsyncSessionLocal
+        from plugins.MT5TradingPlugin.backend.services import agent_bus, research_loop
+    except Exception as exc:  # noqa: BLE001 — plugin may be absent
+        logger.debug(f"[MemorySync] research consumer unavailable: {exc}")
+        return proposals
+
+    watchlist = symbols or list(research_loop.DEFAULT_WATCHLIST)
+    try:
+        async with AsyncSessionLocal() as db:
+            for symbol in watchlist:
+                findings = await research_loop.active_findings(
+                    db, symbol=symbol, limit=20
+                )
+                # Symbol-agnostic macro/sentiment context applies to everything.
+                findings += await research_loop.active_findings(
+                    db, kinds=["sentiment"], limit=5
+                )
+                if not findings:
+                    continue
+
+                verified = [f for f in findings if not f.speculative]
+                # Confidence is the mean of the SOURCE-VERIFIED findings only —
+                # speculation never inflates it.
+                confidence = (
+                    sum(float(f.confidence or 0.0) for f in verified) / len(verified)
+                    if verified else 0.0
+                )
+                high_impact = [
+                    f for f in verified
+                    if f.kind == "calendar" and "high" in (f.body or "").lower()
+                ]
+                stance = "stand_aside" if high_impact else "neutral"
+                rationale = (
+                    f"{len(findings)} active finding(s) for {symbol}, "
+                    f"{len(verified)} source-verified"
+                    + (
+                        f"; {len(high_impact)} high-impact calendar event(s) pending "
+                        "— stand aside until released"
+                        if high_impact else ""
+                    )
+                )
+
+                message = agent_bus.StrategyProposalMessage(
+                    symbol=symbol,
+                    stance=stance,
+                    rationale=rationale,
+                    finding_ids=[f.id for f in findings],
+                    confidence=round(confidence, 4),
+                    speculative=not verified,
+                )
+                await agent_bus.publish_proposal(message)
+                await push_jarvis_brain_state(symbol, rationale)
+                proposals.append(message.to_dict())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[MemorySync] compile_strategies_from_research failed: {exc}")
+
+    return proposals

@@ -1,0 +1,27 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "frontend",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev"],
+      "cwd": "frontend",
+      "port": 3000
+    },
+    {
+      "name": "backend",
+      "runtimeExecutable": ".venv/bin/uvicorn",
+      "runtimeArgs": [
+        "app.main:app",
+        "--host", "0.0.0.0",
+        "--port", "1448",
+        "--loop", "asyncio",
+        "--reload",
+        "--reload-dir", "app",
+        "--reload-dir", "../plugins"
+      ],
+      "cwd": "backend",
+      "port": 1448
+    }
+  ]
+}

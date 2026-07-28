@@ -44,6 +44,7 @@ from plugins.MT5TradingPlugin.backend.services.smc_strategy import (
     SMCStrategyEngine, smc_engine, candles_from_payload, contract_size_for_symbol,
 )
 from plugins.MT5TradingPlugin.backend.services.smc_ai import ai_review
+from plugins.MT5TradingPlugin.backend.services import smc_floor, smc_memory
 from plugins.MT5TradingPlugin.backend.config import mt5_config
 
 router = APIRouter(prefix="/plugins/mt5", tags=["MT5 Trading"])
@@ -426,6 +427,52 @@ async def list_deals(
         ) for d in deals]
 
 
+async def _settle_smc_outcomes(account_id: int, limit: int = 25) -> int:
+    """Close the learning loop: score every placed-but-unsettled SMC signal.
+
+    Loads the candles that elapsed since each signal was emitted, finds the bar
+    that filled the resting limit, and records MFE / MAE / R multiple /
+    time-to-target. Signals whose limit never filled, or whose trade is still
+    running, stay unsettled and are retried on the next sync. Then recalibrates
+    the factor weights from everything realised so far.
+
+    Best-effort throughout — a settlement problem must never fail a deal sync.
+    """
+    settled = 0
+    try:
+        async with AsyncSessionLocal() as db:
+            pending = await smc_memory.unsettled_signals(db, market="mt5", limit=limit)
+            if not pending:
+                return 0
+            # One candle fetch per (symbol, timeframe) rather than per signal.
+            cache: dict[tuple[str, str], list] = {}
+            touched_symbols: set[str] = set()
+            for sig in pending:
+                key = (sig.symbol, sig.timeframe)
+                if key not in cache:
+                    try:
+                        cache[key] = await _load_candles(
+                            account_id, sig.symbol, sig.timeframe, 1000
+                        )
+                    except Exception:  # noqa: BLE001
+                        cache[key] = []
+                if not cache[key]:
+                    continue
+                if await smc_memory.settle_signal(db, sig, cache[key]):
+                    settled += 1
+                    touched_symbols.add(sig.symbol)
+
+            if settled:
+                await smc_memory.recalibrate_weights(db, market="mt5")
+                for sym in touched_symbols:
+                    await smc_memory.recalibrate_weights(
+                        db, market="mt5", symbol_class=sym
+                    )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[MT5/smc-learning] settlement pass skipped: {exc}")
+    return settled
+
+
 @router.post("/accounts/{account_id}/deals/sync")
 async def sync_deals(
     account_id: int,
@@ -455,7 +502,12 @@ async def sync_deals(
             force_today=force_today,
             days_back=days_back,
         )
-        return {"new_deals": count, "synced_at": datetime.utcnow().isoformat()}
+        settled = await _settle_smc_outcomes(account_id)
+        return {
+            "new_deals": count,
+            "smc_outcomes_settled": settled,
+            "synced_at": datetime.utcnow().isoformat(),
+        }
 
 
 @router.post("/accounts/{account_id}/deals/sync/full")
@@ -472,7 +524,12 @@ async def sync_deals_full(account_id: int):
         count = await MT5SyncService.sync_deals(
             db, account, force_today=True, days_back=90
         )
-        return {"new_deals": count, "synced_at": datetime.utcnow().isoformat()}
+        settled = await _settle_smc_outcomes(account_id, limit=100)
+        return {
+            "new_deals": count,
+            "smc_outcomes_settled": settled,
+            "synced_at": datetime.utcnow().isoformat(),
+        }
 
 
 @router.post("/accounts/{account_id}/deals/analyze-history")
@@ -1120,6 +1177,13 @@ async def _load_candles(account_id: int, symbol: str, timeframe: str, count: int
     return candles
 
 
+# Entry timeframe -> the higher timeframe whose bias gates it. Timeframes at
+# H4 and above are their own top-level context and are not gated further.
+_HTF_FOR = {
+    "M1": "M15", "M5": "H1", "M15": "H4", "M30": "H4", "H1": "H4",
+}
+
+
 async def _kronos_from_candles(candles, symbol: str, timeframe: str):
     """Run the Kronos ML forecast on the SAME candles the SMC engine analysed.
 
@@ -1226,31 +1290,65 @@ async def smc_analyze(
     telegram-signals and /agents).
     """
     candles = await _load_candles(account_id, symbol, timeframe, count)
+
+    # Higher-timeframe context: entries on M1..H1 are gated by the H4 structural
+    # bias so the sniper never takes a setup against the dominant trend. Fully
+    # optional — if the HTF feed is unavailable the analysis proceeds ungated.
+    htf_candles = None
+    htf_tf = _HTF_FOR.get(str(timeframe).upper())
+    if htf_tf:
+        try:
+            htf_candles = await _load_candles(account_id, symbol, htf_tf, 300)
+        except Exception as exc:  # noqa: BLE001 — HTF is an enhancement, not a dep
+            logger.debug(f"[MT5/strategy] HTF {htf_tf} load skipped for {symbol}: {exc}")
+
+    # Factor weights learned from this instrument's realised outcomes (Phase 3).
+    # Falls back to smc_scoring.DEFAULT_WEIGHTS until enough trades have closed.
+    async with AsyncSessionLocal() as db:
+        weights = await smc_memory.learned_weights(db, market="mt5", symbol=symbol)
+
     engine = SMCStrategyEngine(
         min_rr=min_rr, max_rr=max_rr, sl_buffer_atr=sl_buffer_atr,
         min_confidence=min_confidence, symbol=symbol,
         contract_size=contract_size_for_symbol(symbol),
+        factor_weights=weights,
     )
-    analysis = engine.analyze(candles)
+    analysis = engine.analyze(candles, htf_candles=htf_candles)
 
     kronos_block = await _kronos_from_candles(candles, symbol, timeframe)
     # Fuse Kronos into signal selection (tags alignment, re-ranks setups).
     _apply_kronos_to_signals(analysis, kronos_block)
 
-    ai_block = None
-    if use_ai and not analysis.get("error") and analysis.get("signals"):
+    # The AI block is ALWAYS produced. `ai_review` runs the health-ranked
+    # provider cascade and falls through to the deterministic SMC floor when
+    # every provider fails, so this endpoint cannot return an empty AI panel.
+    if use_ai:
         async with AsyncSessionLocal() as db:
             try:
                 ai_block = await ai_review(
                     db=db, symbol=symbol, timeframe=timeframe,
                     analysis=analysis, kronos_forecast=kronos_block,
                 )
-            except Exception as e:
-                logger.warning(f"[MT5/strategy] AI review failed: {e}")
-                ai_block = {"available": False, "reason": str(e)}
+            except Exception as e:  # noqa: BLE001 — last line of defence
+                logger.warning(f"[MT5/strategy] AI review raised, using floor: {e}")
+                ai_block = smc_floor.build(analysis, reason=str(e)[:200])
+    else:
+        ai_block = smc_floor.build(analysis, reason="AI review disabled by request")
+
+    # Persist the analysis + every emitted signal so future analyses can learn
+    # from what these setups actually returned.
+    async with AsyncSessionLocal() as db:
+        await smc_memory.record_analysis(
+            db, market="mt5", symbol=symbol, timeframe=timeframe,
+            analysis=analysis, ai_block=ai_block,
+        )
 
     return MT5SmcAnalyzeResponse(
-        symbol=symbol, timeframe=timeframe, ai=ai_block, kronos=kronos_block, **analysis,
+        symbol=symbol, timeframe=timeframe, ai=ai_block, kronos=kronos_block,
+        provider_used=ai_block.get("provider_used"),
+        tier=ai_block.get("tier"),
+        is_degraded=bool(ai_block.get("is_degraded")),
+        **analysis,
     )
 
 
@@ -1279,6 +1377,16 @@ async def smc_analyze_data(data: MT5SmcAnalyzeDataRequest):
     Uses the DB-backed AI router (same providers as telegram-signals and /agents).
     """
     candles = candles_from_payload([c.model_dump() for c in data.candles])
+    # Optional caller-supplied higher-timeframe series. Without it this path
+    # would silently skip the HTF gate that GET /strategy/analyze applies.
+    htf_candles = (
+        candles_from_payload([c.model_dump() for c in data.htf_candles])
+        if data.htf_candles else None
+    )
+
+    async with AsyncSessionLocal() as db:
+        weights = await smc_memory.learned_weights(db, market="mt5", symbol=data.symbol)
+
     engine = SMCStrategyEngine(
         min_rr=data.min_rr, max_rr=data.max_rr, sl_buffer_atr=data.sl_buffer_atr,
         min_confidence=data.min_confidence, symbol=data.symbol,
@@ -1288,27 +1396,40 @@ async def smc_analyze_data(data: MT5SmcAnalyzeDataRequest):
         max_total_loss=data.max_total_loss,
         daily_profit_target_pct=data.daily_profit_target_pct,
         us_session_only=data.us_session_only,
+        factor_weights=weights,
     )
-    analysis = engine.analyze(candles)
+    analysis = engine.analyze(candles, htf_candles=htf_candles)
 
     kronos_block = await _kronos_from_candles(candles, data.symbol, data.timeframe)
     # Fuse Kronos into signal selection (tags alignment, re-ranks setups).
     _apply_kronos_to_signals(analysis, kronos_block)
 
-    ai_block = None
-    if data.use_ai and not analysis.get("error") and analysis.get("signals"):
+    # Same never-fail contract as GET /strategy/analyze.
+    if data.use_ai:
         async with AsyncSessionLocal() as db:
             try:
                 ai_block = await ai_review(
                     db=db, symbol=data.symbol, timeframe=data.timeframe,
                     analysis=analysis, kronos_forecast=kronos_block,
                 )
-            except Exception as e:
-                logger.warning(f"[MT5/strategy] AI review failed: {e}")
-                ai_block = {"available": False, "reason": str(e)}
+            except Exception as e:  # noqa: BLE001 — last line of defence
+                logger.warning(f"[MT5/strategy] AI review raised, using floor: {e}")
+                ai_block = smc_floor.build(analysis, reason=str(e)[:200])
+    else:
+        ai_block = smc_floor.build(analysis, reason="AI review disabled by request")
+
+    async with AsyncSessionLocal() as db:
+        await smc_memory.record_analysis(
+            db, market="mt5", symbol=data.symbol, timeframe=data.timeframe,
+            analysis=analysis, ai_block=ai_block,
+        )
 
     return MT5SmcAnalyzeResponse(
-        symbol=data.symbol, timeframe=data.timeframe, ai=ai_block, kronos=kronos_block, **analysis,
+        symbol=data.symbol, timeframe=data.timeframe, ai=ai_block, kronos=kronos_block,
+        provider_used=ai_block.get("provider_used"),
+        tier=ai_block.get("tier"),
+        is_degraded=bool(ai_block.get("is_degraded")),
+        **analysis,
     )
 
 
@@ -1432,6 +1553,13 @@ async def smc_place(data: MT5SmcPlaceRequest):
             except Exception as insert_err:
                 logger.debug(f"[MT5/place] direct DB insert skipped: {insert_err}")
                 await db.rollback()
+
+            # Link the placed ticket back to the stored SMC signal so its
+            # realised outcome can be attributed to the factors that scored it.
+            await smc_memory.attach_ticket_to_signal(
+                db, market="mt5", symbol=data.symbol, side=data.side,
+                entry=data.entry, ticket=int(ticket),
+            )
 
         # ── Background sync to refresh positions, balance, other orders ────
         try:

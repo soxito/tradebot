@@ -79,7 +79,6 @@ HEADROOM_LOG = (
     else HEADROOM_DATA_DIR / "headroom.log"
 )
 HEADROOM_PLIST = HOME / "Library" / "LaunchAgents" / "ai.headroomlabs.headroom.plist"
-HEADROOM_PROXY_KEY = os.environ.get("HEADROOM_PROXY_KEY", "tradebot-local-headroom")
 
 OBSIDIAN_APP_PATH = Path("/Applications/Obsidian.app")
 OBSIDIAN_VAULT_DIR = (ROOT / "obsidian-vault").resolve()
@@ -135,6 +134,12 @@ OPENMANUS_BASE_PY = next((p for p in _OM_PY_CANDIDATES if Path(p).exists()), str
 BACKEND_PORT       = int(os.environ.get("BACKEND_PORT", "1448"))
 FRONTEND_PORT      = int(os.environ.get("FRONTEND_PORT", "3000"))
 AGENTMEMORY_PORT   = int(os.environ.get("AGENTMEMORY_PORT", "8900"))   # shared memory for OpenHuman
+
+# ── OpenWA (WhatsApp) Gateway ────────────────────────────────────────────────
+OPENWA_API_PORT    = int(os.environ.get("OPENWA_API_PORT", "2785"))
+OPENWA_DASHBOARD_PORT = int(os.environ.get("OPENWA_DASHBOARD_PORT", "2886"))
+OPENWA_API_URL     = f"http://localhost:{OPENWA_API_PORT}"
+OPENWA_DASHBOARD_URL = f"http://localhost:{OPENWA_DASHBOARD_PORT}"
 
 # ── MT5 REST config (read from .env if present, else defaults) ────────────────
 def _read_dotenv() -> Dict[str, str]:
@@ -944,6 +949,64 @@ def ensure_env_obsidian() -> None:
         warn("OBSIDIAN_REST_TOKEN is blank — paste the token from the Obsidian Local REST API plugin settings")
 
 
+def ensure_env_whatsapp() -> None:
+    """Inject missing WhatsApp/OpenWA env vars into the root .env file.
+
+    Only adds keys that are not already present — never overwrites existing
+    values. Generates secure random values for WHATSAPP_OPENWA_API_KEY and
+    WHATSAPP_WEBHOOK_SECRET if they are missing.
+    """
+    import secrets
+    dotenv_path = ROOT / ".env"
+    if not dotenv_path.exists():
+        return  # .env hasn't been created yet — nothing to patch
+
+    existing_text = dotenv_path.read_text()
+    existing_keys = {
+        line.partition("=")[0].strip()
+        for line in existing_text.splitlines()
+        if line.strip() and not line.strip().startswith("#") and "=" in line
+    }
+
+    # Defaults for WhatsApp/OpenWA integration
+    defaults = [
+        # OpenWA Gateway connection
+        ("WHATSAPP_OPENWA_BASE_URL", OPENWA_API_URL),
+        ("WHATSAPP_OPENWA_API_KEY", secrets.token_urlsafe(32) if "WHATSAPP_OPENWA_API_KEY" not in existing_keys else ""),
+        ("WHATSAPP_DEFAULT_SESSION_NAME", "tradebot_whatsapp"),
+        ("WHATSAPP_WEBHOOK_SECRET", secrets.token_urlsafe(32) if "WHATSAPP_WEBHOOK_SECRET" not in existing_keys else ""),
+        ("WHATSAPP_POLL_INTERVAL_SECONDS", "300"),
+        # Sniper defaults
+        ("WHATSAPP_SNIPER_ENABLED_DEFAULT", "false"),
+        ("WHATSAPP_SNIPER_MODE_DEFAULT", "sandbox"),
+        ("WHATSAPP_SNIPER_POSITION_SIZE_USDT_DEFAULT", "100"),
+        ("WHATSAPP_SNIPER_MAX_POSITIONS_DEFAULT", "5"),
+        ("WHATSAPP_SNIPER_MIN_CONFIDENCE_DEFAULT", "0.65"),
+        ("WHATSAPP_SNIPER_MIN_RISK_REWARD_DEFAULT", "1.5"),
+    ]
+
+    missing = [(k, v) for k, v in defaults if k not in existing_keys]
+    if not missing:
+        return  # all keys already present
+
+    lines = [
+        "\n# ── WhatsApp Signal & News Plugin (OpenWA) ────────────────────────────",
+        "# Auto-generated secure values — keep these safe!",
+    ]
+    for k, v in missing:
+        lines.append(f"{k}={v}")
+
+    with dotenv_path.open("a") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+    added = [k for k, _ in missing]
+    ok(f".env ← added WhatsApp/OpenWA keys: {', '.join(added)}")
+    if "WHATSAPP_OPENWA_API_KEY" in added:
+        info("WHATSAPP_OPENWA_API_KEY auto-generated (secure random)")
+    if "WHATSAPP_WEBHOOK_SECRET" in added:
+        info("WHATSAPP_WEBHOOK_SECRET auto-generated (secure random)")
+
+
 def start_obsidian() -> bool:
     if not ensure_dir(OBSIDIAN_VAULT_DIR):
         return False
@@ -1013,8 +1076,14 @@ def _headroom_env_pairs() -> List[Tuple[str, str]]:
     detached-process launcher so both platforms run an identically-configured
     proxy.
     """
+    # Use real OpenAI API as upstream - not the local backend!
+    # The headroom proxy should forward to the actual OpenAI API, not a local relay.
+    openai_target = os.environ.get("OPENAI_TARGET_API_URL", "https://api.openai.com/v1")
+    anthropic_target = os.environ.get("ANTHROPIC_TARGET_API_URL", "https://api.anthropic.com")
+    
     return [
-        ("OPENAI_TARGET_API_URL", f"http://127.0.0.1:{BACKEND_PORT}/api/v1/provider-relay"),
+        ("OPENAI_TARGET_API_URL", openai_target),
+        ("ANTHROPIC_TARGET_API_URL", anthropic_target),
         ("HEADROOM_COMPRESS_SYSTEM_MESSAGES", "1"),
         ("HEADROOM_COMPRESS_USER_MESSAGES", "1"),
         ("HEADROOM_MIN_TOKENS", "1"),
@@ -1026,7 +1095,8 @@ def _headroom_env_pairs() -> List[Tuple[str, str]]:
         ("HEADROOM_PROTECT_ANALYSIS_CONTEXT", "0"),
         ("HEADROOM_INTERCEPT_TOOL_RESULTS", "1"),
         ("HEADROOM_DATA_DIR", str(HEADROOM_DATA_DIR)),
-        ("ANTHROPIC_API_KEY", HEADROOM_PROXY_KEY),
+        # Only set ANTHROPIC_API_KEY if a real key is available
+        # (Removed dummy HEADROOM_PROXY_KEY that breaks auth)
     ]
 
 
@@ -1220,6 +1290,7 @@ def setup_integrations() -> bool:
         # localhost:27124 is reachable natively on Windows/Linux, so we only
         # need the .env keys present and the app running with its REST plugin.
         ensure_env_obsidian()
+        ensure_env_whatsapp()
         ensure_dir(OBSIDIAN_VAULT_DIR)
         if not OBSIDIAN_SETUP_FILE.exists():
             try:
@@ -2782,6 +2853,100 @@ def start_redis_docker() -> Tuple[bool, int]:
     return True, redis_port
 
 
+# ── OpenWA (WhatsApp) Gateway ────────────────────────────────────────────────
+def _openwa_image_available() -> bool:
+    """Check if OpenWA Docker image is available locally."""
+    try:
+        r = run(["docker", "image", "inspect", "openwa/wa-automate:latest"], capture_output=True)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _openwa_binary_available() -> bool:
+    """Check if OpenWA binary is available locally."""
+    return shutil.which("openwa") is not None
+
+
+def ensure_openwa_installed() -> bool:
+    """Ensure OpenWA is available (Docker image or local binary).
+    Tries to pull Docker image first, falls back to installing binary if Docker not available.
+    Returns True if OpenWA is available, False otherwise."""
+    # Check Docker first (preferred method)
+    if _docker_available():
+        info("Checking OpenWA Docker image…")
+        if _openwa_image_available():
+            ok("OpenWA Docker image found locally")
+            return True
+        info("Pulling OpenWA Docker image (openwa/wa-automate:latest)…")
+        if run(["docker", "pull", "openwa/wa-automate:latest"]).returncode == 0:
+            ok("OpenWA Docker image pulled successfully")
+            return True
+        warn("Failed to pull OpenWA Docker image")
+
+    # Check if binary is available
+    if _openwa_binary_available():
+        ok("OpenWA binary found in PATH")
+        return True
+
+    # Try to install binary via pip (if Python environment available)
+    info("Attempting to install openwa-cli via pip…")
+    try:
+        if run([PIP_BIN, "install", "openwa-cli"]).returncode == 0:
+            if _openwa_binary_available():
+                ok("OpenWA CLI installed successfully")
+                return True
+    except Exception:
+        pass
+
+    # Docker not available or failed, binary not available
+    warn("OpenWA not available: Docker image not found and binary not installed")
+    warn("Install Docker and run: docker pull openwa/wa-automate:latest")
+    warn("Or install manually: pip install openwa-cli")
+    return False
+
+
+# ── OpenWA (WhatsApp) Gateway ────────────────────────────────────────────────
+def start_openwa_gateway() -> Tuple[bool, int]:
+    """Start OpenWA Gateway using docker-compose with whatsapp profile.
+    Returns (success, api_port)"""
+    info("Starting OpenWA Gateway (WhatsApp) …")
+
+    # Ensure OpenWA is available first
+    if not ensure_openwa_installed():
+        warn("OpenWA not available — skipping gateway startup")
+        return False, OPENWA_API_PORT
+
+    # Check if already running
+    if wait_for_port("localhost", OPENWA_API_PORT, "OpenWA", max_wait=2):
+        ok(f"OpenWA Gateway already running on :{OPENWA_API_PORT}")
+        return True, OPENWA_API_PORT
+
+    # Use docker-compose with whatsapp profile (preferred)
+    if _docker_available():
+        info("Starting OpenWA Gateway via Docker Compose…")
+        run(["docker", "compose", "--profile", "whatsapp", "up", "-d", "openwa-gateway"], cwd=ROOT)
+
+        if not wait_for_port("localhost", OPENWA_API_PORT, "OpenWA Gateway", max_wait=60):
+            warn(f"OpenWA Gateway failed to start on port {OPENWA_API_PORT}")
+            return False, OPENWA_API_PORT
+
+        ok(f"OpenWA Gateway started on :{OPENWA_API_PORT} (Dashboard: {OPENWA_DASHBOARD_URL})")
+        return True, OPENWA_API_PORT
+
+    # Fallback: try running binary directly if Docker not available
+    if _openwa_binary_available():
+        info("Starting OpenWA Gateway via binary (Docker not available)…")
+        # This would need a background process management approach
+        # For now, just warn
+        warn("OpenWA binary detected but auto-start via binary not fully implemented")
+        warn("Run manually: openwa serve --port 2785")
+        return False, OPENWA_API_PORT
+
+    warn("Neither Docker nor OpenWA binary available")
+    return False, OPENWA_API_PORT
+
+
 # ── Python venv ───────────────────────────────────────────────────────────────
 # Compiled dependency wheels (pandas, numpy, pydantic-core, asyncpg …) are only
 # published for CPython 3.11–3.13. On Python 3.14+ pip can't find wheels and
@@ -4261,6 +4426,7 @@ def print_sox_banner(mode: str, pg_port: int, redis_port: int) -> None:
     print(row("API DOCS", f"http://localhost:{BACKEND_PORT}/docs", CY))
     print(row("MT5 REST", MT5_API_URL, CY))
     print(row("HEADROOM", f"{HEADROOM_URL}/dashboard", CY))
+    print(row("OPENAWA", f"{OPENWA_DASHBOARD_URL}/dashboard", CY))
     print(line("╚", "═", "╝"))
     print(f"\n  {DIM}Logs:{RS} {ROOT}/backend.log  |  {ROOT}/frontend.log\n")
 
@@ -4371,6 +4537,13 @@ def main() -> None:
         results["Redis"] = redis_ok
     if not redis_ok:
         warn("Redis not available — backend may still start in degraded mode")
+
+    # ── 2b. OpenWA Gateway (WhatsApp) ────────────────────────────────────────────
+    header("2b/6  OpenWA Gateway (WhatsApp)")
+    openwa_ok, _ = start_openwa_gateway()
+    results["OpenWA Gateway"] = openwa_ok
+    if not openwa_ok:
+        warn("OpenWA Gateway failed to start — WhatsApp features will be unavailable")
 
     # ── 3. Python environment ─────────────────────────────────────────────────
     header("3/6  Python environment")

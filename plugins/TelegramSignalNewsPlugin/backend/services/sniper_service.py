@@ -31,12 +31,99 @@ from plugins.TelegramSignalNewsPlugin.backend.models import (
     TelegramSniperSettings,
     TelegramSniperTrade,
 )
-from plugins.TelegramSignalNewsPlugin.backend.services.strategy_analysis import analyze_entry, volume_snapshot
+from plugins.TelegramSignalNewsPlugin.backend.services.strategy_analysis import (
+    analyze_entry,
+    volume_snapshot,
+    _fetch_ohlcv as _fetch_ta_ohlcv,
+)
 from plugins.TelegramSignalNewsPlugin.backend.timezone_utils import now_utc_naive
 
 
 def _utcnow() -> datetime:
     return now_utc_naive()
+
+
+# ── Volume gate ──────────────────────────────────────────────────────────────
+# Volume is a hard precondition for every sniper entry. The context is resolved
+# from the same exchange OHLCV the TA layer already uses; when it cannot be
+# established the signal is recorded as NO_TRADE rather than sniped on price.
+
+#: 15m × 200 bars = ~50 hours, comfortably more than the rolling 24h the volume
+#: context requires, and it is the series `analyze_entry` already pulls.
+_VOL_TF = "15m"
+_VOL_LIMIT = 200
+
+
+async def resolve_volume(symbol: str) -> Any:
+    """Resolve the :class:`VolumeContext` for a telegram signal symbol.
+
+    Returns a context whose ``status`` is OK / STALE / INSUFFICIENT /
+    UNAVAILABLE. Never raises — a failure to resolve is itself a NO_TRADE.
+    """
+    from plugins.KronosForecastPlugin.backend.services import volume_context as volctx
+
+    try:
+        rows = await _fetch_ta_ohlcv(symbol, _VOL_TF, _VOL_LIMIT)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Sniper volume fetch failed for {}: {}", symbol, exc)
+        rows = None
+    return await volctx.resolve_volume_context(
+        symbol=symbol, timeframe=_VOL_TF, rows=rows, fetcher=None,
+    )
+
+
+def volume_gate_note(ctx: Any) -> str:
+    """One-line, DB-safe summary of the volume evidence behind a decision."""
+    from plugins.KronosForecastPlugin.backend.services import volume_context as volctx
+
+    if ctx is None:
+        return "NO_TRADE · volume context unresolved"
+    if ctx.status != "OK":
+        return f"NO_TRADE · volume {ctx.status} · {ctx.detail}"[:400]
+    return " · ".join(volctx.volume_evidence_lines(ctx))[:400]
+
+
+def volume_supports(direction: str, ctx: Any) -> tuple[bool, str]:
+    """Apply the direction rules to a resolved volume context.
+
+    Same rules as the Kronos forecast:
+      • rising price + rising relative volume  → continuation, supports the side
+      • rising price + falling relative volume → exhaustion, weakens the side
+      • climactic volume against the move      → reversal risk, blocks the side
+
+    Returns ``(supported, reason)``. ``supported`` False means the entry must
+    not auto-execute.
+    """
+    from plugins.KronosForecastPlugin.backend.services import volume_context as volctx
+
+    if ctx is None or ctx.status != "OK":
+        return False, f"volume {(ctx.status.lower() if ctx else 'unresolved')}"
+
+    # A long maps to the forecast's "up", a short to "down".
+    fdir = "up" if (direction or "").lower() == "long" else "down"
+    if volctx.is_reversal_risk(fdir, ctx):
+        return False, (
+            f"CLIMACTIC volume (x{ctx.relative_volume:.2f}) is confirming the "
+            f"opposite move ({ctx.divergence}) — reversal risk"
+        )
+    if ctx.regime == "DEAD":
+        return False, (
+            f"DEAD volume regime (x{ctx.relative_volume:.2f} of the 24h hourly "
+            f"mean) — too thin to trust the direction"
+        )
+    exhaustion = "EXHAUSTION_UP" if fdir == "up" else "EXHAUSTION_DOWN"
+    if ctx.divergence == exhaustion:
+        return False, (
+            f"{ctx.divergence} — price is still moving but volume is fading "
+            f"({ctx.volume_slope_norm:+.2%}/h); the move is running dry"
+        )
+    confirmation = "CONFIRMED_UP" if fdir == "up" else "CONFIRMED_DOWN"
+    if ctx.divergence == confirmation:
+        return True, (
+            f"{ctx.regime} volume x{ctx.relative_volume:.2f} and {ctx.divergence} "
+            f"— participation is behind the move"
+        )
+    return True, f"{ctx.regime} volume x{ctx.relative_volume:.2f}, {ctx.divergence}"
 
 
 @dataclass(slots=True)
@@ -260,6 +347,7 @@ async def _ai_entry_opinion(
     resistance: float | None,
     opposite_volume: bool,
     volume_ratio: float | None = None,
+    volume_ctx: Any = None,
 ) -> dict | None:
     """Ask the configured AI providers (AiMarketAnalyst) to validate the entry.
 
@@ -279,7 +367,14 @@ async def _ai_entry_opinion(
         "You are a precise crypto futures entry strategist for Telegram signals. "
         "Given a signal plus live market data, decide the BEST limit entry to "
         "maximise the run to take-profit while protecting risk. "
-        "CRITICAL: first CONFIRM the signal DIRECTION using order-flow volume. "
+        "CRITICAL: first CONFIRM the signal DIRECTION using volume. volume_context "
+        "carries measured evidence — 24h volume, the last completed 1h volume, "
+        "relative_volume vs the 24h hourly mean, the regime "
+        "(DEAD/NORMAL/ELEVATED/CLIMACTIC) and the price-volume divergence. Rising "
+        "price on rising relative volume is continuation; rising price on falling "
+        "relative volume is exhaustion; climactic volume against the move is "
+        "reversal risk. A DEAD regime or an exhaustion divergence in the signal's "
+        "own direction must set direction_confirmed=false. "
         "If high_opposite_volume is true or volume_ratio (opposing/total) is >= 0.6, "
         "the pair is likely moving AGAINST the signal — set direction_confirmed=false "
         "and prefer 'skip' (or 'wait' for a much safer entry). Only 'enter' when "
@@ -320,6 +415,9 @@ async def _ai_entry_opinion(
             "resistance": resistance,
             "high_opposite_volume": opposite_volume,
             "volume_ratio": volume_ratio,
+            # Resolved volume gate (measured, never estimated): 24h volume, the
+            # last completed hour, relative volume, regime and divergence.
+            "volume_context": (volume_ctx.model_dump() if volume_ctx is not None else None),
             "sox_ml_forecast": kronos_fc,
         },
         default=str,
@@ -564,6 +662,18 @@ async def run_sniper_cycle(db: AsyncSession) -> dict[str, Any]:
             (d == "long" and live <= (trade.sniper_entry or live))
             or (d == "short" and live >= (trade.sniper_entry or live))
         )
+        if triggered:
+            # Volume gate re-checked at fill time: the context that justified the
+            # plan may have gone stale or turned against the trade while pending.
+            fill_ctx = await resolve_volume(trade.symbol)
+            fill_ok, fill_why = volume_supports(d, fill_ctx)
+            if not fill_ok:
+                trade.volume_confirmed = False
+                trade.reason = f"Fill blocked — {fill_why} · {volume_gate_note(fill_ctx)}"
+                trade.updated_at = _utcnow()
+                pending += 1
+                continue
+            trade.volume_confirmed = True
         if triggered and open_positions < settings.max_positions:
             result = await _place_sim_order(
                 db,
@@ -618,6 +728,23 @@ async def run_sniper_cycle(db: AsyncSession) -> dict[str, Any]:
             db.add(_skip_record(sig, settings, "No live price for symbol"))
             skipped += 1
             continue
+
+        # ── Volume gate: resolved BEFORE any entry is planned. A signal whose
+        # volume cannot be established is recorded as NO_TRADE, never sniped on
+        # price alone. ───────────────────────────────────────────────────────
+        vol_ctx = await resolve_volume(sig.symbol)
+        if vol_ctx.status != "OK":
+            rec = _skip_record(
+                sig, settings,
+                f"NO_TRADE — volume {vol_ctx.status.lower()}: {vol_ctx.detail}",
+                live=live,
+            )
+            rec.volume_confirmed = False
+            db.add(rec)
+            skipped += 1
+            continue
+        vol_ok, vol_why = volume_supports(sig.direction, vol_ctx)
+        vol_note = volume_gate_note(vol_ctx)
 
         plan = reanalyze_signal(
             direction=sig.direction,
@@ -685,6 +812,7 @@ async def run_sniper_cycle(db: AsyncSession) -> dict[str, Any]:
                 resistance=ta_resistance,
                 opposite_volume=ta_volume_warning,
                 volume_ratio=ta_volume_ratio,
+                volume_ctx=vol_ctx,
             )
             if ai:
                 decision = str(ai.get("decision", "")).lower()
@@ -721,8 +849,10 @@ async def run_sniper_cycle(db: AsyncSession) -> dict[str, Any]:
                 if decision == "wait":
                     plan.trigger_now = False
 
-        # ── Confirmation gate: exchange volume + core AI agents ──
-        volume_confirmed = not ta_volume_warning
+        # ── Confirmation gate: volume context + order-flow TA + core AI agents ──
+        # The VolumeContext is authoritative: a signal whose regime/divergence
+        # argues against its own direction can never auto-execute.
+        volume_confirmed = (not ta_volume_warning) and vol_ok
         ai_confirmed: bool | None = None
         agent_note = ""
         if settings.require_ai_confirmation:
@@ -749,8 +879,20 @@ async def run_sniper_cycle(db: AsyncSession) -> dict[str, Any]:
             position_size_usdt=settings.position_size_usdt,
             risk_reward=plan.risk_reward,
             status=SniperTradeStatus.PENDING,
-            reason=(plan.reason + (f" · {ta_note}" if ta_note else "") + (f" · {ai_note}" if ai_note else "") + (f" · {agent_note}" if agent_note else "")),
-            entry_strategy=(ta_note + ((" | " + ai_note) if ai_note else "")) or None,
+            reason=(
+                plan.reason
+                + f" · VOLUME: {vol_why} · {vol_note}"
+                + (f" · {ta_note}" if ta_note else "")
+                + (f" · {ai_note}" if ai_note else "")
+                + (f" · {agent_note}" if agent_note else "")
+            ),
+            # entry_strategy is String(200) — keep the volume verdict first so it
+            # survives truncation, since it is the gating reason.
+            entry_strategy=(
+                f"vol:{vol_ctx.regime}x{vol_ctx.relative_volume:.2f}/{vol_ctx.divergence}"
+                + (f" | {ta_note}" if ta_note else "")
+                + (f" | {ai_note}" if ai_note else "")
+            )[:200],
             rsi=ta_rsi,
             support=ta_support,
             resistance=ta_resistance,
@@ -835,8 +977,10 @@ async def run_sniper_cycle(db: AsyncSession) -> dict[str, Any]:
             # Not confirmed / not ready → leave PENDING for MANUAL execution.
             if not overall_confirmed:
                 blockers = []
-                if not volume_confirmed:
-                    blockers.append("volume opposes direction")
+                if not vol_ok:
+                    blockers.append(f"volume gate: {vol_why}")
+                elif not volume_confirmed:
+                    blockers.append("order-flow volume opposes direction")
                 if settings.require_ai_confirmation and not ai_confirmed:
                     blockers.append("AI agents did not confirm")
                 trade.reason = (trade.reason or "") + " · awaiting manual exec (" + ", ".join(blockers) + ")"
@@ -874,9 +1018,22 @@ async def execute_sniper_trade(
     if trade.status == SniperTradeStatus.PLACED:
         return {"ok": False, "error": "Trade already placed"}
 
+    # Volume gate — re-resolved at execution time, not trusted from the plan.
+    # A forced execution still records the evidence so the trade is never
+    # unexplained, but the user's explicit override is honoured.
+    exec_ctx = await resolve_volume(trade.symbol)
+    exec_ok, exec_why = volume_supports(trade.direction, exec_ctx)
+    trade.volume_confirmed = exec_ok
     if not force:
-        if trade.volume_confirmed is False:
-            return {"ok": False, "error": "Volume opposes direction — use force to override"}
+        if not exec_ok:
+            trade.reason = f"Execution blocked — {exec_why} · {volume_gate_note(exec_ctx)}"
+            trade.updated_at = _utcnow()
+            await db.commit()
+            return {
+                "ok": False,
+                "error": f"NO_TRADE — {exec_why}. Use force to override.",
+                "volume": exec_ctx.model_dump(),
+            }
         if trade.ai_confirmed is False:
             return {"ok": False, "error": "AI agents did not confirm — use force to override"}
 
@@ -920,7 +1077,11 @@ async def execute_sniper_trade(
     if placed_modes:
         trade.status = SniperTradeStatus.PLACED
         trade.executed_mode = "+".join(placed_modes)
-        trade.reason = f"Manually executed ({trade.executed_mode})" + (" [forced]" if force else "")
+        trade.reason = (
+            f"Manually executed ({trade.executed_mode})"
+            + (" [forced]" if force else "")
+            + f" · VOLUME: {exec_why} · {volume_gate_note(exec_ctx)}"
+        )
         trade.updated_at = _utcnow()
         await _store_trade_knowledge(
             db, symbol=trade.symbol, direction=trade.direction,
@@ -1204,6 +1365,10 @@ async def analyze_signal_full(db: AsyncSession, signal_id: int) -> dict[str, Any
     direction = (sig.direction or "").lower()
     want = "buy" if direction == "long" else "sell"
 
+    # ── Volume gate first: no analysis emits a tradeable decision without it ──
+    vol_ctx = await resolve_volume(sig.symbol)
+    vol_ok, vol_why = volume_supports(sig.direction, vol_ctx)
+
     # ── Volume + TA (with optimised entry for the signal's direction) ──
     ta = await analyze_entry(
         symbol=sig.symbol,
@@ -1263,8 +1428,19 @@ async def analyze_signal_full(db: AsyncSession, signal_id: int) -> dict[str, Any
     sell_entry = ta.resistance if (ta.resistance and ta.resistance > live) else round(live * 1.005, 8)
 
     # ── Decision ──
-    if volume_confirms and ai_confirms:
-        decision, reason = "execute", "AI agents and exchange volume both confirm the direction."
+    # The volume gate outranks everything else: without a resolved context there
+    # is no tradeable call to make, whatever the agents say.
+    if vol_ctx.status != "OK":
+        decision, reason = "no_trade", (
+            f"Volume is a hard precondition and it is {vol_ctx.status.lower()} "
+            f"for {sig.symbol}. {vol_ctx.detail}"
+        )
+    elif not vol_ok:
+        decision, reason = "skip", f"Volume argues against the signal: {vol_why}."
+    elif volume_confirms and ai_confirms:
+        decision, reason = "execute", (
+            f"AI agents and volume both confirm the direction — {vol_why}."
+        )
     elif not volume_confirms:
         decision, reason = "monitor", "Volume is pushing against the signal — wait for confirmation."
     elif ai_action in ("hold", "wait", None):
@@ -1294,6 +1470,14 @@ async def analyze_signal_full(db: AsyncSession, signal_id: int) -> dict[str, Any
             "channel_title": sig.channel_title,
         },
         "current_price": live,
+        # The resolved volume gate — 24h volume, last 1h, relative volume,
+        # regime, divergence and why it argues for or against the direction.
+        "volume_context": vol_ctx.model_dump(),
+        "volume_gate": {
+            "supported": vol_ok,
+            "reason": vol_why,
+            "evidence": volume_gate_note(vol_ctx),
+        },
         "volume": {
             "opposite_volume": ta.opposite_volume,
             "volume_ratio": ta.volume_ratio,
@@ -1402,7 +1586,16 @@ async def reanalyze_skipped_signals(db: AsyncSession) -> dict[str, Any]:
         )
         if not plan.ok:
             continue
-        # Quick volume gate (no agent call — saves tokens)
+        # Volume gate — a skipped signal is only re-promoted when volume can be
+        # established AND supports its direction.
+        vol_ctx = await resolve_volume(sig.symbol)
+        vol_ok, vol_why = volume_supports(sig.direction, vol_ctx)
+        if not vol_ok:
+            trade.volume_confirmed = False
+            trade.reason = f"Still NO_TRADE — {vol_why} · {volume_gate_note(vol_ctx)}"
+            trade.updated_at = _utcnow()
+            continue
+        # Quick order-flow read (no agent call — saves tokens)
         vol = await volume_snapshot(sig.symbol, sig.direction)
         if vol.get("opposite_volume"):
             continue
@@ -1412,9 +1605,12 @@ async def reanalyze_skipped_signals(db: AsyncSession) -> dict[str, Any]:
         trade.take_profit = plan.take_profit
         trade.risk_reward = plan.risk_reward
         trade.live_price_at_plan = live
-        trade.volume_confirmed = not vol.get("opposite_volume", False)
+        trade.volume_confirmed = True
         trade.status = SniperTradeStatus.PENDING
-        trade.reason = f"Re-promoted after {cadence}min re-analysis: {plan.reason}"
+        trade.reason = (
+            f"Re-promoted after {cadence}min re-analysis: {plan.reason} "
+            f"· VOLUME: {vol_why} · {volume_gate_note(vol_ctx)}"
+        )
         trade.updated_at = _utcnow()
         promoted += 1
 
@@ -1447,6 +1643,10 @@ async def reanalyze_skipped_signals(db: AsyncSession) -> dict[str, Any]:
         )
         if not plan.ok:
             continue
+        vol_ctx = await resolve_volume(sig.symbol)
+        vol_ok, vol_why = volume_supports(sig.direction, vol_ctx)
+        if not vol_ok:
+            continue  # no volume, no queue — nothing to snipe
         trade = TelegramSniperTrade(
             signal_id=sig.id,
             channel_title=sig.channel_title,
@@ -1461,7 +1661,11 @@ async def reanalyze_skipped_signals(db: AsyncSession) -> dict[str, Any]:
             position_size_usdt=settings.position_size_usdt,
             risk_reward=plan.risk_reward,
             status=SniperTradeStatus.PENDING,
-            reason=f"Re-queued after {cadence}min re-analysis",
+            volume_confirmed=True,
+            reason=(
+                f"Re-queued after {cadence}min re-analysis "
+                f"· VOLUME: {vol_why} · {volume_gate_note(vol_ctx)}"
+            ),
         )
         db.add(trade)
         promoted += 1
@@ -1658,6 +1862,18 @@ async def process_volume_channel_message(db: AsyncSession, message_text: str) ->
             if not live:
                 continue
 
+            # ── Volume gate ──────────────────────────────────────────────────
+            # A whale alert is not a substitute for volume context: the message
+            # reports one actor's flow, the context reports the whole tape.
+            vol_ctx = await resolve_volume(sig.symbol)
+            vol_ok, vol_why = volume_supports(sig_dir, vol_ctx)
+            if not vol_ok:
+                logger.info(
+                    "[WhaleVolume] {} NO_TRADE — {} (seq={})",
+                    sig.symbol, vol_why, whale_seq,
+                )
+                continue
+
             # Volume snapshot (lightweight — confirms whale message direction)
             vol = await volume_snapshot(sig.symbol, sig_dir)
             if vol.get("opposite_volume") and whale_seq < 2:
@@ -1693,6 +1909,7 @@ async def process_volume_channel_message(db: AsyncSession, message_text: str) ->
             reason_note = (
                 f"WhaleVol seq={whale_seq}"
                 + (f" ${info['volume_usd']:,.0f}" if info.get("volume_usd") else "")
+                + f" · VOLUME: {vol_why} · {volume_gate_note(vol_ctx)}"
                 + (f" | {message_text[:60]}" if not whale else "")
             )
             trade_obj = TelegramSniperTrade(
@@ -1710,7 +1927,9 @@ async def process_volume_channel_message(db: AsyncSession, message_text: str) ->
                 risk_reward=plan.risk_reward,
                 status=SniperTradeStatus.PENDING,
                 volume_confirmed=True,
-                ai_confirmation_note=f"Whale volume sequence={whale_seq}",
+                ai_confirmation_note=(
+                    f"Whale volume sequence={whale_seq} · {volume_gate_note(vol_ctx)}"
+                ),
                 reason=reason_note,
             )
             db.add(trade_obj)

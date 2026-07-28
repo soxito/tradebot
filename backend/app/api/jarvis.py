@@ -1561,7 +1561,7 @@ def _safe_float(val, default: float = 0.0) -> float:
 # Fallback version only — the real version is ALWAYS read live from
 # jarvis-extension/manifest.json (see _ext_version()). Keep this in sync so a
 # missing manifest never advertises a stale version.
-_EXT_VERSION = "3.6.7"
+_EXT_VERSION = "3.6.8"
 _EXT_RELEASED = "2026-07-05"
 _EXT_CHANGELOG = [
     "Fix mic hand-off: in-page JARVIS takes over when the extension speech engine stalls (no more stuck 'Starting…')",
@@ -3383,6 +3383,173 @@ def _rsi(closes: List[float], period: int = 14) -> float:
     return round(100 - (100 / (1 + rs)), 2)
 
 
+def _atr(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> float:
+    """Average True Range (Wilder), in price units. 0.0 when not computable.
+
+    Stops and targets must scale with how much the instrument actually moves.
+    A fixed percentage is wrong in both directions at once: 1.5% is a huge stop
+    on XAUUSD and a meaningless one on a low-volatility FX pair, so the same
+    code produces setups that are untradeable on one instrument and instantly
+    stopped out on another.
+    """
+    n = min(len(highs), len(lows), len(closes))
+    if n < period + 1:
+        return 0.0
+    trs: List[float] = []
+    for i in range(n - period, n):
+        prev_close = closes[i - 1]
+        trs.append(max(
+            highs[i] - lows[i],
+            abs(highs[i] - prev_close),
+            abs(lows[i] - prev_close),
+        ))
+    return sum(trs) / len(trs) if trs else 0.0
+
+
+def _directional_bias(
+    current: float,
+    ema50: float,
+    ema200: float,
+    rsi: float,
+    trend: str,
+    buy_pct: float = 0.0,
+    sell_pct: float = 0.0,
+) -> tuple[str, float, List[str]]:
+    """Weigh every signal together and return (bias, confidence 0–1, reasons).
+
+    Replaces a chain of last-writer-wins overrides in which each indicator
+    silently discarded the previous one — volume beat RSI, which beat the trend.
+    That produced the two classic failure modes:
+
+      * A textbook uptrend with RSI 75 was reported as SHORT, because in a
+        strong trend RSI sits overbought for long stretches. Overbought is
+        confirmation there, not a reversal signal, so RSI is only allowed to
+        argue for mean reversion when price is actually ranging.
+      * Retail buy/sell sentiment overrode the entire technical picture. It is
+        now one weighted input among several.
+
+    Confidence reflects how much the signals agree, so a coin-flip setup can be
+    reported as one instead of being presented with the same certainty as a
+    high-conviction one.
+    """
+    score = 0.0
+    weight = 0.0
+    reasons: List[str] = []
+
+    # ── Trend structure (heaviest weight) ────────────────────────────────────
+    if trend == "uptrend":
+        score += 2.0; weight += 2.0
+        reasons.append("price and EMA50 above EMA200")
+    elif trend == "downtrend":
+        score -= 2.0; weight += 2.0
+        reasons.append("price and EMA50 below EMA200")
+    elif ema200 > 0:
+        tilt = 0.6 if current > ema200 else -0.6
+        score += tilt; weight += 0.6
+        reasons.append("ranging, price " + ("above" if tilt > 0 else "below") + " EMA200")
+
+    # ── Momentum (EMA50 vs EMA200 separation) ────────────────────────────────
+    if ema200 > 0 and ema50 > 0:
+        sep = (ema50 - ema200) / ema200
+        if abs(sep) > 0.002:
+            score += max(-1.0, min(1.0, sep * 40)); weight += 1.0
+
+    # ── RSI ──────────────────────────────────────────────────────────────────
+    if rsi >= 70:
+        if trend == "uptrend":
+            # Confirmation, not a reversal — but conviction is trimmed because
+            # entries chased at these levels have poor reward-to-risk.
+            score += 0.4; weight += 1.0
+            reasons.append(f"RSI {rsi:.0f} overbought — trend strength, poor entry")
+        else:
+            score -= 1.2; weight += 1.2
+            reasons.append(f"RSI {rsi:.0f} overbought in a range — mean reversion")
+    elif rsi <= 30:
+        if trend == "downtrend":
+            score -= 0.4; weight += 1.0
+            reasons.append(f"RSI {rsi:.0f} oversold — trend strength, poor entry")
+        else:
+            score += 1.2; weight += 1.2
+            reasons.append(f"RSI {rsi:.0f} oversold in a range — mean reversion")
+    else:
+        # Mild directional tilt away from the midpoint.
+        score += (rsi - 50) / 50 * 0.5; weight += 0.5
+
+    # ── Order-flow / sentiment split (when the venue reports it) ─────────────
+    if buy_pct or sell_pct:
+        total = buy_pct + sell_pct
+        if total > 0:
+            flow = (buy_pct - sell_pct) / total          # −1 … 1
+            score += flow * 1.0; weight += 1.0
+            if abs(flow) > 0.2:
+                reasons.append(
+                    f"order flow {buy_pct:.0f}% buy / {sell_pct:.0f}% sell"
+                )
+
+    if weight <= 0:
+        return "long" if current > ema200 else "short", 0.0, reasons
+
+    normalised = score / weight                            # −1 … 1
+    bias = "long" if normalised >= 0 else "short"
+    return bias, round(min(1.0, abs(normalised)), 2), reasons
+
+
+def _build_setup(
+    bias: str,
+    current: float,
+    swing_high: float,
+    swing_low: float,
+    atr: float,
+) -> Optional[Dict[str, float]]:
+    """Build an entry / stop / target set, or None when no sane one exists.
+
+    Returns None rather than a broken setup. The previous version computed
+    reward with ``abs()``, so a take-profit that had landed on the *wrong side*
+    of the entry — which happens whenever the recent range is tighter than the
+    fixed percentage offsets — still reported a healthy positive R:R. A losing
+    setup presented as a 2:1 winner is worse than no setup at all.
+    """
+    dp = _price_dp(current)
+    # Fall back to a fraction of the recent range when ATR is unavailable, so a
+    # short history degrades the stop distance rather than the whole analysis.
+    rng = max(swing_high - swing_low, 0.0)
+    unit = atr if atr > 0 else rng * 0.25
+    if unit <= 0:
+        return None
+
+    if bias == "long":
+        # Wait for a pullback toward support, but never below the swing low and
+        # never above current price (that would fill instantly at a worse level).
+        entry = min(current, swing_low + unit * 0.5)
+        sl    = entry - unit * 1.5
+        tp1   = entry + unit * 1.5          # 1R structural first target
+        tp2   = max(swing_high, entry + unit * 3.0)
+        if not (sl < entry < tp1 < tp2):
+            return None
+        risk, reward1, reward2 = entry - sl, tp1 - entry, tp2 - entry
+    else:
+        entry = max(current, swing_high - unit * 0.5)
+        sl    = entry + unit * 1.5
+        tp1   = entry - unit * 1.5
+        tp2   = min(swing_low, entry - unit * 3.0)
+        if not (sl > entry > tp1 > tp2):
+            return None
+        risk, reward1, reward2 = sl - entry, entry - tp1, entry - tp2
+
+    if risk <= 0:
+        return None
+
+    return {
+        "entry": round(entry, dp),
+        "sl":    round(sl, dp),
+        "tp1":   round(tp1, dp),
+        "tp2":   round(tp2, dp),
+        "rr1":   round(reward1 / risk, 1),
+        "rr2":   round(reward2 / risk, 1),
+        "atr":   round(unit, dp),
+    }
+
+
 # ── Deep-research helpers (volume · news · AI narrative) ─────────────────────
 # These power JARVIS's rich, human, multi-tool pair analysis.  Each is fully
 # self-contained and NEVER raises — a failure just omits that data section so
@@ -3764,6 +3931,13 @@ async def _compose_ai_narrative(brief: str, symbol: str = "") -> Optional[str]:
                     "alignment with price action, (4) news/sentiment impact, (5) a clear "
                     "directional bias with specific entry zone, stop-loss and take-profit "
                     "levels derived from the data you were given. "
+                    "Quote entry, stop-loss and take-profit levels ONLY as they appear in the "
+                    "brief. If the brief says there is no clean setup, say so plainly and "
+                    "explain what you are waiting for — never substitute levels of your own. "
+                    "Where the brief gives a confidence figure, reflect it honestly: a "
+                    "low-confidence read must be described as marginal, not as a conviction call. "
+                    "If the brief flags insufficient history for an indicator, do not draw "
+                    "trend conclusions from it. "
                     "If the brief says the user ALREADY HOLDS AN OPEN POSITION on this pair, "
                     "add a dedicated 'Position:' section giving a direct recommendation — "
                     "hold, add, reduce, close, or move the stop / take-profit — "
@@ -3842,66 +4016,81 @@ async def _analyze_symbol(symbol: str, original_cmd: str, ex_name: Optional[str]
         ema50  = _ema(closes, 50)
         ema200 = _ema(closes, 200)
         rsi    = _rsi(closes, 14)
+        atr    = _atr(highs, lows, closes, 14)
+        # _ema falls back to the last close when the history is too short, which
+        # makes EMA200 identical to price and silently neuters every trend test.
+        # Track that so the read is qualified rather than quietly wrong.
+        ema200_valid = len(closes) >= 200
 
         swing_high = max(highs[-20:])
         swing_low  = min(lows[-20:])
 
-        if current > ema200 and ema50 > ema200:
-            trend, bias = "uptrend", "long"
+        if not ema200_valid:
+            trend = "ranging"
+        elif current > ema200 and ema50 > ema200:
+            trend = "uptrend"
         elif current < ema200 and ema50 < ema200:
-            trend, bias = "downtrend", "short"
+            trend = "downtrend"
         else:
             trend = "ranging"
-            bias  = "long" if current > ema200 else "short"
 
-        if rsi > 70:
-            rsi_label, bias = "overbought", "short"
-        elif rsi < 30:
-            rsi_label, bias = "oversold", "long"
-        else:
-            rsi_label = f"neutral ({rsi:.0f})"
+        rsi_label = "overbought" if rsi > 70 else "oversold" if rsi < 30 else f"neutral ({rsi:.0f})"
 
-        # Volume flow bias overrides when strong
-        if buy_pct >= 60:
-            bias = "long"
-        elif sell_pct >= 60:
-            bias = "short"
+        bias, confidence, reasons = _directional_bias(
+            current, ema50, ema200 if ema200_valid else 0.0, rsi, trend, buy_pct, sell_pct,
+        )
 
-        dp = _price_dp(current)
-        if bias == "long":
-            entry      = round(swing_low * 1.001,  dp)
-            sl         = round(swing_low * 0.985,  dp)
-            tp1        = round(current * 1.02,     dp)
-            tp2        = round(swing_high * 0.99,  dp)
-            side, side_label = "long", "BUY"
-        else:
-            entry      = round(swing_high * 0.999, dp)
-            sl         = round(swing_high * 1.015, dp)
-            tp1        = round(current * 0.98,     dp)
-            tp2        = round(swing_low * 1.01,   dp)
-            side, side_label = "short", "SHORT"
+        setup = _build_setup(bias, current, swing_high, swing_low, atr)
+        side, side_label = ("long", "BUY") if bias == "long" else ("short", "SHORT")
 
-        risk    = abs(entry - sl)
-        reward1 = abs(tp1 - entry) if bias == "long" else abs(entry - tp1)
-        reward2 = abs(tp2 - entry) if bias == "long" else abs(entry - tp2)
-        rr1     = round(reward1 / risk, 1) if risk > 0 else 0
-        rr2     = round(reward2 / risk, 1) if risk > 0 else 0
+        volume_line = (
+            f"Live Volume Split: BUY {buy_pct:.0f}% ({buy_vol:,.0f}) / "
+            f"SELL {sell_pct:.0f}% ({sell_vol:,.0f})\n"
+        )
+        header = (
+            f"{symbol} | {trend.upper()} | RSI {rsi:.0f} ({rsi_label})\n"
+            f"EMA50={ema50:.4g}  EMA200={ema200:.4g}{'' if ema200_valid else ' (insufficient history)'}"
+            f"  Current={current:.4g}\n"
+            f"Swing Hi={swing_high:.4g}  Swing Lo={swing_low:.4g}  ATR14={atr:.4g}\n"
+            f"{volume_line}"
+            f"Bias: {side_label} · confidence {confidence:.0%}"
+            + (f" · {'; '.join(reasons)}" if reasons else "")
+            + "\n"
+        )
+
+        if not setup:
+            # No setup with the stop and both targets on the correct side of
+            # entry — say so instead of inventing one with a fabricated R:R.
+            msg = (
+                f"{header}\nNo clean {side_label} setup right now, Sir — the recent range is too "
+                f"tight relative to volatility for a stop and targets that make sense. "
+                f"I'd wait for a clearer structure."
+            )
+            return CommandResult(
+                ok=True, action="analyze", detail=msg,
+                speech=(
+                    f"{symbol}: {trend}, RSI {rsi:.0f}. I have a {side_label.lower()} lean at "
+                    f"{confidence:.0%} confidence, but no clean setup — the range is too tight "
+                    f"for a sensible stop, Sir."
+                ),
+                order={
+                    "symbol": symbol, "side": side, "setup": None,
+                    "current_price": current, "rsi": rsi, "trend": trend,
+                    "confidence": confidence,
+                    "price_source": "yahoo_finance_live",
+                },
+            )
+
+        entry, sl, tp1, tp2 = setup["entry"], setup["sl"], setup["tp1"], setup["tp2"]
+        rr1, rr2 = setup["rr1"], setup["rr2"]
 
         confirm_cmd = (
             f"execute {symbol} {side} 5 lot at {entry}; "
             f"set SL {sl}; TP1 {tp1}; TP2 {tp2}"
         )
 
-        volume_line = (
-            f"Live Volume Split: BUY {buy_pct:.0f}% ({buy_vol:,.0f}) / "
-            f"SELL {sell_pct:.0f}% ({sell_vol:,.0f})\n"
-        )
-
         detail = (
-            f"{symbol} | {trend.upper()} | RSI {rsi:.0f} ({rsi_label})\n"
-            f"EMA50={ema50:.4g}  EMA200={ema200:.4g}  Current={current:.4g}\n"
-            f"Swing Hi={swing_high:.4g}  Swing Lo={swing_low:.4g}\n"
-            f"{volume_line}"
+            f"{header}"
             f"\nPROPOSED {side_label} SETUP (LIVE YAHOO FINANCE DATA — NOT EXECUTED)\n"
             f"Entry : {entry}  |  SL : {sl}  |  TP1 : {tp1} (R:R {rr1}x)  |  TP2 : {tp2} (R:R {rr2}x)\n"
             f"\nTo execute say:\n  \"{confirm_cmd}\""
@@ -3910,7 +4099,8 @@ async def _analyze_symbol(symbol: str, original_cmd: str, ex_name: Optional[str]
         speech = (
             f"{symbol} live analysis: {trend}, RSI {rsi:.0f}, {rsi_label}. "
             f"Current price {current}. Buy pressure {buy_pct:.0f}%, sell pressure {sell_pct:.0f}%. "
-            f"Proposed {side_label.lower()} entry at {entry}, SL {sl}, TP1 {tp1}. "
+            f"Proposed {side_label.lower()} entry at {entry}, SL {sl}, TP1 {tp1}, "
+            f"at {confidence:.0%} confidence. "
             f"This is a proposal — say the execute command to confirm, Sir."
         )
 
@@ -3921,9 +4111,14 @@ async def _analyze_symbol(symbol: str, original_cmd: str, ex_name: Optional[str]
             order={
                 "symbol": symbol, "side": side, "proposed_entry": entry,
                 "sl": sl, "tp1": tp1, "tp2": tp2,
+                "rr1": rr1, "rr2": rr2,
                 "current_price": current,
                 "rsi": rsi, "trend": trend,
+                "atr": setup["atr"],
+                "confidence": confidence,
+                "bias_reasons": reasons,
                 "ema50": round(ema50, 6), "ema200": round(ema200, 6),
+                "ema200_valid": ema200_valid,
                 "buy_volume_pct": buy_pct, "sell_volume_pct": sell_pct,
                 "buy_volume": buy_vol, "sell_volume": sell_vol,
                 "price_source": "yahoo_finance_live",
@@ -4005,61 +4200,70 @@ async def _analyze_symbol(symbol: str, original_cmd: str, ex_name: Optional[str]
     ema50  = _ema(closes, 50)
     ema200 = _ema(closes, 200)
     rsi    = _rsi(closes, 14)
+    atr    = _atr(highs, lows, closes, 14)
+    # _ema returns the last close when the history is too short, which makes
+    # EMA200 equal to price and silently defeats every trend comparison below.
+    ema200_valid = len(closes) >= 200
 
     # Recent swing high / low (last 20 candles)
     swing_high = max(highs[-20:])
     swing_low  = min(lows[-20:])
 
     # Trend determination
-    if current > ema200 and ema50 > ema200:
+    if not ema200_valid:
+        trend = "ranging"
+    elif current > ema200 and ema50 > ema200:
         trend = "uptrend"
-        bias  = "long"
     elif current < ema200 and ema50 < ema200:
         trend = "downtrend"
-        bias  = "short"
     else:
         trend = "ranging"
-        bias  = "long" if current > ema200 else "short"
 
-    # Overbought/oversold
-    if rsi > 70:
-        rsi_label = "overbought"
-        bias = "short"   # override
-    elif rsi < 30:
-        rsi_label = "oversold"
-        bias = "long"    # override
-    else:
-        rsi_label = f"neutral ({rsi:.0f})"
+    rsi_label = "overbought" if rsi > 70 else "oversold" if rsi < 30 else f"neutral ({rsi:.0f})"
 
-    # ── Propose entry, SL, TP levels ─────────────────────────────────────────
-    if bias == "long":
-        # Enter near recent low / swing support with TP at swing high
-        entry   = round(swing_low * 1.001, _price_dp(current))   # just above support
-        sl      = round(swing_low * 0.985, _price_dp(current))   # 1.5% below support
-        tp1     = round(current  * 1.02,  _price_dp(current))    # +2% from current
-        tp2     = round(swing_high * 0.99, _price_dp(current))   # near swing high
-        side    = "long"
-        side_label = "BUY"
-    else:
-        entry   = round(swing_high * 0.999, _price_dp(current))
-        sl      = round(swing_high * 1.015, _price_dp(current))
-        tp1     = round(current  * 0.98,   _price_dp(current))
-        tp2     = round(swing_low * 1.01,  _price_dp(current))
-        side    = "short"
-        side_label = "SHORT"
+    # Weighted confluence — see _directional_bias. Spot crypto has no venue
+    # buy/sell split here, so order flow simply does not contribute.
+    bias, confidence, reasons = _directional_bias(
+        current, ema50, ema200 if ema200_valid else 0.0, rsi, trend,
+    )
+    side, side_label = ("long", "BUY") if bias == "long" else ("short", "SHORT")
 
-    # Risk/reward
-    if bias == "long":
-        risk    = abs(entry - sl)
-        reward1 = abs(tp1 - entry)
-        reward2 = abs(tp2 - entry)
-    else:
-        risk    = abs(sl - entry)
-        reward1 = abs(entry - tp1)
-        reward2 = abs(entry - tp2)
+    setup = _build_setup(bias, current, swing_high, swing_low, atr)
 
-    rr1 = round(reward1 / risk, 1) if risk > 0 else 0
-    rr2 = round(reward2 / risk, 1) if risk > 0 else 0
+    header = (
+        f"{display_name} ({symbol}) | {trend.upper()} | RSI {rsi:.0f} ({rsi_label})\n"
+        f"EMA50={ema50:.4g}  EMA200={ema200:.4g}{'' if ema200_valid else ' (insufficient history)'}"
+        f"  Current={current:.4g}\n"
+        f"Swing Hi={swing_high:.4g}  Swing Lo={swing_low:.4g}  ATR14={atr:.4g}\n"
+        f"Bias: {side_label} · confidence {confidence:.0%}"
+        + (f" · {'; '.join(reasons)}" if reasons else "")
+        + "\n"
+    )
+
+    if not setup:
+        # Better to say there is nothing here than to publish a setup whose
+        # stop or targets sit on the wrong side of the entry.
+        msg = (
+            f"{header}\nNo clean {side_label} setup right now, Sir — the recent range is too "
+            f"tight relative to volatility for a stop and targets that make sense. "
+            f"I'd wait for a clearer structure."
+        )
+        return CommandResult(
+            ok=True, action="analyze", detail=msg,
+            speech=(
+                f"{display_name}: {trend}, RSI {rsi:.0f}. I have a {side_label.lower()} lean at "
+                f"{confidence:.0%} confidence, but no clean setup — the range is too tight "
+                f"for a sensible stop, Sir."
+            ),
+            order={
+                "symbol": symbol, "side": side, "setup": None,
+                "current_price": current, "rsi": rsi, "trend": trend,
+                "confidence": confidence,
+            },
+        )
+
+    entry, sl, tp1, tp2 = setup["entry"], setup["sl"], setup["tp1"], setup["tp2"]
+    rr1, rr2 = setup["rr1"], setup["rr2"]
 
     # ── Build response ────────────────────────────────────────────────────────
     confirm_cmd = (
@@ -4068,9 +4272,7 @@ async def _analyze_symbol(symbol: str, original_cmd: str, ex_name: Optional[str]
     )
 
     detail = (
-        f"{display_name} ({symbol}) | {trend.upper()} | RSI {rsi:.0f} ({rsi_label})\n"
-        f"EMA50={ema50:.4g}  EMA200={ema200:.4g}  Current={current:.4g}\n"
-        f"Swing Hi={swing_high:.4g}  Swing Lo={swing_low:.4g}\n"
+        f"{header}"
         f"\nPROPOSED {side_label} SETUP (REAL DATA — NOT EXECUTED)\n"
         f"Entry : {entry}  |  SL : {sl}  |  TP1 : {tp1} (R:R {rr1}x)  |  TP2 : {tp2} (R:R {rr2}x)\n"
         f"\nTo execute say:\n  \"{confirm_cmd}\""
@@ -4079,7 +4281,7 @@ async def _analyze_symbol(symbol: str, original_cmd: str, ex_name: Optional[str]
     speech = (
         f"{display_name} analysis: {trend}, RSI {rsi:.0f}, {rsi_label}. "
         f"Proposed {side_label.lower()} entry at {entry}, SL {sl}, "
-        f"TP1 {tp1}. "
+        f"TP1 {tp1}, at {confidence:.0%} confidence. "
         f"This is a proposal — say the execute command to confirm, Sir."
     )
 

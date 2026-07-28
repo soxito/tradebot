@@ -146,7 +146,7 @@ JARVIS_COMMANDS: list[dict[str, str]] = [
     {"command": "positions",  "description": "List all open futures positions"},
     {"command": "portfolio",  "description": "Portfolio summary (total PnL, equity)"},
     {"command": "signals",    "description": "Latest parsed Telegram signals"},
-    {"command": "sniper",     "description": "Sniper auto-trade status"},
+    {"command": "sniper",     "description": "Sniper status, or SMC analysis — /sniper XAUUSD 1h"},
     {"command": "monitor",    "description": "Start or stop the signal monitor"},
     {"command": "close",      "description": "Close a position — usage: /close BTCUSDT"},
     {"command": "tp",         "description": "Set take-profit — usage: /tp 0.025 BTCUSDT"},
@@ -158,3 +158,24 @@ JARVIS_COMMANDS: list[dict[str, str]] = [
     {"command": "analyze",    "description": "Deep AI analysis (Kronos+news+position) — /analyze BTCUSDT"},
     {"command": "mt5",        "description": "MT5 accounts/positions/scalp — /mt5 status|positions|scalp|close"},
 ]
+
+
+async def sync_bot_commands(token: str) -> bool:
+    """Push ``JARVIS_COMMANDS`` to Telegram so the / menu matches the code.
+
+    Best-effort: logs and returns False on failure instead of raising, so a
+    Telegram outage can never take down the caller (polling loop, webhook
+    setup, mode switch).
+    """
+    if not token:
+        return False
+    try:
+        result = await set_my_commands(token, JARVIS_COMMANDS)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[BotCommands] / menu sync failed: {}", exc)
+        return False
+    if not result.get("ok"):
+        logger.warning("[BotCommands] / menu sync rejected: {}", result.get("description"))
+        return False
+    logger.info("🤖 Telegram / menu synced ({} commands)", len(JARVIS_COMMANDS))
+    return True

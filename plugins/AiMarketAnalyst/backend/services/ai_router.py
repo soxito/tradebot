@@ -10,10 +10,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 import httpx
 from loguru import logger
@@ -197,6 +198,69 @@ def _order_providers(
     return sorted(usable, key=lambda p: (p.priority, p.id))
 
 
+import asyncio
+import random
+from typing import Callable, TypeVar
+
+# ── Retry configuration ────────────────────────────────────────────────────────
+_MAX_RETRIES = 3
+_BASE_DELAY = 1.0  # seconds
+_MAX_DELAY = 30.0
+_JITTER = 0.1  # 10% jitter
+
+# Error codes that should trigger a retry
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+_RETRYABLE_ERRORS = (
+    "ResourceExhausted",
+    "rate limit",
+    "quota exceeded",
+    "too many requests",
+    "Worker local total request limit reached",
+    "connection reset",
+    "timeout",
+)
+
+T = TypeVar("T")
+
+async def _retry_with_backoff(
+    func: Callable[..., T],
+    *args,
+    max_retries: int = _MAX_RETRIES,
+    base_delay: float = _BASE_DELAY,
+    max_delay: float = _MAX_DELAY,
+    **kwargs,
+) -> T:
+    """Execute func with exponential backoff retry for transient errors."""
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            err_str = str(exc).lower()
+            status = getattr(exc, "response", None)
+            status_code = getattr(status, "status_code", None) if status else None
+            
+            is_retryable = (
+                status_code in _RETRYABLE_STATUS
+                or any(e.lower() in err_str for e in _RETRYABLE_ERRORS)
+            )
+            
+            if not is_retryable or attempt >= max_retries:
+                raise
+            
+            # Exponential backoff with jitter
+            delay = min(base_delay * (2 ** attempt), max_delay)
+            delay += random.uniform(-delay * _JITTER, delay * _JITTER)
+            logger.warning(
+                f"Retryable error (attempt {attempt + 1}/{max_retries + 1}): {exc}. "
+                f"Waiting {delay:.1f}s before retry..."
+            )
+            await asyncio.sleep(delay)
+    
+    raise last_exc
+
+
 async def _call_openai_compatible(
     *,
     base_url: str,
@@ -209,18 +273,20 @@ async def _call_openai_compatible(
 ) -> tuple[str, dict[str, int], str | None]:
     """Call an OpenAI-compatible chat endpoint.
 
-    For OpenAI (base_url with "openai.com"), routes through the headroom proxy
-    for compression. For other providers (Groq, Mistral, Cerebras, OpenRouter),
+    For OpenAI (base_url with "openai.com") or NVIDIA (base_url with "nvidia.com" or "integrate.api.nvidia.com"),
+    routes through the headroom proxy for compression. For other providers (Groq, Mistral, Cerebras, OpenRouter),
     calls them directly to avoid 401 errors.
 
     Returns (content, usage, routed_via).
     """
-    # ── Determine routing: OpenAI through proxy, others direct ──────────────
+    # ── Determine routing: OpenAI/NVIDIA through proxy, others direct ──────────────
     is_openai = "openai.com" in base_url
-    if is_openai:
-        # Route OpenAI through headroom proxy for compression
+    is_nvidia = "nvidia.com" in base_url or "integrate.api.nvidia.com" in base_url
+    if is_openai or is_nvidia:
+        # Route OpenAI/NVIDIA through headroom proxy for compression
+        # Use /v1/chat/completions (local headroom binary) not /p/project/v1/ (Cloudflare Workers)
         headroom_proxy = os.getenv("HEADROOM_PROXY_URL", "http://127.0.0.1:8787")
-        url = f"{headroom_proxy.rstrip('/')}/p/tradebot/v1/chat/completions"
+        url = f"{headroom_proxy.rstrip('/')}/v1/chat/completions"
     else:
         # Direct endpoint for other providers
         url = f"{base_url.rstrip('/')}/chat/completions"
@@ -249,31 +315,34 @@ async def _call_openai_compatible(
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
 
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-        resp = await client.post(url, headers=headers, json=payload)
-        if resp.status_code >= 400:
-            # Retry once without json_mode (some free models reject it)
-            if json_mode:
-                payload.pop("response_format", None)
-                resp = await client.post(url, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        # FreeLLMAPI (and similar proxies) report the upstream they routed to.
-        routed_via = resp.headers.get("x-routed-via") or resp.headers.get("X-Routed-Via")
-        attempts = resp.headers.get("x-fallback-attempts")
-        if routed_via and attempts:
-            routed_via = f"{routed_via} (×{attempts})"
-    choices = data.get("choices") or []
-    if not choices:
-        raise RuntimeError("No choices in response")
-    content = (choices[0].get("message") or {}).get("content") or ""
-    raw_usage = data.get("usage") or {}
-    usage = {
-        "prompt_tokens": int(raw_usage.get("prompt_tokens") or 0),
-        "completion_tokens": int(raw_usage.get("completion_tokens") or 0),
-        "total_tokens": int(raw_usage.get("total_tokens") or 0),
-    }
-    return content, usage, routed_via
+    async def _do_request(current_payload: dict) -> tuple[str, dict[str, int], str | None]:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.post(url, headers=headers, json=current_payload)
+            if resp.status_code >= 400:
+                # Retry once without json_mode (some free models reject it)
+                if json_mode and "response_format" in current_payload:
+                    current_payload.pop("response_format", None)
+                    resp = await client.post(url, headers=headers, json=current_payload)
+            resp.raise_for_status()
+            data = resp.json()
+            # FreeLLMAPI (and similar proxies) report the upstream they routed to.
+            routed_via = resp.headers.get("x-routed-via") or resp.headers.get("X-Routed-Via")
+            attempts = resp.headers.get("x-fallback-attempts")
+            if routed_via and attempts:
+                routed_via = f"{routed_via} (×{attempts})"
+            choices = data.get("choices") or []
+            if not choices:
+                raise RuntimeError("No choices in response")
+            content = (choices[0].get("message") or {}).get("content") or ""
+            raw_usage = data.get("usage") or {}
+            usage = {
+                "prompt_tokens": int(raw_usage.get("prompt_tokens") or 0),
+                "completion_tokens": int(raw_usage.get("completion_tokens") or 0),
+                "total_tokens": int(raw_usage.get("total_tokens") or 0),
+            }
+            return content, usage, routed_via
+
+    return await _retry_with_backoff(_do_request, payload)
 
 
 async def get_enabled_providers(db: AsyncSession) -> list[AILLMProvider]:

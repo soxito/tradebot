@@ -144,6 +144,7 @@ const BROKER_SERVERS: { broker: string; servers: string[] }[] = [
   ]},
   // Markets.com
   { broker: 'Markets.com', servers: [
+    'Markets.com-live','Markets.com-demo',
     'MarketscomCY-Live','MarketscomCY-Demo',
   ]},
   // Admirals (Admiral Markets)

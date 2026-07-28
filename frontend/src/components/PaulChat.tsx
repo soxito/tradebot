@@ -12,11 +12,18 @@ import dynamic from 'next/dynamic'
 import { apiClient } from '@/services/api'
 import { interpretVoiceCommand, phoneticWakeMatch, stripWakePhrase, type VoiceAction } from '@/utils/voiceCommands'
 import {
+  AUDIO_BANDS, ECHO_REF_THRESHOLD, ECHO_SELF_MARGIN,
+  adaptVoiceProfile, bandCorrelation, deleteVoiceProfile, estimateF0, extractBands,
+  loadSelfProfile, loadVoiceProfile, pitchScore, saveSelfProfile, saveVoiceProfile,
+  voiceSimilarity, VOICE_FFT_SIZE, type VoiceProfile,
+} from '@/utils/voiceIdentity'
+import {
   Bot, X, Send, Minimize2, Bell, Trash2, ChevronDown,
   AlertTriangle, TrendingUp, TrendingDown, Zap,
   Mic, MicOff, Volume2, VolumeX, Ear, Settings, Play,
 } from 'lucide-react'
 import type { RobotState, AvatarStyle } from './JarvisRobot'
+import { useVoiceTurn, type BargeInReason, type VoiceTurnState } from '@/hooks/useDeepgramAgent'
 import { detectStaticTier, threeDisabled, pollMultiplier } from '@/utils/devicePerformance'
 
 // 3D robot avatar — loaded client-side only (Three.js needs the DOM/WebGL).
@@ -194,87 +201,8 @@ function alertIcon(type: string) {
 function nanoid() { return Math.random().toString(36).slice(2) }
 
 // ── Voice profile / speaker identification ────────────────────────────────────
-// Uses Web Audio API to build a frequency-band fingerprint of the user's voice.
-// Only speech matching this fingerprint is accepted, cancelling out TV, AC, etc.
-
-const VOICE_PROFILE_KEY = 'paul.voiceProfile.v2'
-const AUDIO_BANDS = 12  // frequency band buckets for the fingerprint
-
-interface VoiceProfile {
-  bands: number[]          // average energy per band (normalised 0–1)
-  bandStdDev?: number[]    // std deviation per band — natural voice variation
-  centroid: number         // spectral centroid (0–1)
-  minEnergy: number        // minimum energy threshold
-  calibratedAt: number
-}
-
-function loadVoiceProfile(): VoiceProfile | null {
-  if (typeof window === 'undefined') return null
-  try { const s = localStorage.getItem(VOICE_PROFILE_KEY); return s ? JSON.parse(s) : null }
-  catch { return null }
-}
-function saveVoiceProfile(p: VoiceProfile) {
-  if (typeof window === 'undefined') return
-  try { localStorage.setItem(VOICE_PROFILE_KEY, JSON.stringify(p)) } catch { /* ignore */ }
-}
-function deleteVoiceProfile() {
-  if (typeof window === 'undefined') return
-  try { localStorage.removeItem(VOICE_PROFILE_KEY) } catch { /* ignore */ }
-}
-
-/**
- * Statistical band-distance matching for speaker identification.
- * Each frequency band is checked: is the current value within N standard
- * deviations of the calibrated profile mean?
- * Returns 0–1 where 1 = every band exactly matches the profile.
- *
- * MUCH more robust than cosine similarity for rejecting TV/background voices
- * because it measures per-band deviation scaled to that person’s natural
- * voice variation, making it unique to the calibrated speaker.
- */
-function voiceSimilarity(current: number[], profile: VoiceProfile): number {
-  // Fall back to a conservative tolerance if calibrated without std dev
-  const stdDev = profile.bandStdDev ?? Array(current.length).fill(0.25)  // generous fallback for legacy profiles
-  let score = 0
-  for (let i = 0; i < current.length; i++) {
-    const deviation = Math.abs(current[i] - profile.bands[i])
-    // 3.0 std-deviation tolerance + small fixed floor to avoid over-strict matching
-    const tolerance = stdDev[i] * 3.0 + 0.05
-    score += Math.max(0, 1 - deviation / tolerance)
-  }
-  return score / current.length
-}
-
-/** Extract normalised frequency-band energies from an AnalyserNode. */
-function extractBands(analyser: AnalyserNode, buf: Uint8Array<ArrayBuffer>): number[] {
-  analyser.getByteFrequencyData(buf)
-  const binSize = Math.floor(buf.length / AUDIO_BANDS)
-  const raw = Array.from({ length: AUDIO_BANDS }, (_, b) => {
-    let sum = 0
-    for (let j = b * binSize; j < Math.min((b + 1) * binSize, buf.length); j++) sum += buf[j]
-    return sum / binSize
-  })
-  const max = Math.max(...raw, 1)
-  return raw.map(v => v / max)
-}
-
-// ── Continuous voice-profile learning ─────────────────────────────────────────
-// Slowly blends fresh, high-confidence frames of the user's voice into the stored
-// profile so JARVIS keeps adapting to the user's voice (and mic/room) the more
-// they talk to it. Uses an exponential moving average so a single noisy frame can
-// never corrupt the fingerprint, and recomputes the per-band tolerance and
-// spectral centroid from the updated bands.
-function adaptVoiceProfile(profile: VoiceProfile, bands: number[], alpha = 0.05): VoiceProfile {
-  const newBands = profile.bands.map((b, i) => b * (1 - alpha) + (bands[i] ?? b) * alpha)
-  const std = profile.bandStdDev ?? Array(newBands.length).fill(0.1)
-  const newStd = std.map((s, i) => {
-    const dev = Math.abs((bands[i] ?? newBands[i]) - newBands[i])
-    return Math.max(0.03, Math.min(0.5, s * (1 - alpha) + dev * alpha))
-  })
-  const sum = newBands.reduce((a, b) => a + b, 0) || 0.01
-  const centroid = newBands.reduce((a, v, i) => a + v * i, 0) / (newBands.length * sum)
-  return { ...profile, bands: newBands, bandStdDev: newStd, centroid }
-}
+// Speaker ID and self-voice (echo) rejection live in @/utils/voiceIdentity so the
+// audio maths can be unit-tested without a browser.
 
 // ── Learned vocabulary (per-user word adaptation) ─────────────────────────────
 // Accumulates the words the user actually says so recognition output can be
@@ -824,7 +752,11 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
 
   // ── Speech state ──────────────────────────────────────────────────────────
   const [speechSupported, setSpeechSupported] = useState(false)
-  const [listening, setListening] = useState(false)   // mic dictation active
+  // A user utterance is being captured RIGHT NOW — by the page's dictation
+  // recogniser or by the extension's. Never "a recogniser is armed": an armed
+  // recogniser waiting in silence is the resting state, not listening. Written
+  // only through `markCapturing` (see below).
+  const [listening, setListening] = useState(false)
   const [voiceEnabled, setVoiceEnabled] = useState(
     () => typeof window !== 'undefined' && localStorage.getItem('paul.voice') === '1'
   )
@@ -878,6 +810,12 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
   )
   const [aiVoice, setAiVoice] = useState<string>(
     () => (typeof window !== 'undefined' && localStorage.getItem('paul.aiVoice')) || 'alloy'
+  )
+  // Barge-in threshold: the mic RMS the user must clear, while JARVIS is
+  // talking, to be accepted as an interruption rather than as JARVIS's own echo.
+  // (Replaces the old post-speech mic blackout — the mic is now never gated.)
+  const [bargeInGate, setBargeInGate] = useState<number>(
+    () => Number((typeof window !== 'undefined' && localStorage.getItem('paul.bargeInGate')) || '0.085')
   )
   // 3D robot avatar style (synced to/from the extension via chrome.storage relay)
   const [avatarStyle, setAvatarStyle] = useState<AvatarStyle>(
@@ -935,6 +873,8 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
   // True when a Whisper capture was aborted for speech — its onstop must discard
   // the audio instead of transcribing it (so JARVIS never hears itself).
   const whisperAbortedRef = useRef(false)
+  // Pre-countdown interval for voice calibration
+  const preCountTickRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const startDictationRef = useRef<() => void>(() => {})
   const startWakeRef = useRef<() => void>(() => {})
   const sendRef = useRef<(text?: string) => void>(() => {})
@@ -951,17 +891,35 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
   const wakeEnabledRef = useRef(false)
   const openRef = useRef(false)
   const listeningRef = useRef(false)
+  // ── Listening single-source-of-truth bookkeeping ───────────────────────────
+  // `listening` means ONE thing: a user utterance is being captured right now.
+  // It is NOT "a recogniser is armed" — an armed recogniser waiting in silence is
+  // the resting state, and conflating the two is what left the mic stuck on
+  // "Listening…" forever (the extension's continuously-armed recogniser was
+  // writing this flag). Every write goes through `markCapturing` below, which
+  // records who claimed it and when so the reconciler can expire a stale claim.
+  const captureOwnerRef = useRef<'page' | 'ext' | null>(null)
+  const captureAtRef = useRef(0)
+  // True once voice has been torn down (unmount, route change, tab hidden).
+  // Checked by every restart path, because `rec.stop()` FIRES `onend` and `onend`
+  // is what schedules the next start — without this, tearing down *creates* a
+  // recogniser nobody holds a reference to, and the mic never goes cold.
+  const voiceDisposedRef = useRef(false)
   const voiceURIRef = useRef('')
   const voiceRateRef = useRef(0.96)
   const voicePitchRef = useRef(0.9)
-  const isSpeakingRef = useRef(false)  // true while TTS is playing
-  const interruptRef = useRef(false)   // set true to abort current speech mid-sentence
+  // Derived mirror of the turn machine's SPEAKING state — written ONLY by
+  // useVoiceTurn's onStateChange (see below), read synchronously by the speech
+  // callbacks. Never assign to it anywhere else.
+  const isSpeakingRef = useRef(false)
+  // Bookkeeping for the utterance currently on the speakers (revoke the blob
+  // URL, detach the TTS tap, tell the extension). Cleared the moment a turn ends
+  // by any route, so a barge-in never leaves a dangling handler behind.
+  const activeSpeechRef = useRef<{ cancel: () => void } | null>(null)
   const autoNoiseCalibratingRef = useRef(false)  // true during auto-calibration
-  // Post-speech mic blackout: mic stays gated for this many ms after speech ends
-  // to swallow any audio echo before re-opening recognition. 900ms matches the
-  // extension's echo-tail window so both are synchronised.
+  // Re-arm timer for the recognizers after a reply (the MIC itself is never
+  // gated — this only reopens whichever recogniser should own the transcript).
   const postSpeechGateRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const micGatedRef = useRef(false)  // true during post-speech blackout
   // ── Face Vision (camera) state — relayed from FaceVisionPanel postMessage ──
   // While the camera is live, the user's moving mouth is the ground truth for
   // "the user is talking": JARVIS's TTS can never move the user's mouth, so
@@ -994,6 +952,139 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
   const voiceRafRef     = useRef<number | null>(null)
   const miniRafRef      = useRef<number>(0)
   const miniThrottle    = useRef<number>(0)
+  // ── Self-voice (echo) rejection state ─────────────────────────────────────
+  // Live spectral fingerprint of the audio JARVIS is emitting right now, tapped
+  // from the TTS <audio> element. Null whenever nothing is playing through the
+  // AI-voice path (e.g. the Web Speech synthesiser, which cannot be tapped).
+  const ttsBandsRef      = useRef<number[] | null>(null)
+  const ttsAnalyserRef   = useRef<AnalyserNode | null>(null)
+  const ttsBufRef        = useRef<Uint8Array | null>(null)
+  const ttsCtxRef        = useRef<AudioContext | null>(null)
+  const ttsRafRef        = useRef<number | null>(null)
+  // Elements already routed through the tap — an element can only be connected
+  // to one MediaElementSourceNode, so reconnecting the same one throws.
+  const ttsSourcesRef    = useRef<WeakMap<HTMLAudioElement, MediaElementAudioSourceNode>>(new WeakMap())
+  // Negative fingerprint: what JARVIS's own voice looks like coming back through
+  // the mic. Learned automatically while speaking; persisted between sessions.
+  const selfProfileRef   = useRef<VoiceProfile | null>(null)
+  const selfPersistAtRef = useRef(0)
+  // True when the most recent analysed mic frame was identified as JARVIS's own
+  // echo. Read by the recognizer gates so echo can never wake or command.
+  const echoDetectedRef  = useRef(false)
+  // Live LEVEL (0–1) of what JARVIS is emitting this instant, sampled from the
+  // same TTS tap as `ttsBandsRef` (which is shape-normalised and so carries no
+  // loudness). The turn machine subtracts it from the barge-in threshold, so the
+  // louder JARVIS is the harder it is for his own echo to look like the user.
+  const ttsLevelRef      = useRef(0)
+
+  // ── The voice turn machine (single owner of listening/thinking/speaking) ───
+  // Everything below reads `turn.state` / `turn.stateRef` instead of keeping its
+  // own flags. `isSpeakingRef` survives only as a *derived mirror* written by the
+  // machine's onStateChange, for the many callbacks that need a synchronous read.
+  const bargeInHandlerRef = useRef<(reason: BargeInReason) => void>(() => {})
+  const voiceStateRef = useRef<VoiceTurnState>('IDLE')
+  // When the user cut in. The wake recogniser — which has been listening all
+  // along, so it already has the first syllable — treats anything it hears in
+  // this window as the interrupting command, no wake word needed.
+  const bargeInAtRef = useRef(0)
+  const bargeInFallbackRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const BARGE_IN_CAPTURE_MS = 6000
+  const turn = useVoiceTurn({
+    speakingGate: bargeInGate,
+    getReferenceLevel: () => ttsLevelRef.current,
+    isSelfEcho: () => echoDetectedRef.current,
+    onBargeIn: reason => bargeInHandlerRef.current(reason),
+    onStateChange: next => {
+      voiceStateRef.current = next
+      isSpeakingRef.current = next === 'SPEAKING'
+      // Let every other JARVIS surface (robot, orb, JARVIS Room, extension)
+      // react to the turn without re-deriving it from booleans.
+      if (typeof window !== 'undefined') {
+        try {
+          window.postMessage({ __jarvisPage: true, type: 'jarvis-voice-state', state: next }, window.location.origin)
+        } catch { /* noop */ }
+      }
+    },
+  })
+  const turnRef = useRef(turn)
+  turnRef.current = turn
+
+  // ── TTS reference tap (echo cancellation input) ───────────────────────────
+  // Routes a reply's <audio> element through an AnalyserNode *on its way to the
+  // speakers*, so `ttsBandsRef` always holds the spectrum of what JARVIS is
+  // emitting this instant. The mic analyser compares against it to recognise —
+  // and discard — its own voice coming back in.
+  //
+  // The element still reaches the destination, so audio plays normally; the tap
+  // is passive. Returns false when Web Audio is unavailable, in which case the
+  // learned self-profile carries the echo rejection on its own.
+  const attachTtsReference = useCallback((audio: HTMLAudioElement): boolean => {
+    if (typeof window === 'undefined') return false
+    try {
+      const Ctx = window.AudioContext || (window as any).webkitAudioContext
+      if (!Ctx) return false
+      let ctx = ttsCtxRef.current
+      if (!ctx || ctx.state === 'closed') {
+        ctx = new Ctx()
+        ttsCtxRef.current = ctx
+      }
+      if (ctx.state === 'suspended') { try { ctx.resume() } catch { /* noop */ } }
+
+      let analyser = ttsAnalyserRef.current
+      if (!analyser) {
+        analyser = ctx.createAnalyser()
+        // Same FFT size as the mic analyser so both band vectors are comparable.
+        analyser.fftSize = VOICE_FFT_SIZE
+        analyser.smoothingTimeConstant = 0.80
+        analyser.connect(ctx.destination)
+        ttsAnalyserRef.current = analyser
+        ttsBufRef.current = new Uint8Array(analyser.frequencyBinCount)
+      }
+
+      // An element may only ever be wrapped in one MediaElementSourceNode.
+      let src = ttsSourcesRef.current.get(audio)
+      if (!src) {
+        src = ctx.createMediaElementSource(audio)
+        ttsSourcesRef.current.set(audio, src)
+        src.connect(analyser)
+      }
+
+      // Sample the reference every frame for as long as the clip is playing.
+      if (ttsRafRef.current) cancelAnimationFrame(ttsRafRef.current)
+      const sample = () => {
+        const a = ttsAnalyserRef.current
+        const b = ttsBufRef.current
+        if (!a || !b || audio.paused || audio.ended) {
+          ttsBandsRef.current = null
+          ttsLevelRef.current = 0
+          ttsRafRef.current = null
+          return
+        }
+        ttsBandsRef.current = extractBands(a, b as Uint8Array<ArrayBuffer>)
+        // extractBands normalises the shape, so take the loudness separately —
+        // the turn machine needs to know HOW LOUD we are, not just the timbre.
+        const raw = b as Uint8Array
+        let sum = 0
+        for (let i = 0; i < raw.length; i++) sum += raw[i]
+        ttsLevelRef.current = sum / raw.length / 255
+        ttsRafRef.current = requestAnimationFrame(sample)
+      }
+      sample()
+      return true
+    } catch {
+      // Autoplay policy, cross-origin media, or no Web Audio — fall back to the
+      // learned self-profile, which needs no reference signal.
+      ttsBandsRef.current = null
+      ttsLevelRef.current = 0
+      return false
+    }
+  }, [])
+
+  const detachTtsReference = useCallback(() => {
+    if (ttsRafRef.current) { cancelAnimationFrame(ttsRafRef.current); ttsRafRef.current = null }
+    ttsBandsRef.current = null
+    ttsLevelRef.current = 0
+  }, [])
   // Latest MT5 page context (account + symbol + timeframe) published by /mt5-live.
   // Persisted to sessionStorage so it survives navigation and lets JARVIS
   // analyse / place orders from ANY page, not just /mt5-live.
@@ -1200,11 +1291,26 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     if (typeof window === 'undefined') return
     try {
       window.postMessage(
-        { __jarvisPage: true, type: 'jarvis-activity', listening, thinking: streaming },
+        {
+          __jarvisPage: true,
+          type: 'jarvis-activity',
+          // `listening` is "somebody is talking to JARVIS right now": a recogniser
+          // capturing an utterance, or the energy monitor confirming user speech.
+          // It used to be OR-ed with `turn.state === 'LISTENING'`, which is the
+          // machine's ARMED state — permanently true for as long as voice is on.
+          // That is why the JARVIS Room orb sat on "listening" in a silent room:
+          // the flag it renders could never go false.
+          listening: listening || turn.userSpeaking,
+          // The armed state is still published, under its own name, for any
+          // surface that wants to show "ready" as distinct from "hearing you".
+          armed:     turn.state === 'LISTENING',
+          thinking:  turn.state === 'THINKING'  || streaming,
+          state:     turn.state,
+        },
         window.location.origin,
       )
     } catch { /* noop */ }
-  }, [listening, streaming])
+  }, [listening, streaming, turn.state, turn.userSpeaking])
 
   // ── Send message ──────────────────────────────────────────────────────────
   const send = useCallback(async (overrideText?: string) => {
@@ -1363,6 +1469,10 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
 
     try {
       abortRef.current = new AbortController()
+      // THINKING is a real state of the conversation, not just a spinner: hand
+      // the machine the stream's abort so barge-in can cancel a reply that has
+      // not even started being spoken yet.
+      turnRef.current.beginThinking({ streamAbort: abortRef.current })
       const resp = await fetch(
         `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:1448/api/v1'}/plugins/agent-paul/chat`,
         {
@@ -1447,6 +1557,9 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
   useEffect(() => {
     voiceEnabledRef.current = voiceEnabled
     if (typeof window !== 'undefined') localStorage.setItem('paul.voice', voiceEnabled ? '1' : '0')
+    // Turning voice off must also close any open follow-up window, otherwise
+    // the mic keeps reopening for a conversation the user just ended.
+    if (!voiceEnabled) conversationUntilRef.current = 0
   }, [voiceEnabled])
   useEffect(() => {
     wakeEnabledRef.current = wakeEnabled
@@ -1699,6 +1812,91 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
   useEffect(() => { openRef.current = open }, [open])
   useEffect(() => { listeningRef.current = listening }, [listening])
 
+  /**
+   * The ONLY writer of `listening`.
+   *
+   * One flag, one meaning — "a user utterance is being captured right now" — and
+   * one owner at a time. `owner` records which surface made the claim so a claim
+   * can only be released by whoever made it (or by the reconciler); this is what
+   * stops the extension's always-armed recogniser and the page's per-utterance
+   * dictation from overwriting each other's state, which is how the mic used to
+   * end up permanently stuck on "Listening…" with nobody speaking.
+   *
+   * `listeningRef` is written synchronously here as well as by the mirroring
+   * effect above: every recogniser re-arm path reads the ref, and waiting a
+   * render for it would let a stale `true` suppress the re-arm.
+   */
+  const markCapturing = useCallback((on: boolean, owner: 'page' | 'ext' = 'page') => {
+    if (on) {
+      captureOwnerRef.current = owner
+      captureAtRef.current = Date.now()
+      listeningRef.current = true
+      setListening(true)
+      return
+    }
+    // Only the surface that claimed the capture may clear it — otherwise a
+    // routine status ping from the idle extension would cancel the page's live
+    // dictation (and vice versa).
+    if (captureOwnerRef.current && captureOwnerRef.current !== owner) return
+    captureOwnerRef.current = null
+    captureAtRef.current = 0
+    listeningRef.current = false
+    setListening(false)
+  }, [])
+  const markCapturingRef = useRef(markCapturing)
+  markCapturingRef.current = markCapturing
+
+  /**
+   * Stop a Web Speech recogniser so it stays stopped.
+   *
+   * `rec.stop()` fires `onend`, and `onend` is where the auto-restart lives — so
+   * a bare `rec.stop()` in a teardown path does not stop anything, it schedules
+   * a replacement that nobody holds a reference to. Detaching the handlers first
+   * is the only way to make a stop final. Every teardown path uses this; only
+   * the deliberate "end this utterance and re-arm" paths call `rec.stop()`
+   * directly.
+   */
+  const detachRecognizer = useCallback((rec: SpeechRecognitionLike | null) => {
+    if (!rec) return
+    try { rec.onresult = null } catch { /* noop */ }
+    try { rec.onend = null } catch { /* noop */ }
+    try { rec.onerror = null } catch { /* noop */ }
+    try { rec.onstart = null } catch { /* noop */ }
+    try { rec.stop() } catch { /* noop */ }
+    try { rec.abort?.() } catch { /* noop */ }
+  }, [])
+  const detachRecognizerRef = useRef(detachRecognizer)
+  detachRecognizerRef.current = detachRecognizer
+
+  // ── Capture reconciler (the belt, not the braces) ─────────────────────────
+  // The braces are single ownership + guaranteed teardown below. This is the
+  // backstop: a capture claim must stay backed by something that is actually
+  // capturing. A page claim needs a live recogniser or recorder; an extension
+  // claim needs a refresh (the content script re-posts status on every
+  // transition). An unbacked claim is dropped, so `listening` can never latch.
+  const CAPTURE_STALE_MS = 12_000
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (!listeningRef.current) return
+      const owner = captureOwnerRef.current
+      const age = Date.now() - captureAtRef.current
+      if (owner === 'page') {
+        const live = !!dictationRef.current || !!whisperRecorderRef.current
+        if (!live || age > CAPTURE_STALE_MS) markCapturingRef.current(false, 'page')
+        return
+      }
+      if (owner === 'ext') {
+        if (age > CAPTURE_STALE_MS) markCapturingRef.current(false, 'ext')
+        return
+      }
+      // Claimed by nobody — an impossible state, so clear it unconditionally.
+      captureOwnerRef.current = null
+      listeningRef.current = false
+      setListening(false)
+    }, 2000)
+    return () => clearInterval(id)
+  }, [])
+
   // Persist + mirror voice-selection prefs into refs (used inside speak()).
   useEffect(() => {
     voiceURIRef.current = voiceURI
@@ -1768,12 +1966,11 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     setSpeechSupported(!!getSpeechRecognition() && typeof window !== 'undefined' && 'speechSynthesis' in window)
   }, [])
 
-  // Barge-in is possible only when we can reliably tell the user apart from
-  // JARVIS's own voice — i.e. speaker-ID (voice match) is enabled AND a profile
-  // exists. Without it we fall back to fully muting the mic during speech.
-  const canBargeIn = useCallback(() => {
-    return voiceMatchEnabledRef.current && !!loadVoiceProfile()
-  }, [])
+  // Barge-in no longer needs a "can we?" test: the turn machine's always-open
+  // capture discriminates the user from JARVIS's echo with AEC + a raised energy
+  // gate + consecutive-frame confirmation + the live TTS reference, so it is
+  // available in every configuration (the optional speaker-ID profile, when
+  // enabled, still adds a further gate at the transcript level).
 
   // ── Face Vision (camera) gates ────────────────────────────────────────────
   // FaceVisionPanel broadcasts lip/identity state via postMessage. While the
@@ -1797,57 +1994,99 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     return faceStateRef.current.talking || Date.now() - lastMouthActiveAtRef.current < MOUTH_WINDOW_MS
   }, [faceFresh])
 
-  // ── Mic gating while JARVIS speaks ────────────────────────────────────────
-  // Always aborts any active dictation/Whisper capture so a command-in-progress
-  // never records JARVIS's own voice. When speaker-ID is enabled we KEEP the wake
-  // recognizer alive so the user can still interrupt by voice — the stored-voice
-  // gate rejects JARVIS's own TTS, so it never self-triggers. When speaker-ID is
-  // off we fully stop the wake recognizer (zero self-hearing). The extension is
-  // told whether barge-in is allowed via the `speak-status` message in speak().
-  const muteMicForSpeech = useCallback(() => {
-    const bargeIn = canBargeIn()
-    // Abort active capture either way (never record our own voice mid-command).
-    try { dictationRef.current?.stop() } catch { /* noop */ }
-    try {
-      const rec = whisperRecorderRef.current
-      if (rec && rec.state !== 'inactive') {
-        whisperAbortedRef.current = true  // discard the capture in onstop
-        rec.stop()
-      }
-    } catch { /* noop */ }
-    try { whisperStreamRef.current?.getTracks().forEach(t => t.stop()) } catch { /* noop */ }
-    setRecording(false)
-    // Arm the post-speech mic blackout gate so any echo after onend is discarded.
-    micGatedRef.current = true
+  // ── Conversation mode ─────────────────────────────────────────────────────
+  // Once the user has addressed JARVIS, the wake word should not be needed
+  // again for every follow-up — a conversation is a back-and-forth, not a series
+  // of unrelated commands. Each exchange opens a window during which the mic
+  // reopens for dictation the moment JARVIS stops speaking; when the window
+  // lapses without a reply, listening falls back to waiting for the wake word.
+  const conversationUntilRef = useRef(0)
+  const CONVERSATION_WINDOW_MS = 25_000
+
+  const inConversation = useCallback(
+    () => Date.now() < conversationUntilRef.current,
+    [],
+  )
+  /** Extend the follow-up window — call whenever the user addresses JARVIS. */
+  const touchConversation = useCallback(() => {
+    conversationUntilRef.current = Date.now() + CONVERSATION_WINDOW_MS
+  }, [])
+  /** End it immediately (explicit "that's all", chat closed, voice off). */
+  const endConversation = useCallback(() => { conversationUntilRef.current = 0 }, [])
+
+  /**
+   * Make sure a recogniser owns the transcript again after a reply.
+   *
+   * The microphone itself is never gated any more — the turn machine's capture
+   * runs through SPEAKING too — so this is only about which Web Speech
+   * recogniser should be delivering text: dictation inside a conversation
+   * window, the wake listener otherwise. It is called from every way speech can
+   * end (normal, error, barge-in) and is idempotent, because the one thing
+   * JARVIS may never do is end up neither speaking nor listening.
+   */
+  const resumeListeningAfterSpeech = useCallback((delayMs?: number) => {
     clearTimeout(postSpeechGateRef.current ?? undefined)
-    if (bargeIn) {
-      // Keep the wake listener running so the user's voice can interrupt JARVIS.
-      if (wakeEnabledRef.current && !extVoiceReadyRef.current && !wakeRef.current) {
-        try { startWakeRef.current() } catch { /* noop */ }
+    if (voiceDisposedRef.current) return
+    postSpeechGateRef.current = setTimeout(() => {
+      if (voiceDisposedRef.current) return       // torn down while we waited
+      if (extVoiceReadyRef.current) return       // extension owns the transcript
+      if (inConversation() && voiceEnabledRef.current) {
+        if (!listeningRef.current) startDictationRef.current()
+        return
       }
-    } else {
-      try { wakeRef.current?.stop() } catch { /* noop */ }
-      setListening(false)
-      listeningRef.current = false
+      if (wakeEnabledRef.current && !listeningRef.current) startWakeRef.current()
+    }, delayMs ?? 150)
+  }, [inConversation])
+
+  // ── Holding the floor while JARVIS speaks (full duplex) ───────────────────
+  // Nothing here stops the microphone, closes a MediaStream, or kills the wake
+  // recogniser: that is precisely what made JARVIS deaf mid-reply. Capture and
+  // recognition keep running for the whole utterance; self-hearing is prevented
+  // by the turn machine's gates plus the transcript-level `state === 'SPEAKING'`
+  // drop in the recognisers below. The only thing we stop is an in-progress
+  // *dictation* utterance, because its accumulated text belongs to the turn that
+  // just ended — the recogniser is immediately restarted by the wake listener.
+  const holdFloorForSpeech = useCallback(() => {
+    try { dictationRef.current?.stop() } catch { /* noop */ }
+    // TTS starting ends the user's capture, synchronously. `rec.onend` would get
+    // there eventually, but "eventually" is a window in which the UI says the mic
+    // is capturing the user while JARVIS is the one talking — and a window in
+    // which `listeningRef` blocks the very re-arm that follows the reply.
+    markCapturingRef.current(false, 'page')
+    clearTimeout(postSpeechGateRef.current ?? undefined)
+    // A new reply closes any previous barge-in capture window.
+    bargeInAtRef.current = 0
+    if (bargeInFallbackRef.current) { clearTimeout(bargeInFallbackRef.current); bargeInFallbackRef.current = null }
+    // Keep a listener alive for the whole reply so the user can cut in verbally
+    // as well as by energy (the wake-word path still works during speech).
+    if (wakeEnabledRef.current && !extVoiceReadyRef.current && !wakeRef.current) {
+      try { startWakeRef.current() } catch { /* noop */ }
     }
-  }, [canBargeIn])
+  }, [])
 
   // ── Speak (TTS) — JARVIS-grade, using the chosen voice + tuned prosody ────
+  // The turn machine owns the lifecycle: speak() hands it everything cancellable
+  // (the TTS request, the audio element) and it decides when the turn ends —
+  // either normally, or because the user cut in.
   const speak = useCallback(async (text: string, onEnd?: () => void) => {
     if (typeof window === 'undefined') return
     const clean = cleanForSpeech(text)
     if (!clean) return
-    // Silence the mic for the duration of speech. When speaker-ID is on we keep
-    // listening for the user's voice so they can interrupt (barge-in); otherwise
-    // we go fully deaf so JARVIS never hears itself.
-    muteMicForSpeech()
-    const allowBargeIn = canBargeIn()
+    const t = turnRef.current
+    // Superseding an utterance already on the speakers ("One moment, Sir." → the
+    // answer): silence it first so the two never overlap. This is a handover, not
+    // a barge-in, so the state stays SPEAKING.
+    try { activeSpeechRef.current?.cancel() } catch { /* noop */ }
+    t.cancelSpeech()
+    // Full duplex: the mic keeps capturing throughout. This only hands the
+    // transcript back to the wake listener for the duration of the reply.
+    holdFloorForSpeech()
     const emitSpeaking = (speaking: boolean) => {
       try {
-        // `allowBargeIn` tells the extension whether to keep its mic open during
-        // speech (so the user can cut in) or fully stop until JARVIS finishes.
+        // Barge-in is always available now, so the extension is told to keep its
+        // mic open for the whole reply.
         window.postMessage(
-          { __jarvisPage: true, type: 'speak-status', speaking, allowBargeIn, text: speaking ? clean : undefined },
+          { __jarvisPage: true, type: 'speak-status', speaking, allowBargeIn: true, text: speaking ? clean : undefined },
           window.location.origin,
         )
       } catch { /* noop */ }
@@ -1855,9 +2094,30 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
 
     // A: High-quality AI Voice (OpenAI TTS)
     if (aiVoiceEnabled) {
+      const ttsAbort = new AbortController()
+      // Enter SPEAKING *before* the request: a barge-in during synthesis must
+      // cancel the request itself, not just whatever eventually plays.
+      t.beginSpeaking({ ttsAbort })
       emitSpeaking(true)
-      isSpeakingRef.current = true
-      interruptRef.current = false
+      let url: string | null = null
+      let settled = false
+      const finish = (spokenFully: boolean) => {
+        if (settled) return
+        settled = true
+        if (activeSpeechRef.current === token) activeSpeechRef.current = null
+        detachTtsReference()
+        emitSpeaking(false)
+        if (url) { try { URL.revokeObjectURL(url) } catch { /* noop */ } ; url = null }
+        if (spokenFully) onEnd?.()
+      }
+      // Invoked by the machine after it has ducked playback and aborted the
+      // request — this is only the bookkeeping half of a barge-in.
+      const token = { cancel: () => finish(false) }
+      activeSpeechRef.current = token
+      // True only while THIS utterance is the one on the speakers. A superseded
+      // utterance must never end the turn — its late onended/onerror would drop
+      // the machine out of SPEAKING while the *next* reply is still playing.
+      const isCurrent = () => activeSpeechRef.current === token
       try {
         const formData = new FormData()
         formData.append('text', clean)
@@ -1868,57 +2128,52 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
           {
             method: 'POST',
             body: formData,
+            signal: ttsAbort.signal,
           }
         )
         if (!resp.ok) throw new Error('AI TTS failed')
         const blob = await resp.blob()
-        const url = URL.createObjectURL(blob)
+        // Cut in while the audio was still being rendered — never start playing.
+        if (ttsAbort.signal.aborted) { finish(false); return }
+        url = URL.createObjectURL(blob)
         const audio = new Audio(url)
-        audio.onerror = () => {
-          isSpeakingRef.current = false
-          interruptRef.current = false
-          emitSpeaking(false)
-          try { URL.revokeObjectURL(url) } catch { /* noop */ }
-          // Recover the mic after echo-tail blackout (900ms = matches extension gate)
-          clearTimeout(postSpeechGateRef.current ?? undefined)
-          postSpeechGateRef.current = setTimeout(() => {
-            micGatedRef.current = false
-            if (wakeEnabledRef.current && !listeningRef.current) startWake()
-          }, 900)
+        const endTurn = (spokenFully: boolean) => {
+          const mine = isCurrent()
+          finish(spokenFully)
+          if (!mine) return
+          turnRef.current.endSpeaking()
+          resumeListeningAfterSpeech()
         }
-        audio.onended = () => {
-          isSpeakingRef.current = false
-          interruptRef.current = false
-          emitSpeaking(false)
-          URL.revokeObjectURL(url)
-          onEnd?.()
-          clearTimeout(postSpeechGateRef.current ?? undefined)
-          postSpeechGateRef.current = setTimeout(() => {
-            micGatedRef.current = false
-            if (wakeEnabledRef.current && !listeningRef.current) startWake()
-          }, 900)
+        audio.onerror  = () => endTurn(false)
+        audio.onended  = () => endTurn(true)
+        // Tap the outgoing audio so the mic analyser knows, frame by frame,
+        // exactly what JARVIS is emitting — and can discard it on the way back
+        // in. Must be attached before play() so no audio escapes untracked.
+        attachTtsReference(audio)
+        // Hand the element to the machine (so barge-in can duck and flush it)
+        // and restart the grace window from the moment audio really starts.
+        t.beginSpeaking({ audio, ttsAbort: null })
+        try {
+          await audio.play()
+        } catch {
+          // Autoplay blocked / element detached — don't leave the turn open.
+          endTurn(false)
         }
-        audio.play()
-        const checker = setInterval(() => {
-          if (interruptRef.current) {
-            audio.pause()
-            clearInterval(checker)
-            isSpeakingRef.current = false
-            emitSpeaking(false)
-            URL.revokeObjectURL(url)
-          }
-        }, 50)
         return
       } catch (err) {
+        // An abort is a barge-in, not a failure: the machine is already back in
+        // LISTENING, so don't fall through and start talking again.
+        if (ttsAbort.signal.aborted) { finish(false); return }
+        finish(false)
         console.error('AI TTS failed, falling back to system voice', err)
       }
     }
 
     // B: System voice fallback (Web Speech API)
-    if (!('speechSynthesis' in window)) return
+    if (!('speechSynthesis' in window)) { t.endSpeaking(); return }
     window.speechSynthesis.cancel()
+    t.beginSpeaking({ cancelSynthesis: true })
     emitSpeaking(true)
-    interruptRef.current = false
     const u = new SpeechSynthesisUtterance(clean)
     const voices = window.speechSynthesis.getVoices()
     let chosen = voiceURIRef.current ? voices.find(v => v.voiceURI === voiceURIRef.current) : undefined
@@ -1928,47 +2183,76 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     u.rate = voiceRateRef.current || 0.96
     u.pitch = voicePitchRef.current || 0.9
     u.volume = 1
-    isSpeakingRef.current = true
-    u.onend = () => {
-      isSpeakingRef.current = false
-      interruptRef.current = false
+    let synthSettled = false
+    const synthFinish = (spokenFully: boolean) => {
+      if (synthSettled) return
+      synthSettled = true
+      if (activeSpeechRef.current === synthToken) activeSpeechRef.current = null
       emitSpeaking(false)
-      onEnd?.()
-      // Resume wake listening after echo-tail blackout (900ms matches extension gate)
-      clearTimeout(postSpeechGateRef.current ?? undefined)
-      postSpeechGateRef.current = setTimeout(() => {
-        micGatedRef.current = false
-        if (wakeEnabledRef.current && !listeningRef.current) startWake()
-      }, 900)
+      if (spokenFully) onEnd?.()
     }
-    u.onerror = () => {
-      isSpeakingRef.current = false
-      emitSpeaking(false)
-      clearTimeout(postSpeechGateRef.current ?? undefined)
-      postSpeechGateRef.current = setTimeout(() => {
-        micGatedRef.current = false
-        if (wakeEnabledRef.current && !listeningRef.current) startWake()
-      }, 900)
+    const synthToken = { cancel: () => synthFinish(false) }
+    activeSpeechRef.current = synthToken
+    // cancel() on a superseded utterance fires onend/onerror asynchronously —
+    // after the next reply has already claimed the turn. Only the current
+    // utterance may end it.
+    const synthEnd = (spokenFully: boolean) => {
+      const mine = activeSpeechRef.current === synthToken
+      synthFinish(spokenFully)
+      if (!mine) return
+      turnRef.current.endSpeaking()
+      resumeListeningAfterSpeech()
     }
+    u.onend   = () => synthEnd(true)
+    u.onerror = () => synthEnd(false)
     window.speechSynthesis.speak(u)
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [aiVoiceEnabled, aiVoice])
+  }, [aiVoiceEnabled, aiVoice, attachTtsReference, detachTtsReference, holdFloorForSpeech, resumeListeningAfterSpeech])
 
-  // Interrupt JARVIS mid-speech and immediately start listening (human-like interruptibility)
+  // Interrupt JARVIS mid-speech and immediately start listening. Delegates to the
+  // machine so that every interruption path — energy barge-in, wake word, camera,
+  // the UI stop button — goes through exactly the same cancellation.
   const interruptSpeech = useCallback(() => {
     if (typeof window === 'undefined') return
-    // Abort both speech paths: AI <audio> (watched via interruptRef) and the
-    // Web Speech synthesiser.
-    interruptRef.current = true
-    if ('speechSynthesis' in window) window.speechSynthesis.cancel()
-    isSpeakingRef.current = false
-    // Tell the extension JARVIS has stopped talking so it resumes normal
-    // listening immediately. Without this the extension keeps pageSpeaking=true
-    // (because synthesis.cancel() fires no onend) and goes deaf.
-    try {
-      window.postMessage({ __jarvisPage: true, type: 'speak-status', speaking: false }, window.location.origin)
-    } catch { /* noop */ }
+    turnRef.current.bargeIn('manual')
   }, [])
+
+  // ── What happens the instant the machine confirms the user cut in ──────────
+  // By the time this runs the machine has already ducked and flushed playback,
+  // aborted the TTS request and any streaming response, and moved to LISTENING.
+  // This is the page-side half: clean up the utterance, tell the extension, and
+  // put the transcript in front of the words the user is *still saying*.
+  bargeInHandlerRef.current = (reason: BargeInReason) => {
+    try { activeSpeechRef.current?.cancel() } catch { /* noop */ }
+    activeSpeechRef.current = null
+    detachTtsReference()
+    // Abort the in-flight chat stream too — the user has moved on, and a reply
+    // that keeps streaming would be spoken over the new question.
+    try { abortRef.current?.abort() } catch { /* noop */ }
+    if (typeof window !== 'undefined') {
+      try {
+        window.postMessage({ __jarvisPage: true, type: 'speak-status', speaking: false }, window.location.origin)
+      } catch { /* noop */ }
+    }
+    // The user is mid-sentence — keep the follow-up window open and start
+    // capturing immediately (no wake word needed to finish their own thought).
+    conversationUntilRef.current = Date.now() + CONVERSATION_WINDOW_MS
+    if (extVoiceReadyRef.current || robotLockedRef.current) return
+    if (reason === 'wake-word') return   // that path dispatches its own command
+
+    // Don't restart a recogniser on top of the user's sentence: the wake listener
+    // is already running and heard the words that triggered the barge-in, so give
+    // it the window to deliver them. Opening a fresh dictation here would throw
+    // away the first syllable — the classic "it stopped but missed what I said".
+    bargeInAtRef.current = Date.now()
+    if (bargeInFallbackRef.current) clearTimeout(bargeInFallbackRef.current)
+    bargeInFallbackRef.current = setTimeout(() => {
+      bargeInFallbackRef.current = null
+      // Nothing came through (wake listener dead, or the user only made a noise)
+      // → fall back to dictation so the floor is definitely open.
+      if (bargeInAtRef.current && !listeningRef.current) startDictationRef.current()
+    }, 1200)
+  }
 
   // ── Face Vision sync + camera barge-in ─────────────────────────────────────
   // Consumes FaceVisionPanel's `jarvis-face-state` broadcasts. When the camera
@@ -1988,13 +2272,10 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
       }
       if (d.isTalking) lastMouthActiveAtRef.current = Date.now()
       // Camera barge-in: the user's mouth is moving while JARVIS is speaking →
-      // stop reading NOW and hand the mic to the user.
-      if (isSpeakingRef.current && cameraSeesUserTalking()) {
-        interruptSpeech()
-        micGatedRef.current = false  // camera confirmed it's the user — skip the echo blackout
-        if (!extVoiceReadyRef.current && !listeningRef.current) {
-          setTimeout(() => startDictationRef.current(), 150)
-        }
+      // stop reading NOW and hand the mic to the user. The machine's own
+      // handler starts dictation; the camera is simply another trigger for it.
+      if (voiceStateRef.current === 'SPEAKING' && cameraSeesUserTalking()) {
+        turnRef.current.bargeIn('camera')
       }
     }
     window.addEventListener('message', onFaceMsg)
@@ -2080,24 +2361,92 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
       const ctx = new (window.AudioContext || (window as any).webkitAudioContext)()
       voiceAudioCtxRef.current = ctx
       const analyser = ctx.createAnalyser()
-      analyser.fftSize = 512
+      analyser.fftSize = VOICE_FFT_SIZE
       analyser.smoothingTimeConstant = 0.80
       voiceAnalyserRef.current = analyser
       const buf = new Uint8Array(analyser.frequencyBinCount)
       voiceBufRef.current = buf
-      ctx.createMediaStreamSource(stream).connect(analyser)
+      // Time-domain buffer for pitch estimation (fftSize samples, not bins).
+      const timeBuf = new Uint8Array(analyser.fftSize)
+      const source = ctx.createMediaStreamSource(stream)
+      source.connect(analyser)
+
       // Last match state broadcast to the extension — only post on change so the
       // extension's `pageVoiceMatch` (which gates its Deepgram escalation) stays
       // in sync without flooding the page with messages every frame.
       let lastSentMatch: boolean | null = null
+      // Pitch is far more expensive than band extraction (YIN scans ~700 lags
+      // over a 1024-sample window), and vocal pitch does not meaningfully change
+      // inside 100 ms — so it is measured on a timer rather than every frame and
+      // reused in between. Keeps the analyser affordable on low-end machines.
+      let lastF0 = 0
+      let lastF0At = 0
+      const measureF0 = (): number => {
+        const now = Date.now()
+        if (now - lastF0At >= 100) {
+          lastF0At = now
+          lastF0 = estimateF0(analyser, timeBuf as Uint8Array<ArrayBuffer>, ctx.sampleRate)
+        }
+        return lastF0
+      }
       const check = () => {
         if (!voiceAudioCtxRef.current) return
         const bands = extractBands(analyser, buf)
         const energy = (voiceBufRef.current as Uint8Array).reduce((s, v) => s + v, 0) / (voiceBufRef.current as Uint8Array).length
+        const speaking = isSpeakingRef.current
+
+        // ── Echo detection ─────────────────────────────────────────────────
+        // Only meaningful while JARVIS is actually emitting audio; at all other
+        // times nothing of ours can be in the mic, so the check is skipped.
+        let isEcho = false
+        if (speaking && energy >= profile.minEnergy * 0.35) {
+          // (1) Live reference: the mic frame tracks the shape of what the
+          // speakers are emitting right now → it *is* the speakers.
+          const ref = ttsBandsRef.current
+          if (ref && bandCorrelation(bands, ref) >= ECHO_REF_THRESHOLD) isEcho = true
+          // (2) Learned self-profile: the frame resembles JARVIS's own voice
+          // more than it resembles the user's. The margin keeps a genuine
+          // barge-in (which pushes the frame toward the user) from being eaten.
+          if (!isEcho && selfProfileRef.current) {
+            const selfSim = voiceSimilarity(bands, selfProfileRef.current)
+            const userSim = voiceSimilarity(bands, profile)
+            if (selfSim > userSim + ECHO_SELF_MARGIN) isEcho = true
+          }
+
+          // ── Learn the self-profile ───────────────────────────────────────
+          // Frames confirmed as echo (or, before a profile exists, any frame
+          // heard while speaking that does NOT look like the user) teach JARVIS
+          // what its own voice sounds like through this mic and room.
+          const userSim = voiceSimilarity(bands, profile)
+          if (isEcho || userSim < 0.45) {
+            const base = selfProfileRef.current ?? {
+              bands: bands.slice(),
+              bandStdDev: Array(bands.length).fill(0.12),
+              centroid: profile.centroid,
+              minEnergy: profile.minEnergy,
+              calibratedAt: Date.now(),
+            }
+            selfProfileRef.current = adaptVoiceProfile(base, bands, 0.08)
+            const now = Date.now()
+            if (now - selfPersistAtRef.current > 5000) {
+              selfPersistAtRef.current = now
+              saveSelfProfile(selfProfileRef.current)
+            }
+          }
+        }
+        echoDetectedRef.current = isEcho
+
         // Only score frames with clear speech energy — ignore silence/noise floor
         if (energy >= profile.minEnergy * 0.55) {
-          const sim = voiceSimilarity(bands, profile)
-          const frameMatch = sim >= 0.58  // statistical threshold — balanced for real-world use
+          // Echo can never count as the user, whatever it scores against the
+          // profile — this is what stops JARVIS answering its own voice.
+          // Pitch is weighted alongside spectral shape: a different speaker with
+          // a similar timbre still almost always sits at a different F0, and it
+          // is what separates the user from a synthesised voice.
+          const f0  = measureF0()
+          const raw = voiceSimilarity(bands, profile)
+          const sim = isEcho ? 0 : raw * 0.7 + pitchScore(f0, profile) * 0.3
+          const frameMatch = !isEcho && sim >= 0.58  // statistical threshold — balanced for real-world use
           // Rolling 30-frame window (~1 second at 30fps) — temporal consistency
           // Prevents TV/background voices matching a single unlucky frame
           voiceMatchWindowRef.current.push(frameMatch)
@@ -2108,11 +2457,13 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
           // (so we never train on the assistant's own TTS), gently blend it into
           // the stored profile so the fingerprint keeps adapting to the user's
           // voice over time. Persist at most once every 5s to avoid churn.
-          if (sim >= 0.72 && !isSpeakingRef.current) {
-            const adapted = adaptVoiceProfile(profile, bands)
+          if (sim >= 0.72 && !speaking) {
+            const adapted = adaptVoiceProfile(profile, bands, 0.05, f0)
             profile.bands = adapted.bands
             profile.bandStdDev = adapted.bandStdDev
             profile.centroid = adapted.centroid
+            profile.f0 = adapted.f0
+            profile.f0StdDev = adapted.f0StdDev
             const now = Date.now()
             if (now - profilePersistAtRef.current > 5000) {
               profilePersistAtRef.current = now
@@ -2126,8 +2477,11 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
           voiceMatchRef.current = win.filter(Boolean).length / win.length >= 0.55
         } else if (energy >= profile.minEnergy * 0.55) {
           // Window still filling — use a strict single-frame threshold
-          voiceMatchRef.current = voiceSimilarity(bands, profile) >= 0.60
+          voiceMatchRef.current = !isEcho && voiceSimilarity(bands, profile) >= 0.60
         }
+        // A frame identified as echo overrides the rolling window outright: no
+        // amount of prior user speech may let JARVIS's own voice through.
+        if (isEcho) voiceMatchRef.current = false
         // Mirror the live speaker-ID result to the extension so its Deepgram
         // escalation only fires for the calibrated user's voice too.
         if (extConnectedRef.current && voiceMatchRef.current !== lastSentMatch) {
@@ -2145,7 +2499,11 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
         try { window.postMessage({ __jarvisPage: true, type: 'voice-match-update', isMatch: true }, window.location.origin) } catch { /* noop */ }
       }
     }
-  }, [voiceMatchEnabled])
+}, [voiceMatchEnabled])
+
+  // Restore the learned self-voice fingerprint so echo rejection is already
+  // effective on the first reply of a new session.
+  useEffect(() => { selfProfileRef.current = loadSelfProfile() }, [])
 
   const stopVoiceMatching = useCallback(() => {
     if (voiceRafRef.current) cancelAnimationFrame(voiceRafRef.current)
@@ -2166,10 +2524,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     if (calibrating) return
     setCalibrating(true)
     // Stop any current TTS immediately — we cannot record while speaking
-    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-      window.speechSynthesis.cancel()
-      isSpeakingRef.current = false
-    }
+    turnRef.current.bargeIn('manual')
     // Also stop the wake listener so it doesn't compete with the calibration mic
     try { wakeRef.current?.stop() } catch { /* noop */ }
     try { dictationRef.current?.stop() } catch { /* noop */ }
@@ -2178,13 +2533,13 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     // fully clear and lets the user prepare to speak.
     let countdown = 11  // 3s pre-count + 8s record
     setCalibCountdown(countdown)
-    const preCountTick = setInterval(() => {
+    preCountTickRef.current = setInterval(() => {
       countdown--
       setCalibCountdown(countdown)
-      if (countdown <= 8) clearInterval(preCountTick)
+      if (countdown <= 8 && preCountTickRef.current) clearInterval(preCountTickRef.current)
     }, 1000)
     await new Promise<void>(resolve => setTimeout(resolve, 3000))
-    clearInterval(preCountTick)
+    if (preCountTickRef.current) clearInterval(preCountTickRef.current)
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -2192,18 +2547,25 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
       })
       const ctx = new (window.AudioContext || (window as any).webkitAudioContext)()
       const analyser = ctx.createAnalyser()
-      analyser.fftSize = 512; analyser.smoothingTimeConstant = 0.85
+      analyser.fftSize = VOICE_FFT_SIZE; analyser.smoothingTimeConstant = 0.85
       ctx.createMediaStreamSource(stream).connect(analyser)
       const buf = new Uint8Array(analyser.frequencyBinCount)
+      const timeBuf = new Uint8Array(analyser.fftSize)
       const samples: number[][] = []
       const energySamples: number[] = []
+      const f0Samples: number[] = []
       let recCountdown = 8
       setCalibCountdown(recCountdown)
       const tick = setInterval(() => { recCountdown--; setCalibCountdown(recCountdown) }, 1000)
       const samplingInterval = setInterval(() => {
         const bands = extractBands(analyser, buf)
         const energy = buf.reduce((s, v) => s + v, 0) / buf.length
-        if (energy > 8) { samples.push(bands); energySamples.push(energy) }
+        if (energy > 8) {
+          samples.push(bands); energySamples.push(energy)
+          // Voiced frames only — estimateF0 returns 0 for consonants and noise.
+          const f0 = estimateF0(analyser, timeBuf as Uint8Array<ArrayBuffer>, ctx.sampleRate)
+          if (f0 > 0) f0Samples.push(f0)
+        }
       }, 80)
       await new Promise<void>(resolve => setTimeout(resolve, 8000))
       clearInterval(samplingInterval); clearInterval(tick); setCalibCountdown(0)
@@ -2232,12 +2594,28 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
       const centroid = normalizedBands.reduce((s, v, i) => s + v * i, 0) /
         (AUDIO_BANDS * Math.max(normalizedBands.reduce((s, v) => s + v, 0), 0.01))
       const avgEnergy = energySamples.reduce((s, v) => s + v, 0) / energySamples.length
+
+      // Pitch: the median is used rather than the mean because autocorrelation
+      // occasionally locks onto a harmonic and reports double or half the true
+      // F0 — outliers a mean would absorb and a median ignores. Only recorded
+      // when enough voiced frames were captured to be meaningful.
+      let f0: number | undefined
+      let f0StdDev: number | undefined
+      if (f0Samples.length >= 10) {
+        const sorted = [...f0Samples].sort((a, b) => a - b)
+        f0 = sorted[Math.floor(sorted.length / 2)]
+        const variance = sorted.reduce((s, v) => s + (v - f0!) ** 2, 0) / sorted.length
+        f0StdDev = Math.max(8, Math.min(60, Math.sqrt(variance)))
+      }
+
       const profile: VoiceProfile = {
         bands: normalizedBands,
         bandStdDev,
         centroid,
         minEnergy: avgEnergy * 0.25,
         calibratedAt: Date.now(),
+        f0,
+        f0StdDev,
       }
       saveVoiceProfile(profile)
       setVoiceProfile(profile)
@@ -2264,13 +2642,13 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     setProfileTesting(true)
     setProfileTestResult(null)
     // Stop TTS so it doesn't bleed into the test recording
-    if (typeof window !== 'undefined' && 'speechSynthesis' in window) window.speechSynthesis.cancel()
+    turnRef.current.bargeIn('manual')
     try { wakeRef.current?.stop() } catch { /* noop */ }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       const ctx = new (window.AudioContext || (window as any).webkitAudioContext)()
       const analyser = ctx.createAnalyser()
-      analyser.fftSize = 512; analyser.smoothingTimeConstant = 0.80
+      analyser.fftSize = VOICE_FFT_SIZE; analyser.smoothingTimeConstant = 0.80
       ctx.createMediaStreamSource(stream).connect(analyser)
       const buf = new Uint8Array(analyser.frequencyBinCount)
       const sims: number[] = []
@@ -2333,6 +2711,23 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
       speak(last.content)
     }
   }, [messages, streaming, voiceEnabled, speak])
+
+  // ── Never park outside LISTENING ──────────────────────────────────────────
+  // A THINKING turn that produces no speech (voice off, a silent UI command, a
+  // failed request) would otherwise sit in THINKING until the machine's timeout.
+  // Once streaming has stopped, give TTS a moment to take over the turn — and if
+  // it doesn't, hand the turn back so JARVIS is listening again.
+  useEffect(() => {
+    if (streaming) return
+    if (turn.state !== 'THINKING') return
+    const id = setTimeout(() => {
+      if (turnRef.current.stateRef.current === 'THINKING') {
+        turnRef.current.endSpeaking()
+        resumeListeningAfterSpeech(0)
+      }
+    }, 800)
+    return () => clearTimeout(id)
+  }, [streaming, turn.state, resumeListeningAfterSpeech])
 
   // ── Auto-resolve MT5 context ───────────────────────────────────────────────
   // When no context has been published by /mt5-live (e.g. user navigated to
@@ -2728,6 +3123,10 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
       case 'close_chat': say(action.say); setOpen(false); return true
       case 'new_chat': say(action.say); void newChat(); return true
       case 'stop_listening': say(action.say); setWakeEnabled(false); return true
+      case 'stop_speaking':
+        // Yield the floor, keep the ears: cancel the reply and stay in LISTENING.
+        turnRef.current.bargeIn('manual')
+        return true
       case 'repeat': {
         // Re-read the most recent assistant response on demand.
         const lastReply = lastAssistantRef.current
@@ -2843,10 +3242,15 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
   // extension. With no extension present, the in-page mic is the fallback.
 
   // Stop any in-page recognizer (used when the extension takes over the mic).
+  // Detached, not merely stopped: a bare stop() re-arms itself from onend and
+  // the page would end up fighting the extension for the one microphone.
   const stopVoiceRecognizers = useCallback(() => {
-    try { wakeRef.current?.stop() } catch { /* noop */ }
-    try { dictationRef.current?.stop() } catch { /* noop */ }
-    setListening(false)
+    detachRecognizerRef.current(wakeRef.current)
+    detachRecognizerRef.current(dictationRef.current)
+    wakeRef.current = null
+    dictationRef.current = null
+    wakeStartedRef.current = false
+    markCapturingRef.current(false, 'page')
   }, [])
 
   // Let the extension own the mic — suppress the in-page recognizers so the two
@@ -2938,6 +3342,9 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     // Learn the user's words + auto-correct toward their vocabulary.
     const t = learnAndCorrect(text)
     if (!t) return
+    // The user addressed JARVIS through the extension — open the follow-up
+    // window so the next utterance needs no wake word here either.
+    touchConversation()
     if (!openRef.current) setOpen(true)
     const handled = commandRef.current(t)
     if (handled) return
@@ -2956,7 +3363,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     }
     // AI intent fallback: try to resolve natural phrasing to an action before chat.
     resolveIntentRef.current(t).then(done => { if (!done) sendRef.current(t) })
-  }, [speak, learnAndCorrect])
+  }, [speak, learnAndCorrect, touchConversation])
 
   // Send a notification to the extension → shows as a desktop notification.
   const notifyExtension = useCallback((title: string, body: string) => {
@@ -3027,14 +3434,11 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
       robotLockedRef.current = locked
       setRobotLocked(locked)
       if (locked) {
-        // Stop all in-page speech recognition
+        // Stop all in-page speech recognition — the extension robot now owns the
+        // conversation. Cancelling through the machine keeps its state honest.
         try { dictationRef.current?.stop() } catch { /* noop */ }
         try { wakeRef.current?.stop() } catch { /* noop */ }
-        // Stop any active TTS
-        if (typeof window !== 'undefined' && window.speechSynthesis) {
-          window.speechSynthesis.cancel()
-        }
-        isSpeakingRef.current = false
+        turnRef.current.bargeIn('manual')
       }
     }
     // Also listen for extension robot-mode message
@@ -3047,10 +3451,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
         if (locked) {
           try { dictationRef.current?.stop() } catch { /* noop */ }
           try { wakeRef.current?.stop() } catch { /* noop */ }
-          if (typeof window !== 'undefined' && window.speechSynthesis) {
-            window.speechSynthesis.cancel()
-          }
-          isSpeakingRef.current = false
+          turnRef.current.bargeIn('manual')
         }
       }
       // Relay wake-word events to robot avatar
@@ -3153,11 +3554,18 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
           }
           break
         case 'status':
-          // Mirror the extension's ACTUAL listening state onto mic ownership and
-          // the indicator — ownership follows listening + voiceReady, handled by
-          // markExtConnected (which reads d.listening and d.voiceReady).
+          // `d.listening` means "the extension's recogniser is ARMED". That is
+          // its resting state — it is armed continuously, in silence, for as long
+          // as voice is enabled — so it decides mic OWNERSHIP and nothing else.
           markExtConnected(d)
-          setListening(!!d.listening)
+          // `d.capturing` is the extension's separate, honest "a user utterance
+          // is being captured right now" flag. Feeding `d.listening` in here is
+          // the bug this whole change exists to kill: it latched the indicator on
+          // permanently and, worse, `listeningRef` is the guard on every in-page
+          // recogniser re-arm, so a latched true left JARVIS visibly "listening"
+          // and actually deaf. Extensions too old to send `capturing` simply
+          // never claim it — they can no longer latch anything either.
+          markCapturingRef.current(!!d.capturing, 'ext')
           break
       }
     }
@@ -3253,8 +3661,13 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
 
   // ── Mic dictation (single utterance → fills input → auto-sends) ────────────
   const stopDictation = useCallback(() => {
+    // Deliberate end-of-utterance: let onend run (it dispatches the command and
+    // re-arms the wake listener), but release the capture claim synchronously so
+    // nothing can observe "listening" for a recogniser that is already closing.
     try { dictationRef.current?.stop() } catch { /* noop */ }
-    setListening(false)
+    // A Whisper capture is the other way the page can hold the mic.
+    try { whisperRecorderRef.current?.stop() } catch { /* noop */ }
+    markCapturingRef.current(false, 'page')
     setRecording(false)
   }, [])
 
@@ -3275,20 +3688,34 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
   }, [])
 
   const startDictation = useCallback(() => {
+    // No mic gate any more: dictation may open at any point in the turn,
+    // including while JARVIS is still speaking (the results are dropped until
+    // the machine confirms a barge-in — see the SPEAKING check in onresult).
     if (extVoiceReadyRef.current) return  // extension owns the mic — no in-page recognizer
 
     // A: AI Speech (Whisper) — uses MediaRecorder for high-fidelity capture
     if (aiSpeechEnabled) {
       void (async () => {
         try {
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+          const stream = await navigator.mediaDevices.getUserMedia({
+            // Same processing as the turn machine's capture: with AEC on, this
+            // recorder no longer has to be killed when JARVIS starts talking.
+            audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+          })
           const recorder = new MediaRecorder(stream)
           whisperRecorderRef.current = recorder
           whisperStreamRef.current = stream
           const chunks: Blob[] = []
-          setListening(true)
+          // Torn down while getUserMedia was in flight — don't open a capture
+          // nobody will ever close.
+          if (voiceDisposedRef.current) {
+            try { stream.getTracks().forEach(t => t.stop()) } catch { /* noop */ }
+            whisperRecorderRef.current = null
+            whisperStreamRef.current = null
+            return
+          }
+          markCapturingRef.current(true, 'page')
           setRecording(true)
-          listeningRef.current = true
 
           // Stop wake listener while actively dictating
           try { wakeRef.current?.stop() } catch { /* noop */ }
@@ -3296,10 +3723,10 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
           recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data) }
           recorder.onstop = async () => {
             setRecording(false)
-            setListening(false)
-            listeningRef.current = false
-            // Aborted because JARVIS started speaking — discard the capture so it
-            // is never transcribed (and don't resume wake; speak() handles that).
+            markCapturingRef.current(false, 'page')
+            // Explicitly abandoned (unmount / robot lock) — discard the capture
+            // instead of transcribing it. Note this is NOT used for "JARVIS
+            // started speaking" any more: the capture survives a reply.
             if (whisperAbortedRef.current) {
               whisperAbortedRef.current = false
               try { stream.getTracks().forEach(t => t.stop()) } catch { /* noop */ }
@@ -3349,7 +3776,11 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
             whisperStreamRef.current = null
             // Don't auto-resume wake while JARVIS is talking — speak() resumes it
             // after it finishes so the assistant never records its own voice.
-            if (wakeEnabledRef.current && !isSpeakingRef.current) setTimeout(() => startWakeRef.current(), 600)
+            if (voiceDisposedRef.current) return
+            if (wakeEnabledRef.current && !isSpeakingRef.current) setTimeout(() => {
+              if (voiceDisposedRef.current) return
+              startWakeRef.current()
+            }, 600)
           }
 
           recorder.start()
@@ -3358,9 +3789,9 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
           setTimeout(() => { if (recorder.state === 'recording') recorder.stop() }, 4500)
         } catch (err) {
           console.error('AI recording failed', err)
-          setListening(false)
+          markCapturingRef.current(false, 'page')
           setRecording(false)
-          listeningRef.current = false
+          if (voiceDisposedRef.current) return
           if (wakeEnabledRef.current) startWakeRef.current()
         }
       })()
@@ -3370,6 +3801,14 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     // B: Standard Web Speech API (Fast, low-bandwidth)
     const SR = getSpeechRecognition()
     if (!SR) return
+    // Never open a recogniser onto a torn-down component: refs outlive unmount,
+    // so without this the async restart paths below would resurrect the mic.
+    if (voiceDisposedRef.current) return
+    // Detach the previous dictation recogniser rather than stopping it — a bare
+    // stop() would fire its onend, which schedules yet another start, and the two
+    // would leapfrog each other with only the newest tracked by the ref.
+    detachRecognizerRef.current(dictationRef.current)
+    dictationRef.current = null
     // Stop wake listener while actively dictating (avoid double-capture).
     try { wakeRef.current?.stop() } catch { /* noop */ }
     const rec = new SR()
@@ -3380,13 +3819,22 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     let finalText = ''
     let lowConfSeen = false   // a measured-but-below-threshold final was dropped
     rec.onresult = (e: any) => {
-      // Self-hearing hard gate: NEVER transcribe while JARVIS is talking (or in
-      // the post-speech echo tail) unless the camera can SEE the user's mouth
-      // moving — JARVIS's own TTS can never move the user's mouth.
-      if ((isSpeakingRef.current || micGatedRef.current) && !cameraSeesUserTalking()) return
+      // Self-hearing gate, full-duplex edition: the recogniser KEEPS RUNNING
+      // while JARVIS talks, but its text is dropped for as long as the machine
+      // is still in SPEAKING. Real user speech flips the machine to LISTENING
+      // (energy barge-in, ~150ms) before the recogniser has finalised anything,
+      // so the user's words survive and JARVIS's own echo never does. The camera
+      // is an independent override: TTS cannot move the user's mouth.
+      if (voiceStateRef.current === 'SPEAKING' && !cameraSeesUserTalking()) return
+      // Self-voice gate: the mic analyser identified this audio as JARVIS's own
+      // output returning through the speakers. Never transcribe it.
+      if (echoDetectedRef.current) return
       // Camera gate: when the camera is live, only accept speech while the
       // user's mouth is (or was just) moving.
       if (!mouthGateOpen()) return
+      // Speaker gate: with voice ID on, only the calibrated user may dictate —
+      // otherwise a television or a second person in the room can issue commands.
+      if (voiceMatchEnabledRef.current && voiceAudioCtxRef.current && !voiceMatchRef.current) return
       let interim = ''
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const t = e.results[i][0].transcript
@@ -3410,14 +3858,19 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
         silenceTimerRef.current = setTimeout(() => { try { rec.stop() } catch { /* noop */ } }, 900)
       }
     }
-    rec.onerror = () => setListening(false)
+    rec.onerror = () => { markCapturingRef.current(false, 'page') }
     rec.onend = () => {
       if (silenceTimerRef.current) { clearTimeout(silenceTimerRef.current); silenceTimerRef.current = null }
-      setListening(false)
+      // The capture is over the instant onend fires — before any dispatch, which
+      // can be async and can even fail. Releasing it here (not in a callback) is
+      // what guarantees silence always leaves the listening state.
+      markCapturingRef.current(false, 'page')
+      if (dictationRef.current === rec) dictationRef.current = null
       // Learn the user's words + auto-correct toward their vocabulary.
       const text = learnAndCorrect(finalText)
       if (text) {
         dgMissCountRef.current = 0  // heard a command cleanly → reset miss streak
+        touchConversation()         // keep the follow-up window open
         // 1. Try a hands-free navigation/UI command first
         const handled = commandRef.current(text)
         if (!handled) {
@@ -3445,13 +3898,33 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
         // measured-but-rejected guess is a clear low-confidence miss (escalates
         // immediately); a totally empty result waits for the consecutive-miss gate.
         noteVoiceMissRef.current(lowConfSeen ? 'low_confidence' : 'empty')
+        // Silence at the mic ends the exchange — otherwise a conversation that
+        // has clearly finished keeps reopening dictation until it times out.
+        endConversation()
       }
-      if (wakeEnabledRef.current) setTimeout(() => startWakeRef.current(), 600)
+      // Re-open the mic. When the reply is spoken, speak() has already taken
+      // ownership of the resume and this backs off; when it is silent (a
+      // handled UI command, or a text-only answer) this is the only thing that
+      // reopens listening, so it must never be skipped or JARVIS goes deaf.
+      if (voiceDisposedRef.current) return
+      setTimeout(() => {
+        // Teardown may have happened during the 600ms wait — and teardown is
+        // exactly when this fires, because stopping a recogniser IS what calls
+        // onend. Without this guard the unmount path builds a fresh recogniser
+        // that nothing holds and nothing can ever stop.
+        if (voiceDisposedRef.current) return
+        if (voiceStateRef.current === 'SPEAKING' || listeningRef.current) return
+        if (inConversation() && voiceEnabledRef.current) { startDictationRef.current(); return }
+        if (wakeEnabledRef.current) startWakeRef.current()
+      }, 600)
     }
     dictationRef.current = rec
-    setListening(true)
-    try { rec.start() } catch { setListening(false) }
-  }, [aiSpeechEnabled, speak, noteAndGetThreshold, learnAndCorrect, pickAlternative, cameraSeesUserTalking, mouthGateOpen])
+    markCapturingRef.current(true, 'page')
+    try { rec.start() } catch {
+      dictationRef.current = null
+      markCapturingRef.current(false, 'page')
+    }
+  }, [aiSpeechEnabled, speak, noteAndGetThreshold, learnAndCorrect, pickAlternative, cameraSeesUserTalking, mouthGateOpen, touchConversation, endConversation, inConversation])
 
   // ── Shared one-shot command dispatcher ────────────────────────────────────
   // Mirrors the dictation pipeline so a single-utterance wake ("Jarvis,
@@ -3462,6 +3935,9 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     const cmd = learnAndCorrect(text)
     if (!cmd) return
     dgMissCountRef.current = 0  // a dispatched command is a hit → reset miss streak
+    // The user just spoke to JARVIS — open (or extend) the follow-up window so
+    // the next thing they say needs no wake word.
+    touchConversation()
     setInput(cmd)
     const handled = commandRef.current(cmd)
     if (handled) return
@@ -3479,7 +3955,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     } else {
       resolveIntentRef.current(cmd).then(done => { if (!done) sendRef.current(cmd) })
     }
-  }, [speak, learnAndCorrect])
+  }, [speak, learnAndCorrect, touchConversation])
   dispatchVoiceCommandRef.current = dispatchVoiceCommand
 
   // ── Wake-word listener ("Hi Jarvis") — continuous background recognition ──
@@ -3488,11 +3964,18 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
   const startWake = useCallback(() => {
     const SR = getSpeechRecognition()
     if (!SR || !wakeEnabledRef.current) return
+    if (voiceDisposedRef.current) return   // torn down — never re-open the mic
     if (extVoiceReadyRef.current) return  // extension owns the mic — no in-page recognizer
     if (wakeErrorPausedRef.current) return  // paused after a mic error — re-armed on next gesture
-    // Don't start recognition if we're still in the post-speech echo-tail blackout
-    if (micGatedRef.current) return
-    try { wakeRef.current?.stop() } catch { /* noop */ }
+    // Deliberately NO speaking/blackout check: the wake listener runs through
+    // JARVIS's own replies so the user can always cut in.
+    // DETACH the outgoing recogniser, don't merely stop it: stop() fires onend,
+    // onend schedules another start, and the result is two live recognisers with
+    // only the newest reachable through `wakeRef` — a mic that keeps itself hot
+    // no matter what anyone stops. StrictMode's double mount hits this every time.
+    detachRecognizerRef.current(wakeRef.current)
+    wakeRef.current = null
+    wakeStartedRef.current = false
     const rec = new SR()
     rec.lang = 'en-US'
     rec.continuous = true
@@ -3506,9 +3989,15 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
         // conf===0 means Chrome didn't measure confidence (“unmeasured”) — let those through.
         if (conf > 0 && conf < threshold) continue
 
+        // Self-voice gate: the mic analyser identified this moment's audio as
+        // JARVIS's own output coming back in. Never act on it.
+        if (echoDetectedRef.current) continue
+
         // Voice profile gate: when speaker ID is enabled, reject non-matching voices.
         // This is the PRIMARY defence against TV/background voices.
-        if (voiceMatchEnabled && !voiceMatchRef.current) continue
+        // Read through the ref — startWake is memoised and would otherwise
+        // capture a stale `voiceMatchEnabled`, silently disabling the gate.
+        if (voiceMatchEnabledRef.current && !voiceMatchRef.current) continue
 
         // Camera gate: when the camera is live, only the user's moving mouth
         // opens hearing — JARVIS's own TTS can never pass this, so it cannot
@@ -3516,13 +4005,14 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
         if (!mouthGateOpen()) continue
         // While JARVIS is speaking with the camera live, require the camera to
         // actually SEE the user talking before honouring any speech.
-        if (isSpeakingRef.current && faceFresh() && !cameraSeesUserTalking()) continue
+        if (voiceStateRef.current === 'SPEAKING' && faceFresh() && !cameraSeesUserTalking()) continue
 
-        // Interrupt gate: user says the wake name while JARVIS is speaking →
-        // interrupt. Requires the wake phrase (not any speech) to prevent TV
-        // voices interrupting.
-        if (isSpeakingRef.current && hasWakeWord(t, wakeRequireGreetingRef.current)) {
-          interruptSpeech()
+        // Interrupt gate: the wake name spoken over a reply. The energy monitor
+        // has almost always already barged in by the time a transcript arrives —
+        // this path exists for the case where it hasn't (very quiet speaker,
+        // headphones) and for carrying the command in the same breath.
+        if (voiceStateRef.current === 'SPEAKING' && hasWakeWord(t, wakeRequireGreetingRef.current)) {
+          turnRef.current.bargeIn('wake-word')
           try { rec.stop() } catch { /* noop */ }
           if (!openRef.current) setOpen(true)
           const cmd = stripWakePhrase(t, wakeRequireGreetingRef.current)
@@ -3534,6 +4024,20 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
           } else {
             setTimeout(() => startDictationRef.current(), 200)
           }
+          return
+        }
+
+        // Post-barge-in window: JARVIS has just been cut off, so whatever this
+        // listener hears next IS the user's command — no wake word required,
+        // because they are already mid-sentence.
+        if (bargeInAtRef.current && Date.now() - bargeInAtRef.current < BARGE_IN_CAPTURE_MS) {
+          if (!e.results[i].isFinal) continue
+          const spoken = stripWakePhrase(t, false).trim() || t.trim()
+          if (spoken.length < 2) continue
+          bargeInAtRef.current = 0
+          if (bargeInFallbackRef.current) { clearTimeout(bargeInFallbackRef.current); bargeInFallbackRef.current = null }
+          if (!openRef.current) setOpen(true)
+          dispatchVoiceCommandRef.current(spoken)
           return
         }
 
@@ -3571,17 +4075,24 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
       }
     }
     rec.onend = () => {
+      // A superseded recogniser must not speak for the live one, and must not
+      // restart itself: `rec !== wakeRef.current` means something already
+      // replaced (or detached) this one, and it is now nothing but a source of
+      // duplicate microphones.
+      if (wakeRef.current !== rec) return
       // Wake recognizer is no longer running — the watchdog may re-arm it.
       wakeStartedRef.current = false
-      // While JARVIS is speaking we normally keep the mic muted (speak()'s onend
-      // resumes wake afterwards). BUT when speaker-ID barge-in is enabled we keep
-      // the wake recognizer alive during speech so the user can interrupt — the
-      // stored-voice gate above rejects JARVIS's own voice.
-      const speakingBlocks = isSpeakingRef.current && !canBargeIn()
-      if (wakeEnabledRef.current && !listeningRef.current && !speakingBlocks && !wakeErrorPausedRef.current) {
+      wakeRef.current = null
+      // Torn down: this onend IS the teardown's own stop() coming back. Restart
+      // here and the mic outlives the component.
+      if (voiceDisposedRef.current) return
+      // Restart unconditionally, INCLUDING while JARVIS is speaking: the listener
+      // must be alive for the whole reply or the wake-word interrupt path dies
+      // with it. Self-hearing is handled by the gates in onresult, not by silence.
+      if (wakeEnabledRef.current && !listeningRef.current && !wakeErrorPausedRef.current) {
         setTimeout(() => {
-          const stillBlocked = isSpeakingRef.current && !canBargeIn()
-          if (wakeEnabledRef.current && !listeningRef.current && !stillBlocked && !wakeErrorPausedRef.current) startWake()
+          if (voiceDisposedRef.current) return
+          if (wakeEnabledRef.current && !listeningRef.current && !wakeErrorPausedRef.current) startWakeRef.current()
         }, 400)
       }
     }
@@ -3590,38 +4101,49 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     wakeStartedRef.current = false
     wakeStartAtRef.current = Date.now()
     try { rec.start() } catch { /* noop */ }
-  }, [speak, interruptSpeech, noteAndGetThreshold, canBargeIn, mouthGateOpen, faceFresh, cameraSeesUserTalking])
+  }, [speak, noteAndGetThreshold, mouthGateOpen, faceFresh, cameraSeesUserTalking])
 
   startDictationRef.current = startDictation
   startWakeRef.current = startWake
 
   // ── Toggle wake mode on/off ───────────────────────────────────────────────
+  // Depends on `wakeEnabled` ONLY. It used to depend on `startWake` as well,
+  // which is a useCallback over speak/gates and so changed identity on ordinary
+  // re-renders: every change re-ran this effect, whose cleanup stopped the live
+  // recogniser (waking its onend → a restart 400ms later) while the body started
+  // another — two recognisers on one microphone, one of them unreachable. The
+  // current callback is reached through `startWakeRef`, so identity churn is
+  // irrelevant and exactly one recogniser exists at a time.
   useEffect(() => {
-    if (wakeEnabled) {
-      startWake()
-    } else {
-      try { wakeRef.current?.stop() } catch { /* noop */ }
+    if (wakeEnabled) startWakeRef.current()
+    else {
+      detachRecognizerRef.current(wakeRef.current)
+      wakeRef.current = null
+      wakeStartedRef.current = false
     }
-    return () => { try { wakeRef.current?.stop() } catch { /* noop */ } }
-  }, [wakeEnabled, startWake])
+    return () => {
+      detachRecognizerRef.current(wakeRef.current)
+      wakeRef.current = null
+      wakeStartedRef.current = false
+    }
+  }, [wakeEnabled])
 
   // ── In-page wake watchdog (heavy chart pages) ─────────────────────────────
   // On chart / WebGL pages the Web Speech recognizer can silently die (start()
   // throws and is swallowed, or onstart never fires) so JARVIS goes deaf until a
   // gesture. This 3s backstop re-arms the wake recognizer whenever it SHOULD be
-  // running (page owns the mic, wake on, not in dictation / speaking / blackout /
-  // robot-lock) but hasn't reached onstart within a few seconds. It never fires
-  // while the extension owns the mic or during normal listening/speaking.
+  // running (page owns the mic, wake on, not in dictation / robot-lock) but
+  // hasn't reached onstart within a few seconds. It deliberately still fires
+  // while JARVIS is SPEAKING — that is exactly when the listener must be alive.
   useEffect(() => {
     if (!speechSupported) return
     const id = setInterval(() => {
+      if (voiceDisposedRef.current) return          // torn down / tab hidden
       if (!wakeEnabledRef.current) return
       if (extVoiceReadyRef.current) return          // extension owns the mic
       if (listeningRef.current) return              // capturing a command
       if (robotLockedRef.current) return            // robot-mode exclusive lock
       if (wakeErrorPausedRef.current) return        // paused after mic denial (gesture re-arms)
-      if (micGatedRef.current) return               // post-speech echo blackout
-      if (isSpeakingRef.current && !canBargeIn()) return  // muted while JARVIS talks
       // Healthy recognizer → nothing to do. Only re-arm when a start never
       // succeeded within 3s (silent failure), avoiding restarts during silence.
       if (wakeStartedRef.current) return
@@ -3629,7 +4151,20 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
       try { startWakeRef.current() } catch { /* noop */ }
     }, 3000)
     return () => clearInterval(id)
-  }, [speechSupported, canBargeIn])
+  }, [speechSupported])
+
+  // ── The always-open capture that makes barge-in possible ──────────────────
+  // Opened once while voice is in use and kept running through every state; only
+  // switching voice off entirely (or the extension/robot taking ownership of the
+  // device) tears it down. It is never stopped to silence feedback.
+  useEffect(() => {
+    const wanted = (voiceEnabled || wakeEnabled) && !robotLocked && !extVoiceReady
+    // A disposed component (tab hidden, route changing, unmounting) must never
+    // re-open the device from a state change that happens to land mid-teardown.
+    if (wanted && !voiceDisposedRef.current) void turn.start()
+    else turn.stop()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [voiceEnabled, wakeEnabled, robotLocked, extVoiceReady])
 
   // ── Ensure wake listening starts after the first user gesture ─────────────
   // Browsers block mic access until the user interacts with the page, so the
@@ -3642,6 +4177,8 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
       // browser re-prompt for the mic, so JARVIS self-heals instead of staying
       // deaf after a one-off denial.
       wakeErrorPausedRef.current = false
+      // The gesture is also the moment the barge-in capture is allowed to open.
+      if (voiceEnabledRef.current || wakeEnabledRef.current) void turnRef.current.start()
       if (wakeEnabledRef.current && !listeningRef.current) {
         try { startWake() } catch { /* noop */ }
       }
@@ -3661,11 +4198,123 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     }
   }, [speechSupported, startWake])
 
-  // ── Cleanup speech on unmount ─────────────────────────────────────────────
-  useEffect(() => () => {
-    try { dictationRef.current?.stop() } catch { /* noop */ }
-    try { wakeRef.current?.stop() } catch { /* noop */ }
-    if (typeof window !== 'undefined' && 'speechSynthesis' in window) window.speechSynthesis.cancel()
+  // ── The one teardown ──────────────────────────────────────────────────────
+  // Every way voice can end — unmount, route change, tab hidden, page unload —
+  // funnels through here, because partial teardowns are what left orphaned
+  // recognisers holding a live microphone with the UI stuck on "Listening…".
+  //
+  // Order matters: `voiceDisposedRef` is set FIRST, so any onend/onerror woken up
+  // by the stops below sees a disposed component and declines to restart. The
+  // recognisers are then detached (handlers nulled) rather than merely stopped,
+  // so they cannot re-arm even if a timer already in flight reaches them.
+  const teardownVoice = useCallback(() => {
+    voiceDisposedRef.current = true
+
+    // Timers that could restart something after we are gone.
+    if (voiceRafRef.current) cancelAnimationFrame(voiceRafRef.current)
+    if (miniRafRef.current) cancelAnimationFrame(miniRafRef.current)
+    if (miniThrottle.current) clearTimeout(miniThrottle.current)
+    if (silenceTimerRef.current) { clearTimeout(silenceTimerRef.current); silenceTimerRef.current = null }
+    if (postSpeechGateRef.current) { clearTimeout(postSpeechGateRef.current); postSpeechGateRef.current = null }
+    if (bargeInFallbackRef.current) { clearTimeout(bargeInFallbackRef.current); bargeInFallbackRef.current = null }
+    if (learnPersistTimerRef.current) clearTimeout(learnPersistTimerRef.current)
+    if (extReleaseTimerRef.current) { clearTimeout(extReleaseTimerRef.current); extReleaseTimerRef.current = null }
+    if (preCountTickRef.current) { clearInterval(preCountTickRef.current); preCountTickRef.current = null }
+
+    // Recognisers — detached, so their onend cannot rebuild them.
+    detachRecognizerRef.current(dictationRef.current)
+    detachRecognizerRef.current(wakeRef.current)
+    dictationRef.current = null
+    wakeRef.current = null
+    wakeStartedRef.current = false
+
+    // Whisper capture: abandon rather than transcribe, and stop its tracks.
+    whisperAbortedRef.current = true
+    try { whisperRecorderRef.current?.stop() } catch { /* noop */ }
+    whisperRecorderRef.current = null
+    try { whisperStreamRef.current?.getTracks().forEach(t => t.stop()) } catch { /* noop */ }
+    whisperStreamRef.current = null
+
+    // The always-open barge-in capture and anything on the speakers.
+    try { turnRef.current.stop() } catch { /* noop */ }
+    try { voiceStreamRef.current?.getTracks().forEach(t => t.stop()) } catch { /* noop */ }
+    voiceStreamRef.current = null
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      try { window.speechSynthesis.cancel() } catch { /* noop */ }
+    }
+
+    // Audio contexts.
+    try { voiceAudioCtxRef.current?.close() } catch { /* noop */ }
+    voiceAudioCtxRef.current = null
+    if (ttsRafRef.current) { try { cancelAnimationFrame(ttsRafRef.current) } catch { /* noop */ } }
+    try { ttsCtxRef.current?.close() } catch { /* noop */ }
+    ttsCtxRef.current = null
+
+    // Release the capture claim whoever holds it, and say so out loud: other
+    // surfaces (the JARVIS Room orb) latch on the last value they were told, so
+    // going quiet mid-"listening" is what left the orb glowing forever.
+    markCapturingRef.current(false, 'page')
+    markCapturingRef.current(false, 'ext')
+    if (typeof window !== 'undefined') {
+      try {
+        window.postMessage(
+          { __jarvisPage: true, type: 'jarvis-activity', listening: false, thinking: false, state: 'IDLE' },
+          window.location.origin,
+        )
+        window.postMessage({ __jarvisPage: true, type: 'jarvis-voice-state', state: 'IDLE' }, window.location.origin)
+        window.postMessage({ __jarvisPage: true, type: 'speak-status', speaking: false }, window.location.origin)
+      } catch { /* noop */ }
+    }
+  }, [])
+  const teardownVoiceRef = useRef(teardownVoice)
+  teardownVoiceRef.current = teardownVoice
+
+  // Coming back from a *pausing* teardown (tab hidden). Unmount and unload never
+  // resume — nothing is left to resume into.
+  const resumeVoice = useCallback(() => {
+    if (!voiceDisposedRef.current) return
+    voiceDisposedRef.current = false
+    if (voiceEnabledRef.current || wakeEnabledRef.current) void turnRef.current.start()
+    if (wakeEnabledRef.current && !extVoiceReadyRef.current) startWakeRef.current()
+  }, [])
+  const resumeVoiceRef = useRef(resumeVoice)
+  resumeVoiceRef.current = resumeVoice
+
+  // ── Teardown triggers ─────────────────────────────────────────────────────
+  // Unmount, Next.js route change, tab hidden, page unload. PaulChat lives in
+  // the Layout and survives navigation, so a route change and a hidden tab are
+  // *pauses* — teardown then resume — while unmount and unload are final. Either
+  // way the listening state lands on idle, which is the point.
+  // Deliberately mounted ONCE (`[]`), with the router reached through a ref.
+  // Depending on `router` here would re-run this on every render that hands back
+  // a new router object — and its cleanup is a full teardown, so voice would be
+  // destroyed and rebuilt continuously and never actually run.
+  const routerEventsRef = useRef(router.events)
+  routerEventsRef.current = router.events
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') teardownVoiceRef.current()
+      else resumeVoiceRef.current()
+    }
+    const onPause = () => teardownVoiceRef.current()
+    const onResume = () => { if (document.visibilityState !== 'hidden') resumeVoiceRef.current() }
+    const events = routerEventsRef.current
+    document.addEventListener('visibilitychange', onVisibility)
+    window.addEventListener('pagehide', onPause)
+    window.addEventListener('beforeunload', onPause)
+    events?.on?.('routeChangeStart', onPause)
+    events?.on?.('routeChangeComplete', onResume)
+    events?.on?.('routeChangeError', onResume)
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility)
+      window.removeEventListener('pagehide', onPause)
+      window.removeEventListener('beforeunload', onPause)
+      events?.off?.('routeChangeStart', onPause)
+      events?.off?.('routeChangeComplete', onResume)
+      events?.off?.('routeChangeError', onResume)
+      teardownVoiceRef.current()
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const toggleMic = () => {
@@ -3675,7 +4324,9 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
 
   const toggleVoice = () => {
     setVoiceEnabled(v => {
-      if (v && typeof window !== 'undefined' && 'speechSynthesis' in window) window.speechSynthesis.cancel()
+      // Turning voice off mid-reply cancels the turn through the machine, so the
+      // state cannot be left on SPEAKING with nothing playing.
+      if (v) turnRef.current.bargeIn('manual')
       return !v
     })
   }
@@ -3741,11 +4392,20 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     } catch { /* ignore */ }
   }
 
-  // Derive the robot animation state from the live voice pipeline.
+  // Derive the robot animation state from the turn machine — one mapping, and it
+  // re-renders on every transition (the old version read a ref, so the robot only
+  // caught up whenever something else happened to re-render the chat).
+  // `turn.state === 'LISTENING'` is the machine's ARMED state — it is true for as
+  // long as the microphone capture is open, which (with the wake word on) means
+  // permanently. Feeding it in here pinned the robot to 'listening' forever: the
+  // label never cleared, and because 'listening' is one of the avatar's
+  // STOP_STATES the robot also stopped walking and could never return to idle.
+  // The robot reacts to the user actually speaking — a recogniser capturing an
+  // utterance, or the energy monitor confirming voice — never to mere readiness.
   const robotState: RobotState =
-    isSpeakingRef.current ? 'talking'
-    : streaming ? 'thinking'
-    : (listening || recording) ? 'listening'
+    turn.state === 'SPEAKING'  ? 'talking'
+    : turn.state === 'THINKING' || streaming ? 'thinking'
+    : listening || recording || turn.userSpeaking ? 'listening'
     : 'idle'
 
   return (
@@ -3759,7 +4419,11 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
           energy={robotEnergy}
           avatarStyle={avatarStyle}
           extRobotActive={robotLocked}
-          useOpenHumanMascot={true}
+          // The Three.js robot is the actual JARVIS avatar (sentinel / aurora /
+          // ember). This was pinned to the flat SVG mascot, which bypassed the
+          // whole 3D path — no canvas was ever created and the variant system,
+          // worker and scene code were dead.
+          useOpenHumanMascot={false}
           onClick={() => !robotLocked && setOpen(o => !o)}
         />
       )}
@@ -4092,6 +4756,40 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
                       {label}
                     </button>
                   ))}
+                </div>
+              </div>
+
+              {/* ── Barge-in threshold ──────────────────────────────────── */}
+              <div className="border-t border-gray-800 pt-3 space-y-2">
+                <div className="text-[11px] font-semibold text-purple-300 uppercase tracking-wide">Interrupting JARVIS</div>
+                <p className="text-[9px] text-gray-500 leading-relaxed">
+                  The mic now stays open while JARVIS talks, so you can cut in at any time.
+                  This sets how loudly you must speak to be taken as an interruption rather
+                  than as JARVIS hearing his own voice. Lower = easier to interrupt.
+                </p>
+
+                <div>
+                  <label className="flex justify-between text-[10px] text-gray-500 mb-1">
+                    <span>Barge-in threshold</span>
+                    <span className="text-purple-300">{bargeInGate.toFixed(3)} RMS</span>
+                  </label>
+                  <input
+                    type="range" min={0.04} max={0.18} step={0.005}
+                    value={bargeInGate}
+                    onChange={e => {
+                      const v = Number(e.target.value)
+                      setBargeInGate(v)
+                      localStorage.setItem('paul.bargeInGate', String(v))
+                    }}
+                    className="w-full accent-purple-500"
+                  />
+                  <div className="flex justify-between text-[9px] text-gray-600 mt-0.5">
+                    <span>Sensitive</span><span>Balanced</span><span>Strict</span>
+                  </div>
+                </div>
+                <div className="text-[9px] text-gray-500">
+                  Turn state: <span className="text-cyan-300">{turn.state}</span>
+                  {turn.captureLive ? ' · mic open' : ' · mic closed'}
                 </div>
               </div>
 

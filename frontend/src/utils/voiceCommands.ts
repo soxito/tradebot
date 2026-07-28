@@ -24,6 +24,10 @@ export interface VoiceAction {
     | 'close_chat'
     | 'new_chat'
     | 'stop_listening'
+    // Yield the floor: stop reading the current reply but KEEP listening. The
+    // spoken counterpart of barge-in, for when the user would rather say "that's
+    // enough" than talk over the assistant.
+    | 'stop_speaking'
     | 'repeat'
     | 'help'
     // ── Hands-free form / UI control ──
@@ -152,6 +156,11 @@ export function interpretVoiceCommand(raw: string): VoiceAction | null {
   if (!t) return null
 
   // ── Global widget controls ──────────────────────────────────────────────
+  // Yield the floor. Checked BEFORE stop_listening (which ends the conversation)
+  // because these phrases mean "stop talking", not "stop hearing me" — the mic
+  // must stay open. `say` is empty: acknowledging out loud would defeat it.
+  if (/\b(stop talking|stop speaking|be quiet|quiet please|shut up|shush|hush|silence|that('?| i)s enough|enough of that)\b/.test(t))
+    return { type: 'stop_speaking', say: '' }
   if (/\b(stop listening|stop the mic|mute the mic|stand down|that('?| i)s all)\b/.test(t))
     return { type: 'stop_listening', say: 'Standing by, Sir.' }
   // Re-read the last response on demand ("read that again", "repeat", etc.)
@@ -309,10 +318,35 @@ function nameLike(w: string): boolean {
   if (w === 'jarvis' || w === 'paul' || w === 'sox') return true
   if (lev(w, 'jarvis') <= 2) return true
   if (w.length >= 3 && lev(w, 'paul') <= 1) return true
-  // Common speech-to-text mis-hearings of the short name "sox".
-  if (w === 'socks' || w === 'sax' || w === 'sacks' || w === 'sachs') return true
+  // Common speech-to-text mis-hearings of the short name "sox". It is only
+  // three phonemes, so engines render it in many ways; an edit-distance rule
+  // is too loose for a word this short and would match "six", "box", "fox",
+  // so the accepted forms are enumerated instead.
+  if (SOX_HOMOPHONES.has(w)) return true
   return false
 }
+
+// Recognised renderings of "S.O.X" — plain mis-hearings plus the spelled-out
+// and dotted forms engines produce for an initialism.
+const SOX_HOMOPHONES = new Set([
+  'socks', 'sox', 'soks', 'sax', 'sacks', 'sachs', 'saks',
+  'soc', 'socs', 'sock', 'soxs', 'sox\'s',
+])
+
+// How far into an utterance the wake name may appear and still count as a
+// deliberate address. Speech engines routinely prepend fillers and false
+// starts ("um jarvis…", "so, paul…", "okay so jarvis…"), which a strict
+// first-token rule rejects — the single most common cause of "I called it and
+// nothing happened". Beyond this window a name is treated as incidental
+// mention rather than an address.
+const WAKE_NAME_MAX_INDEX = 2
+
+// Short filler / false-start tokens that may precede the name without making
+// the mention incidental.
+const WAKE_FILLERS = new Set([
+  'um', 'uh', 'er', 'ah', 'oh', 'so', 'well', 'now', 'and', 'but',
+  'please', 'right', 'alright', 'excuse', 'me', 'sorry', 'just',
+])
 
 // Greeting words that may optionally precede the wake name.
 const WAKE_GREETING = '(?:hi|hey|hello|ok|okay|yo|yes|wake up|listen|attention)'
@@ -323,8 +357,32 @@ const WAKE_GREETING_SET = new Set([
 
 // Split a transcript into lowercase word tokens, dropping punctuation so that
 // "Hey, Jarvis!" tokenises the same as "hey jarvis".
+//
+// Spelled-out initialisms are folded back into a single token first: engines
+// transcribe "S.O.X" as "s o x" (or "s. o. x."), which would otherwise
+// tokenise into three unrecognisable one-letter words.
 function wakeTokens(s: string): string[] {
-  return (s || '').toLowerCase().replace(/[^a-z\s]/g, ' ').split(/\s+/).filter(Boolean)
+  const folded = (s || '').toLowerCase().replace(/\bs\W*o\W*x\b/g, 'sox')
+  return folded.replace(/[^a-z\s]/g, ' ').split(/\s+/).filter(Boolean)
+}
+
+// Index of the first name-like token that counts as an address, or -1.
+// Accepts the name at the very start, after a greeting, or after a short run
+// of filler words — but not deep inside a sentence.
+function wakeNameIndex(w: string[]): number {
+  const limit = Math.min(w.length, WAKE_NAME_MAX_INDEX + 1)
+  for (let i = 0; i < limit; i++) {
+    if (!nameLike(w[i])) continue
+    // Every token before the name must be a filler or greeting, otherwise this
+    // is a mention inside a sentence ("tell paul I said hi") rather than an
+    // address to the assistant.
+    let leadOk = true
+    for (let j = 0; j < i; j++) {
+      if (!WAKE_FILLERS.has(w[j]) && !WAKE_GREETING_SET.has(w[j])) { leadOk = false; break }
+    }
+    if (leadOk) return i
+  }
+  return -1
 }
 
 /**
@@ -347,9 +405,10 @@ export function phoneticWakeMatch(transcript: string, requireGreeting = false): 
     if (WAKE_GREETING_SET.has(w[i]) && nameLike(w[i + 1])) return true
   }
   if (requireGreeting) return false
-  // Bare-name branch: the utterance must START with a name-like token so that
-  // a stray name mid-sentence in ambient audio does not wake the assistant.
-  return nameLike(w[0])
+  // Bare-name branch: the name must open the utterance, allowing only fillers
+  // ahead of it, so a stray name mid-sentence in ambient audio never wakes the
+  // assistant while "um, jarvis…" still does.
+  return wakeNameIndex(w) >= 0
 }
 
 /**
@@ -358,20 +417,38 @@ export function phoneticWakeMatch(transcript: string, requireGreeting = false): 
  * name does not leak into the question sent to the AI.
  */
 export function stripWakePhrase(transcript: string, requireGreeting = false): string {
-  let t = (transcript || '').trim()
+  // Fold a spelled-out "S.O.X" so it strips as the single name token that
+  // phoneticWakeMatch matched against.
+  let t = (transcript || '').replace(/\bs\W*o\W*x\b/gi, 'sox').trim()
   if (!t) return ''
-  // Try to strip a leading greeting + (fuzzy) name first, tolerating any
-  // punctuation between them ("Hey, Jarvis" / "ok jarvis").
-  const gn = t.match(new RegExp(`^[^a-z]*\\b${WAKE_GREETING}\\b[\\s,.:;!?-]+([a-z]+)\\b`, 'i'))
-  if (gn && nameLike(gn[1].toLowerCase())) {
-    t = t.slice(gn[0].length)
-  } else if (!requireGreeting) {
-    // Otherwise strip a leading bare name token.
-    const bare = t.match(/^[^a-z]*([a-z]+)\b/i)
-    if (bare && nameLike(bare[1].toLowerCase())) {
-      t = t.slice(bare[0].length)
+
+  // Walk the leading tokens, consuming fillers and greetings until the wake
+  // name is reached, then consume the name too. Anything after it is the
+  // command. Mirrors wakeNameIndex so the matcher and the stripper can never
+  // disagree — a disagreement means the name leaks into the AI prompt or, worse,
+  // the whole command is eaten.
+  const LEAD = /^[^a-z]*([a-z']+)([\s,.:;!?-]*)/i
+  let rest = t
+  let sawName = false
+  let consumedGreeting = false
+  for (let step = 0; step <= WAKE_NAME_MAX_INDEX; step++) {
+    const m = rest.match(LEAD)
+    if (!m) break
+    const word = m[1].toLowerCase()
+    if (nameLike(word)) {
+      // In strict mode a bare name is not an address unless a greeting preceded it.
+      if (requireGreeting && !consumedGreeting) break
+      rest = rest.slice(m[0].length)
+      sawName = true
+      break
     }
+    if (WAKE_GREETING_SET.has(word)) { consumedGreeting = true }
+    else if (!WAKE_FILLERS.has(word)) break   // real word → no wake phrase here
+    rest = rest.slice(m[0].length)
   }
+
+  // No name found — leave the transcript untouched rather than eating words.
+  if (!sawName) return t.replace(/^[\s,.:;!?-]+/, '').trim()
   // Drop leftover separators ("jarvis, help me" -> "help me").
-  return t.replace(/^[\s,.:;!?-]+/, '').trim()
+  return rest.replace(/^[\s,.:;!?-]+/, '').trim()
 }

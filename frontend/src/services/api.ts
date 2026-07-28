@@ -108,6 +108,25 @@ export const apiClient = {
       signal,
     });
   },
+  /**
+   * Broker-independent OHLCV (Yahoo) for any FX pair, metal, index, commodity
+   * or crypto — the chart's primary candle source. Covers every instrument
+   * from one feed, unlike the crypto-exchange fallback, and is never stale the
+   * way the MT5 bridge's frozen `PriceHistoryEx` can be.
+   */
+  getMarketCandles: (
+    symbol: string,
+    timeframe: string = 'H1',
+    limit: number = 400,
+    signal?: AbortSignal,
+  ) => api.get('/market/candles', { params: { symbol, timeframe, limit }, timeout: 30000, signal }),
+  /**
+   * Live quote (Yahoo) for any instrument. Pairs with getMarketCandles: a chart
+   * drawn from Yahoo polls this for its live line and forming bar, since the
+   * crypto-exchange ticker does not list FX, indices or spot metals.
+   */
+  getMarketPrice: (symbol: string, signal?: AbortSignal) =>
+    api.get('/market/price', { params: { symbol }, timeout: 15000, signal }),
   placeSpotOrder: (data: {
     exchange: string;
     symbol: string;
@@ -150,6 +169,12 @@ export const apiClient = {
   }) => api.post('/signals/smc/generate', data),
   getSmcSignals: (params?: { limit?: number; status?: string; symbol?: string; timeframe?: string }) =>
     api.get('/signals/smc/signals', { params }),
+  /** Crypto SMC sniper — same engine, scoring, provider router and learning
+   *  loop as mt5.smcAnalyze; only the candle source differs. */
+  cryptoSmcAnalyze: (symbol: string, params?: {
+    exchange?: string; timeframe?: string; count?: number; min_rr?: number;
+    max_rr?: number; sl_buffer_atr?: number; min_confidence?: number; use_ai?: boolean;
+  }) => api.get('/signals/smc/analyze', { params: { symbol, ...params }, timeout: 60000 }),
   getSmcOverview: (params?: {
     symbol?: string;
     timeframe?: string;
@@ -699,7 +724,7 @@ export const apiClient = {
       api.get('/plugins/mt5/strategy/analyze', { params: { account_id: accountId, symbol, ...params }, timeout: 60000 }),
     smcBacktest: (data: { account_id: number; symbol: string; timeframe?: string; count?: number; min_rr?: number; sl_buffer_atr?: number; expiry_bars?: number }) =>
       api.post('/plugins/mt5/strategy/backtest', data, { timeout: 120000 }),
-    smcAnalyzeData: (data: { symbol: string; timeframe?: string; min_rr?: number; max_rr?: number; sl_buffer_atr?: number; min_confidence?: number; use_ai?: boolean; account_balance?: number; risk_per_trade_pct?: number; contract_size?: number; max_total_loss?: number; daily_profit_target_pct?: number; us_session_only?: boolean; candles: { time: number; open: number; high: number; low: number; close: number; volume?: number | null }[] }) =>
+    smcAnalyzeData: (data: { symbol: string; timeframe?: string; min_rr?: number; max_rr?: number; sl_buffer_atr?: number; min_confidence?: number; use_ai?: boolean; account_balance?: number; risk_per_trade_pct?: number; contract_size?: number; max_total_loss?: number; daily_profit_target_pct?: number; us_session_only?: boolean; candles: { time: number; open: number; high: number; low: number; close: number; volume?: number | null }[]; /** Higher-timeframe series; its bias gates entries server-side. */ htf_candles?: { time: number; open: number; high: number; low: number; close: number; volume?: number | null }[] }) =>
       api.post('/plugins/mt5/strategy/analyze-data', data, { timeout: 60000 }),
     smcBacktestData: (data: { symbol: string; timeframe?: string; min_rr?: number; max_rr?: number; sl_buffer_atr?: number; min_confidence?: number; expiry_bars?: number; starting_balance?: number; risk_per_trade_pct?: number; contract_size?: number; recovery_enabled?: boolean; max_risk_multiplier?: number; max_total_loss?: number; daily_profit_target_pct?: number; use_ai?: boolean; candles: { time: number; open: number; high: number; low: number; close: number; volume?: number | null }[] }) =>
       api.post('/plugins/mt5/strategy/backtest-data', data, { timeout: 120000 }),
@@ -1069,6 +1094,40 @@ export const apiClient = {
     /** Batch forecast several symbols at once. */
     batch: (data: { exchange?: string; timeframe?: string; symbols: string[]; lookback?: number; pred_len?: number; samples?: number }) =>
       api.post('/plugins/kronos/batch', data),
+  },
+
+  // ── Background research + news/FOMO prediction ───────────────────────────
+  research: {
+    /** Findings that have not decayed yet, newest first. `include_speculative:
+     *  false` returns only source-verified findings — the ones allowed to gate
+     *  a trade signal. `kind` accepts a comma-separated list. */
+    findings: (params?: {
+      kind?: string
+      symbol?: string
+      include_speculative?: boolean
+      limit?: number
+    }) => api.get('/research/findings', { params }),
+    /** Economic calendar window: ForexFactory for this week, TradingView
+     *  beyond it, out to ~30 days. `refresh` bypasses the 15-minute cache. */
+    calendar: (params?: {
+      days?: number
+      currency?: string
+      impact?: string
+      fomo_only?: boolean
+      refresh?: boolean
+    }) => api.get('/research/calendar', { params }),
+    /** Next high-impact events, nearest-first, future only. */
+    upcoming: (limit = 8, symbol?: string) =>
+      api.get('/research/calendar/upcoming', { params: { limit, symbol } }),
+    /** The exact calendar block currently injected into every agent prompt. */
+    reminder: () => api.get('/research/reminder'),
+    /** Research loop state: running, interval, last cycle result. */
+    status: () => api.get('/research/status'),
+    /** Run one cycle now — collect, store, publish, remind. Hits every news
+     *  feed and the calendar, so it takes a while. */
+    run: () => api.post('/research/run', null, { timeout: 120000 }),
+    start: (interval = 900) => api.post('/research/start', { interval }),
+    stop: () => api.post('/research/stop'),
   },
 
   // ─── Ngrok ───

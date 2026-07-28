@@ -409,3 +409,149 @@ class MT5PluginSetting(MT5Base):
     key = Column(String(100), nullable=False, unique=True, index=True)
     value = Column(Text, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# ── SMC learning loop ──────────────────────────────────────
+# Additive tables backing the sniper's learning loop. Every analysis, every
+# emitted signal and every realised outcome is persisted here so new signals can
+# be grounded in what actually happened last time a similar setup appeared, and
+# so factor weights can be recalibrated from realised P&L rather than intuition.
+#
+# Shared by the MT5 and crypto signal paths — `market` distinguishes them.
+
+class SmcAnalysisRecord(MT5Base):
+    """One /strategy/analyze call: the market read and how it was produced."""
+    __tablename__ = "mt5_smc_analyses"
+
+    id = Column(Integer, primary_key=True, index=True)
+    market = Column(String(10), nullable=False, default="mt5", index=True)  # mt5 | crypto
+    symbol = Column(String(30), nullable=False, index=True)
+    timeframe = Column(String(10), nullable=False)
+    bias = Column(String(12), nullable=True)
+    htf_bias = Column(String(12), nullable=True)
+    last_price = Column(Float, nullable=True)
+    atr = Column(Float, nullable=True)
+    rsi = Column(Float, nullable=True)
+    volume_z = Column(Float, nullable=True)
+    momentum = Column(String(20), nullable=True)
+    signal_count = Column(Integer, default=0)
+    # Provenance from the analysis router (Phase 1).
+    provider_used = Column(String(120), nullable=True)
+    tier = Column(String(20), nullable=True)      # primary | cascade | deterministic
+    is_degraded = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        Index("ix_mt5_smc_analyses_symbol_time", "symbol", "created_at"),
+    )
+
+
+class SmcSignalRecord(MT5Base):
+    """A single emitted sniper setup, with the factor scores that produced it."""
+    __tablename__ = "mt5_smc_signals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    analysis_id = Column(Integer, nullable=True, index=True)   # SmcAnalysisRecord.id
+    market = Column(String(10), nullable=False, default="mt5", index=True)
+    symbol = Column(String(30), nullable=False, index=True)
+    timeframe = Column(String(10), nullable=False)
+    side = Column(String(4), nullable=False)                   # buy | sell
+    zone_kind = Column(String(30), nullable=True)
+    entry = Column(Float, nullable=False)
+    stop_loss = Column(Float, nullable=False)
+    take_profit = Column(Float, nullable=False)
+    rr = Column(Float, nullable=True)
+    confidence = Column(Float, nullable=True)
+    bias = Column(String(12), nullable=True)
+    htf_bias = Column(String(12), nullable=True)
+    # Full numeric breakdown, plus a flat {factor: contribution} map so
+    # similarity search and weight recalibration avoid re-parsing the nested form.
+    score_breakdown = Column(JSON, nullable=True)
+    factor_vector = Column(JSON, nullable=True)
+    confluence = Column(JSON, nullable=True)
+    volume_confirmed = Column(Boolean, default=False)
+    # Set once the setup is linked to a real placed trade.
+    ticket = Column(BigInteger, nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        Index("ix_mt5_smc_signals_symbol_side_time", "symbol", "side", "created_at"),
+    )
+
+
+class SmcOutcome(MT5Base):
+    """Realised result of a signal that was actually traded."""
+    __tablename__ = "mt5_smc_outcomes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    signal_id = Column(Integer, nullable=False, index=True)    # SmcSignalRecord.id
+    market = Column(String(10), nullable=False, default="mt5", index=True)
+    symbol = Column(String(30), nullable=False, index=True)
+    ticket = Column(BigInteger, nullable=True, index=True)
+    # Maximum favourable / adverse excursion in price terms and in R multiples.
+    mfe = Column(Float, default=0.0)
+    mae = Column(Float, default=0.0)
+    mfe_r = Column(Float, default=0.0)
+    mae_r = Column(Float, default=0.0)
+    r_multiple = Column(Float, default=0.0)
+    win = Column(Boolean, default=False)
+    exit_price = Column(Float, nullable=True)
+    exit_reason = Column(String(30), nullable=True)   # tp | sl | manual | expiry
+    time_to_target_s = Column(Integer, nullable=True)
+    pnl = Column(Float, default=0.0)
+    closed_at = Column(DateTime, nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("signal_id", name="uq_mt5_smc_outcome_signal"),
+    )
+
+
+class SmcFactorWeight(MT5Base):
+    """Factor weight recalibrated from realised outcomes.
+
+    `symbol_class` scopes the learning: "*" is the global weight, otherwise the
+    instrument symbol. Read back by smc_scoring.score_signal via smc_memory.
+    """
+    __tablename__ = "mt5_smc_factor_weights"
+
+    id = Column(Integer, primary_key=True, index=True)
+    market = Column(String(10), nullable=False, default="mt5")
+    symbol_class = Column(String(30), nullable=False, default="*")
+    factor = Column(String(60), nullable=False)
+    weight = Column(Float, nullable=False)
+    default_weight = Column(Float, nullable=False)
+    sample_count = Column(Integer, default=0)
+    win_contribution = Column(Float, default=0.0)   # mean contribution on winners
+    loss_contribution = Column(Float, default=0.0)  # mean contribution on losers
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("market", "symbol_class", "factor",
+                         name="uq_mt5_smc_factor_weight"),
+    )
+
+
+class ResearchFinding(MT5Base):
+    """A background-research finding with its verifiable source (Phase 4)."""
+    __tablename__ = "mt5_research_findings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    kind = Column(String(30), nullable=False, index=True)  # calendar | news | sentiment | prediction
+    symbol = Column(String(30), nullable=True, index=True)
+    headline = Column(String(400), nullable=False)
+    body = Column(Text, nullable=True)
+    source = Column(String(120), nullable=True)
+    source_url = Column(String(600), nullable=True)
+    confidence = Column(Float, default=0.0)
+    # True when no verifiable source URL backs the finding. Speculative findings
+    # must never gate a trade signal on their own.
+    speculative = Column(Boolean, default=True, index=True)
+    provider_used = Column(String(120), nullable=True)
+    published_at = Column(DateTime, nullable=True)
+    decay_at = Column(DateTime, nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        Index("ix_mt5_research_kind_time", "kind", "created_at"),
+    )

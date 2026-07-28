@@ -6,18 +6,35 @@
  * freeze source on 8 GB machines). This worker owns an OffscreenCanvas and runs
  * the entire animation off-thread, so the UI thread stays free and responsive.
  *
+ * There are two render paths:
+ *   • WebGL — one of the orb looks from `three/robotVariants`, driven by
+ *     `three/variantScene`. This is the path taken whenever `init` carries a
+ *     `variant`, which is always the case from the room today.
+ *   • 2D canvas — the original ~980-particle painter, kept as the fallback for
+ *     when WebGL cannot be created inside a worker. Selecting a different orb
+ *     look has no effect on this path; it is a last resort, not a variant.
+ *
  * The page keeps an identical main-thread fallback for browsers without
  * OffscreenCanvas support — see useSoxOrb in pages/jarvis-room.tsx.
  *
  * Message protocol (main → worker):
- *   init       { canvas, cssW, cssH, deviceDpr, profile, state }  (canvas transferred)
+ *   init       { canvas, cssW, cssH, deviceDpr, profile, state,
+ *                variant?, gfx?, reducedMotion? }        (canvas transferred)
  *   resize     { cssW, cssH, deviceDpr }
  *   quality    { profile }
  *   state      { state }
+ *   energy     { energy }        0..1 voice envelope, WebGL path only
+ *   variant    { variant }       hot-swap the look, WebGL path only
  *   visibility { hidden }
  *   stop       {}
  */
 import type { PerfProfile } from '../utils/devicePerformance'
+import {
+  createVariantScene,
+  type VariantGfx,
+  type VariantSceneHandle,
+} from '../three/variantScene'
+import type { VariantId } from '../three/robotVariants'
 
 type SoxState = 'idle' | 'listening' | 'thinking' | 'talking'
 
@@ -365,6 +382,15 @@ function draw(now?: number) {
   const glowC = goldMix > 0.52
     ? mixRGB([220, 130, 40], ORANGE, Math.min(1, (goldMix - 0.52) / 0.48))
     : mixRGB([88, 148, 235], [165, 210, 255], coreMix)
+    // 9a. BLOOM HALO — a wide, very soft falloff behind the core. Without it the
+    // nucleus ends abruptly and leaves a dead gap between the core and the
+    // particle cloud; the halo bridges them and gives the orb visible depth.
+    const halo = ctx.createRadialGradient(cx, cy, R * 0.18, cx, cy, R * 1.02)
+    halo.addColorStop(0,    `rgba(${glowC[0]},${glowC[1]},${glowC[2]},${(0.16 + coreMix * 0.12).toFixed(3)})`)
+    halo.addColorStop(0.55, `rgba(${glowC[0]},${glowC[1]},${glowC[2]},${(0.05 + coreMix * 0.04).toFixed(3)})`)
+    halo.addColorStop(1,    'rgba(0,0,0,0)')
+    ctx.fillStyle = halo; ctx.beginPath(); ctx.arc(cx, cy, R * 1.02, 0, Math.PI * 2); ctx.fill()
+
   const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, R * 0.64)
   g.addColorStop(0,    `rgba(${glowC[0]},${glowC[1]},${glowC[2]},${(0.42 + coreMix * 0.40).toFixed(3)})`)
   g.addColorStop(0.45, 'rgba(50,110,210,0.07)')
@@ -378,26 +404,75 @@ function draw(now?: number) {
   ng.addColorStop(0.7, `rgba(${nc[0]},${nc[1]},${nc[2]},${(0.20 + coreMix * 0.22).toFixed(3)})`)
   ng.addColorStop(1,   'rgba(0,0,0,0)')
   ctx.fillStyle = ng; ctx.beginPath(); ctx.arc(cx, cy, R * 0.24, 0, Math.PI * 2); ctx.fill()
+
+    // 9b. IRIS — a segmented ring just outside the nucleus, counter-rotating
+    // against the particle cloud. Reads as a machined aperture and gives the eye
+    // a hard edge to lock onto against all the soft gradients.
+    {
+      const segs = 12
+      const rot  = -(t * 0.010) % (Math.PI * 2)
+      const ir   = R * 0.335
+      ctx.lineWidth   = 1.6
+      ctx.strokeStyle = `rgba(${nc[0]},${nc[1]},${nc[2]},${(0.30 + coreMix * 0.34).toFixed(3)})`
+      for (let i = 0; i < segs; i++) {
+        const a0 = rot + (i / segs) * Math.PI * 2
+        ctx.beginPath(); ctx.arc(cx, cy, ir, a0, a0 + (Math.PI * 2 / segs) * 0.62); ctx.stroke()
+      }
+    }
 }
 
-interface InitMsg { type: 'init'; canvas: OffscreenCanvas; cssW: number; cssH: number; deviceDpr: number; profile: PerfProfile; state: SoxState }
+interface InitMsg {
+  type: 'init'; canvas: OffscreenCanvas; cssW: number; cssH: number; deviceDpr: number
+  profile: PerfProfile; state: SoxState
+  variant?: VariantId; gfx?: VariantGfx; reducedMotion?: boolean
+}
 interface ResizeMsg { type: 'resize'; cssW: number; cssH: number; deviceDpr: number }
 interface QualityMsg { type: 'quality'; profile: PerfProfile }
 interface StateMsg { type: 'state'; state: SoxState }
+interface EnergyMsg { type: 'energy'; energy: number }
+interface VariantMsg { type: 'variant'; variant: VariantId }
 interface VisibilityMsg { type: 'visibility'; hidden: boolean }
 interface StopMsg { type: 'stop' }
-type InMsg = InitMsg | ResizeMsg | QualityMsg | StateMsg | VisibilityMsg | StopMsg
+type InMsg = InitMsg | ResizeMsg | QualityMsg | StateMsg | EnergyMsg | VariantMsg | VisibilityMsg | StopMsg
+
+// ── WebGL variant path ────────────────────────────────────────────────────────
+let gl: VariantSceneHandle | null = null
+const live = { state: 'idle' as SoxState, energy: 0 }
 
 self.onmessage = (e: MessageEvent<InMsg>) => {
   const d = e.data
   switch (d.type) {
     case 'init': {
       canvas = d.canvas
-      ctx = canvas.getContext('2d')
-      if (!ctx) return
       cssW = d.cssW; cssH = d.cssH; deviceDpr = d.deviceDpr
       profile = d.profile || DEFAULT_PROFILE
       state = d.state || 'idle'
+      live.state = state
+
+      // Preferred: the WebGL orb look. Only if the renderer cannot be created
+      // at all does the canvas fall through to the 2D painter below — at that
+      // point no drawing context has been claimed, so 2D is still available.
+      if (d.variant && d.gfx) {
+        gl = createVariantScene({
+          canvas: d.canvas,
+          mode: 'orb',
+          variant: d.variant,
+          width: cssW,
+          height: cssH,
+          dpr: deviceDpr,
+          gfx: d.gfx,
+          reducedMotion: !!d.reducedMotion,
+          getState: () => ({ state: live.state, energy: live.energy, px: 0, py: 0 }),
+        })
+        if (gl) {
+          self.postMessage({ type: 'ready', drawCalls: gl.drawCalls() })
+          break
+        }
+        self.postMessage({ type: 'webgl-fallback' })
+      }
+
+      ctx = canvas.getContext('2d')
+      if (!ctx) return
       buildParticles()
       resize()
       running = true
@@ -407,6 +482,7 @@ self.onmessage = (e: MessageEvent<InMsg>) => {
     }
     case 'resize': {
       cssW = d.cssW; cssH = d.cssH; deviceDpr = d.deviceDpr
+      if (gl) { gl.setSize(cssW, cssH); break }
       resize()
       break
     }
@@ -416,15 +492,27 @@ self.onmessage = (e: MessageEvent<InMsg>) => {
     }
     case 'state': {
       state = d.state
+      live.state = d.state
+      break
+    }
+    case 'energy': {
+      live.energy = d.energy
+      break
+    }
+    case 'variant': {
+      gl?.setVariant(d.variant)
       break
     }
     case 'visibility': {
       hidden = d.hidden
+      gl?.setHidden(d.hidden)
       break
     }
     case 'stop': {
       running = false
       cancelAnimationFrame(raf)
+      gl?.dispose()
+      gl = null
       break
     }
   }
