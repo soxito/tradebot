@@ -74,6 +74,16 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Pair catalog sync loop failed to start: {e}")
 
+    # SMC background research loop (economic calendar + news + sentiment) backing
+    # /research. Started here too so the feed is live in API-only mode — the
+    # worker autostart above is skipped when START_WORKERS_IN_API=False.
+    if settings.AUTO_START_RESEARCH_LOOP and not started_workers.get("research_loop"):
+        try:
+            from app.core.scheduler import start_research_loop
+            start_research_loop(settings.RESEARCH_LOOP_INTERVAL_SECONDS)
+        except Exception as e:
+            logger.warning(f"Research loop failed to start: {e}")
+
     # Realtime price-tick fan-out for SSE subscribers (idempotent; self-throttles
     # to zero work when no client is connected).
     if settings.AUTO_START_PRICE_TICK_LOOP:
