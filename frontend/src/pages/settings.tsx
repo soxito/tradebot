@@ -3,6 +3,7 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { apiClient } from '@/services/api'
 import { Settings, AlertTriangle, Shield, Target, Activity, Zap, Search, X, Plus, Bell } from 'lucide-react'
 import { useStreamState } from '@/hooks/useEventStream'
+import { useApiBaseUrl, useApiRootUrl } from '@/hooks/useApiUrl'
 import {
   notificationsSupported,
   notificationsEnabled,
@@ -80,6 +81,8 @@ interface PineScriptItem {
 }
 
 export default function SettingsPage() {
+  const apiBaseUrl = useApiBaseUrl()
+  const apiRootUrl = useApiRootUrl()
   const [tradingStatus, setTradingStatus] = useState<any>(null)
   const [liveSettings, setLiveSettings] = useState<any>(null)
   const [simSettings, setSimSettings] = useState<any>(null)
@@ -954,19 +957,19 @@ export default function SettingsPage() {
           <h2 className="font-semibold mb-4">Quick Links</h2>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
             <QuickLink
-              href={`${process.env.NEXT_PUBLIC_API_URL?.replace('/api/v1', '')}/docs`}
+              href={`${apiRootUrl}/docs`}
               label="Swagger UI"
             />
             <QuickLink
-              href={`${process.env.NEXT_PUBLIC_API_URL?.replace('/api/v1', '')}/health`}
+              href={`${apiRootUrl}/health`}
               label="Health Check"
             />
             <QuickLink
-              href={`${process.env.NEXT_PUBLIC_API_URL}/status`}
+              href={`${apiBaseUrl}/status`}
               label="API Status"
             />
             <QuickLink
-              href={`${process.env.NEXT_PUBLIC_API_URL}/exchanges/status`}
+              href={`${apiBaseUrl}/exchanges/status`}
               label="Exchange Status"
             />
             <QuickLink
@@ -986,7 +989,7 @@ export default function SettingsPage() {
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
             <div className="flex justify-between py-2 border-b border-gray-700/50">
               <span className="text-gray-400">API URL</span>
-              <span className="font-mono text-xs">{process.env.NEXT_PUBLIC_API_URL}</span>
+              <span className="font-mono text-xs">{apiBaseUrl}</span>
             </div>
             <div className="flex justify-between py-2 border-b border-gray-700/50">
               <span className="text-gray-400">Frontend</span>

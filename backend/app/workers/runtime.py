@@ -10,16 +10,22 @@ from app.core.scheduler import (
     start_pair_catalog_sync_loop,
     start_position_monitor,
     start_pump_monitor_loop,
+    start_jarvis_learning_loop,
     start_research_loop,
     start_scheduler,
+    start_signal_research_queue,
+    start_vault_sync_loop,
     start_sniper_loop,
     stop_auto_trade_loop,
     stop_live_auto_trade_loop,
     stop_pair_catalog_sync_loop,
     stop_position_monitor,
     stop_pump_monitor_loop,
+    stop_jarvis_learning_loop,
     stop_research_loop,
     stop_scheduler,
+    stop_signal_research_queue,
+    stop_vault_sync_loop,
     stop_sniper_loop,
 )
 
@@ -97,6 +103,26 @@ def start_background_workers(allow_in_api: bool = False) -> dict[str, bool]:
     else:
         started["research_loop"] = False
 
+    if settings.AUTO_START_SIGNAL_RESEARCH_QUEUE:
+        started["signal_research_queue"] = start_signal_research_queue(
+            settings.SIGNAL_RESEARCH_CONCURRENCY,
+            settings.SIGNAL_RESEARCH_SCAN_SECONDS,
+        )
+    else:
+        started["signal_research_queue"] = False
+
+    if settings.AUTO_START_VAULT_SYNC_LOOP:
+        started["vault_sync_loop"] = start_vault_sync_loop(
+            settings.VAULT_SYNC_INTERVAL_SECONDS
+        )
+    else:
+        started["vault_sync_loop"] = False
+
+    if settings.AUTO_START_JARVIS_LEARNING_LOOP:
+        started["jarvis_learning_loop"] = start_jarvis_learning_loop()
+    else:
+        started["jarvis_learning_loop"] = False
+
     return started
 
 
@@ -110,3 +136,6 @@ def stop_background_workers() -> None:
     stop_pump_monitor_loop()
     stop_pair_catalog_sync_loop()
     stop_research_loop()
+    stop_signal_research_queue()
+    stop_vault_sync_loop()
+    stop_jarvis_learning_loop()

@@ -1,0 +1,159 @@
+name: Desktop Release
+
+# Builds the TradeBot desktop app for macOS, Windows and Linux.
+#
+# Every job runs on its own OS on purpose: the app embeds a native CPython plus
+# compiled wheels (numpy, pandas, cryptography, asyncpg), none of which
+# cross-compile. macOS also needs two runners — arm64 and x64 — because the
+# Python runtime and its wheels are per-architecture.
+#
+# Triggered by a `v*` tag; `workflow_dispatch` builds artifacts without
+# publishing, for testing the pipeline itself.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write # required to create the GitHub Release
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+
+    strategy:
+      fail-fast: false # one platform failing shouldn't discard the others
+      matrix:
+        include:
+          - name: macOS (Apple Silicon)
+            os: macos-14
+          - name: macOS (Intel)
+            os: macos-13
+          - name: Windows
+            os: windows-latest
+          - name: Linux
+            os: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            desktop/package-lock.json
+
+      # The relocatable CPython is a ~70MB download per build; cache it by the
+      # pinned release so reruns don't refetch it.
+      - name: Cache Python runtime
+        uses: actions/cache@v4
+        with:
+          path: .build-cache
+          key: pbs-${{ runner.os }}-${{ runner.arch }}-20241219-3.12.8
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      # Fails the build if a secret was staged. Runs as part of
+      # build-desktop.mjs, before electron-builder is ever invoked.
+      - name: Build and package
+        run: node scripts/build-desktop.mjs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+          # ── Signing ──────────────────────────────────────────────────────
+          # Unset today, so builds are unsigned and users must click through
+          # Gatekeeper / SmartScreen (see docs/DESKTOP.md). Adding these repo
+          # secrets turns signing on with no workflow change:
+          #
+          #   CSC_LINK              base64 .p12, Apple Developer ID
+          #   CSC_KEY_PASSWORD      its password
+          #   APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID
+          #                         notarization (also set `notarize: true`
+          #                         in desktop/electron-builder.yml)
+          #   WIN_CSC_LINK          base64 .pfx, Windows code-signing cert
+          #   WIN_CSC_KEY_PASSWORD  its password
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+
+      # Independent re-check of the *packaged* tree, not just the staging dir.
+      # If electron-builder's allowlist ever regresses, this catches it before
+      # anything reaches a public Release.
+      - name: Verify no secrets in artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dir in dist-desktop/*/; do
+            [ -d "$dir" ] || continue
+            node scripts/check-no-secrets.mjs "$dir"
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tradebot-${{ matrix.os }}
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            dist-desktop/*.dmg
+            dist-desktop/*.zip
+            dist-desktop/*.exe
+            dist-desktop/*.AppImage
+            dist-desktop/*.deb
+            dist-desktop/latest*.yml
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true # reviewed by a human before going public
+          generate_release_notes: true
+          files: artifacts/**/*
+          body: |
+            ## TradeBot Desktop ${{ github.ref_name }}
+
+            | Platform | Download |
+            | --- | --- |
+            | macOS (Apple Silicon) | `TradeBot-*-arm64.dmg` |
+            | macOS (Intel) | `TradeBot-*.dmg` |
+            | Windows | `TradeBot-Setup-*.exe` |
+            | Linux | `TradeBot-*.AppImage` or `.deb` |
+
+            These builds are **not code-signed yet**. First launch needs one
+            extra step:
+
+            - **macOS** — right-click the app → *Open* → *Open*. Double-clicking
+              shows "cannot be opened because the developer cannot be verified".
+            - **Windows** — *More info* → *Run anyway* on the SmartScreen prompt.
+            - **Linux** — `chmod +x TradeBot-*.AppImage` before running.
+
+            No Python, Node, PostgreSQL, Redis or Docker install is required —
+            everything is bundled. Your data lives in the app's per-user data
+            folder (**Help → Open Data Folder**) and survives updates and
+            uninstalls.

@@ -179,9 +179,42 @@ export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault, chart
   const [launchingPairs, setLaunchingPairs] = useState(false)   // launching pair bundle
   const [showPairPicker, setShowPairPicker] = useState(false)   // pair-picker panel open
   const [pairSearchQuery, setPairSearchQuery] = useState('')    // filter inside pair picker
-  const [selectedPairs, setSelectedPairs] = useState<Set<string>>(  // user-selected pairs
+  // Pair selection survives reloads, restarts and pauses. It used to reset to
+  // the three defaults on every mount, so anyone who had curated a watchlist
+  // rebuilt it by hand each time — and worse, after a restart-pause the only
+  // way back was to re-select the pairs and Start from scratch.
+  const [selectedPairs, setSelectedPairs] = useState<Set<string>>(
     () => new Set(['XAUUSD', 'GBPUSD', 'EURUSD'])               // default 3 popular pairs
   )
+
+  const pairsStorageKey = `mt5.scalp.selectedPairs.${accountId}`
+  const pairsLoaded = useRef(false)
+
+  // Restore this account's watchlist before the first persist can overwrite it.
+  useEffect(() => {
+    pairsLoaded.current = false
+    try {
+      const raw = window.localStorage.getItem(pairsStorageKey)
+      if (raw) {
+        const saved = JSON.parse(raw)
+        if (Array.isArray(saved) && saved.length) setSelectedPairs(new Set(saved))
+      }
+    } catch {
+      // A corrupt entry must not cost the user the panel — fall back to defaults.
+    }
+    pairsLoaded.current = true
+  }, [pairsStorageKey])
+
+  useEffect(() => {
+    // Skip the render before the restore has run, or an empty initial state
+    // would be written over the saved list.
+    if (!pairsLoaded.current) return
+    try {
+      window.localStorage.setItem(pairsStorageKey, JSON.stringify([...selectedPairs]))
+    } catch {
+      // Storage full or blocked — selection still works for this session.
+    }
+  }, [selectedPairs, pairsStorageKey])
 
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Tracks which session id we last synced settings from so we don't
@@ -323,6 +356,41 @@ export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault, chart
     }
   }
 
+  // Split once: paused sessions are resumable, running ones are pausable, and
+  // both counts drive the controls below.
+  const pausedSessions = allSessions.filter(s => s.status === 'paused')
+  const runningSessions = allSessions.filter(s => s.status === 'active')
+
+  // Pause / resume the whole account without losing a thing. The session rows
+  // keep every setting, so this is the path that replaces "Stop All, re-pick
+  // the pairs, Start again".
+  const handlePauseAll = async () => {
+    const running = allSessions.filter(s => s.status === 'active').map(s => s.symbol)
+    if (!running.length) { setError('No running bots to pause'); return }
+    setLaunchingPairs(true); setError(null)
+    try {
+      await apiClient.mt5.scalp.pause(accountId)
+      await refreshStatus()
+    } catch (e: any) {
+      setError(e?.response?.data?.detail || e?.message || 'Failed to pause')
+    } finally {
+      setLaunchingPairs(false)
+    }
+  }
+
+  const handleResume = async (symbols?: string[]) => {
+    setLaunchingPairs(true); setError(null)
+    if (symbols?.length === 1) setBusySymbol(symbols[0])
+    try {
+      await apiClient.mt5.scalp.resume(accountId, symbols)
+      await refreshStatus()
+    } catch (e: any) {
+      setError(e?.response?.data?.detail || e?.message || 'Failed to resume')
+    } finally {
+      setLaunchingPairs(false); setBusySymbol(null)
+    }
+  }
+
   // Launch only the user-selected pairs
   const handleLaunchSelected = async () => {
     const activePairs = allSessions.filter(s => s.status === 'active').map(s => s.symbol)
@@ -456,7 +524,10 @@ export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault, chart
           <div className="rounded-xl border border-gray-700/50 bg-gray-900/40 overflow-hidden">
             <div className="px-3 py-2 border-b border-gray-700/40 flex items-center justify-between">
               <span className="text-[11px] font-semibold text-gray-300 uppercase tracking-wide">
-                Active Pairs ({allSessions.length})
+                {/* Paused sessions are listed here too, so the count says which
+                    is which rather than calling a paused bot "active". */}
+                Pairs ({runningSessions.length} active
+                {pausedSessions.length > 0 && `, ${pausedSessions.length} paused`})
               </span>
               <div className="flex items-center gap-3">
                 <span className="text-[11px] text-gray-500">
@@ -469,6 +540,24 @@ export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault, chart
                     {allSessions.reduce((s, x) => s + x.combined_pnl, 0).toFixed(2)}
                   </span>
                 </span>
+                {pausedSessions.length > 0 && (
+                  <button
+                    onClick={() => handleResume()}
+                    disabled={busy || launchingPairs}
+                    className="text-[10px] text-green-300 hover:text-green-200 px-2 py-0.5 rounded border border-green-500/40 hover:border-green-500/70 transition disabled:opacity-40 font-semibold"
+                  >
+                    Resume {pausedSessions.length} Paused
+                  </button>
+                )}
+                {runningSessions.length > 0 && (
+                  <button
+                    onClick={handlePauseAll}
+                    disabled={busy || launchingPairs}
+                    className="text-[10px] text-yellow-300 hover:text-yellow-200 px-2 py-0.5 rounded border border-yellow-500/30 hover:border-yellow-500/60 transition disabled:opacity-40"
+                  >
+                    Pause All
+                  </button>
+                )}
                 <button
                   onClick={handleCloseAll}
                   disabled={busy || launchingPairs}
@@ -781,7 +870,16 @@ export default function MT5ScalpBotPanel({ accountId, serverSymbolDefault, chart
             <div className="flex-1">
               <div className="font-semibold text-yellow-300 mb-0.5">Bot paused after backend restart</div>
               <div className="text-yellow-400/80">{session.ai_note}</div>
-              <div className="mt-1.5 text-yellow-500/70">Click <strong className="text-yellow-300">Activate</strong> to resume trading on this session.</div>
+              <div className="mt-1.5 text-yellow-500/70">
+                Your pairs and settings were kept — resume picks up exactly where it left off.
+              </div>
+              <button
+                onClick={() => handleResume()}
+                disabled={busy || launchingPairs}
+                className="mt-2 text-[11px] font-semibold text-green-200 bg-green-600/20 hover:bg-green-600/30 border border-green-500/40 px-2.5 py-1 rounded transition disabled:opacity-40"
+              >
+                Resume {pausedSessions.length > 1 ? `all ${pausedSessions.length} paused bots` : 'this bot'}
+              </button>
             </div>
           </div>
         )}

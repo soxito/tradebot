@@ -1,12 +1,12 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useTranslation } from "next-i18next";
+import { getApiBaseUrl } from "@/services/api";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:1448/api/v1";
+// Resolved lazily — the desktop build picks the API port at launch.
+const API_URL = () => getApiBaseUrl();
 
 export default function WhatsAppSniperPage({ onStatsChange }) {
-  const { t } = useTranslation("common");
   const [settings, setSettings] = useState({
     enabled: false,
     mode: "sandbox",
@@ -41,7 +41,7 @@ export default function WhatsAppSniperPage({ onStatsChange }) {
 
   const fetchSettings = async () => {
     try {
-      const res = await fetch(`${API_URL}/plugins/whatsapp/sniper/settings`);
+      const res = await fetch(`${API_URL()}/plugins/whatsapp/sniper/settings`);
       const data = await res.json();
       setSettings(data);
     } catch (e) {
@@ -52,7 +52,7 @@ export default function WhatsAppSniperPage({ onStatsChange }) {
   const fetchTrades = async () => {
     try {
       setLoading(true);
-      const res = await fetch(`${API_URL}/plugins/whatsapp/sniper/trades?limit=50`);
+      const res = await fetch(`${API_URL()}/plugins/whatsapp/sniper/trades?limit=50`);
       const data = await res.json();
       setTrades(data);
       if (onStatsChange) onStatsChange({ sniper_trades: data.length });
@@ -67,7 +67,7 @@ export default function WhatsAppSniperPage({ onStatsChange }) {
     setSaving(true);
     setMessage({ type: "", text: "" });
     try {
-      const res = await fetch(`${API_URL}/plugins/whatsapp/sniper/settings`, {
+      const res = await fetch(`${API_URL()}/plugins/whatsapp/sniper/settings`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(settings),
@@ -87,7 +87,7 @@ export default function WhatsAppSniperPage({ onStatsChange }) {
   const handleRunSniper = async () => {
     setLoading(true);
     try {
-      const res = await fetch(`${API_URL}/plugins/whatsapp/sniper/run`, { method: "POST" });
+      const res = await fetch(`${API_URL()}/plugins/whatsapp/sniper/run`, { method: "POST" });
       const data = await res.json();
       setMessage({ type: "success", text: `Sniper cycle completed` });
       fetchTrades();
@@ -100,7 +100,7 @@ export default function WhatsAppSniperPage({ onStatsChange }) {
 
   const handleExecuteTrade = async (tradeId, mode) => {
     try {
-      const res = await fetch(`${API_URL}/plugins/whatsapp/sniper/trades/${tradeId}/execute`, {
+      const res = await fetch(`${API_URL()}/plugins/whatsapp/sniper/trades/${tradeId}/execute`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ mode, force: true }),

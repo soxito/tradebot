@@ -1,13 +1,13 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useTranslation } from "next-i18next";
+import { getApiBaseUrl } from "@/services/api";
 import Link from "next/link";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:1448/api/v1";
+// Resolved lazily — the desktop build picks the API port at launch.
+const API_URL = () => getApiBaseUrl();
 
 export default function WhatsAppChannels({ onStatsChange }) {
-  const { t } = useTranslation("common");
   const [channels, setChannels] = useState([]);
   const [chats, setChats] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -31,7 +31,7 @@ export default function WhatsAppChannels({ onStatsChange }) {
 
   const fetchChannels = async () => {
     try {
-      const res = await fetch(`${API_URL}/plugins/whatsapp/channels`);
+      const res = await fetch(`${API_URL()}/plugins/whatsapp/channels`);
       const data = await res.json();
       setChannels(data);
     } catch (e) {
@@ -42,7 +42,7 @@ export default function WhatsAppChannels({ onStatsChange }) {
   const fetchChats = async () => {
     setLoading(true);
     try {
-      const res = await fetch(`${API_URL}/plugins/whatsapp/chats`);
+      const res = await fetch(`${API_URL()}/plugins/whatsapp/chats`);
       const data = await res.json();
       setChats(data);
     } catch (e) {
@@ -58,8 +58,8 @@ export default function WhatsAppChannels({ onStatsChange }) {
     setMessage({ type: "", text: "" });
     try {
       const url = editing
-        ? `${API_URL}/plugins/whatsapp/channels/${editing.id}`
-        : `${API_URL}/plugins/whatsapp/channels`;
+        ? `${API_URL()}/plugins/whatsapp/channels/${editing.id}`
+        : `${API_URL()}/plugins/whatsapp/channels`;
       const method = editing ? "PATCH" : "POST";
       const res = await fetch(url, {
         method,
@@ -85,7 +85,7 @@ export default function WhatsAppChannels({ onStatsChange }) {
   const handleDelete = async (id) => {
     if (!confirm("Delete this channel?")) return;
     try {
-      await fetch(`${API_URL}/plugins/whatsapp/channels/${id}`, { method: "DELETE" });
+      await fetch(`${API_URL()}/plugins/whatsapp/channels/${id}`, { method: "DELETE" });
       fetchChannels();
     } catch (e) {
       console.error("Failed to delete:", e);
@@ -123,7 +123,7 @@ export default function WhatsAppChannels({ onStatsChange }) {
   const handlePreview = async (channelId) => {
     setLoading(true);
     try {
-      const res = await fetch(`${API_URL}/plugins/whatsapp/channels/${channelId}/preview`, {
+      const res = await fetch(`${API_URL()}/plugins/whatsapp/channels/${channelId}/preview`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ limit: 20 }),

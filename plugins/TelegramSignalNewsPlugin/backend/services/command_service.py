@@ -9,6 +9,7 @@ sending the reply via ``bot_service.send_message``.
 """
 from __future__ import annotations
 
+import asyncio
 import math
 import re
 from typing import Any
@@ -16,11 +17,34 @@ from typing import Any
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.text_format import format_for_telegram
+
 # ── Per-chat conversation history ─────────────────────────────────────────────
 # Keyed by Telegram chat_id string; stores last _MAX_HISTORY * 2 messages so
 # Jarvis can follow the thread across turns.
 _CHAT_HISTORY: dict[str, list[dict[str, str]]] = {}
 _MAX_HISTORY = 20  # most-recent user+assistant pairs to keep
+
+# ── Pending command offer ─────────────────────────────────────────────────────
+# When a chat reply offers a command ("I can run /forecast BTCUSDT"), the offer
+# is parked here so the user's "yes" actually runs it instead of being answered
+# with another paragraph. Keyed by chat_id → (command, args).
+_PENDING_OFFER: dict[str, tuple[str, str]] = {}
+
+#: Commands a bare "yes" is allowed to trigger. Read-only by design — an
+#: affirmative must never be able to place, close or amend a trade, because the
+#: text that offered it was written by the model, not by the user.
+_AUTORUN_SAFE = frozenset({
+    "forecast", "analyze", "signals", "sniper", "status", "positions",
+    "portfolio", "mt5",
+})
+
+#: Non-symbol words that are legitimately arguments to those commands, so an
+#: offered "/mt5 positions" keeps its subcommand while "/forecast BTCUSDT for
+#: you" drops the prose.
+_OFFER_SUBCOMMANDS = frozenset({
+    "status", "positions", "orders", "scalp", "smc", "bitget", "binance",
+})
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
@@ -64,10 +88,25 @@ async def parse_and_execute(
 
     # ── Command dispatch ──────────────────────────────────────────────────────
     if text.startswith("/"):
+        _PENDING_OFFER.pop(chat_id, None)
         cmd_raw, _, args = text.partition(" ")
         # Strip any @BotName suffix from the command
         cmd = cmd_raw.split("@")[0].lstrip("/").lower()
         return await _dispatch(cmd, args.strip(), db)
+
+    # ── "Yes" to a command the last reply offered ─────────────────────────────
+    # Jarvis used to end on "Would you like me to execute that?" and then had
+    # nowhere to put the answer: the confirmation went back through free-text
+    # chat and produced another paragraph. Run what was offered instead.
+    pending = _PENDING_OFFER.get(chat_id)
+    if pending and _is_affirmative(text):
+        _PENDING_OFFER.pop(chat_id, None)
+        cmd, cmd_args = pending
+        _record_history(chat_id, "user", text)
+        reply, mode, markup = await _dispatch(cmd, cmd_args, db)
+        if reply:
+            _record_history(chat_id, "assistant", reply)
+        return reply, mode, markup
 
     # Non-command free text → full Jarvis AI chat
     fallback = await _ai_fallback(text, db, chat_id=chat_id)
@@ -189,6 +228,9 @@ async def _handle_start(_args: str, _db: AsyncSession) -> tuple[str, str]:
         "/order long BTCUSDT 100 — Paper trade from Kronos signal ($100 margin)",
         "/order live long BTCUSDT 100 — LIVE Bitget futures order",
         "/analyze BTCUSDT — Deep AI analysis (Kronos + news + position)",
+        "<i>Both work on every pair — crypto and MT5 (FX majors/crosses/exotics,</i>",
+        "<i>metals, indices, energy, softs). e.g. /forecast XAUUSD 4h, /analyze GBPJPY.</i>",
+        "<i>MT5 pairs are analysis-only — place those with your broker.</i>",
         "",
         "🖥 <b>MT5 Trading</b>",
         "/mt5 status — List MT5 accounts",
@@ -526,6 +568,32 @@ def _fmt_sniper_analysis(resp: Any) -> str:
                 f"   {_esc(sg('zone_kind', '—'))} · fusion "
                 f"{fusion if fusion is not None else '—'} {tag}"
             )
+            # The factor attribution. This message used to print no reason at
+            # all — only the AI block's prose — so every deterministic factor
+            # that produced the score was invisible to the user.
+            reason = sg("reason")
+            if reason:
+                lines.append(f"   <i>{_esc(_clip(str(reason), 220))}</i>")
+
+    # ── Macro context ─────────────────────────────────────────────────────────
+    # Stated whether or not it applied: "the dollar says nothing about this pair,
+    # and here is why" is the honest answer, and silence would read as an
+    # omission rather than a decision.
+    macro = g("macro")
+    if isinstance(macro, dict) and (macro.get("reason") or macro.get("lines")):
+        lines.append("")
+        if macro.get("applied"):
+            regime = str(macro.get("regime") or "UNKNOWN").replace("_", "-").lower()
+            lines.append(
+                f"🌍 <b>Macro</b> — {_esc(str(macro.get('reason') or regime))}"
+            )
+            for line in list(macro.get("lines") or [])[:2]:
+                lines.append(f"   <i>{_esc(_clip(str(line), 200))}</i>")
+        else:
+            lines.append(
+                f"🌍 <b>Macro</b> — <i>not applied: "
+                f"{_esc(_clip(str(macro.get('reason') or 'unavailable'), 160))}</i>"
+            )
 
     # ── Kronos ML fusion ──────────────────────────────────────────────────────
     k = g("kronos")
@@ -627,11 +695,11 @@ async def _handle_sl(args: str, _db: AsyncSession) -> tuple[str, str]:
     return await _jarvis_command(f"set stop loss at {price} on {symbol}")
 
 
-async def _handle_jarvis(args: str, _db: AsyncSession) -> tuple[str, str]:
+async def _handle_jarvis(args: str, db: AsyncSession) -> tuple[str, str]:
     """Forward free-form text to the Jarvis command engine."""
     if not args:
         return "❓ Usage: /jarvis &lt;command&gt;\nExample: /jarvis show positions", "HTML"
-    return await _jarvis_command(args)
+    return await _jarvis_command(args, db)
 
 
 async def _handle_unknown(_args: str, _db: AsyncSession) -> tuple[str, str]:
@@ -640,11 +708,23 @@ async def _handle_unknown(_args: str, _db: AsyncSession) -> tuple[str, str]:
 
 # ── Jarvis bridge ─────────────────────────────────────────────────────────────
 
-async def _jarvis_command(cmd: str) -> tuple[str, str]:
+async def _jarvis_command(cmd: str, db: AsyncSession | None = None) -> tuple[str, str]:
     """Call the Jarvis execute_command handler and return (reply_text, parse_mode)."""
     try:
         from app.api.jarvis import execute_command, CommandRequest
         result = await execute_command(CommandRequest(command=cmd))
+
+        # A failed *analysis* is not the end of the conversation. This is where
+        # "❌ I couldn't find a Bitget-tradeable pair for GBPUSD, Sir." was
+        # rendered — a dead end for a question the AI chat can answer perfectly
+        # well. Hand it over instead of showing the user a wall.
+        if not result.ok and result.action in ("analyze", "unknown") and db is not None:
+            reply, mode, _ = await _ai_fallback(
+                cmd, db, hint=result.detail or result.speech or ""
+            )
+            if reply:
+                return reply, mode
+
         emoji = "✅" if result.ok else "❌"
         # For rich analysis, prefer the full detail (AI narrative + news + levels)
         # over the short spoken summary so Telegram users get the complete research.
@@ -652,10 +732,72 @@ async def _jarvis_command(cmd: str) -> tuple[str, str]:
             body = result.detail
         else:
             body = result.speech or result.detail
-        text = f"{emoji} {body}"
-        return text[:4000], "HTML"
+        # `body` carries the AI-composed narrative, so it can contain the same
+        # markdown and LaTeX as a chat reply — and its bare "&" and "<" would
+        # make Telegram reject the message under parse_mode=HTML. The old
+        # text[:4000] also cut mid-word.
+        return f"{emoji} {format_for_telegram(body)}", "HTML"
     except Exception as exc:  # noqa: BLE001
         return f"❌ Jarvis error: {exc}", "HTML"
+
+
+async def _news_context(text: str, symbols: list[str]) -> str | None:
+    """Headlines for the instruments named, plus a live search on the question.
+
+    Mirrors what the web chat already injects (paul_chat.build_jarvis_system_prompt);
+    Telegram had none of it, which is why the same question answered well in the
+    browser and got a refusal here. Both sources are cached and keyless.
+    """
+    try:
+        from plugins.AgentPaulPlugin.backend.services import news_research
+    except Exception:  # noqa: BLE001
+        return None
+
+    blocks: list[str] = []
+    try:
+        for sym in symbols[:2]:
+            hits = await news_research.news_for_symbol(sym, limit=3)
+            if hits:
+                lines = [f"### Recent news — {sym}"]
+                lines += [
+                    f"  - [{h['source']}] ({h['sentiment']:+.2f}) {h['title']}"
+                    for h in hits[:3]
+                ]
+                blocks.append("\n".join(lines))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[AI] symbol news skipped: {}", exc)
+
+    try:
+        web = await news_research.web_news_search(text.strip(), limit=5)
+        if web:
+            lines = ["### Live web search (most recent first)"]
+            for item in web[:5]:
+                when = item.get("published_at")
+                when_s = when.strftime("%Y-%m-%d %H:%M") if when else ""
+                lines.append(f"  - [{item.get('source', '?')}] {when_s} {item.get('title', '')}")
+            blocks.append("\n".join(lines))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[AI] web search skipped: {}", exc)
+
+    if not blocks:
+        return None
+    return "## Live News & Web Results\n" + "\n\n".join(blocks)
+
+
+async def _learned_context(db: AsyncSession, symbols: list[str]) -> str | None:
+    """What past calls on these instruments actually did — win rate, realised R.
+
+    Returns None until enough proposals have settled; a win rate over three
+    trades is noise dressed as evidence and would make the model *more*
+    confidently wrong, not less.
+    """
+    try:
+        from app.services import analysis_journal
+
+        return await analysis_journal.memory_block_for(db, symbols)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[AI] learned context skipped: {}", exc)
+        return None
 
 
 # ── Conversation history helpers ─────────────────────────────────────────────
@@ -673,33 +815,111 @@ def _record_history(chat_id: str, role: str, content: str) -> None:
         _CHAT_HISTORY[chat_id] = bucket[-(_MAX_HISTORY * 2):]
 
 
-def _jarvis_system_prompt(live_data: str | None = None) -> str:
-    """System prompt that gives the LLM the full Jarvis persona and capability list.
+def _jarvis_system_prompt(
+    live_data: str | None = None,
+    *,
+    price_block: str | None = None,
+    news_block: str | None = None,
+    learned: str | None = None,
+) -> str:
+    """System prompt giving the LLM the Jarvis persona and its real capabilities.
 
-    If *live_data* is provided it is appended as a data block so the LLM can
-    analyse real numbers instead of suggesting the user run commands.
+    Every block is optional and appended only when the caller could fetch it, so
+    a failed lookup degrades to a thinner prompt rather than a false statement
+    about what the assistant can do.
     """
     base = (
         "You are JARVIS, the AI trading assistant for your principal. Always address "
         "them as 'Sir'. You are connected to a live trading system with the following "
         "capabilities:\n"
         "• Crypto futures (Bitget): /order, /close, /tp, /sl, /positions, /portfolio\n"
-        "• Kronos ML forecasting engine: /forecast BTCUSDT\n"
+        "• Kronos ML forecasting engine: /forecast BTCUSDT — works for crypto AND\n"
+        "  every MT5 instrument (e.g. /forecast XAUUSD 4h, /forecast GBPJPY,\n"
+        "  /forecast US30, /forecast USOIL). Timeframes 1m–1w.\n"
         "• MT5 forex trading: /mt5 status, /mt5 positions, /mt5 scalp\n"
         "• Live market signals & sniper: /signals, /sniper\n"
-        "• Deep AI market analysis: /analyze BTCUSDT\n\n"
+        "• Deep AI market analysis: /analyze BTCUSDT — works for crypto AND for FX,\n"
+        "  metals, indices, energy and softs (e.g. /analyze GBPUSD, /analyze XAUUSD)\n\n"
+        "When a user asks how to forecast or predict an instrument, do NOT stop at\n"
+        "describing the method — these two commands ARE the platform's answer, and\n"
+        "they run on whatever pair they named. RUN them: call the forecast_symbol\n"
+        "or analyze_symbol tool and answer with the real numbers it returns.\n"
+        "NEVER end on 'Would you like me to execute that?' or 'shall I run it?' —\n"
+        "asking permission to read data the user already asked for wastes their\n"
+        "turn. Run it first, then offer the follow-up.\n"
+        "When you DO have live engine numbers, they are the answer: lead with the\n"
+        "direction, % move, target, confidence and the anchor price they came\n"
+        "from, and say it is a live Kronos run — never file them at the bottom as\n"
+        "'for reference' or as an 'example' under a general explanation.\n"
+        "NEVER close by asking the user to name an instrument. If the thread has\n"
+        "named one — this turn or an earlier one — that is the instrument, and you\n"
+        "forecast it. The platform appends the live forecast card beneath your\n"
+        "reply automatically, so 'tell me a pair and I'll run it instantly' is\n"
+        "always wrong: it has already run.\n"
+        "Any follow-up you offer must be written as the literal command, e.g.\n"
+        "`/forecast BTCUSDT 4h` or `/analyze XAUUSD`, so 'yes' can run it.\n"
+        "NEVER offer to place, size or manage a trade for the user and NEVER ask\n"
+        "them for a position size or risk parameters — orders are theirs to send.\n"
+        "If a trade is the natural next step, print the exact command they would\n"
+        "send (`/order long BTCUSDT 100`) and stop there.\n"
+        "A cash index (GER40, UK100, FRA40 …) carries no traded volume, so /forecast\n"
+        "returns NO_TRADE for it by design — /analyze still gives the full read.\n\n"
+        "LIVE DATA — READ THIS CAREFULLY:\n"
+        "You HAVE live market data for EVERY asset class: crypto, FX majors and "
+        "crosses, metals (gold XAUUSD, silver XAGUSD, platinum, palladium), indices "
+        "(US30, NAS100, US500, GER40, UK100, JPN225 …), energy (USOIL, UKOIL, NGAS) "
+        "and softs. You also have live internet news search.\n"
+        "NEVER say 'the current platform does not provide a live gold-price feed', "
+        "'the current toolset does not include a live price feed', 'I cannot pull the "
+        "exact spot price from external markets', or any variation. Those are FALSE. "
+        "Never ask the user to supply a price you can fetch, and never ask permission "
+        "to query market data — you already have it. If a fetch genuinely failed, say "
+        "so and offer to retry; do not call it a missing capability.\n\n"
+        "YOUR SCOPE IS EVERYTHING — NOT JUST TRADING:\n"
+        "Trading is one of your jobs, not the limit of your knowledge. Answer "
+        "questions in ANY field — mathematics (show your working), physics, "
+        "chemistry, biology, medicine, history, geography, law, philosophy, "
+        "programming, languages, cooking, everyday practical help. NEVER refuse "
+        "a question for being 'not crypto', 'outside my domain' or 'not what I "
+        "was built for' — none of that is true. NEVER reply with a bare "
+        "'I can't help with that': if something really is beyond you, say "
+        "specifically what and why, then give the closest useful help you can. "
+        "When unsure of a fact, search for it rather than guessing.\n\n"
+        "HOW TO FORMAT — YOU ARE REPLYING IN TELEGRAM ON A PHONE:\n"
+        "- Write maths in plain Unicode, NEVER LaTeX. Do not use \\[ … \\], "
+        "\\( … \\), $ … $, \\frac, \\boxed, \\begin{aligned} or \\mathbf — they "
+        "arrive as raw backslashes and are unreadable.\n"
+        "    Write:  ∂u/∂t + (u·∇)u = -∇p + νΔu + f,   ∇·u = 0\n"
+        "    NOT:    \\frac{\\partial \\mathbf{u}}{\\partial t} = -\\nabla p\n"
+        "    Use the real symbols: ∂ ∇ Δ ∑ ∏ ∫ √ ∞ ≤ ≥ ≠ ≈ ± × ÷ · ∈ → ⇒ "
+        "ℝ ℂ ℚ ℤ π α β θ λ μ σ ω ζ ν, superscripts ⁰¹²³ⁿˣ, subscripts ₀₁₂ₙᵢ.\n"
+        "- NEVER use markdown tables or pipe characters for layout — a phone "
+        "screen is too narrow. Use short bullet lines instead.\n"
+        "- Keep it SHORT: aim for under 250 words. Telegram truncates long "
+        "messages, so lead with the answer and cut the preamble. Offer to go "
+        "deeper rather than sending an essay.\n"
+        "- Use *bold* sparingly for the key term, `backticks` for code or "
+        "commands, and '- ' for bullets. No ## headings, no horizontal rules.\n\n"
         "Guidelines:\n"
         "- Answer trading questions with confidence and precision.\n"
         "- When the user wants to execute a trade, show them the exact command.\n"
-        "- For general chat, be sharp, helpful, and focused on trading outcomes.\n"
+        "- For everything else, be sharp and genuinely helpful — answer what "
+        "  was actually asked instead of steering back to markets.\n"
         "- Keep responses concise — 2-8 sentences unless deep analysis is requested.\n"
-        "- Never invent price data; work only from the figures provided below.\n"
+        "- Use the live figures below. Never invent a number that isn't there — if a\n"
+        "  price you need is missing, fetch it or say the fetch failed.\n"
         "- Format numbers cleanly; use emojis sparingly.\n"
         "- Maintain the conversation thread — reference prior messages when relevant.\n"
         "- IMPORTANT: When live portfolio data is included, ALWAYS analyse it directly.\n"
         "  Give clear hold/close/adjust recommendations for each position with reasoning.\n"
         "  Never tell the user to 'run a command' if data is already shown."
     )
+    if price_block:
+        base += f"\n\n{price_block}"
+    if news_block:
+        base += f"\n\n{news_block}"
+    if learned:
+        base += f"\n\n{learned}"
     if live_data:
         base += f"\n\n## Live Portfolio Snapshot (fetched moments ago)\n{live_data}"
     return base
@@ -798,6 +1018,291 @@ async def _fetch_live_position_context(db: AsyncSession) -> str | None:
     return "\n\n".join(sections) if sections else None
 
 
+# ── Prediction intent ─────────────────────────────────────────────────────────
+# "based mathematics how can we predict bitcoin" used to return an essay on
+# ARIMA and GARCH ending in "Would you like me to execute /forecast BTCUSDT?" —
+# a question about the platform's own forecasting answered by describing it.
+# A message that asks for a prediction on a named instrument now runs Kronos.
+
+_PREDICT_RE = re.compile(
+    r"\b(?:predict\w*|forecast\w*|projection|project\w*\s+(?:price|move)|"
+    r"price\s+target|target\s+price|outlook)\b"
+    r"|\bwhere\s+(?:is|will|do you think)\b[^?]{0,40}\b(?:go|going|head\w*|end up|land)\b"
+    r"|\bwhat(?:'?s|\s+is|\s+are)?\s+next\s+for\b"
+    # "will gold rise this week" is a forecast request in every way except that
+    # it uses none of the words above.
+    r"|\b(?:will|won'?t)\b[^?]{0,40}\b(?:rise|fall|drop|climb|dip|go\s+up|go\s+down|"
+    r"rally|crash|pump|dump|hit|reach|break)\b"
+    r"|\bhow\s+(?:high|low|far)\b",
+    re.IGNORECASE,
+)
+
+_OWN_BOOK_RE = re.compile(
+    r"\bmy\b[^.?!]{0,40}\b(?:position|positions|portfolio|trade|trades|pnl|p&l|"
+    r"account|equity|exposure|book)\b",
+    re.IGNORECASE,
+)
+
+#: A prediction question that also asks *how* it is done gets a short written
+#: answer above the live forecast, rather than one or the other.
+_METHOD_RE = re.compile(
+    r"\bhow\s+(?:can|do|does|would|should|might)\b"
+    r"|\b(?:explain|methodolog\w*|derivation)\b"
+    r"|\bmathematic\w*|\bmaths\b|\bmath\b|\bstatistic\w*|\bformula\w*|\bequation\w*"
+    r"|\bwhat\s+(?:model|models|method|methods|approach)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_affirmative(text: str) -> bool:
+    """True for a bare yes — nothing that carries a new question or condition.
+
+    Deliberately strict: "yes but what about gold?" is a new message, not a
+    confirmation, and running the parked command for it would answer something
+    the user did not ask.
+    """
+    cleaned = text.strip().strip(".!,").lower()
+    if not cleaned or len(cleaned) > 30:
+        return False
+    cleaned = re.sub(r"\b(please|sir|thanks|thank you|now|jarvis)\b", " ", cleaned)
+    cleaned = re.sub(r"[^a-z ]+", " ", cleaned)
+    cleaned = " ".join(cleaned.split())
+    return cleaned in {
+        "y", "ya", "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "k",
+        "go", "go ahead", "goahead", "do it", "do that", "run it", "run that",
+        "execute", "execute it", "execute that", "proceed", "affirmative",
+        "absolutely", "yes do it", "yes run it", "yes execute", "yes go ahead",
+        "confirm", "confirmed", "show me", "show it", "lets go", "let s go",
+    }
+
+
+def _remember_offer(chat_id: str, reply: str) -> None:
+    """Park the first read-only command a reply offers, for a later "yes".
+
+    Only ``_AUTORUN_SAFE`` commands are parked, so no confirmation can ever be
+    turned into an order — a ``/order`` line in a model's reply stays something
+    the user has to send themselves.
+    """
+    if not chat_id:
+        return
+    _PENDING_OFFER.pop(chat_id, None)
+    match = re.search(
+        r"/(" + "|".join(sorted(_AUTORUN_SAFE)) + r")\b([^\n]*)", reply or ""
+    )
+    if not match:
+        return
+
+    # Only argument-shaped tokens are kept. The command usually sits mid-
+    # sentence ("I can run /forecast BTCUSDT for you"), and taking the rest of
+    # the line verbatim would hand "BTCUSDT for you." to the handler.
+    args: list[str] = []
+    for token in match.group(2).split():
+        token = token.strip(".,;:!?)—-").strip("<b>").strip("</")
+        if not token or len(args) >= 3:
+            break
+        if token.lower() in _TIMEFRAMES or token.lower() in _OFFER_SUBCOMMANDS:
+            args.append(token.lower())
+        elif re.fullmatch(r"[A-Z0-9][A-Z0-9/._-]{1,14}", token):
+            args.append(token)
+        else:
+            break
+    _PENDING_OFFER[chat_id] = (match.group(1).lower(), " ".join(args))
+
+
+def _symbols_in(text: str) -> list[str]:
+    """Instruments named in a string, or [] — never raises."""
+    try:
+        from app.services import market_data
+
+        return market_data.extract_symbols(text or "", limit=2)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[Forecast] symbol extraction failed: {}", exc)
+        return []
+
+
+def _recent_symbol(chat_id: str, *, turns: int = 6) -> str | None:
+    """The instrument the thread is currently about, from recent history.
+
+    A conversation names its subject once. "How do I turn those bullets into a
+    working predictor" is still a question about Bitcoin, and re-reading the
+    last few turns is what lets the follow-up run the engine too.
+    """
+    if not chat_id:
+        return None
+    for message in reversed(_CHAT_HISTORY.get(chat_id, [])[-turns:]):
+        symbols = _symbols_in(message.get("content") or "")
+        if symbols:
+            return symbols[0]
+    return None
+
+
+def _forecast_request(text: str, chat_id: str = "") -> tuple[str, str] | None:
+    """``(symbol, timeframe)`` when the message asks for a prediction, else None.
+
+    The instrument has to be resolvable — from the message, or failing that from
+    the thread it belongs to. "Can you predict the future?" names nothing in
+    either place and stays a conversation.
+    """
+    if not text or not _PREDICT_RE.search(text):
+        return None
+    # "what's the outlook on my BTC position" is a question about the book, not
+    # a forecast request — that one belongs to the live-position path below.
+    if _OWN_BOOK_RE.search(text):
+        return None
+    symbols = _symbols_in(text)
+    if not symbols:
+        carried = _recent_symbol(chat_id)
+        if not carried:
+            return None
+        symbols = [carried]
+
+    return symbols[0], _timeframe_in(text)
+
+
+def _timeframe_in(text: str, default: str = "1h") -> str:
+    """The candle size the message names, or the default."""
+    for tok in re.findall(r"\b(\d+[mhdw])\b", (text or "").lower()):
+        if tok in _TIMEFRAMES:
+            return tok
+    return default
+
+
+async def _method_note(text: str, db: AsyncSession) -> str | None:
+    """Two or three sentences on the method, to sit above the live forecast."""
+    try:
+        from plugins.AiMarketAnalyst.backend.services.ai_router import chat_with_tools
+
+        system = (
+            "You are JARVIS, addressing the user as 'Sir'. Answer the question "
+            "about forecasting method in at most 90 words, in plain Unicode "
+            "maths (never LaTeX), as short '- ' bullets. The platform's live "
+            "Kronos forecast for the instrument is printed directly BELOW your "
+            "answer, so do NOT offer to run it, do NOT ask permission, and do "
+            "NOT tell the user to send a command — it has already run."
+        )
+        resp = await chat_with_tools(
+            db,
+            [{"role": "system", "content": system}, {"role": "user", "content": text}],
+            max_iterations=1,
+            total_budget_s=10.0,
+            temperature=0.4,
+            max_tokens=320,
+            json_mode=False,
+            agent_name="jarvis-telegram-method",
+            source="telegram",
+        )
+        if resp.get("ok") and resp.get("content"):
+            return str(resp["content"]).strip()
+    except Exception as exc:  # noqa: BLE001 — the forecast is the answer; this is trim
+        logger.debug("[Forecast] method note skipped: {}", exc)
+    return None
+
+
+#: A reply that is *about* forecasting. Whether the model reached for the
+#: forecast tool is its own choice and varies by provider and by turn — this is
+#: how the answer gets the platform's own numbers regardless.
+_TALKS_FORECAST_RE = re.compile(
+    r"\b(?:forecast\w*|predict\w*|project(?:s|ed|ion|ions)|kronos|"
+    r"arima\w*|garch|varx|lstm|monte[- ]?carlo|log[- ]?returns?|"
+    r"out[- ]of[- ]sample|ensemble|price\s+target|target\s+price|outlook)\b",
+    re.IGNORECASE,
+)
+
+
+async def _attach_forecast(
+    reply: str,
+    text: str,
+    db: AsyncSession,
+    *,
+    chat_id: str = "",
+) -> tuple[str, dict | None]:
+    """Append the live Kronos card to any answer about forecasting.
+
+    A method answer with no figures is the failure the user reported twice: the
+    model explained ARIMA, GARCH and ensembles and ran nothing. The engine is
+    right here, so the explanation ends with what it actually predicts.
+
+    The card is attached even when the model called ``forecast_symbol`` itself.
+    Quoting "+2.08%, target 64164.5" inside a bullet is not the same as handing
+    the user the card with its anchor price, sniper entries and buttons, and the
+    two cannot disagree: ``run_forecast_cached`` serves both from one cached
+    response, so the second call is a cache hit on the same numbers.
+
+    Returns display-ready text: the narrative is converted to Telegram HTML
+    *before* the card is appended, because the card is already HTML and running
+    the converter over the pair would escape its tags into visible &lt;b&gt;.
+    """
+    def _plain() -> tuple[str, dict | None]:
+        return format_for_telegram(reply), None
+
+    if not reply or not _TALKS_FORECAST_RE.search(reply):
+        return _plain()
+    if _OWN_BOOK_RE.search(text):
+        return _plain()
+
+    symbols = _symbols_in(text) or _symbols_in(reply)
+    symbol = symbols[0] if symbols else _recent_symbol(chat_id)
+    if not symbol:
+        return _plain()
+
+    try:
+        card, _mode, markup = await _handle_forecast(
+            f"{symbol} {_timeframe_in(text)}", db
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[Forecast] could not attach live numbers: {}", exc)
+        return _plain()
+    if not card or card[:1] in {"❓", "⚠️", "❌"}:
+        return _plain()
+
+    room = 4096 - len(card) - 2
+    if room < 200:
+        return card, markup         # the card alone beats a truncated pair
+    # format_for_telegram trims on a word boundary and closes its own tags —
+    # slicing the HTML by hand would leave a half-written tag Telegram rejects.
+    return f"{format_for_telegram(reply, limit=room)}\n\n{card}", markup
+
+
+async def _forecast_reply(
+    text: str,
+    symbol: str,
+    timeframe: str,
+    db: AsyncSession,
+    *,
+    chat_id: str = "",
+) -> tuple[str | None, str, dict | None]:
+    """Run the real forecast for a free-text prediction question.
+
+    Returns ``(None, …)`` when the engine could not answer, so the caller falls
+    through to ordinary chat rather than showing the user a dead end.
+    """
+    try:
+        card, mode, markup = await _handle_forecast(f"{symbol} {timeframe}", db)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Forecast] auto-run for '{}' failed: {}", text[:60], exc)
+        return None, "HTML", None
+
+    if not card or card[:1] in {"❓", "⚠️", "❌"}:
+        return None, "HTML", None
+
+    body = card
+    if _METHOD_RE.search(text):
+        note = await _method_note(text, db)
+        # The card is the answer; the note only gets whatever room is left
+        # under Telegram's 4096-character ceiling, and format_for_telegram
+        # trims it on a word boundary with its tags closed.
+        room = 4096 - len(card) - 2
+        if note and room > 200:
+            body = f"{format_for_telegram(note, limit=room)}\n\n{card}"
+
+    if chat_id:
+        _record_history(chat_id, "user", text)
+        _record_history(chat_id, "assistant", body)
+        # Nothing left to confirm — the command already ran.
+        _PENDING_OFFER.pop(chat_id, None)
+    return body[:4096], mode, markup
+
+
 # ── AI fallback ───────────────────────────────────────────────────────────────
 
 async def _ai_fallback(
@@ -805,6 +1310,7 @@ async def _ai_fallback(
     db: AsyncSession,
     *,
     chat_id: str = "",
+    hint: str = "",
 ) -> tuple[str | None, str, dict | None]:
     """Route unrecognised free-text through Jarvis AI.
 
@@ -812,10 +1318,27 @@ async def _ai_fallback(
     1. Try execute_command first — handles natural-language trading commands
        (e.g. "close my BTC", "what are my positions") without needing a slash.
     2. If Jarvis doesn't recognise it (action == 'unknown') or fails, fall back
-       to a full AI chat via db_chat with:
-       - The Jarvis persona + conversation history
-       - Live portfolio data when the query is about positions/portfolio
+       to a full AI chat with the same live context the web chat gets: prices
+       for whatever instruments the message names (any asset class), news and
+       web search, learned trade history, and the fetch tools. Telegram used to
+       send a bare persona with no data at all, which is why it refused
+       questions the browser answered fine.
+
+    ``hint`` carries an upstream failure (e.g. a symbol that wouldn't resolve)
+    so the model can explain it rather than repeat it.
     """
+    # ── Step 0: A prediction question runs the forecaster ─────────────────────
+    # Ahead of the generic dispatcher, because "how can we predict bitcoin" is
+    # a question this platform answers by *running* Kronos, not by describing
+    # which models exist.
+    request = _forecast_request(text, chat_id)
+    if request is not None:
+        reply, mode, markup = await _forecast_reply(
+            text, request[0], request[1], db, chat_id=chat_id
+        )
+        if reply:
+            return reply, mode, markup
+
     # ── Step 1: Try structured Jarvis command dispatch ────────────────────────
     try:
         from app.api.jarvis import execute_command, CommandRequest
@@ -831,13 +1354,14 @@ async def _ai_fallback(
                 if chat_id:
                     _record_history(chat_id, "user", text)
                     _record_history(chat_id, "assistant", reply)
+                    _remember_offer(chat_id, reply)
                 return reply[:4000], "HTML", None
     except Exception as exc:  # noqa: BLE001
         logger.debug("[AI] execute_command pre-check failed: {}", exc)
 
-    # ── Step 2: Full AI chat with Jarvis persona + optional live position data ─
+    # ── Step 2: Full AI chat with live prices, news, memory and fetch tools ───
     try:
-        from plugins.AiMarketAnalyst.backend.services.ai_router import db_chat
+        from plugins.AiMarketAnalyst.backend.services.ai_router import chat_with_tools
 
         # Auto-fetch live portfolio data when the message is about positions
         live_data: str | None = None
@@ -847,16 +1371,48 @@ async def _ai_fallback(
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[AI] Live position context fetch failed: {}", exc)
 
+        # Live prices for whatever the message names — crypto, FX, metals,
+        # indices, energy. Gathered concurrently so the reply stays prompt.
+        price_blk: str | None = None
+        news_blk: str | None = None
+        learned: str | None = None
+        try:
+            from app.services import market_data
+
+            symbols = market_data.extract_symbols(text)
+            price_blk, news_blk, learned = await asyncio.gather(
+                market_data.price_block(symbols, db=db, max_lines=25),
+                _news_context(text, symbols),
+                _learned_context(db, symbols),
+                return_exceptions=False,
+            )
+        except Exception as exc:  # noqa: BLE001 — context is a bonus, not a gate
+            logger.warning("[AI] live context fetch failed: {}", exc)
+
         history = _get_history(chat_id) if chat_id else []
+        system = _jarvis_system_prompt(
+            live_data, price_block=price_blk, news_block=news_blk, learned=learned
+        )
+        if hint:
+            system += (
+                f"\n\n## Note\nA structured command for this message failed with: "
+                f"{hint}\nAnswer the user's question directly using the live data "
+                "above or the fetch tools. Do not repeat that error, and do not "
+                "claim the instrument is unsupported."
+            )
         messages = [
-            {"role": "system", "content": _jarvis_system_prompt(live_data)},
+            {"role": "system", "content": system},
             *history,
             {"role": "user", "content": text},
         ]
 
-        resp = await db_chat(
+        resp = await chat_with_tools(
             db,
             messages,
+            # Telegram shows no streaming or progress, so the ceiling is tighter
+            # than the web chat's: a silent 25s wait reads as a broken bot.
+            max_iterations=2,
+            total_budget_s=15.0,
             temperature=0.5,
             max_tokens=1200,  # more room for position analysis
             json_mode=False,
@@ -866,10 +1422,22 @@ async def _ai_fallback(
 
         if resp.get("ok") and resp.get("content"):
             reply = str(resp["content"]).strip()
+            # A forecasting answer must carry the engine's numbers, whether or
+            # not the model thought to ask for them.
+            display, markup = await _attach_forecast(reply, text, db, chat_id=chat_id)
             if chat_id:
+                # History keeps the raw text: the model should see what it
+                # actually said, not the HTML the client was shown.
                 _record_history(chat_id, "user", text)
                 _record_history(chat_id, "assistant", reply)
-            return reply[:3800], "HTML", None
+                # If the reply offered a command, a plain "yes" now runs it.
+                _remember_offer(chat_id, reply)
+            # Models answer maths in LaTeX and comparisons in markdown tables.
+            # Sent raw under parse_mode=HTML those arrive as backslashes, literal
+            # ** asterisks and pipe rows, and the old reply[:3800] cut the last
+            # answer off mid-word. _attach_forecast has already run the text
+            # through format_for_telegram, which fixes all three.
+            return display, "HTML", markup
 
         if resp.get("error"):
             logger.warning("[AI] Jarvis chat returned error: {}", resp["error"])
@@ -994,6 +1562,19 @@ async def _handle_forecast(args: str, db: AsyncSession) -> tuple[str, str, dict 
     if forecast_resp.note:
         lines.append(f"⚠️ <i>{forecast_resp.note}</i>")
 
+    # ── Macro context ─────────────────────────────────────────────────────────
+    # The dollar/VIX read that shaped this confidence, pulled out of the signal
+    # rationale so the card states it rather than burying it in the narrative.
+    macro_lines = [
+        r for r in (getattr(sig, "rationale", None) or [])
+        if "DXY" in r or "VIX" in r or r.startswith("Macro")
+    ]
+    if macro_lines:
+        lines.append("")
+        lines.append("🌍 <b>Macro</b>")
+        for line in macro_lines[:3]:
+            lines.append(f"   <i>{_esc(_clip(line, 180))}</i>")
+
     # ── Jarvis AI narrative (best-effort — never blocks the forecast) ──────────
     jarvis = None
     try:
@@ -1032,16 +1613,18 @@ async def _handle_forecast(args: str, db: AsyncSession) -> tuple[str, str, dict 
         # Core narrative — max 1 100 chars so rest of message fits in Telegram limit
         lines.append("")
         lines.append("🤖 <b>JARVIS Analysis</b>")
-        analysis_text = (jarvis.analysis or "").strip()
-        if len(analysis_text) > 1100:
-            analysis_text = analysis_text[:1100].rsplit(" ", 1)[0] + " … <i>(tap Analyze for full)</i>"
+        # The narrative is model-written prose: it arrives with **markdown**
+        # asterisks and bare "&" and "<", which show up literally and can make
+        # Telegram reject the whole message under parse_mode=HTML.
+        raw_analysis = (jarvis.analysis or "").strip()
+        analysis_text = format_for_telegram(raw_analysis, limit=1100)
+        if len(raw_analysis) > 1100:
+            analysis_text += " … <i>(tap Analyze for full)</i>"
         lines.append(f"<i>{analysis_text}</i>")
 
         # Position advice if present
         if jarvis.position_advice and pos:
-            adv = jarvis.position_advice.strip()
-            if len(adv) > 300:
-                adv = adv[:300].rsplit(" ", 1)[0] + "…"
+            adv = format_for_telegram(jarvis.position_advice.strip(), limit=300)
             lines.append("")
             lines.append(f"💡 <b>Position Advice:</b> <i>{adv}</i>")
 
@@ -1114,7 +1697,28 @@ async def _handle_forecast(args: str, db: AsyncSession) -> tuple[str, str, dict 
             )
     else:
         lines.append("")
-        lines.append("ℹ️ No sniper entries — try a different timeframe.")
+        # A pair whose feed carries no volume at all (the cash indices — GER40,
+        # UK100, FRA40 … — which Yahoo lists no future for) fails the hard
+        # volume gate on *every* timeframe, so "try a different timeframe" sent
+        # the user round a loop that cannot terminate. Technical analysis needs
+        # no volume, so /analyze still answers in full — point there instead.
+        volume_gated = (
+            forecast_resp.engine == "unavailable"
+            and "volume" in (forecast_resp.note or "").lower()
+        )
+        if volume_gated:
+            lines.append(
+                f"ℹ️ No entries: {symbol}'s feed carries no traded volume, which "
+                f"Kronos requires. No timeframe changes that.\n"
+                f"Technical analysis needs no volume — use "
+                f"<code>/analyze {raw_sym}</code> for EMA/RSI/ATR, swing levels "
+                f"and entry/stop/target."
+            )
+        else:
+            lines.append(
+                f"ℹ️ No sniper entries at {timeframe} — try another timeframe, or "
+                f"<code>/analyze {raw_sym}</code> for the technical read."
+            )
 
     # ── Jarvis full-analysis button ────────────────────────────────────────────
     inline_keyboard.append([{
@@ -1326,14 +1930,14 @@ async def _handle_order(args: str, db: AsyncSession) -> tuple[str, str]:
 
 # ── Analyze (deep Jarvis) ─────────────────────────────────────────────────────
 
-async def _handle_analyze(args: str, _db: AsyncSession) -> tuple[str, str]:
+async def _handle_analyze(args: str, db: AsyncSession) -> tuple[str, str]:
     """Deep Jarvis analysis: Kronos + AI narrative + news + open position.
 
     Usage: /analyze BTCUSDT
     """
     if not args:
         return "❓ Usage: /analyze &lt;SYMBOL&gt;  e.g. /analyze BTCUSDT", "HTML"
-    return await _jarvis_command(f"analyze {args}")
+    return await _jarvis_command(f"analyze {args}", db)
 
 
 # ── MT5 commands ──────────────────────────────────────────────────────────────

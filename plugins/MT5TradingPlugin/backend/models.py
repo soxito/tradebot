@@ -555,3 +555,75 @@ class ResearchFinding(MT5Base):
     __table_args__ = (
         Index("ix_mt5_research_kind_time", "kind", "created_at"),
     )
+
+
+class SignalResearchJob(MT5Base):
+    """One PAIR's research job — every live signal on that instrument at once.
+
+    Research is batched per instrument, not per signal. Three Telegram calls and
+    an SMC setup on XAUUSD are four opinions about one market: researching them
+    separately burns four times the model budget and yields four unreconciled
+    answers. Researched together they corroborate or contradict each other, and
+    the disagreement between their entries is itself information — it is what
+    produces the two entry plans in `entries`.
+
+    The queue runs a bounded number of these concurrently and the Research page
+    renders `stage`/`progress`/`steps` live, so a run is observable rather than
+    a black box.
+    """
+    __tablename__ = "mt5_signal_research_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String(30), nullable=False, index=True)
+    #: Where the signals came from — "telegram+smc" when a pair has several.
+    source = Column(String(40), nullable=False, default="manual")
+    #: "pair:{SYMBOL}" — the natural key. Not a DB unique constraint: a pair is
+    #: legitimately re-researched once its cooldown lapses, or immediately when
+    #: a signal arrives that the last run did not see.
+    signal_ref = Column(String(80), nullable=False, index=True)
+    #: The individual "{source}:{id}" refs folded into this run, and the full
+    #: signal payloads the model was shown. Together they are the audit trail
+    #: for "which signals produced these entries".
+    signal_refs = Column(JSON, nullable=True)
+    signals = Column(JSON, nullable=True)
+    signal_count = Column(Integer, default=1)
+
+    #: The consensus of the batch — majority direction, or None when the signals
+    #: genuinely disagree (which the research is expected to resolve).
+    direction = Column(String(8), nullable=True)                    # buy | sell
+    entry = Column(Float, nullable=True)
+    stop_loss = Column(Float, nullable=True)
+    take_profit = Column(Float, nullable=True)
+
+    #: The deliverable: exactly two costed entry plans, primary and secondary,
+    #: each with its own stop and target. Shape per entry:
+    #: {label, side, entry, stop_loss, take_profit, rr, confidence, trigger,
+    #:  rationale}. Read by the sniper paths and rendered wherever a pair's
+    #: signals are shown.
+    entries = Column(JSON, nullable=True)
+
+    status = Column(String(16), nullable=False, default="queued", index=True)
+    stage = Column(String(40), nullable=True)
+    progress = Column(Float, default=0.0)
+    #: [{name, status, detail, ms}] — the per-step audit the UI checklists.
+    steps = Column(JSON, nullable=True)
+
+    verdict = Column(String(16), nullable=True)   # bullish|bearish|neutral|stand_aside
+    verdict_confidence = Column(Float, nullable=True)
+    horizon_hours = Column(Integer, nullable=True)
+    rationale = Column(Text, nullable=True)
+    #: URLs the prediction was built from. Empty ⇒ the finding is speculative.
+    sources = Column(JSON, nullable=True)
+    speculative = Column(Boolean, default=True)
+    finding_id = Column(Integer, nullable=True, index=True)   # ResearchFinding.id
+    provider_used = Column(String(120), nullable=True)
+    error = Column(Text, nullable=True)
+
+    queued_at = Column(DateTime, default=datetime.utcnow, index=True)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("ix_mt5_srj_status_queued", "status", "queued_at"),
+        Index("ix_mt5_srj_symbol_status", "symbol", "status"),
+    )

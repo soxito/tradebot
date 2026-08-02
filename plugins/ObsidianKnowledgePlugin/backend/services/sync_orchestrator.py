@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -493,3 +493,152 @@ async def _try_push(bridge: Any, path: Path, vault_root: Path) -> None:
         await bridge.push_note(rel, content)
     except Exception:
         pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Auto-sync loop
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# The vault is only useful if it reflects what the desk has actually been doing,
+# and a sync nobody remembers to press is a vault that quietly goes stale. This
+# runs one on a timer and, just as importantly, records WHEN it last ran.
+#
+# `/status` derives its `last_sync_at` from max(VaultNote.updated_at), which is
+# the last time a note changed — not the last time a sync ran. A cycle that
+# finds nothing new leaves that timestamp untouched, so the page would keep
+# showing an ever-older time while syncing perfectly happily every 5 minutes.
+# `_last_run` below is the honest answer to "when did this last run".
+
+_sync_task: Optional[asyncio.Task] = None
+_sync_running = False
+_sync_interval = 300  # 5 minutes
+_sync_started_at: Optional[str] = None
+_last_run: Optional[Dict[str, Any]] = None
+
+
+def _utc_now_iso() -> str:
+    """An ISO timestamp the browser cannot misread.
+
+    `datetime.utcnow().isoformat()` yields a NAIVE string, and `new Date(...)`
+    in JS parses that as LOCAL time — so on a UTC+2 machine a sync from two
+    minutes ago rendered as "2h 2m ago". Offset-aware output removes the guess.
+    """
+    return datetime.now(timezone.utc).isoformat()
+
+
+def get_vault_sync_status() -> Dict[str, Any]:
+    """Loop state for the vault page: running, cadence, and the last real run."""
+    next_due = None
+    if _sync_running and _last_run and _last_run.get("at"):
+        try:
+            last = datetime.fromisoformat(_last_run["at"])
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+            next_due = (last + timedelta(seconds=_sync_interval)).isoformat()
+        except (TypeError, ValueError):
+            next_due = None
+    return {
+        "running": _sync_running,
+        "interval_seconds": _sync_interval,
+        "started_at": _sync_started_at,
+        "last_run": _last_run,
+        "next_run_at": next_due,
+    }
+
+
+async def _run_one_cycle() -> Dict[str, Any]:
+    """One sync against its own session, recorded whether or not it changed anything."""
+    global _last_run
+    from app.core.database import AsyncSessionLocal
+
+    started = _utc_now_iso()
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await run_sync(db=db)
+        _last_run = {
+            "at": started,
+            "status": "ok" if result.get("errors", 0) == 0 else "partial",
+            "written": result.get("written", 0),
+            "skipped": result.get("skipped", 0),
+            "errors": result.get("errors", 0),
+            "duration_ms": result.get("duration_ms", 0),
+            "trigger": "auto",
+        }
+        logger.info(
+            f"🗂️  [VAULT SYNC] {_last_run['written']} written, "
+            f"{_last_run['skipped']} unchanged, {_last_run['errors']} error(s)"
+        )
+    except Exception as exc:  # noqa: BLE001 — a bad cycle must not kill the loop
+        _last_run = {
+            "at": started, "status": "error",
+            "error": str(exc)[:500], "trigger": "auto",
+        }
+        logger.error(f"🗂️  [VAULT SYNC] cycle failed: {exc}")
+    return _last_run
+
+
+def record_manual_sync(result: Dict[str, Any]) -> None:
+    """Record a sync the user pressed, so the page shows it as the latest run."""
+    global _last_run
+    _last_run = {
+        "at": _utc_now_iso(),
+        "status": "ok" if result.get("errors", 0) == 0 else "partial",
+        "written": result.get("written", 0),
+        "skipped": result.get("skipped", 0),
+        "errors": result.get("errors", 0),
+        "duration_ms": result.get("duration_ms", 0),
+        "trigger": "manual",
+    }
+
+
+async def _sync_loop() -> None:
+    global _sync_running
+    logger.info(f"🗂️  [VAULT SYNC] auto-sync started — every {_sync_interval}s")
+    # Let the app finish booting before the first pass; a sync walks the whole
+    # vault and competes with startup for the event loop.
+    try:
+        await asyncio.sleep(20)
+    except asyncio.CancelledError:
+        _sync_running = False
+        return
+
+    while _sync_running:
+        await _run_one_cycle()
+        try:
+            await asyncio.sleep(_sync_interval)
+        except asyncio.CancelledError:
+            break
+    _sync_running = False
+    logger.info("🗂️  [VAULT SYNC] auto-sync stopped")
+
+
+def start_vault_sync_loop(interval: int = 300) -> bool:
+    global _sync_task, _sync_running, _sync_interval, _sync_started_at
+
+    if _sync_task is not None and not _sync_task.done():
+        logger.warning("Vault sync loop already running")
+        return False
+
+    # Floor of 60s: a full vault walk every few seconds is pure churn.
+    _sync_interval = max(60, int(interval or 300))
+    _sync_running = True
+    _sync_started_at = _utc_now_iso()
+    _sync_task = asyncio.create_task(_sync_loop())
+    logger.info(f"🗂️  Vault auto-sync started (every {_sync_interval}s)")
+    return True
+
+
+def stop_vault_sync_loop() -> bool:
+    global _sync_running, _sync_task, _sync_started_at
+
+    if not _sync_running and (_sync_task is None or _sync_task.done()):
+        logger.warning("Vault sync loop is not running")
+        return False
+
+    _sync_running = False
+    if _sync_task:
+        _sync_task.cancel()
+    _sync_task = None
+    _sync_started_at = None
+    logger.info("🗂️  Vault auto-sync stopped")
+    return True

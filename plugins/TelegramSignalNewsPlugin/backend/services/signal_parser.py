@@ -70,6 +70,12 @@ _SYM_SLASH = re.compile(r"#?\b([A-Z0-9]{1,15})/(USDT|USD|BTC|ETH)\b")
 _SYM_GLUED = re.compile(r"\b([A-Z0-9]{2,15})(USDT|USD)\b")
 _SYM_HASH = re.compile(r"#([A-Z0-9]{1,15})\b")
 
+# Spot commodity/metal aliases that channels quote by name (e.g. "GOLD BUY NOW").
+_SYMBOL_ALIASES = {
+    "GOLD": "XAUUSD",
+    "SILVER": "XAGUSD",
+}
+
 # Forex pair symbols: EURUSD, GBPUSD, XAUUSD, USDJPY, GBPJPY, etc.
 # Matches any 6-char combination of the major currency codes.
 _FOREX_CCYS = (
@@ -81,6 +87,23 @@ _SYM_FOREX = re.compile(
     rf"\b({_FOREX_CCYS})/?({_FOREX_CCYS})\b",
     re.IGNORECASE,
 )
+
+# A whole symbol that is exactly two forex/metal currency codes (e.g. XAUUSD,
+# EURUSD, USDJPY) — used to route signals to the Forex tab regardless of the
+# channel's configured market type.
+_FOREX_PAIR_FULL = re.compile(rf"^{_FOREX_CCYS}{_FOREX_CCYS}$", re.IGNORECASE)
+
+
+def classify_market_type(symbol: str | None) -> str | None:
+    """Return 'forex' for FX/metal pairs, 'crypto' for USDT pairs, else None."""
+    if not symbol:
+        return None
+    s = symbol.upper().replace("/", "")
+    if s.endswith("USDT"):
+        return "crypto"
+    if _FOREX_PAIR_FULL.match(s):
+        return "forex"
+    return None
 
 _LEVERAGE = re.compile(r"(?:leverage[\s\-:]*)?(?:cross|isolated)?\s*\(?\s*(\d{1,3})\s*[xх]\s*\)?", re.IGNORECASE)
 
@@ -101,6 +124,20 @@ _OPPOSITE_DIR = re.compile(
     r"|contra(?:ry|dict)\s+signal",
     re.IGNORECASE,
 )
+
+# Markdown artefacts some channels leave in the raw text: **bold**, [label](url)
+# links (including tg://emoji links wrapping emojis) that split labels from prices.
+_MD_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+_MD_BOLD = re.compile(r"\*{1,3}")
+
+
+def _normalize(text: str) -> str:
+    """Strip Telegram markdown so labels and prices sit next to each other."""
+    if not text:
+        return text
+    text = _MD_LINK.sub(r"\1", text)  # [🔼](tg://emoji?id=…) -> 🔼
+    text = _MD_BOLD.sub("", text)      # **TP1 4081** -> TP1 4081
+    return text
 
 
 def _detect_direction(text: str) -> str | None:
@@ -140,6 +177,10 @@ def _detect_symbol(text: str) -> str | None:
         token = m.group(1).upper()
         if token not in {"LONG", "SHORT", "BUY", "SELL", "TP", "SL", "VIP"}:
             return token
+    # Named commodities like "GOLD BUY NOW" map to their forex pair.
+    for alias, mapped in _SYMBOL_ALIASES.items():
+        if re.search(rf"\b{alias}\b", text, re.IGNORECASE):
+            return mapped
     return None
 
 
@@ -196,6 +237,30 @@ def _detect_entry(text: str) -> tuple[float | None, str | None]:
                 return val, raw
             except ValueError:
                 continue
+
+    # ── Priority 3: Entry embedded on the direction line (no "entry" keyword) ──
+    # e.g. "LONG : 0.32711 - 0.32809", "GOLD BUY NOW 4051_4054", "SELL NOW 4078".
+    # A range is averaged; a single price is used directly.
+    m = re.search(
+        rf"(?:long|short|buy|sell)\b[^\d\n]*{_NUM}\s*[-–—_]\s*{_NUM}",
+        text, re.IGNORECASE,
+    )
+    if m:
+        try:
+            lo, hi = float(m.group(1)), float(m.group(2))
+            if lo >= 0.00001 and hi >= 0.00001:
+                return round((lo + hi) / 2, 10), m.group(1)
+        except ValueError:
+            pass
+    m = re.search(rf"(?:long|short|buy|sell)\b[^\d\n]*{_NUM}", text, re.IGNORECASE)
+    if m:
+        raw = m.group(1)
+        try:
+            val = float(raw)
+            if val >= 0.00001:
+                return val, raw
+        except ValueError:
+            pass
     return None, None
 
 
@@ -209,9 +274,10 @@ def _detect_stop_loss(text: str) -> tuple[float | None, str | None]:
     if m:
         return None, m.group(1).replace(" ", "")
 
-    # Numeric SL on same or next line
+    # Numeric SL on same or next line. Allow a hyphen in "Stop-Loss", an "@"
+    # separator ("SL @ 4068"), and a stray emoji/symbol before the price.
     patterns = [
-        rf"(?:⛔️?|🚫)?\s*(?:stop\s*loss|sl)\s*[:=]?\s*\n?\s*{_NUM}",
+        rf"(?:stop[\s\-]*loss|sl)\s*[:=@]?\s*\n?\s*[^\d\n]{{0,4}}{_NUM}",
         rf"stop\s*targets?\s*[:=]?\s*\n?\s*{_NUM}",
     ]
     for pat in patterns:
@@ -242,9 +308,11 @@ def _detect_take_profits(text: str) -> list[float]:
         except ValueError:
             pass
 
-    # Labelled: "TP1: 0.105727"
+    # Labelled: "TP1: 0.105727", "► TP 1: 0.33006", "TP1 🔼4081".
+    # The index (1-2 digits) is required so it can't be mistaken for the price
+    # (e.g. "After TP1 → SL to BE"). A stray emoji/symbol before the price is ok.
     if not tps:
-        for m in re.finditer(rf"tp\s*\d*\s*[:=]?\s*{_NUM}", text, re.IGNORECASE):
+        for m in re.finditer(rf"tp\s*\d{{1,2}}\s*[:=@]?\s*[^\d\n]{{0,4}}{_NUM}", text, re.IGNORECASE):
             try:
                 tps.append(float(m.group(1)))
             except ValueError:
@@ -265,6 +333,7 @@ def parse_entry_signal(text: str) -> ParsedSignal | None:
     if not text or not text.strip():
         return None
 
+    text = _normalize(text)
     direction = _detect_direction(text)
     symbol = _detect_symbol(text)
     if direction is None or symbol is None:
@@ -330,6 +399,7 @@ def parse_outcome(text: str) -> SignalOutcome | None:
     if not text:
         return None
 
+    text = _normalize(text)
     symbol = _detect_symbol(text)
     if symbol is None:
         return None

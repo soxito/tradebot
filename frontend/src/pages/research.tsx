@@ -36,9 +36,19 @@ import {
   ResearchKind,
   useResearchFeed,
 } from '@/hooks/useResearchFeed'
+import SignalResearchBoard from '@/components/research/SignalResearchBoard'
 import { SOUTH_AFRICA_TIMEZONE, formatDateTimeZA } from '@/utils/datetime'
 
 const POLL_MS = 60_000
+
+/** The page's three jobs: read the findings, read the diary, watch the agents. */
+type View = 'overview' | 'calendar' | 'signals'
+
+const VIEWS: { id: View; label: string; hint: string }[] = [
+  { id: 'overview', label: 'Overview', hint: 'Findings the background loop collected' },
+  { id: 'calendar', label: 'Calendar', hint: 'Scheduled events and the agent reminder' },
+  { id: 'signals', label: 'Signal Research', hint: 'Live per-pair research jobs' },
+]
 
 /** Day and time keys, both in the app's timezone, so the grid and the events
  *  it buckets can never disagree about which day an 01:30 release falls on. */
@@ -99,6 +109,7 @@ function decayIn(decayAt: string | null): string {
 }
 
 export default function ResearchPage() {
+  const [view, setView] = useState<View>('overview')
   const [fomoOnly, setFomoOnly] = useState(true)
   const [currency, setCurrency] = useState<string | null>(null)
   const [tab, setTab] = useState<'all' | ResearchKind>('all')
@@ -196,7 +207,10 @@ export default function ResearchPage() {
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          {/* The loop controls drive the ambient research loop only. The signal
+              queue has its own start/stop on its tab, so showing these there
+              would be two different switches wearing the same label. */}
+          <div className={`flex items-center gap-2 ${view === 'signals' ? 'hidden' : ''}`}>
             <span
               className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs border ${
                 data.status?.running
@@ -240,6 +254,28 @@ export default function ResearchPage() {
           </div>
         )}
 
+        {/* ── View tabs ──────────────────────────────────────────────────── */}
+        <div className="flex flex-wrap gap-1 bg-gray-800/40 rounded-lg p-1 w-fit">
+          {VIEWS.map((v) => (
+            <button
+              key={v.id}
+              onClick={() => setView(v.id)}
+              title={v.hint}
+              className={`px-4 py-2 rounded-md text-sm transition ${
+                view === v.id
+                  ? 'bg-tradebot-accent/20 text-tradebot-accent'
+                  : 'text-gray-400 hover:text-white'
+              }`}
+            >
+              {v.label}
+            </button>
+          ))}
+        </div>
+
+        {view === 'signals' && <SignalResearchBoard />}
+
+        {view === 'overview' && (
+        <>
         {/* ── Stats ──────────────────────────────────────────────────────── */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
           <StatCard label="Active findings" value={data.findings.length}
@@ -263,6 +299,11 @@ export default function ResearchPage() {
           />
         </div>
 
+        </>
+        )}
+
+        {view === 'calendar' && (
+        <>
         {/* ── Calendar ───────────────────────────────────────────────────── */}
         <div className="bg-gray-800/60 border border-gray-700/50 rounded-xl p-4 space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
@@ -447,8 +488,11 @@ export default function ResearchPage() {
             {data.reminder?.content || 'No reminder written yet — run a research cycle.'}
           </pre>
         </div>
+        </>
+        )}
 
         {/* ── Findings ───────────────────────────────────────────────────── */}
+        {view === 'overview' && (
         <div className="space-y-3">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex gap-1 bg-gray-800/40 rounded-lg p-1 w-fit">
@@ -492,6 +536,7 @@ export default function ResearchPage() {
             </div>
           )}
         </div>
+        )}
       </div>
     </>
   )

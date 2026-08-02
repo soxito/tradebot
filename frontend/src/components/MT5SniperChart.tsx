@@ -21,7 +21,7 @@ import {
   createChart, IChartApi, ISeriesApi, SeriesMarker, Time, LineStyle,
   CrosshairMode, ColorType,
 } from 'lightweight-charts'
-import { apiClient } from '@/services/api'
+import { apiClient, type PriceBasis } from '@/services/api'
 import { ZoneBoxPrimitive, ZoneBox } from './MT5ZonePrimitive'
 import {
   Crosshair, RefreshCw, Target, TrendingUp, TrendingDown, Activity,
@@ -53,6 +53,13 @@ interface SmcSignal {
   formed_index: number
   formed_time: number
   confluence: string[]
+  /** Kronos ML fusion — does the forecast agree with this side, and by how much.
+   *  `null` alignment means there was no usable forecast, not disagreement. */
+  kronos_aligned?: boolean | null
+  /** SMC confidence adjusted by Kronos agreement; drives the signal ordering. */
+  fusion_score?: number | null
+  /** Why the forecast moved (or did not move) this setup. */
+  kronos_note?: string | null
   /** Numeric audit trail for `confidence` — see backend smc_scoring.py. */
   score_breakdown?: {
     total: number
@@ -65,7 +72,7 @@ interface SmcSignal {
     by_family: Record<string, number>
     factors: {
       name: string
-      family: 'volume' | 'structure' | 'movement' | 'risk'
+      family: 'volume' | 'structure' | 'movement' | 'risk' | 'macro'
       raw_value: number
       normalized: number
       weight: number
@@ -123,6 +130,17 @@ interface AiReview {
   rated_signals?: { entry: number; verdict: string; confidence: number; note: string }[]
 }
 
+/** A setup the engine built and then refused, with the gate that stopped it. */
+interface RejectedSignal {
+  side: 'buy' | 'sell'
+  entry: number
+  rr: number
+  confidence: number
+  /** htf_bias | volume | confidence */
+  gate: string
+  detail: string
+}
+
 interface Analysis {
   symbol: string
   timeframe: string
@@ -138,6 +156,9 @@ interface Analysis {
   liquidity?: { buyside: number[]; sellside: number[] }
   zones?: SmcZone[]
   signals?: SmcSignal[]
+  /** Candidates the hard gates refused, and which gate stopped each.
+   *  Only populated when the engine had something to reject. */
+  rejected_signals?: RejectedSignal[]
   structure_events?: SmcStructureEvent[]
   us_session?: { enabled: boolean; open_time: number | null; open_price: number | null; live_in_session: boolean }
   ai?: AiReview | null
@@ -266,6 +287,17 @@ interface PendingChartOrder {
 
 const TIMEFRAMES = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1'] as const
 
+/** Metals quote two genuinely different prices — spot and the COMEX future. */
+const METAL_SYMBOLS = new Set([
+  'XAUUSD', 'XAGUSD', 'XPTUSD', 'XPDUSD', 'GOLD', 'SILVER', 'PLATINUM', 'PALLADIUM',
+])
+
+/** True when this instrument has both a spot and a futures series to choose from.
+ *  Broker decorations are stripped first so XAUUSD.m still matches. */
+function supportsPriceBasis(sym: string): boolean {
+  return METAL_SYMBOLS.has(stripBrokerSuffix(sym)) || METAL_SYMBOLS.has(normalizePair(sym))
+}
+
 // ── Chart layer visibility ───────────────────────────────────────────────────
 const LAYER_KEYS = ['zones', 'range', 'liquidity', 'setup', 'structure', 'position', 'kronos'] as const
 type LayerKey = typeof LAYER_KEYS[number]
@@ -304,6 +336,10 @@ const MT5_TF_TO_EXCHANGE: Record<string, string> = { M1: '1m', M5: '5m', M15: '1
 const HTF_FOR: Record<string, string> = { M1: 'M15', M5: 'H1', M15: 'H4', M30: 'H4', H1: 'H4' }
 /** Optimal candle count per timeframe — enough SMC structure without hitting backend 1000-bar limit. */
 const TF_CANDLE_COUNT: Record<string, number> = { M1: 1000, M5: 800, M15: 600, M30: 500, H1: 400, H4: 300, D1: 200, W1: 100 }
+/** Default framing for a newly loaded symbol. */
+const VISIBLE_BARS = 60   // recent candles visible by default
+const RIGHT_PAD    = 14   // empty bars on the right for the Kronos forecast
+
 const CRYPTO_EXCHANGES = new Set(['bitget', 'binance', 'bybit', 'okx', 'kucoin', 'coinbase', 'huobi', 'gate'])
 const FOREX_TO_CRYPTO: Record<string, string> = {
   XAUUSD: 'XAUUSDT', XAGUSD: 'XAGUSDT', BTCUSD: 'BTCUSDT',
@@ -501,6 +537,10 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
   const symbolSearchTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const symbolBoxRef = useRef<HTMLDivElement | null>(null)
   const [timeframe, setTimeframe] = useState(cfg0.timeframe ?? 'H1')
+  // Spot by default: it is what a broker fills at, so the levels this chart
+  // produces are the ones the user can actually trade. Futures is there for
+  // anyone charting the COMEX contract itself.
+  const [priceBasis, setPriceBasis] = useState<PriceBasis>('spot')
   const [minRR, setMinRR] = useState(cfg0.minRR ?? 2)
   const [maxLoss, setMaxLoss] = useState(cfg0.maxLoss ?? 15)        // hard max $ loss the user will accept
   const [useCap, setUseCap] = useState(cfg0.useCap ?? false)       // false = risk-% only (no cap, fixed-fractional)
@@ -807,7 +847,7 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
   const loadSourceCandles = useCallback(async (tf: string, count: number): Promise<{ candles: Candle[]; source: string }> => {
     // 1) Yahoo primary — covers every instrument this chart can show.
     try {
-      const res = await apiClient.getMarketCandles(symbol, tf, count)
+      const res = await apiClient.getMarketCandles(symbol, tf, count, undefined, priceBasis)
       const raw: Candle[] = res.data?.candles ?? []
       if (raw.length > 0) return { candles: raw, source: res.data?.source || 'yahoo' }
     } catch { /* fall through */ }
@@ -834,7 +874,38 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
       if (raw.length > 0) return { candles: raw, source: 'mt5' }
     } catch { /* fall through */ }
     return { candles: [], source: 'none' }
-  }, [accountId, symbol, fallbackExchange])
+  }, [accountId, symbol, fallbackExchange, priceBasis])
+
+  /**
+   * Frame a freshly loaded symbol on its own latest bars.
+   *
+   * Both axes have to be reset explicitly on a symbol switch:
+   *  • Vertical — lightweight-charts turns `autoScale` OFF permanently as soon
+   *    as the user drags the price axis. Without re-enabling it, XAUUSD's
+   *    ~3300 range stays applied to the next pair, so a 1.08 EURUSD candle
+   *    series collapses into a flat line at the bottom of the pane.
+   *  • Horizontal — the previous pair's scroll position survives `setData`,
+   *    so the view can sit far away from the newest bar.
+   */
+  const resetChartView = useCallback((barCount: number) => {
+    const cs = candleSeries.current
+    if (!chartMounted.current || !chart.current || !cs || barCount <= 0) return
+    const apply = () => {
+      if (!chartMounted.current || !chart.current || !candleSeries.current) return
+      try {
+        candleSeries.current.priceScale().applyOptions({ autoScale: true })
+        chart.current.timeScale().setVisibleLogicalRange({
+          from: Math.max(0, barCount - VISIBLE_BARS),
+          to: barCount - 1 + RIGHT_PAD,
+        })
+      } catch { /* chart disposed between ref read and use */ }
+    }
+    apply()
+    // lightweight-charts restores its own scroll position on the frame after
+    // setData, which silently undoes a range applied synchronously — so pin it
+    // again on the next frame.
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(apply)
+  }, [])
 
   const fetchCandles = useCallback(async () => {
     if (!accountId) return
@@ -863,15 +934,9 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
           const prec = precisionFor(raw.flatMap(c => [c.open, c.high, c.low, c.close]))
           cs.applyOptions({ priceFormat: { type: 'price', precision: prec, minMove: Math.pow(10, -prec) } })
           cs.setData(raw.map(c => ({ time: c.time as Time, open: c.open, high: c.high, low: c.low, close: c.close })))
-          // Default zoom on page load: show the most recent bars (not all history),
-          // leaving room on the right for the Kronos forecast projection.
-          const ts = chart.current?.timeScale()
-          if (ts) {
-            const VISIBLE_BARS = 60   // recent candles visible by default
-            const RIGHT_PAD = 14      // empty bars on the right for the forecast
-            const from = Math.max(0, raw.length - VISIBLE_BARS)
-            ts.setVisibleLogicalRange({ from, to: raw.length - 1 + RIGHT_PAD })
-          }
+          // Frame the newest bars of *this* pair — on page load and on every
+          // symbol/timeframe switch, so no view is inherited from the last pair.
+          resetChartView(raw.length)
         } catch { /* chart disposed between ref read and use */ }
       } else {
         // Wipe the previous pair's candles — leaving them up makes a successful
@@ -886,7 +951,7 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
     } finally {
       setLoading(false)
     }
-  }, [accountId, symbol, timeframe, fallbackExchange, loadSourceCandles])
+  }, [accountId, symbol, timeframe, fallbackExchange, loadSourceCandles, priceBasis, resetChartView])
 
   // ── SMC analysis (runs on whatever candles are currently displayed) ─────────
   const runAnalysis = useCallback(async () => {
@@ -991,7 +1056,7 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
         return typeof ask === 'number' ? ask : null
       }
       if (isYahoo) {
-        const res = await apiClient.getMarketPrice(symbol)
+        const res = await apiClient.getMarketPrice(symbol, undefined, priceBasis)
         const p = res.data?.price
         return typeof p === 'number' && isFinite(p) ? p : null
       }
@@ -1059,7 +1124,7 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
         livePriceLine.current = null
       }
     }
-  }, [accountId, symbol, timeframe, loading, sourceLabel, priceSource])
+  }, [accountId, symbol, timeframe, loading, sourceLabel, priceSource, priceBasis])
 
   // Persist the chosen price source + run a one-off connection test.
   const testPriceSource = useCallback(async () => {
@@ -1118,6 +1183,7 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
   }, [positionReview, accountId, positions, symbol, onPlaced])
 
   const signals = analysis?.signals ?? []
+  const rejected = analysis?.rejected_signals ?? []
   const selected = signals[selectedIdx] ?? null
 
   // ── Draw overlays (zones, equilibrium, liquidity, selected setup) ───────────
@@ -1569,6 +1635,31 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
             </button>
           ))}
         </div>
+        {/* Spot vs futures — metals only. Gold and silver have two genuinely
+            different prices: spot, which is what a broker quotes and fills at,
+            and the COMEX contract, which trades above spot by the cost of carry
+            (~1.4% for gold). Everything else has one series, so the control is
+            hidden rather than shown inert. */}
+        {supportsPriceBasis(symbol) && (
+          <div
+            className="flex gap-0.5 bg-gray-800/70 rounded-lg p-0.5"
+            title="Spot = the price your broker quotes and fills at. Futures = the COMEX contract, which trades above spot by the cost of carry."
+          >
+            {(['spot', 'futures'] as PriceBasis[]).map(b => (
+              <button
+                key={b}
+                onClick={() => setPriceBasis(b)}
+                className={`px-2 py-1 rounded text-xs font-medium capitalize transition-colors ${
+                  priceBasis === b
+                    ? 'bg-amber-500/25 text-amber-300'
+                    : 'text-gray-400 hover:text-gray-200'
+                }`}
+              >
+                {b}
+              </button>
+            ))}
+          </div>
+        )}
         <div className="flex items-center gap-1 text-xs text-gray-400">
           <span>Min RR</span>
           <select value={minRR} onChange={e => setMinRR(Number(e.target.value))}
@@ -2022,7 +2113,47 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
               </div>
             )}
             {signals.length === 0 && !analyzing && (
+              /* An empty panel used to be indistinguishable from a broken
+                 sniper. When the engine found candidates and refused them, say
+                 so and name the gate — that is a market condition the trader can
+                 act on, not a failure. */
+              rejected.length > 0 ? (
+                <div className="py-3 space-y-2">
+                  <p className="text-xs text-gray-400">
+                    No tradeable setups — the engine found {rejected.length} candidate
+                    {rejected.length === 1 ? '' : 's'} and rejected {rejected.length === 1 ? 'it' : 'them all'}:
+                  </p>
+                  {rejected.map((r, i) => (
+                    <div
+                      key={`${r.side}-${r.entry}-${i}`}
+                      className="flex items-center justify-between rounded border border-gray-700/40 bg-gray-800/30 px-2 py-1.5"
+                    >
+                      <span className="text-[11px] text-gray-400">
+                        <span className={r.side === 'buy' ? 'text-blue-400/70' : 'text-orange-400/70'}>
+                          {r.side.toUpperCase()}
+                        </span>
+                        {' @ '}{r.entry}
+                        <span className="text-gray-600"> · RR {r.rr} · {(r.confidence * 100).toFixed(0)}%</span>
+                      </span>
+                      <span
+                        className="text-[9px] px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-300/90 font-medium whitespace-nowrap ml-2"
+                        title={r.detail}
+                      >
+                        {r.gate === 'htf_bias' ? 'HTF opposes'
+                          : r.gate === 'volume' ? 'no volume'
+                          : r.gate === 'confidence' ? 'low conviction'
+                          : r.gate}
+                      </span>
+                    </div>
+                  ))}
+                  <p className="text-[10px] text-gray-600">
+                    These gates exist to keep you out of counter-trend and unconfirmed
+                    entries. Wait for structure, or switch to the higher timeframe&apos;s direction.
+                  </p>
+                </div>
+              ) : (
               <p className="text-xs text-gray-500 py-3 text-center">No sniper-grade setups right now. Wait for price to build structure or lower Min RR.</p>
+              )
             )}
             <div className="space-y-2">
               {signals.map((s, i) => {
@@ -2070,7 +2201,33 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
                             structure-only
                           </span>
                         )}
-                        <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-tradebot-accent/20 text-tradebot-accent font-semibold">
+                        {/* Kronos verdict. The forecast re-ranks these cards, so
+                            without this the reordering is an unexplained shuffle.
+                            `null` means no usable forecast — shown as neither
+                            agreement nor opposition. */}
+                        {s.kronos_aligned !== null && s.kronos_aligned !== undefined && (
+                          <span
+                            title={s.kronos_note || undefined}
+                            className={`text-[9px] px-1.5 py-0.5 rounded-full font-semibold ${
+                              s.kronos_aligned
+                                ? 'bg-violet-500/20 text-violet-300'
+                                : 'bg-gray-500/20 text-gray-400'
+                            }`}
+                          >
+                            {s.kronos_aligned ? '🔮 Kronos ✓' : '🔮 Kronos ✗'}
+                            {typeof s.fusion_score === 'number'
+                              ? ` ${(s.fusion_score * 100).toFixed(0)}%`
+                              : ''}
+                          </span>
+                        )}
+                        <span
+                          className="text-[10px] px-1.5 py-0.5 rounded-full bg-tradebot-accent/20 text-tradebot-accent font-semibold"
+                          title={
+                            typeof s.fusion_score === 'number' && s.fusion_score !== s.confidence
+                              ? `SMC ${(s.confidence * 100).toFixed(0)}% → fused ${(s.fusion_score * 100).toFixed(0)}% after Kronos`
+                              : undefined
+                          }
+                        >
                           {(s.confidence * 100).toFixed(0)}% · RR {s.rr}
                         </span>
                       </div>
@@ -2130,10 +2287,18 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
                         const isFb = c === 'strong_false_breakout' || c === 'possible_false_breakout' || c === 'wicked_into_zone'
                         const isBelowRr = c === 'below_min_rr'
                         const isRej = c === 'rejection_wick'
+                        // Macro reads as weather, not structure — its own hue,
+                        // and a muted one when it did not apply to this pair.
+                        const isMacroGood = c === 'macro_supportive'
+                        const isMacroBad = c === 'macro_headwind'
+                        const isMacroOff = c === 'macro_na' || c === 'macro_neutral'
                         const cls = isBelowRr ? 'bg-amber-700/50 text-amber-200'
                           : isSweep ? 'bg-purple-700/40 text-purple-200'
                           : isFb ? 'bg-red-700/40 text-red-200'
                           : isRej ? 'bg-pink-700/40 text-pink-200'
+                          : isMacroGood ? 'bg-teal-700/40 text-teal-200'
+                          : isMacroBad ? 'bg-orange-700/40 text-orange-200'
+                          : isMacroOff ? 'bg-gray-700/40 text-gray-400'
                           : 'bg-gray-700/60 text-gray-300'
                         return (
                           <span key={c} className={`text-[9px] px-1.5 py-0.5 rounded ${cls}`}>{c.replace(/_/g, ' ')}</span>

@@ -130,6 +130,21 @@ _OM_PY_CANDIDATES = [
 ]
 OPENMANUS_BASE_PY = next((p for p in _OM_PY_CANDIDATES if Path(p).exists()), str(PY_BIN))
 
+# ── Local speech engine (STT/TTS sidecar) ─────────────────────────────────────
+# huggingface/speech-to-speech based local Parakeet-TDT STT + Qwen3-TTS service
+# (see speech_engine/README.md). Runs in its own venv/process so its heavy ML
+# deps never touch backend/requirements.txt. backend/app/api/voice.py calls it
+# first (short timeout) and falls back to OpenAI Whisper/TTS on any error.
+# Opt-out with TRADEBOT_SKIP_SPEECH_ENGINE_SETUP=1.
+SPEECH_ENGINE_DIR      = (ROOT / "speech_engine").resolve()
+SPEECH_ENGINE_VENV     = SPEECH_ENGINE_DIR / ".venv"
+SPEECH_ENGINE_VENV_BIN = SPEECH_ENGINE_VENV / _VENV_BIN
+SPEECH_ENGINE_PY_BIN   = SPEECH_ENGINE_VENV_BIN / f"python{_EXE}"
+SPEECH_ENGINE_PIP_BIN  = SPEECH_ENGINE_VENV_BIN / f"pip{_EXE}"
+SPEECH_ENGINE_UVICORN_BIN = SPEECH_ENGINE_VENV_BIN / f"uvicorn{_EXE}"
+SPEECH_ENGINE_PORT     = int(os.environ.get("SPEECH_ENGINE_PORT", "8790"))
+SPEECH_ENGINE_SETUP_ENABLED = os.environ.get("TRADEBOT_SKIP_SPEECH_ENGINE_SETUP", "").strip().lower() not in ("1", "true", "yes", "on")
+
 # ── Ports ─────────────────────────────────────────────────────────────────────
 BACKEND_PORT       = int(os.environ.get("BACKEND_PORT", "1448"))
 FRONTEND_PORT      = int(os.environ.get("FRONTEND_PORT", "3000"))
@@ -1998,16 +2013,20 @@ def _mt5_port() -> int:
 def _mt5_candidate_ports() -> list:
     """Ports to probe for a live mtapi-io bridge — configured port first,
     then the common alternatives people run mt5rest on (8090 is the usual
-    Windows default, 8092 is this project's default)."""
+    Windows default, 8092 is this project's default).
+
+    Never probe this project's own ports: the TradeBot API answers HTTP on
+    them, which used to be mistaken for a bridge and written to .env."""
+    own_ports = {BACKEND_PORT, FRONTEND_PORT, 8080, 8000, 3000}
     ports: list = []
     try:
         cfg = _mt5_port()
-        if cfg:
+        if cfg and cfg not in own_ports:
             ports.append(cfg)
     except Exception:
         pass
-    for p in (8090, 8092, 8080, 8000):
-        if p not in ports:
+    for p in (8092, 8090, 8091, 8093):
+        if p not in ports and p not in own_ports:
             ports.append(p)
     return ports
 
@@ -2015,23 +2034,38 @@ def _mt5_candidate_ports() -> list:
 def _is_mt5_bridge(host: str, port: int, timeout: float = 1.0) -> bool:
     """Return True if an mtapi-io mt5rest bridge answers HTTP on host:port.
 
-    A bare TCP-open check is not enough (some unrelated service could hold the
-    port), so we confirm an HTTP server actually responds. mt5rest exposes a
-    Swagger UI at ``/`` and REST endpoints such as ``/CheckConnect`` — any HTTP
-    status back (even 400/404) proves a live HTTP service is listening."""
+    "Any HTTP response" is NOT enough: this project's own API answers on
+    nearby ports, and accepting its 404 caused MT5_API_URL to be rewritten to
+    the TradeBot backend. So we require an mtapi-io fingerprint:
+      * ``GET /ping``          → body ``OK``
+      * ``GET /CheckConnect``  → mtapi error JSON (INVALID_TOKEN / nodeName)
+      * any response served by ``Server: Kestrel`` (mt5rest is ASP.NET)"""
     if not port_open(host, port, min(timeout, 0.5)):
         return False
     import urllib.request
     import urllib.error
-    for path in ("/CheckConnect", "/swagger/index.html", "/"):
+
+    def _fingerprint(resp_headers, body: str) -> bool:
+        if "kestrel" in (resp_headers.get("Server", "") or "").lower():
+            return True
+        low = body.strip().lower()
+        return low.startswith("ok") or "invalid_token" in low or "nodename" in low
+
+    for path in ("/ping", "/CheckConnect"):
         url = f"http://{host}:{port}{path}"
         try:
             with urllib.request.urlopen(url, timeout=timeout) as resp:
-                resp.read(256)
+                body = resp.read(512).decode("utf-8", "replace")
+                if _fingerprint(resp.headers, body):
+                    return True
+        except urllib.error.HTTPError as e:
+            # An HTTP status alone proves nothing — check the fingerprint too.
+            try:
+                body = e.read(512).decode("utf-8", "replace")
+            except Exception:
+                body = ""
+            if _fingerprint(e.headers, body):
                 return True
-        except urllib.error.HTTPError:
-            # Server answered with an HTTP status → it IS a live HTTP service.
-            return True
         except Exception:
             continue
     return False
@@ -3494,6 +3528,188 @@ def _ensure_vibe_agent_json() -> None:
         warn(f"Could not create ~/.vibe-trading/agent.json: {_ex}")
 
 
+def _speech_engine_configured() -> bool:
+    """True when SPEECH_ENGINE_ENABLED/SPEECH_ENGINE_URL are already set in .env."""
+    enabled = _DOTENV.get("SPEECH_ENGINE_ENABLED", os.environ.get("SPEECH_ENGINE_ENABLED", ""))
+    return enabled.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _report_speech_engine_health() -> bool:
+    """Poll /health and report whether the models actually loaded.
+
+    `ready` only goes true once BOTH the Parakeet-TDT STT handler and the
+    Qwen3-TTS TTS handler have finished constructing — which is also when
+    each backend's underlying HF/mlx model weights finish downloading (first
+    run) and loading into memory. A 200 with `ready: false` means the sidecar
+    process is up but at least one of the two models failed to download/load,
+    so callers should still treat it as "not really working" even though the
+    port is open.
+    """
+    health = http_json(f"http://localhost:{SPEECH_ENGINE_PORT}/health", timeout=5)
+    if not health:
+        warn("Speech engine is listening but /health did not respond — OpenAI fallback stays active")
+        return False
+    if health.get("ready"):
+        ok(f"Speech engine ready — STT={health.get('stt_backend', '?')} (Parakeet-TDT), "
+           f"TTS={health.get('tts_backend', '?')} (Qwen3-TTS)")
+        return True
+    warn(f"Speech engine is up but models are NOT ready (Parakeet-TDT/Qwen3-TTS failed to download or "
+         f"load) — check {(ROOT / 'speech-engine.log').name}. OpenAI fallback stays active.")
+    return False
+
+
+def ensure_speech_engine() -> bool:
+    """Check whether the local speech engine is configured; configure it if not.
+
+    "Configured" means: its own venv exists with the service's deps installed,
+    and SPEECH_ENGINE_ENABLED/SPEECH_ENGINE_URL are set in the root .env so the
+    backend's /voice/stt and /voice/tts routes will call it. If any of that is
+    missing this sets it up (creates speech_engine/.venv, installs
+    speech_engine/requirements.txt, writes the .env keys), then starts the
+    `uvicorn main:app` sidecar on :SPEECH_ENGINE_PORT as a detached process if
+    it isn't already listening.
+
+    Best-effort: a failure here never blocks startup — voice.py silently falls
+    back to OpenAI Whisper/TTS on any speech-engine error.
+    Opt-out: set TRADEBOT_SKIP_SPEECH_ENGINE_SETUP=1.
+    """
+    if not SPEECH_ENGINE_SETUP_ENABLED:
+        warn("Speech engine setup skipped (TRADEBOT_SKIP_SPEECH_ENGINE_SETUP set) — OpenAI fallback stays active")
+        return True
+
+    if not SPEECH_ENGINE_DIR.exists():
+        warn("speech_engine/ not found — skipping local speech engine setup")
+        return True
+
+    reqs = SPEECH_ENGINE_DIR / "requirements.txt"
+    if not reqs.exists():
+        warn("speech_engine/requirements.txt not found — skipping local speech engine setup")
+        return True
+
+    already_configured = (
+        SPEECH_ENGINE_UVICORN_BIN.exists()
+        and SPEECH_ENGINE_PY_BIN.exists()
+        and run([str(SPEECH_ENGINE_PY_BIN), "-c", "import fastapi, uvicorn"],
+                 cwd=SPEECH_ENGINE_DIR).returncode == 0
+        and _speech_engine_configured()
+    )
+    if already_configured:
+        ok("Speech engine already configured (venv + .env) — skipping setup")
+    else:
+        info("Speech engine not fully configured — configuring now …")
+
+        # ── 1. venv ──────────────────────────────────────────────────────────
+        if not SPEECH_ENGINE_PY_BIN.exists():
+            info("Creating speech_engine virtual environment …")
+            py = _best_python()
+            r = run([py, "-m", "venv", str(SPEECH_ENGINE_VENV)])
+            if r.returncode != 0:
+                warn(f"Failed to create speech_engine venv: {r.stderr[:200]} — "
+                     "OpenAI fallback stays active")
+                return True
+            ok("speech_engine venv created")
+
+        # ── 2. deps ──────────────────────────────────────────────────────────
+        check = run([str(SPEECH_ENGINE_PY_BIN), "-c", "import fastapi, uvicorn"], cwd=SPEECH_ENGINE_DIR)
+        if check.returncode != 0:
+            info("Installing speech_engine dependencies (one-time, may take a while) …")
+            ok_inst, err = _spinner_run(
+                [str(SPEECH_ENGINE_PIP_BIN), "install", "--quiet", "-r", str(reqs)],
+                "pip install -r speech_engine/requirements.txt",
+                cwd=SPEECH_ENGINE_DIR,
+                timeout=1800,
+            )
+            if not ok_inst:
+                warn(f"speech_engine dependency install failed ({(err or '')[:160]}) — "
+                     "OpenAI fallback stays active; re-run start.py to retry.")
+                return True
+            ok("speech_engine dependencies installed")
+        else:
+            ok("speech_engine dependencies already installed")
+
+        # ── 3. .env keys (only fill in what's missing — never override a
+        #      deliberate user opt-out or custom URL) ───────────────────────
+        dotenv_path = ROOT / ".env"
+        if dotenv_path.exists():
+            if "SPEECH_ENGINE_ENABLED" not in _DOTENV:
+                if _write_env_var("SPEECH_ENGINE_ENABLED", "true"):
+                    _DOTENV["SPEECH_ENGINE_ENABLED"] = "true"
+                    ok(".env ← SPEECH_ENGINE_ENABLED=true")
+            if "SPEECH_ENGINE_URL" not in _DOTENV:
+                if _write_env_var("SPEECH_ENGINE_URL", f"http://localhost:{SPEECH_ENGINE_PORT}"):
+                    _DOTENV["SPEECH_ENGINE_URL"] = f"http://localhost:{SPEECH_ENGINE_PORT}"
+                    ok(f".env ← SPEECH_ENGINE_URL=http://localhost:{SPEECH_ENGINE_PORT}")
+        else:
+            warn("Root .env not found — could not persist SPEECH_ENGINE_ENABLED/SPEECH_ENGINE_URL")
+
+    # ── 4. start the sidecar if enabled and not already running ────────────────
+    if not _speech_engine_configured():
+        info("Speech engine configured but disabled (SPEECH_ENGINE_ENABLED not true in .env) — not starting")
+        return True
+
+    log_path = ROOT / "speech-engine.log"
+
+    if port_open("127.0.0.1", SPEECH_ENGINE_PORT, 0.5):
+        ok(f"Speech engine already running on :{SPEECH_ENGINE_PORT}")
+        _report_speech_engine_health()
+        return True
+
+    if not SPEECH_ENGINE_UVICORN_BIN.exists():
+        warn("speech_engine uvicorn binary not found — cannot start sidecar")
+        return True
+
+    info(f"Starting speech engine on :{SPEECH_ENGINE_PORT} …")
+    cmd = [str(SPEECH_ENGINE_UVICORN_BIN), "main:app", "--host", "0.0.0.0", "--port", str(SPEECH_ENGINE_PORT)]
+    try:
+        if IS_WINDOWS:
+            DETACHED = 0x00000008
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            subprocess.Popen(
+                cmd,
+                cwd=str(SPEECH_ENGINE_DIR),
+                stdout=open(log_path, "a"),
+                stderr=subprocess.STDOUT,
+                creationflags=DETACHED | CREATE_NEW_PROCESS_GROUP,
+            )
+        else:
+            subprocess.Popen(
+                cmd,
+                cwd=str(SPEECH_ENGINE_DIR),
+                stdout=open(log_path, "a"),
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+    except Exception as exc:
+        warn(f"Speech engine failed to start: {exc}")
+        return True
+
+    # The FastAPI startup event (which calls engine.load_models()) blocks the
+    # server from accepting connections until it finishes, and on a first run
+    # that includes downloading the Parakeet-TDT STT + Qwen3-TTS weights from
+    # HF/mlx — several GB, easily minutes on a slow connection. Wait generously
+    # before giving up on the port.
+    max_wait_s = 900  # 15 min
+    info("Waiting for speech engine to boot (first run downloads Parakeet-TDT + "
+         "Qwen3-TTS model weights — this can take several minutes) …")
+    booted = False
+    for i in range(max_wait_s):
+        time.sleep(1)
+        if port_open("127.0.0.1", SPEECH_ENGINE_PORT, 0.5):
+            booted = True
+            break
+        if (i + 1) % 60 == 0:
+            warn(f"  still waiting … {(i + 1) // 60} min elapsed (check {log_path.name})")
+
+    if not booted:
+        warn(f"Speech engine did not come up within {max_wait_s // 60} min — "
+             f"check {log_path.name}. OpenAI fallback stays active.")
+        return True
+
+    ok(f"Speech engine listening on :{SPEECH_ENGINE_PORT}")
+    _report_speech_engine_health()
+    return True
+
+
 def ensure_openhuman_deps() -> bool:
     """Check OpenHuman desktop connectivity and install if needed.
 
@@ -4570,6 +4786,11 @@ def main() -> None:
     # The OpenHuman desktop app is a separate install (see hint printed below).
     # Best-effort: never blocks startup.
     ensure_openhuman_deps()
+
+    # Local speech engine — check if configured (venv + .env), configure it if
+    # not, then start the STT/TTS sidecar. Best-effort: never blocks startup
+    # (voice.py falls back to OpenAI Whisper/TTS on any error).
+    ensure_speech_engine()
 
     # OpenManus MCP sidecar — clone FoundationAgents/OpenManus, install deps,
     # and start run_mcp.py as a background daemon so all AI provider calls route

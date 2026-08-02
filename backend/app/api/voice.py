@@ -2,6 +2,8 @@ from fastapi import APIRouter, UploadFile, File, HTTPException, Response, Form
 from typing import Optional, Any
 import os
 import io
+import wave
+import asyncio
 import httpx
 from loguru import logger
 
@@ -11,6 +13,11 @@ try:
     from openai import AsyncOpenAI
 except ImportError:
     AsyncOpenAI = None
+
+try:
+    import riva.client
+except ImportError:
+    riva = None  # type: ignore
 
 router = APIRouter(prefix="/voice", tags=["voice"])
 
@@ -324,54 +331,224 @@ async def dg_fn_get_position_summary():
 async def get_client():
     if AsyncOpenAI is None:
         return None
-    api_key = os.getenv("OPENAI_API_KEY", "")
+    api_key = settings.OPENAI_API_KEY or os.getenv("OPENAI_API_KEY", "")
     if not api_key:
         return None
     return AsyncOpenAI(api_key=api_key)
 
+
+# ── NVIDIA NIM hosted speech (fast, cloud) ────────────────────────────────────
+# Tried first — hosted Parakeet ASR / Magpie TTS inference is far faster than
+# the local MLX engine below on this Mac's CPU/MPS. Any error/timeout falls
+# straight through to the local engine, then OpenAI, so a stale function-id or
+# a network hiccup degrades quietly instead of failing the request.
+
+_riva_tts_service = None
+
+
+def _nvidia_timeout() -> float:
+    return max(settings.NVIDIA_SPEECH_TIMEOUT_MS, 1) / 1000.0
+
+
+def _get_riva_tts_service():
+    global _riva_tts_service
+    if riva is None or not settings.NVIDIA_API_KEY:
+        return None
+    if _riva_tts_service is None:
+        auth = riva.client.Auth(
+            uri="grpc.nvcf.nvidia.com:443",
+            use_ssl=True,
+            metadata_args=[
+                ["function-id", settings.NVIDIA_TTS_FUNCTION_ID],
+                ["authorization", f"Bearer {settings.NVIDIA_API_KEY}"],
+            ],
+        )
+        _riva_tts_service = riva.client.SpeechSynthesisService(auth)
+    return _riva_tts_service
+
+
+async def _nvidia_stt(content: bytes, filename: str) -> Optional[str]:
+    if not settings.NVIDIA_ASR_ENABLED or not settings.NVIDIA_API_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=_nvidia_timeout()) as client:
+            resp = await client.post(
+                settings.NVIDIA_ASR_INVOKE_URL,
+                headers={"Authorization": f"Bearer {settings.NVIDIA_API_KEY}"},
+                data={"language": settings.NVIDIA_ASR_LANGUAGE},
+                files={"file": (filename, content)},
+            )
+        if resp.status_code != 200:
+            logger.warning(f"NVIDIA NIM ASR returned {resp.status_code}: {resp.text[:200]}")
+            return None
+        data = resp.json()
+        text = data.get("text")
+        if text is None and isinstance(data.get("results"), list) and data["results"]:
+            # Defensive fallback in case the hosted response is segments-shaped
+            # rather than OpenAI-Whisper-shaped.
+            first = data["results"][0]
+            text = first.get("text") or (first.get("alternatives") or [{}])[0].get("transcript")
+        return text
+    except Exception as e:
+        logger.warning(f"NVIDIA NIM ASR unavailable, trying next engine: {e}")
+        return None
+
+
+def _nvidia_tts_sync(text: str) -> bytes:
+    service = _get_riva_tts_service()
+    if service is None:
+        raise RuntimeError("riva client not available or NVIDIA_API_KEY missing")
+    resp = service.synthesize(
+        text=text,
+        voice_name=settings.NVIDIA_TTS_VOICE,
+        language_code=settings.NVIDIA_TTS_LANGUAGE,
+        sample_rate_hz=settings.NVIDIA_TTS_SAMPLE_RATE_HZ,
+        encoding=riva.client.AudioEncoding.LINEAR_PCM,
+    )
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(settings.NVIDIA_TTS_SAMPLE_RATE_HZ)
+        wav_file.writeframes(resp.audio)
+    return buf.getvalue()
+
+
+async def _nvidia_tts(text: str) -> Optional[tuple[bytes, str]]:
+    if not settings.NVIDIA_TTS_ENABLED or not settings.NVIDIA_API_KEY or riva is None:
+        return None
+    try:
+        audio = await asyncio.wait_for(asyncio.to_thread(_nvidia_tts_sync, text), timeout=_nvidia_timeout())
+        return audio, "audio/wav"
+    except Exception as e:
+        logger.warning(f"NVIDIA NIM TTS unavailable, trying next engine: {e}")
+        return None
+
+
+def _warm_nvidia_tts_in_background() -> None:
+    """Pre-establish the Riva gRPC/TLS connection at process start.
+
+    The first synthesize() call on a fresh channel is slow/occasionally flaky
+    (cold TLS handshake); every call after that is fast (~1s). Paying that
+    cost once at startup, off the request path, means the first real user
+    request doesn't eat it.
+    """
+    if not settings.NVIDIA_TTS_ENABLED or not settings.NVIDIA_API_KEY or riva is None:
+        return
+
+    def _run():
+        try:
+            _nvidia_tts_sync("warm up")
+            logger.info("NVIDIA NIM TTS: connection warmed")
+        except Exception as e:
+            logger.warning(f"NVIDIA NIM TTS warmup failed (will retry lazily on first request): {e}")
+
+    import threading
+    threading.Thread(target=_run, daemon=True).start()
+
+
+_warm_nvidia_tts_in_background()
+
+
+# ── Local speech engine (huggingface/speech-to-speech, Parakeet-TDT + Qwen3-TTS) ─
+# Tried after NVIDIA NIM (offline/private fallback — much slower on CPU/MPS);
+# any error/timeout falls straight through to the existing OpenAI Whisper/TTS
+# path below.
+
+def _speech_engine_timeout() -> float:
+    return max(settings.SPEECH_ENGINE_TIMEOUT_MS, 1) / 1000.0
+
+
+async def _local_stt(content: bytes, filename: str) -> Optional[str]:
+    if not settings.SPEECH_ENGINE_ENABLED:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=_speech_engine_timeout()) as client:
+            resp = await client.post(
+                f"{settings.SPEECH_ENGINE_URL}/stt",
+                files={"file": (filename, content)},
+            )
+        if resp.status_code != 200:
+            logger.warning(f"speech_engine STT returned {resp.status_code}: {resp.text[:200]}")
+            return None
+        return resp.json().get("text")
+    except Exception as e:
+        logger.warning(f"speech_engine STT unavailable, falling back to OpenAI: {e}")
+        return None
+
+
+async def _local_tts(text: str) -> Optional[tuple[bytes, str]]:
+    if not settings.SPEECH_ENGINE_ENABLED:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=_speech_engine_timeout()) as client:
+            resp = await client.post(
+                f"{settings.SPEECH_ENGINE_URL}/tts",
+                data={"text": text},
+            )
+        if resp.status_code != 200:
+            logger.warning(f"speech_engine TTS returned {resp.status_code}: {resp.text[:200]}")
+            return None
+        return resp.content, resp.headers.get("content-type", "audio/wav")
+    except Exception as e:
+        logger.warning(f"speech_engine TTS unavailable, falling back to OpenAI: {e}")
+        return None
+
+
 @router.post("/stt")
 async def speech_to_text(file: UploadFile = File(...)):
-    """Convert speech to text using OpenAI Whisper"""
+    """Convert speech to text — NVIDIA NIM (fast) -> local engine -> OpenAI Whisper."""
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty audio file")
+
+    nvidia_text = await _nvidia_stt(content, file.filename or "audio.wav")
+    if nvidia_text is not None:
+        return {"text": nvidia_text, "engine": "nvidia"}
+
+    local_text = await _local_stt(content, file.filename or "audio.wav")
+    if local_text is not None:
+        return {"text": local_text, "engine": "local"}
+
     client = await get_client()
     if not client:
         raise HTTPException(status_code=500, detail="OpenAI API key not configured or openai package missing")
-    
+
     try:
-        # Read file content
-        content = await file.read()
-        if not content:
-            raise HTTPException(status_code=400, detail="Empty audio file")
-            
-        # Create a buffer from content
         buffer = io.BytesIO(content)
-        # Whisper requires a filename with extension
-        buffer.name = file.filename or "audio.wav"
-        
-        # Call Whisper
+        buffer.name = file.filename or "audio.wav"  # Whisper requires a named file
         transcript = await client.audio.transcriptions.create(
             model="whisper-1",
             file=buffer
         )
-        return {"text": transcript.text}
+        return {"text": transcript.text, "engine": "openai"}
     except Exception as e:
         logger.error(f"STT error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/tts")
 async def text_to_speech(text: str = Form(...), voice: str = Form("alloy")):
-    """Convert text to speech using OpenAI TTS"""
+    """Convert text to speech — NVIDIA NIM (fast) -> local engine -> OpenAI TTS."""
+    nvidia_result = await _nvidia_tts(text)
+    if nvidia_result is not None:
+        nvidia_audio, content_type = nvidia_result
+        return Response(content=nvidia_audio, media_type=content_type)
+
+    local_result = await _local_tts(text)
+    if local_result is not None:
+        local_audio, content_type = local_result
+        return Response(content=local_audio, media_type=content_type)
+
     client = await get_client()
     if not client:
         raise HTTPException(status_code=500, detail="OpenAI API key not configured or openai package missing")
-    
+
     try:
-        # Call OpenAI TTS
         response = await client.audio.speech.create(
             model="tts-1",
             voice=voice,
             input=text
         )
-        # Return as audio stream
         return Response(content=response.content, media_type="audio/mpeg")
     except Exception as e:
         logger.error(f"TTS error: {e}")

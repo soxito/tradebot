@@ -45,7 +45,14 @@ _SYSTEM_PROMPT = (
     "and climactic volume against the move is reversal risk. For crypto also "
     "cover how market-cap size and rank shape liquidity risk. Never invent a "
     "volume number that is not in the input; "
-    "(5) ACTIONABLE TAKEAWAY — give one specific, risk-aware recommendation with "
+    "(5) MACRO CONTEXT — the dollar index and VIX lines supplied under 'Why this "
+    "direction was chosen' are a real input to this forecast's confidence, so say "
+    "so in one or two sentences: quote the DXY and VIX figures given, say whether "
+    "they support or oppose the move, and say plainly when the macro read did not "
+    "apply to this instrument and why. Never invent a DXY or VIX number that is "
+    "not in the input, and never claim macro was used when the input says it was "
+    "not; "
+    "(6) ACTIONABLE TAKEAWAY — give one specific, risk-aware recommendation with "
     "a clear entry rationale, stop-loss zone, and take-profit target derived from "
     "the forecast numbers. "
     "If an OPEN POSITION is provided, add a final section titled 'Position:' that "
@@ -411,11 +418,19 @@ async def _learn(
         cap = _fmt_usd(market.market_cap) if market else None
         body = analysis
         if sig:
+            # The macro clause goes in the structured header, not only in the
+            # prose: this line is what recall and the knowledge panel match on,
+            # and it survives even when the narrative came from the
+            # deterministic fallback rather than the model.
+            macro_note = next(
+                (r for r in (sig.rationale or []) if r.startswith("Macro")), ""
+            )
             body = (
                 f"[{resp.engine}] {resp.symbol} {resp.timeframe}: {sig.direction} "
                 f"{sig.pct_change:+.2f}% (conf {sig.confidence * 100:.0f}%), target "
                 f"{sig.target_price:.6g} from {resp.anchor_price:.6g}"
                 + (f", mcap {cap}" if cap else "")
+                + (f", {macro_note.rstrip('.')}" if macro_note else "")
                 + f".\n\n{analysis}"
             )
         async with AsyncSessionLocal() as db:
@@ -485,6 +500,17 @@ def _fallback_analysis(
                 "Reversal risk: climactic volume is confirming the opposite move, so "
                 "the confidence has been cut accordingly."
             )
+
+    # Macro, on the deterministic path too. A NO_TRADE skips the LLM entirely,
+    # so without this the one case where the trader most wants to know what was
+    # considered would be the one case that never says.
+    macro_lines = [
+        line for line in (getattr(resp.signal, "rationale", None) or [])
+        if "DXY" in line or "VIX" in line or line.startswith("Macro")
+    ]
+    if macro_lines:
+        parts.append(" ".join(macro_lines))
+
     if resp.decision == "LOW_CONFIDENCE":
         parts.append(
             "This sits below the tradeable confidence floor once volume is factored "

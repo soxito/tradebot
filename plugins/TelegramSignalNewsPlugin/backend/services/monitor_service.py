@@ -23,6 +23,7 @@ from plugins.TelegramSignalNewsPlugin.backend.models import (
 from plugins.TelegramSignalNewsPlugin.backend.schemas import TelegramPollRequest
 from plugins.TelegramSignalNewsPlugin.backend.services.ingest_service import run_poll
 from plugins.TelegramSignalNewsPlugin.backend.services.signal_parser import (
+    classify_market_type,
     parse_entry_signal,
     parse_outcome,
 )
@@ -72,26 +73,30 @@ def _signal_dedupe_hash(channel_source_id: int, message_id: str, symbol: str) ->
     return hashlib.sha256(raw).hexdigest()
 
 
-async def create_signals_from_messages(db: AsyncSession, limit: int = 500) -> dict[str, int]:
+async def create_signals_from_messages(
+    db: AsyncSession, limit: int = 500, since_hours: int | None = 24
+) -> dict[str, int]:
     """Scan recent ingest messages, create entry signals, and apply outcomes.
 
     Idempotent: a signal is keyed by (channel, message_id, symbol) so re-runs
     never duplicate. Returns counts for telemetry.
+
+    ``since_hours`` bounds how far back to scan. The live monitor uses 24h for a
+    cheap incremental pass; pass ``None`` (manual rebuild) to scan all history.
     """
     created = 0
     outcomes_applied = 0
 
     # Pull the most recent SIGNALS-kind messages only — volume/news channels
-    # are filtered out so they don't eat up the scan budget. We only look at
-    # messages from the last 24 hours so the set stays manageable even as the
-    # history grows over months.
-    since_24h = now_utc_naive() - timedelta(hours=24)
+    # are filtered out so they don't eat up the scan budget.
+    conditions = [TelegramIngestMessage.source_kind == SourceKind.SIGNALS]
+    if since_hours is not None:
+        conditions.append(
+            TelegramIngestMessage.created_at >= now_utc_naive() - timedelta(hours=since_hours)
+        )
     result = await db.execute(
         select(TelegramIngestMessage)
-        .where(
-            TelegramIngestMessage.source_kind == SourceKind.SIGNALS,
-            TelegramIngestMessage.created_at >= since_24h,
-        )
+        .where(*conditions)
         .order_by(desc(TelegramIngestMessage.created_at))
         .limit(limit)
     )
@@ -112,6 +117,11 @@ async def create_signals_from_messages(db: AsyncSession, limit: int = 500) -> di
         # 1) Actionable entry signal?
         parsed = parse_entry_signal(text)
         if parsed is not None:
+            # Route by the actual symbol first (XAUUSD -> forex, TRXUSDT ->
+            # crypto); fall back to the channel's configured market type.
+            market_type = classify_market_type(parsed.symbol) or channel_market_types.get(
+                msg.channel_source_id, "crypto"
+            )
             dedupe = _signal_dedupe_hash(msg.channel_source_id, msg.telegram_message_id, parsed.symbol)
             insert_stmt = (
                 pg_insert(TelegramParsedSignal)
@@ -132,7 +142,7 @@ async def create_signals_from_messages(db: AsyncSession, limit: int = 500) -> di
                         raw_text=text,
                         posted_at=msg.posted_at,
                         dedupe_hash=dedupe,
-                        market_type=channel_market_types.get(msg.channel_source_id, "crypto"),
+                        market_type=market_type,
                 )
                 .on_conflict_do_nothing()
                 .returning(TelegramParsedSignal.id)

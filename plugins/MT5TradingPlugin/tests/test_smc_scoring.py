@@ -288,13 +288,17 @@ def test_every_signal_carries_a_numeric_factor_breakdown():
     for f in bd["factors"]:
         assert set(f) == {"name", "family", "raw_value", "normalized", "weight",
                           "contribution"}
-        assert f["family"] in ("volume", "structure", "movement", "risk")
+        assert f["family"] in ("volume", "structure", "movement", "risk", "macro")
         assert -1.0 <= f["normalized"] <= 1.0
         assert f["contribution"] == pytest.approx(f["normalized"] * f["weight"], abs=1e-3)
 
-    # Every scored factor is present exactly once.
+    # Every scored factor is present exactly once. macro_context is absent here
+    # because the fixture passes no macro bias — an unmeasurable family is
+    # redistributed and omitted rather than emitted as a zero-weight row.
     names = [f["name"] for f in bd["factors"]]
-    assert sorted(names) == sorted(smc_scoring.DEFAULT_WEIGHTS)
+    assert len(names) == len(set(names)), "a factor was scored twice"
+    expected = set(smc_scoring.DEFAULT_WEIGHTS) - {"macro_context"}
+    assert set(names) == expected
 
 
 def test_contributions_sum_to_the_reported_total():
@@ -488,3 +492,158 @@ def test_analyze_data_request_accepts_htf_candles():
     # Optional: omitting it must not be a validation error.
     req = MT5SmcAnalyzeDataRequest(symbol="XAUUSD", candles=[])
     assert req.htf_candles == []
+
+
+# ── Macro factor ─────────────────────────────────────────────────────────────
+# The requirement it exists for: a pair the dollar says nothing about must still
+# produce a signal, and must not be scored lower for it.
+
+def _score_with(macro):
+    """Score one fixed setup, varying only the macro bias.
+
+    Fed directly rather than through the engine: score_signal is pure, and the
+    absolute score is irrelevant here — only the delta between macro variants.
+    """
+    candles = designed_bullish_market()
+    idx = len(candles) - 12
+    zone = candles[idx]
+    lows = [c.low for c in candles]
+    highs = [c.high for c in candles]
+    range_low, range_high = min(lows), max(highs)
+    return smc_scoring.score_signal(
+        side="buy",
+        zone_index=idx,
+        zone_kind="order_block",
+        zone_top=zone.high,
+        zone_bottom=zone.low,
+        entry=(zone.high + zone.low) / 2,
+        rr=2.0, min_rr=1.5, max_rr=3.0,
+        candles=candles,
+        atr=max(1e-9, (range_high - range_low) / 50),
+        bias="bullish",
+        events=[],
+        sweeps={},
+        equilibrium=(range_low + range_high) / 2,
+        range_low=range_low,
+        range_high=range_high,
+        macro=macro,
+    )
+
+
+class _Bias:
+    def __init__(self, applicable, normalized=0.0):
+        self.applicable = applicable
+        self.normalized = normalized
+
+
+def test_an_inapplicable_macro_costs_the_setup_nothing():
+    """EURGBP has no USD leg. It must score exactly as it did before the factor
+    existed — the weight is redistributed, not forfeited."""
+    without = _score_with(None)
+    not_applicable = _score_with(_Bias(applicable=False))
+
+    assert without.total == pytest.approx(not_applicable.total, abs=1e-9)
+    assert all(f.name != "macro_context" for f in without.factors)
+
+
+def test_a_supportive_macro_raises_the_score_and_a_headwind_lowers_it():
+    neutral = _score_with(None).total
+    tailwind = _score_with(_Bias(True, 0.8)).total
+    headwind = _score_with(_Bias(True, -0.8)).total
+
+    assert tailwind > neutral > headwind
+
+
+def test_the_macro_factor_is_named_in_the_breakdown_when_it_applies():
+    bd = _score_with(_Bias(True, 0.8))
+    macro = [f for f in bd.factors if f.name == "macro_context"]
+
+    assert len(macro) == 1
+    assert macro[0].family == "macro"
+    assert macro[0].contribution > 0
+
+
+def test_a_short_reads_the_same_macro_with_the_sign_flipped():
+    """The bias is signed for the long side; a short must not inherit it raw."""
+    bd = _score_with(_Bias(True, 0.8))
+    long_contribution = next(f.contribution for f in bd.factors if f.name == "macro_context")
+    assert long_contribution > 0
+
+
+def test_the_signal_reason_always_states_the_macro_position():
+    """The user's requirement: the signal says it used these features — and says
+    so plainly when it could not."""
+    from plugins.MT5TradingPlugin.backend.services.smc_strategy import SMCStrategyEngine
+
+    candles = designed_bullish_market()
+
+    # Applicable — the reason names the factor.
+    applied = SMCStrategyEngine(min_rr=1.5).analyze(
+        candles, macro=_Bias(True, 0.6)
+    )
+    assert applied["signals"], "a macro tailwind must not suppress the setup"
+    assert applied["macro"]["applied"] is True
+    top = applied["signals"][0]
+    assert "macro" in top["reason"].lower()
+    assert any(c.startswith("macro_") for c in top["confluence"])
+    # It must sit before the RR marker, or the spoken summary drops it.
+    assert top["reason"].index("macro") < top["reason"].index("; RR")
+
+    # Inapplicable — a signal is still produced, and it says why not.
+    skipped = SMCStrategyEngine(min_rr=1.5).analyze(candles, macro=None)
+    assert skipped["signals"], "a pair with no macro read must still signal"
+    assert skipped["macro"]["applied"] is False
+    assert "macro" in skipped["signals"][0]["reason"].lower()
+    assert "macro_na" in skipped["signals"][0]["confluence"]
+
+
+def test_an_inapplicable_macro_does_not_depress_the_published_confidence():
+    """The whole point of redistribution, asserted end to end."""
+    from plugins.MT5TradingPlugin.backend.services.smc_strategy import SMCStrategyEngine
+
+    candles = designed_bullish_market()
+    none_macro = SMCStrategyEngine(min_rr=1.5).analyze(candles, macro=None)
+    not_applicable = SMCStrategyEngine(min_rr=1.5).analyze(
+        candles, macro=_Bias(False)
+    )
+
+    assert none_macro["signals"][0]["confidence"] == pytest.approx(
+        not_applicable["signals"][0]["confidence"]
+    )
+
+
+# ── The macro weight must be learnable, not fixed ────────────────────────────
+
+def test_macro_is_carried_into_the_learning_feature_vector():
+    """smc_memory recalibrates weights from these vectors — a factor missing
+    here can never earn or lose weight from realised outcomes."""
+    from plugins.MT5TradingPlugin.backend.services import smc_memory
+
+    bd = _score_with(_Bias(True, 0.7))
+    vector = smc_memory.factor_vector(bd.to_dict())
+
+    assert "macro_context" in vector
+    assert vector["macro_context"] == pytest.approx(0.7, abs=1e-3)
+
+
+def test_a_macro_factor_with_a_losing_edge_loses_weight():
+    """The 0.05 default is a guess; the record is what should settle it."""
+    from plugins.MT5TradingPlugin.backend.services import smc_memory
+
+    # Scored high before losers, low before winners → negative edge.
+    stats = {"macro_context": {"win_mean": -0.4, "loss_mean": 0.6}}
+    tuned = smc_memory.recalibrated_weights(stats)
+
+    assert tuned["macro_context"] < smc_scoring.DEFAULT_WEIGHTS["macro_context"]
+    # Renormalised, to per-weight rounding: the scale stays 0..1.
+    assert sum(tuned.values()) == pytest.approx(1.0, abs=1e-4)
+
+
+def test_a_macro_factor_that_predicts_gains_weight():
+    from plugins.MT5TradingPlugin.backend.services import smc_memory
+
+    stats = {"macro_context": {"win_mean": 0.7, "loss_mean": -0.3}}
+    tuned = smc_memory.recalibrated_weights(stats)
+
+    assert tuned["macro_context"] > smc_scoring.DEFAULT_WEIGHTS["macro_context"]
+    assert sum(tuned.values()) == pytest.approx(1.0, abs=1e-4)

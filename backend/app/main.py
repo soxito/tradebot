@@ -84,6 +84,42 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Research loop failed to start: {e}")
 
+    # Per-signal research queue backing /research → Signal Research. Started here
+    # too, same reasoning as the loop above: in API-only mode this is the only
+    # thing that turns incoming signals into predictions.
+    if settings.AUTO_START_SIGNAL_RESEARCH_QUEUE and not started_workers.get(
+        "signal_research_queue"
+    ):
+        try:
+            from app.core.scheduler import start_signal_research_queue
+            start_signal_research_queue(
+                settings.SIGNAL_RESEARCH_CONCURRENCY,
+                settings.SIGNAL_RESEARCH_SCAN_SECONDS,
+            )
+        except Exception as e:
+            logger.warning(f"Signal research queue failed to start: {e}")
+
+    # Obsidian vault auto-sync. Started here too so the vault stays current in
+    # API-only mode, same reasoning as the loops above.
+    if settings.AUTO_START_VAULT_SYNC_LOOP and not started_workers.get("vault_sync_loop"):
+        try:
+            from app.core.scheduler import start_vault_sync_loop
+            start_vault_sync_loop(settings.VAULT_SYNC_INTERVAL_SECONDS)
+        except Exception as e:
+            logger.warning(f"Vault sync loop failed to start: {e}")
+
+    # JARVIS learning loop — settles published proposals against real candles so
+    # the assistant's confidence is measured rather than asserted. Started here
+    # too so it runs in API-only mode, same reasoning as the research loop above.
+    if settings.AUTO_START_JARVIS_LEARNING_LOOP and not started_workers.get(
+        "jarvis_learning_loop"
+    ):
+        try:
+            from app.core.scheduler import start_jarvis_learning_loop
+            start_jarvis_learning_loop()
+        except Exception as e:
+            logger.warning(f"JARVIS learning loop failed to start: {e}")
+
     # Realtime price-tick fan-out for SSE subscribers (idempotent; self-throttles
     # to zero work when no client is connected).
     if settings.AUTO_START_PRICE_TICK_LOOP:
@@ -186,14 +222,17 @@ async def health_check():
     }
 
 
-@app.get("/")
-async def root():
-    """Root endpoint"""
-    return {
-        "message": "TradeBot API",
-        "version": "0.1.0",
-        "docs": "/docs" if settings.DEBUG else "disabled",
-    }
+if not settings.STATIC_DIR:
+    # Skipped in the desktop app, where "/" serves the bundled UI instead
+    # (see the StaticFiles mount at the bottom of this module).
+    @app.get("/")
+    async def root():
+        """Root endpoint"""
+        return {
+            "message": "TradeBot API",
+            "version": "0.1.0",
+            "docs": "/docs" if settings.DEBUG else "disabled",
+        }
 
 
 @app.get("/cors-test")
@@ -216,3 +255,52 @@ if settings.PLUGIN_AUTO_MOUNT:
     )
 else:
     logger.info("Plugin auto-mount disabled (PLUGIN_AUTO_MOUNT=False)")
+
+
+# ── Bundled frontend (desktop app only) ────────────────────
+#
+# The desktop build exports the Next.js app to static files and serves them from
+# this process, so UI and API share one origin. That removes CORS entirely and —
+# because the port is chosen at launch — lets the frontend discover the API from
+# `window.location` instead of a port baked in at build time.
+#
+# Mounted last so every API route and plugin router above it wins the match.
+
+if settings.STATIC_DIR:
+    from pathlib import Path as _Path
+    from fastapi.staticfiles import StaticFiles
+    from starlette.exceptions import HTTPException
+    from starlette.responses import FileResponse
+
+    _static_root = _Path(settings.STATIC_DIR)
+
+    if not (_static_root / "index.html").is_file():
+        logger.error(
+            f"TRADEBOT_STATIC_DIR={_static_root} has no index.html — "
+            "the frontend export is missing or incomplete; UI will not load"
+        )
+    else:
+        class _ExportedSPA(StaticFiles):
+            """StaticFiles that serves the app shell for unmatched page routes.
+
+            The Next.js export writes `out/<route>/index.html` per page, and
+            StaticFiles redirects `/trading` → `/trading/` on its own, so most
+            navigation already works. This covers the remainder: a hard reload
+            of a client-side route that has no exported directory would
+            otherwise return the API's JSON 404 instead of the app.
+
+            Only extensionless paths fall back. A missing `.js` or `.css` must
+            still 404 — answering those with HTML turns a broken build into a
+            confusing MIME-type error in the console instead of a clear miss.
+            """
+
+            async def get_response(self, path: str, scope):
+                try:
+                    return await super().get_response(path, scope)
+                except HTTPException as exc:
+                    if exc.status_code != 404 or _Path(path).suffix:
+                        raise
+                return FileResponse(_static_root / "index.html")
+
+        app.mount("/", _ExportedSPA(directory=_static_root, html=True), name="ui")
+        logger.info(f"🖥️  Serving bundled frontend from {_static_root}")

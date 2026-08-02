@@ -488,6 +488,29 @@ def _dealing_range(swings: List[Swing]) -> Optional[Tuple[float, float]]:
 
 # ── Chart-display zone selector ────────────────────────────────────────────────
 
+def _macro_payload(macro: Optional[Any]) -> Dict[str, Any]:
+    """Serialise the macro bias for the API, including when it did not apply.
+
+    Reported either way on purpose: "the dollar was not consulted for this pair,
+    and here is why" is information the trader needs, and silence reads as an
+    omission rather than a decision.
+    """
+    if macro is None:
+        return {
+            "applied": False,
+            "reason": "macro context was not consulted for this analysis",
+            "lines": [],
+        }
+    return {
+        "applied": bool(getattr(macro, "applicable", False)),
+        "normalized": round(float(getattr(macro, "normalized", 0.0) or 0.0), 4),
+        "regime": getattr(macro, "regime", "UNKNOWN"),
+        "usd_leg": getattr(macro, "usd_leg", "none"),
+        "reason": getattr(macro, "reason", ""),
+        "lines": list(getattr(macro, "lines", []) or []),
+    }
+
+
 def _best_zones_for_chart(zones: List[Zone]) -> List[Dict[str, Any]]:
     """
     Return the minimal, highest-quality subset of zones for chart drawing.
@@ -625,6 +648,9 @@ class SMCStrategyEngine:
         self.us_session_only = us_session_only
         self.require_structure = require_structure
         self.factor_weights = factor_weights
+        # Gate rejections for the current analyse() call. Initialised here as
+        # well as per-run because backtest() reaches _build_signal directly.
+        self._rejected: List[Dict[str, Any]] = []
         # Higher daily target → more aggressive: surface more setups and relax the
         # confidence gate so more entries are generated to chase the target.
         # (50% → selective/3 signals … 1000% → aggressive/14 signals.)
@@ -757,6 +783,28 @@ class SMCStrategyEngine:
 
     # -- signal construction ----------------------------------------------------
 
+    def _reject(
+        self, side: str, entry: float, rr: float,
+        confidence: float, gate: str, detail: str,
+    ) -> None:
+        """Record a setup the gates threw out, and why.
+
+        Rejections used to be a bare ``return None``, so an analysis that found
+        real structure but filtered every candidate was indistinguishable from
+        one that found nothing at all — the panel just showed no signals and the
+        user could only conclude the sniper was broken. Gold on H1 does exactly
+        this whenever its only candidates are counter-trend buys into a bearish
+        H4: the gate is right to block them, but silence is not an answer.
+        """
+        self._rejected.append({
+            "side": side,
+            "entry": round(float(entry), 6),
+            "rr": round(float(rr), 2),
+            "confidence": round(float(confidence), 3),
+            "gate": gate,
+            "detail": detail,
+        })
+
     def _build_signal(
         self,
         zone: Zone,
@@ -797,8 +845,12 @@ class SMCStrategyEngine:
         if side == "buy":
             entry = zone.top  # proximal edge of bullish zone (limit fill on retrace)
             if entry >= last_price:
+                self._reject(side, entry, 0.0, 0.0, "location",
+                             "zone sits at or above price — a buy limit must rest below it")
                 return None  # must be a resting BUY LIMIT below price
             if entry > equilibrium + eq_tolerance:
+                self._reject(side, entry, 0.0, 0.0, "location",
+                             "zone is in premium — buys are only taken at a discount")
                 return None  # only buy in discount (incl. equilibrium-zone band)
             # Tag: true discount vs equilibrium-zone entry.
             confluence.append("discount" if entry <= equilibrium else "equilibrium_zone")
@@ -832,8 +884,12 @@ class SMCStrategyEngine:
         else:  # sell
             entry = zone.bottom
             if entry <= last_price:
+                self._reject(side, entry, 0.0, 0.0, "location",
+                             "zone sits at or below price — a sell limit must rest above it")
                 return None  # resting SELL LIMIT above price
             if entry < equilibrium - eq_tolerance:
+                self._reject(side, entry, 0.0, 0.0, "location",
+                             "zone is in discount — sells are only taken at a premium")
                 return None  # only sell in premium (incl. equilibrium-zone band)
             confluence.append("premium" if entry >= equilibrium else "equilibrium_zone")
 
@@ -863,6 +919,8 @@ class SMCStrategyEngine:
         reward = abs(tp - entry)
         rr = reward / risk if risk > 0 else 0.0
         if rr < self.min_rr:
+            self._reject(side, entry, rr, 0.0, "risk_reward",
+                         f"RR {rr:.2f} is below the {self.min_rr:.1f} floor")
             return None
         # Hard guarantee: never emit a setup whose reward does not exceed risk.
         # (min_rr is clamped >= 1.0, but require a strict edge so reward > risk.)
@@ -997,16 +1055,23 @@ class SMCStrategyEngine:
             choch_index=choch_index,
             htf_bias=prim.get("htf_bias"),
             weights=self.factor_weights,
+            macro=prim.get("macro"),
         )
 
         # Hard gate 1: no signal fires without volume confirmation. The
         # zone-forming candle must have traded above its rolling mean, and any
         # break of structure in this direction must itself be volume-confirmed.
         if not breakdown.volume_confirmed:
+            self._reject(side, entry, rr, breakdown.total, "volume",
+                         "zone was not volume-confirmed")
             return None
 
         # Hard gate 2: a higher-timeframe bias that opposes this trade blocks it.
         if breakdown.htf_blocked:
+            self._reject(
+                side, entry, rr, breakdown.total, "htf_bias",
+                f"{prim.get('htf_bias')} higher timeframe opposes this {side}",
+            )
             return None
 
         confidence = round(breakdown.total, 2)
@@ -1059,6 +1124,27 @@ class SMCStrategyEngine:
             factors.append("structure aligned")
         if not factors:
             factors.append(zone.kind.replace("_", " "))
+
+        # ── Macro, stated either way ─────────────────────────────────────────
+        # The user's requirement is that the signal says it used these features
+        # — and says so plainly when it could not. This must land BEFORE the
+        # "; RR" marker: MT5SniperChart strips everything from there onward when
+        # it builds the spoken summary, so a clause after it is never heard.
+        macro = prim.get("macro")
+        if macro is not None and getattr(macro, "applicable", False):
+            macro_norm = float(getattr(macro, "normalized", 0.0) or 0.0)
+            aligned = macro_norm if side == "buy" else -macro_norm
+            if aligned > 0.1:
+                confluence.append("macro_supportive")
+            elif aligned < -0.1:
+                confluence.append("macro_headwind")
+            else:
+                confluence.append("macro_neutral")
+            factors.append(f"macro {getattr(macro, 'reason', '')}".strip())
+        else:
+            confluence.append("macro_na")
+            why = getattr(macro, "reason", "") if macro is not None else "macro not consulted"
+            factors.append(why or "macro n/a")
         # Join factors; capitalise only the very first word so CHoCH / FVG
         # abbreviations in the middle of the string are preserved as-is.
         joined = ", ".join(factors)
@@ -1157,18 +1243,30 @@ class SMCStrategyEngine:
         self,
         candles: List[Candle],
         htf_candles: Optional[List[Candle]] = None,
+        macro: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Produce drawable zones + currently-valid pending sniper limit setups.
 
         ``htf_candles`` are higher-timeframe bars for the same instrument. When
         supplied, their structural bias GATES entries: a setup whose direction
         opposes the HTF bias is rejected outright rather than merely penalised.
+
+        ``macro`` is an ``app.services.macro_context.MacroBias`` resolved by the
+        caller. This method is synchronous and is re-entered once per bar by
+        ``backtest``, so it must never fetch: an omitted bias simply means the
+        setup is scored without macro, with the weight redistributed rather than
+        forfeited.
         """
+        # Fresh ledger per analysis — rejections describe THIS run, and a stale
+        # carry-over would explain the previous chart's absence, not this one's.
+        self._rejected: List[Dict[str, Any]] = []
+
         if len(candles) < 40:
             return {"error": "Not enough candles (need >= 40)", "signals": [], "zones": []}
 
         prim = self._primitives(candles)
         prim["htf_bias"] = self._htf_bias(htf_candles)
+        prim["macro"] = macro
         atr = prim["atr"]
         last_price = candles[-1].close
         bias = prim["bias"]
@@ -1235,7 +1333,12 @@ class SMCStrategyEngine:
                 if not sig:
                     continue
                 if sig.confidence < self.min_confidence:
-                    continue  # quality gate — skip low-conviction setups
+                    # quality gate — skip low-conviction setups
+                    self._reject(
+                        sig.side, sig.entry, sig.rr, sig.confidence, "confidence",
+                        f"scored {sig.confidence:.2f}, below the {self.min_confidence:.2f} floor",
+                    )
+                    continue
                 # Structure gate: the entry decision must be backed by detectable
                 # SMC structure — an OB/FVG zone PLUS at least one of BOS / CHoCH /
                 # a strong-high or weak-low extreme / trend alignment. Raw zones
@@ -1349,6 +1452,13 @@ class SMCStrategyEngine:
             },
             "zones": _best_zones_for_chart(zones),
             "signals": [s.to_dict() for s in signals],
+            # Candidates the gates threw out. Only meaningful when `signals` is
+            # empty — that is exactly when the user needs to know the difference
+            # between "found nothing" and "found setups and refused them".
+            # Highest-conviction first, capped so it stays readable.
+            "rejected_signals": sorted(
+                self._rejected, key=lambda r: -r["confidence"]
+            )[:6],
             "us_session": {
                 "enabled": self.us_session_only,
                 "open_time": us_open.time if us_open else None,
@@ -1360,6 +1470,8 @@ class SMCStrategyEngine:
                 k: v for k, v in prim.get("sweeps", {}).items()
                 if k != "_candles"  # never serialise the candle list
             },
+            # ── Macro context, reported whether or not it applied ─────────────
+            "macro": _macro_payload(macro),
         }
 
     # -- public: backtest -------------------------------------------------------

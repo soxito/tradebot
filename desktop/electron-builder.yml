@@ -1,0 +1,108 @@
+# electron-builder configuration for the TradeBot desktop app.
+#
+# Kept in YAML rather than package.json so the reasoning below can live next to
+# the settings it explains — electron-builder rejects unknown keys, so JSON
+# offered nowhere to put it.
+#
+# The payload under resources/ is produced by scripts/build-desktop.mjs; run
+# that rather than invoking electron-builder directly.
+
+appId: com.tradebot.desktop
+productName: TradeBot
+copyright: Copyright © TradeBot
+
+directories:
+  output: ../dist-desktop
+  buildResources: build
+
+# An explicit ALLOWLIST, never copy-everything-minus-exclusions.
+#
+# The repo root holds a .env with live exchange keys and an authenticated
+# Telegram .session file. An exclusion-based config leaks them the moment
+# someone adds a secret with a name nobody anticipated. scripts/check-no-secrets.mjs
+# enforces the same rule independently, before this ever runs.
+files:
+  - main.js
+  - preload.js
+  - splash.html
+  - package.json
+
+# Staged into desktop/resources/ by scripts/build-desktop.mjs.
+# `python` is a relocatable CPython with the backend's dependencies installed.
+extraResources:
+  - from: resources/python
+    to: python
+  - from: resources/backend
+    to: backend
+  - from: resources/plugins
+    to: plugins
+  - from: resources/frontend
+    to: frontend
+  - from: resources/pinescripts.json
+    to: pinescripts.json
+
+mac:
+  category: public.app-category.finance
+  target:
+    - target: dmg
+      arch: [arm64, x64]
+    - target: zip
+      arch: [arm64, x64]
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  # codesign forks once per file, and the bundled CPython carries tens of
+  # thousands of them — signing takes over an hour unsupervised. Only Mach-O
+  # binaries actually need a signature; compiled bytecode is inert data that
+  # the loader never executes directly, so skipping it cuts the file count by
+  # roughly half with no effect on what Gatekeeper verifies.
+  signIgnore:
+    - .*/__pycache__/.*
+    - .*\.pyc$
+  # Unsigned until a Developer ID certificate exists. electron-builder skips
+  # signing when CSC_LINK / CSC_KEY_PASSWORD are absent; set those secrets in
+  # CI and flip `notarize` to true to turn both on.
+  #
+  # NOTE: electron-updater cannot verify an unsigned macOS update, so macOS
+  # auto-update stays disabled in main.js until this is done.
+  notarize: false
+
+dmg:
+  contents:
+    - x: 130
+      y: 220
+    - x: 410
+      y: 220
+      type: link
+      path: /Applications
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  # To sign, set WIN_CSC_LINK / WIN_CSC_KEY_PASSWORD in CI — no config change
+  # needed here.
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  perMachine: false
+  createDesktopShortcut: true
+  # Left at the default false on purpose: the user's SQLite database and API
+  # keys live in appData, and an uninstall must not destroy them.
+  deleteAppDataOnUninstall: false
+
+linux:
+  category: Office
+  target:
+    - target: AppImage
+      arch: [x64]
+    - target: deb
+      arch: [x64]
+  maintainer: TradeBot
+
+publish:
+  - provider: github
+    owner: soxito
+    repo: tradebot

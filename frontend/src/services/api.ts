@@ -17,11 +17,35 @@ const normalizeBrowserHost = (url: string): string => {
   return url.replace('://localhost:', '://127.0.0.1:').replace('://localhost/', '://127.0.0.1/');
 };
 
+/**
+ * Resolve the API base URL, in priority order.
+ *
+ * 1. `window.__TRADEBOT_API_URL__` — injected by the desktop app's Electron
+ *    preload, for the case where the UI is loaded from somewhere other than the
+ *    backend itself.
+ * 2. Same-origin mode — the desktop build, where the Python backend serves this
+ *    bundle and the API from one port chosen at launch. The port cannot be
+ *    known when the frontend is built, so it is read from `window.location`
+ *    rather than baked in.
+ * 3. `NEXT_PUBLIC_API_URL` — explicit build-time override (Docker, LAN, ngrok).
+ * 4. The current host with the backend's port — so localhost, 127.0.0.1 and
+ *    LAN IPs all reach the matching backend in development.
+ * 5. The loopback default, for server-side rendering where there is no window.
+ */
 export const getApiBaseUrl = () => {
+  if (typeof window !== 'undefined') {
+    const injected = (window as any).__TRADEBOT_API_URL__;
+    if (typeof injected === 'string' && injected) {
+      return injected.replace(/\/$/, '');
+    }
+    if (process.env.NEXT_PUBLIC_API_SAME_ORIGIN === '1') {
+      return `${window.location.origin}/api/v1`;
+    }
+  }
+
   const envUrl = process.env.NEXT_PUBLIC_API_URL;
   if (envUrl) return normalizeBrowserHost(envUrl);
-  // No explicit env: in the browser follow the current host so localhost,
-  // 127.0.0.1, and LAN IPs all target the matching backend.
+
   if (typeof window !== 'undefined') {
     const { protocol, hostname } = window.location;
     const host = hostname === 'localhost' ? '127.0.0.1' : hostname;
@@ -31,7 +55,21 @@ export const getApiBaseUrl = () => {
   return DEFAULT_API_BASE_URL;
 };
 
-const getApiRootUrl = () => getApiBaseUrl().replace(/\/api\/v1\/?$/, '');
+/** The API origin without the `/api/v1` suffix — for /health, /docs, SSE, WS. */
+export const getApiRootUrl = () => getApiBaseUrl().replace(/\/api\/v1\/?$/, '');
+
+/** The API origin as a WebSocket URL (`ws://` / `wss://`). */
+export const getApiWsUrl = () => getApiRootUrl().replace(/^http/, 'ws');
+
+/**
+ * Which price series to read for a metal.
+ *
+ * Gold and silver have two real, different prices: spot — what a broker quotes
+ * and fills at — and the COMEX future, which trades above spot by the cost of
+ * carry (about 1.4% for gold when last measured). Only metals have the
+ * distinction; every other instrument has one series and ignores this.
+ */
+export type PriceBasis = 'spot' | 'futures';
 
 export const api = axios.create({
   baseURL: getApiBaseUrl(),
@@ -119,14 +157,16 @@ export const apiClient = {
     timeframe: string = 'H1',
     limit: number = 400,
     signal?: AbortSignal,
-  ) => api.get('/market/candles', { params: { symbol, timeframe, limit }, timeout: 30000, signal }),
+    /** Metals only: 'spot' (broker-style, default) or the COMEX 'futures' contract. */
+    basis: PriceBasis = 'spot',
+  ) => api.get('/market/candles', { params: { symbol, timeframe, limit, basis }, timeout: 30000, signal }),
   /**
-   * Live quote (Yahoo) for any instrument. Pairs with getMarketCandles: a chart
-   * drawn from Yahoo polls this for its live line and forming bar, since the
+   * Live quote for any instrument. Pairs with getMarketCandles: a chart drawn
+   * from this feed polls it for its live line and forming bar, since the
    * crypto-exchange ticker does not list FX, indices or spot metals.
    */
-  getMarketPrice: (symbol: string, signal?: AbortSignal) =>
-    api.get('/market/price', { params: { symbol }, timeout: 15000, signal }),
+  getMarketPrice: (symbol: string, signal?: AbortSignal, basis: PriceBasis = 'spot') =>
+    api.get('/market/price', { params: { symbol, basis }, timeout: 15000, signal }),
   placeSpotOrder: (data: {
     exchange: string;
     symbol: string;
@@ -780,6 +820,13 @@ export const apiClient = {
       }) => api.post('/plugins/mt5/scalp/start', data),
       stop: (accountId: number, symbol: string) =>
         api.post('/plugins/mt5/scalp/stop', { account_id: accountId, symbol }),
+      // Pause/resume keep the session rows — and therefore the pairs and every
+      // setting — so resuming never needs the pair picker. Omit `symbols` to
+      // act on every session on the account in that state.
+      pause: (accountId: number, symbols?: string[]) =>
+        api.post('/plugins/mt5/scalp/pause', { account_id: accountId, symbols }),
+      resume: (accountId: number, symbols?: string[]) =>
+        api.post('/plugins/mt5/scalp/resume', { account_id: accountId, symbols }),
       status: (accountId: number) => api.get(`/plugins/mt5/scalp/status/${accountId}`),
       closeAll: (accountId: number) => api.post(`/plugins/mt5/scalp/close-all/${accountId}`),
       searchSymbols: (accountId: number, q: string) =>
@@ -1030,6 +1077,13 @@ export const apiClient = {
       api.post('/plugins/obsidian-knowledge/notes', data),
     sync: (data?: { export_decisions?: boolean; export_signals?: boolean; export_communities?: boolean; limit?: number }) =>
       api.post('/plugins/obsidian-knowledge/sync', data ?? {}),
+    /** Auto-sync loop state: when the vault last actually synced, and when next.
+     *  Distinct from `status().last_sync_at`, which is only the newest note's
+     *  timestamp and does not move when a cycle finds nothing to write. */
+    syncStatus: () => api.get('/plugins/obsidian-knowledge/sync/status'),
+    syncStart: (interval = 300) =>
+      api.post('/plugins/obsidian-knowledge/sync/start', null, { params: { interval } }),
+    syncStop: () => api.post('/plugins/obsidian-knowledge/sync/stop'),
     graph: () => api.get('/plugins/obsidian-knowledge/graph'),
     search: (data: { query: string; note_type?: string; symbol?: string; limit?: number }) =>
       api.post('/plugins/obsidian-knowledge/search', data),
@@ -1128,6 +1182,29 @@ export const apiClient = {
     run: () => api.post('/research/run', null, { timeout: 120000 }),
     start: (interval = 900) => api.post('/research/start', { interval }),
     stop: () => api.post('/research/stop'),
+
+    // ── Per-signal research queue ──────────────────────────────────────────
+    // The loop above researches the ambient background; these drive the queue
+    // that researches the app's own signals into per-pair predictions.
+    /** Research jobs with their per-step progress. `status` accepts a
+     *  comma-separated list, e.g. "queued,researching". */
+    jobs: (params?: { status?: string; symbol?: string; limit?: number }) =>
+      api.get('/research/jobs', { params }),
+    job: (id: number) => api.get(`/research/jobs/${id}`),
+    /** Queue state: running, slots in use, backlog, last sweep. */
+    queueStatus: () => api.get('/research/queue/status'),
+    queueStart: (concurrency = 5, scan_interval = 180) =>
+      api.post('/research/queue/start', { concurrency, scan_interval }),
+    queueStop: () => api.post('/research/queue/stop'),
+    /** Sweep every signal source now and queue what is not already in flight. */
+    scan: () => api.post('/research/scan', null, { timeout: 60000 }),
+    /** Queue one pair by hand. */
+    enqueue: (symbol: string, source = 'manual') =>
+      api.post('/research/jobs', { symbol, source }),
+    /** The reconciled plan for one instrument: verdict + two costed entries. */
+    plan: (symbol: string) => api.get(`/research/plan/${encodeURIComponent(symbol)}`),
+    /** Plans for many instruments at once — one request per page, not per row. */
+    plans: (symbols: string) => api.get('/research/plans', { params: { symbols } }),
   },
 
   // ─── Ngrok ───

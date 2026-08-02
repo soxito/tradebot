@@ -236,12 +236,20 @@ async def _exchange_candles(symbol: str, timeframe: str, count: int) -> List[Dic
 
 
 async def _forex_candles(symbol: str, timeframe: str, count: int) -> List[Dict[str, Any]]:
-    """Recent FX/metals OHLC via the core forex_provider (hourly/daily), resampled."""
+    """Recent non-crypto OHLC via the universal resolver, resampled.
+
+    Gated on ``market_data.is_universal_symbol`` rather than
+    ``forex_provider.is_forex_symbol``: the latter knows only a handful of
+    majors plus gold, so every FX cross, index and commodity returned nothing
+    here and the caller fell through to the live-quote buffer with no history.
+    """
     try:
-        from app.exchanges import forex_provider  # type: ignore
-        if not forex_provider.is_forex_symbol(symbol):
+        from app.services import market_data  # type: ignore
+        if not market_data.is_universal_symbol(symbol):
             return []
-        ohlcv, _ticker = await forex_provider.fetch_ohlcv(symbol, timeframe="1h", limit=400)
+        ohlcv, _ticker = await market_data.fetch_ohlcv_universal(
+            symbol, timeframe="1h", limit=400
+        )
         if not ohlcv:
             return []
         base = [

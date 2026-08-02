@@ -109,6 +109,7 @@ class PluginLoader:
                 async with engine.begin() as conn:
                     for metadata in metadata_objects:
                         await conn.run_sync(metadata.create_all)
+                        await conn.run_sync(self._add_missing_columns, metadata)
 
                 initialized.append(plugin.manifest.slug)
                 logger.info(f"Initialized plugin tables: {plugin.manifest.slug}")
@@ -148,6 +149,45 @@ class PluginLoader:
                 logger.warning(message)
 
         return mounted
+
+    @staticmethod
+    def _add_missing_columns(sync_conn, metadata) -> None:
+        """Add columns a plugin model gained since its table was created.
+
+        ``create_all`` only ever CREATEs — it will not touch a table that
+        already exists. Without this, adding a field to a plugin model works on
+        a fresh database and silently breaks every existing one, which surfaces
+        much later as an ``UndefinedColumn`` on an unrelated query.
+
+        Additive only, and deliberately so: dropping or retyping a column is a
+        decision that belongs in a reviewed migration, not in a boot path.
+        Identifiers come from the model metadata, never from user input.
+        """
+        from sqlalchemy import inspect as sa_inspect, text
+        from sqlalchemy.schema import CreateColumn
+
+        inspector = sa_inspect(sync_conn)
+        existing_tables = set(inspector.get_table_names())
+
+        for table in metadata.sorted_tables:
+            if table.name not in existing_tables:
+                continue  # just created with every column
+            present = {col["name"] for col in inspector.get_columns(table.name)}
+            for column in table.columns:
+                if column.name in present or column.primary_key:
+                    continue
+                try:
+                    ddl = CreateColumn(column).compile(sync_conn.engine)
+                    sync_conn.execute(
+                        text(f'ALTER TABLE "{table.name}" ADD COLUMN {ddl}')
+                    )
+                    logger.info(f"Added column {table.name}.{column.name}")
+                except Exception as exc:  # noqa: BLE001
+                    # A column that cannot be added (a NOT NULL with no default
+                    # on a populated table) must not stop the rest of boot.
+                    logger.warning(
+                        f"Could not add column {table.name}.{column.name}: {exc}"
+                    )
 
     @staticmethod
     def _extract_metadata_objects(module: object) -> list[object]:

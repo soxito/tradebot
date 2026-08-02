@@ -27,6 +27,7 @@ from pydantic import BaseModel
 
 from app.exchanges.manager import exchange_manager, SupportedExchange
 from app.exchanges.forex_provider import is_forex_symbol, fetch_ohlcv as forex_fetch_ohlcv
+from app.services import market_data
 
 router = APIRouter(prefix="/jarvis", tags=["jarvis"])
 
@@ -712,6 +713,25 @@ async def _brain_deep_research(
     if not symbol:
         return
     try:
+        user_content = (
+            f"Research context for {symbol}:\n\n"
+            f"{context_brief[:600] if context_brief else 'No prior context.'}"
+        )
+        # Agent-Reach live search grounds this brain in real, fetched sources
+        # instead of pure model recall. Fire-and-forget already, so the added
+        # latency is invisible to the user. No-op unless AGENT_REACH_ENABLED.
+        from app.core.config import settings as _app_settings
+        if _app_settings.AGENT_REACH_ENABLED:
+            try:
+                from app.services import agent_reach_client
+                live_research = await agent_reach_client.research_summary_for_symbol(
+                    symbol, token_budget=600
+                )
+                if live_research:
+                    user_content += f"\n\nLive web research for {symbol}:\n{live_research}"
+            except Exception as _ar_exc:
+                logger.debug(f"[JARVIS brain-researcher] Agent-Reach context skipped: {_ar_exc}")
+
         msgs = [
             {
                 "role": "system",
@@ -728,10 +748,7 @@ async def _brain_deep_research(
             },
             {
                 "role": "user",
-                "content": (
-                    f"Research context for {symbol}:\n\n"
-                    f"{context_brief[:600] if context_brief else 'No prior context.'}"
-                ),
+                "content": user_content,
             },
         ]
         research = await _brain_call(
@@ -2772,18 +2789,17 @@ async def _dispatch(cmd: str, ex: Optional[str]) -> CommandResult:  # noqa: C901
             r'PEPE|SHIB|WIF|BONK|FLOKI|[A-Z]{2,10})USDT?)\b',
             cmd.upper(),
         )
-        if not _sym_m:
-            # try first word after keyword
-            if _ana_m.lastindex and _ana_m.group(_ana_m.lastindex):
-                sym_candidate = _ana_m.group(_ana_m.lastindex).upper()
-                if not sym_candidate.endswith("USDT"):
-                    sym_candidate += "USDT"
-            else:
-                sym_candidate = ""
-        else:
-            sym_candidate = _sym_m.group(1)
-            if not sym_candidate.endswith("USDT"):
-                sym_candidate += "USDT"
+        # The regexes above are TOKEN FINDERS only — canonicalisation belongs to
+        # market_data. This used to append "USDT" unconditionally, which turned
+        # GBPUSD into GBPUSDUSDT and made every FX pair, metal and index fail the
+        # forex gate below and dead-end on a Bitget lookup.
+        _raw_token = ""
+        if _sym_m:
+            _raw_token = _sym_m.group(1)
+        elif _ana_m.lastindex and _ana_m.group(_ana_m.lastindex):
+            _raw_token = _ana_m.group(_ana_m.lastindex).upper()
+
+        sym_candidate, _ = market_data.canonicalize_for_analysis(_raw_token)
 
         if sym_candidate:
             return await _analyze_symbol(sym_candidate, cmd, ex, deep=_wants_deep_research(cmd))
@@ -2885,112 +2901,17 @@ def _err(action: str, msg: str) -> CommandResult:
     return CommandResult(ok=False, action=action, detail=msg, speech=msg)
 
 
-async def _fetch_live_prices_brief() -> str:
-    """Fetch BTC/ETH/SOL/BNB live prices for the news brief.
+async def _fetch_live_prices_brief(symbols: list[str] | None = None) -> str:
+    """Live prices for the news brief — delegates to the shared resolver.
 
-    Tries three sources in order: Bitget SDK → CoinGecko → Binance.
-    Returns a formatted string with live prices, or a fallback message.
-    Always uses REAL prices — never training data.
-    Fetches ALL supported USDT pairs from each exchange, sorted by 24h volume,
-    so the AI sees the full market picture — not just 5 hardcoded symbols.
+    Used to assemble crypto tickers inline, filtered on "/USDT", which is why
+    the brief could never mention gold, an index or an FX pair. market_data
+    serves every asset class from one priority chain, so this is now a thin
+    adapter that keeps the existing call site and return shape.
     """
-    import httpx as _hx
-
-    lines: List[str] = []
-
-    # --- Bitget ccxt: fetch ALL active futures tickers at once ---
-    try:
-        connector = exchange_manager.get_exchange(SupportedExchange.BITGET)
-        if connector:
-            try:
-                # ccxt fetch_tickers() returns every listed market in one call
-                all_tickers = await connector.exchange.fetch_tickers()
-                # Keep only USDT-margined pairs, sort by quoteVolume desc
-                usdt_tickers = [
-                    (sym, t) for sym, t in all_tickers.items()
-                    if "/USDT" in sym
-                ]
-                usdt_tickers.sort(
-                    key=lambda x: float(x[1].get("quoteVolume") or 0), reverse=True
-                )
-                for sym, t in usdt_tickers[:80]:
-                    last = t.get("last") or t.get("close")
-                    chg  = t.get("percentage")
-                    if last:
-                        clean = sym.split(":")[0].replace("/", "")
-                        chg_str = f" ({float(chg):+.2f}%/24h)" if chg is not None else ""
-                        lines.append(f"  {clean}: ${float(last):,.4f}{chg_str}")
-            except Exception:
-                # ccxt bulk failed — fall back to individual SDK calls for key pairs
-                for sym in ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
-                            "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT"]:
-                    try:
-                        t = await connector.get_futures_ticker(sym)
-                        d = t if not isinstance(t, dict) else t.get("data") or t
-                        if isinstance(d, list):
-                            d = d[0] if d else {}
-                        last = (d.get("lastPr") or d.get("last")
-                                or d.get("close") or d.get("markPrice"))
-                        chg  = d.get("change24h") or d.get("priceChangePercent") or ""
-                        if last:
-                            chg_str = f" ({float(chg)*100:+.2f}%/24h)" if chg else ""
-                            lines.append(f"  {sym}: ${float(last):,.4f}{chg_str}")
-                    except Exception:
-                        pass
-    except Exception:
-        pass
-
-    # --- Binance public: ALL USDT pairs sorted by 24h quoteVolume ---
-    if not lines:
-        try:
-            async with _hx.AsyncClient(timeout=8.0) as c:
-                r = await c.get("https://api.binance.com/api/v3/ticker/24hr")
-                tickers = r.json() if isinstance(r.json(), list) else []
-                # Filter to USDT spot pairs, sort by 24h volume
-                usdt = [
-                    t for t in tickers
-                    if isinstance(t, dict) and str(t.get("symbol", "")).endswith("USDT")
-                ]
-                usdt.sort(
-                    key=lambda x: float(x.get("quoteVolume") or 0), reverse=True
-                )
-                for t in usdt[:80]:
-                    sym = t.get("symbol", "")
-                    px  = t.get("lastPrice")
-                    chg = t.get("priceChangePercent")
-                    if sym and px:
-                        chg_str = f" ({float(chg):+.2f}%/24h)" if chg else ""
-                        lines.append(f"  {sym}: ${float(px):,.4f}{chg_str}")
-        except Exception:
-            pass
-
-    # --- CoinGecko: top 100 coins by market cap (final fallback) ---
-    if not lines:
-        try:
-            async with _hx.AsyncClient(timeout=8.0) as c:
-                r = await c.get(
-                    "https://api.coingecko.com/api/v3/coins/markets",
-                    params={
-                        "vs_currency": "usd",
-                        "order": "market_cap_desc",
-                        "per_page": 100,
-                        "page": 1,
-                        "sparkline": "false",
-                    },
-                )
-                for coin in (r.json() or []):
-                    sym = (coin.get("symbol") or "").upper() + "USDT"
-                    px  = coin.get("current_price")
-                    chg = coin.get("price_change_percentage_24h")
-                    if px:
-                        chg_str = f" ({float(chg):+.2f}%/24h)" if chg is not None else ""
-                        lines.append(f"  {sym}: ${float(px):,.4f}{chg_str}")
-        except Exception:
-            pass
-
-    if lines:
-        return f"LIVE PRICES — {len(lines)} pairs (fetched this second — use ONLY these, NEVER training data):\n" + "\n".join(lines)
-    return "LIVE PRICES: Unable to fetch right now — do NOT use training data prices."
+    return await market_data.price_block(
+        symbols or [], include_top_crypto=True, max_lines=60
+    )
 
 
 async def _fetch_live_news_brief() -> str:
@@ -3714,15 +3635,25 @@ async def _find_open_position(symbol: str) -> Optional[Dict[str, Any]]:
 #   Secondary = best available fallback when primary is rate-limited or down
 #   Tertiary = last-resort fallback, always different provider family
 #
+#   GitHub Models was retired by GitHub (every endpoint answers HTTP 410
+#   `github_models_retirement_brownout`), so it has been removed from every
+#   chain below — leaving it in cost each task an attempt that could only fail.
+#
+#   NVIDIA Nemotron 3 Ultra 550B leads every reasoning task — it is the deepest
+#   model NVIDIA serves free. Nemotron Super 120B sits directly behind it in each
+#   chain: a 550B is likelier to hit capacity (HTTP 529), and the 120B is the
+#   same family and verified to return parseable JSON.
+#
 #   market_analysis – deep technical + SMC bias read (needs frontier reasoning)
-#                     primary:   NVIDIA Nemotron 120B  (frontier free, no per-min cap)
-#                     secondary: GitHub o3             (OpenAI strongest reasoning; 1 req/60s cap)
-#                     tertiary:  Groq 120B MoE          (fast free fallback)
+#                     primary:   NVIDIA Nemotron 550B  (deepest free reasoning)
+#                     secondary: NVIDIA Nemotron 120B  (same family, when 550B is busy)
+#                     tertiary:  Cerebras / Groq 120B   (fast free fallbacks)
 #
 #   news_context    – RAG-optimised news summarisation (needs large context + retrieval quality)
-#                     primary:   GitHub GPT-4o          (OpenAI flagship, excellent news synthesis)
+#                     primary:   NVIDIA Nemotron 550B  (deepest free reasoning)
 #                     secondary: Cohere Command A       (256K ctx, RAG-tuned, best for news)
 #                     tertiary:  Gemini 2.5 Flash       (1M ctx, highest quality Gemini fallback)
+#                     then:      Groq 120B MoE          (fast free last resort)
 #
 #   volume_analysis – quantitative buy/sell pressure (needs speed + no rate-limit cap)
 #                     primary:   Cerebras gpt-oss-120B  (wafer speed, same quality as Groq 120B)
@@ -3730,25 +3661,37 @@ async def _find_open_position(symbol: str) -> Optional[Dict[str, Any]]:
 #                     tertiary:  NVIDIA Nemotron 120B   (frontier reasoning fallback)
 #
 #   synthesis       – final decisive JARVIS narrative (needs deepest reasoning + confident output)
-#                     primary:   NVIDIA Nemotron 120B  (frontier free, most reliable for synthesis)
-#                     secondary: GitHub o3              (OpenAI o3 – strongest reasoning when available)
+#                     primary:   NVIDIA Nemotron 550B  (deepest free reasoning)
+#                     secondary: NVIDIA Nemotron 120B  (same family, when 550B is busy)
 #                     tertiary:  Groq 120B MoE           (fast free fallback)
 #
-#   news_position   – map many headlines to many open positions (1M ctx REQUIRED)
-#                     primary:   Gemini 2.5 Flash       (1M ctx, highest quality available Gemini)
-#                     secondary: Cohere Command A       (256K ctx, RAG-quality fallback)
-#                     tertiary:  Gemini 3.1 Flash-Lite  (1M ctx, 500 req/day – quota fallback)
+#   news_position   – map many headlines to many open positions (context-hungry)
+#                     primary:   NVIDIA Nemotron 550B  (128K ctx – see the note below)
+#                     secondary: Gemini 2.5 Flash       (1M ctx – catches an over-long prompt)
+#                     tertiary:  Cohere Command A       (256K ctx, RAG-quality fallback)
+#                     then:      Gemini 3.1 Flash-Lite  (1M ctx, 500 req/day – quota fallback)
+#
+# NOTE on news_position and context: this task was originally specced as
+# "1M ctx REQUIRED" because it maps every headline onto every open position.
+# Nemotron Super tops out at 128K. That is ample for a normal desk, but a very
+# large book on a heavy news day can exceed it — which is exactly why the 1M
+# Gemini sits immediately behind it: a context-overflow is a 400 from the
+# provider, and the chain below treats that like any other failure and falls
+# through to a model that can hold the prompt.
 
 _JARVIS_TASK_MODELS: Dict[str, list] = {
     "market_analysis": [
-        ("nvidia",  "nvidia/nemotron-3-super-120b-a12b"),# frontier free reasoning – primary (no per-min cap)
-        ("github",  "o3"),                               # OpenAI o3 – strong reasoning fallback (1 req/min)
+        ("nvidia",  "nvidia/nemotron-3-ultra-550b-a55b"),# PRIMARY – NVIDIA's deepest free model
+        ("nvidia",  "nvidia/nemotron-3-super-120b-a12b"),# 120B when the 550B is at capacity
+        ("cerebras","gpt-oss-120b"),                     # wafer-speed 120B fallback
         ("groq",    "openai/gpt-oss-120b"),              # fast 120B last-resort fallback
     ],
     "news_context": [
-        ("github",  "gpt-4o"),                           # GPT-4o – excellent news synthesis
+        ("nvidia",  "nvidia/nemotron-3-ultra-550b-a55b"),# PRIMARY – NVIDIA's deepest free model
+        ("nvidia",  "nvidia/nemotron-3-super-120b-a12b"),# 120B when the 550B is at capacity
         ("cohere",  "command-a-03-2025"),                # RAG-tuned, 256K
         ("gemini",  "gemini-2.5-flash"),                 # highest quality Gemini (1M)
+        ("groq",    "openai/gpt-oss-120b"),              # fast free last resort
     ],
     "volume_analysis": [
         ("cerebras","gpt-oss-120b"),                     # wafer speed, no rate-limit cap
@@ -3756,12 +3699,14 @@ _JARVIS_TASK_MODELS: Dict[str, list] = {
         ("nvidia",  "nvidia/nemotron-3-super-120b-a12b"),# frontier reasoning fallback
     ],
     "synthesis": [
-        ("nvidia",  "nvidia/nemotron-3-super-120b-a12b"),# frontier free – most reliable for synthesis
-        ("github",  "o3"),                               # OpenAI o3 – strongest reasoning (subscription)
+        ("nvidia",  "nvidia/nemotron-3-ultra-550b-a55b"),# PRIMARY – NVIDIA's deepest free model
+        ("nvidia",  "nvidia/nemotron-3-super-120b-a12b"),# 120B when the 550B is at capacity
         ("groq",    "openai/gpt-oss-120b"),              # fast free fallback
     ],
     "news_position": [
-        ("gemini",  "gemini-2.5-flash"),                 # highest quality 1M Gemini
+        ("nvidia",  "nvidia/nemotron-3-ultra-550b-a55b"),# PRIMARY – NVIDIA's deepest free model
+        ("nvidia",  "nvidia/nemotron-3-super-120b-a12b"),# 120B when the 550B is at capacity
+        ("gemini",  "gemini-2.5-flash"),                 # 1M ctx – catches a prompt too big for 128K
         ("cohere",  "command-a-03-2025"),                # 256K RAG-quality fallback
         ("gemini",  "gemini-3.1-flash-lite"),            # 1M lite, 500/day quota fallback
     ],
@@ -3981,151 +3926,243 @@ async def _compose_ai_narrative(brief: str, symbol: str = "") -> Optional[str]:
     return None
 
 
+async def _analysis_from_series(
+    symbol: str, ohlcv: List[List], ticker: Dict, *, deep: bool = False
+) -> CommandResult:
+    """Turn a candle series into a trade proposal.
+
+    Split out of ``_analyze_symbol`` so every non-crypto route — the forex/metals
+    providers and the universal Yahoo fallback — produces an identical proposal
+    from whichever source could serve the instrument, instead of each route
+    carrying its own copy of the indicator maths.
+
+    NEVER places an order: the result carries the exact command the user must
+    say to execute it.
+    """
+    closes  = [float(c[4]) for c in ohlcv]
+    highs   = [float(c[2]) for c in ohlcv]
+    lows    = [float(c[3]) for c in ohlcv]
+    current = closes[-1]
+    buy_pct  = ticker.get("buy_pct", 0)
+    sell_pct = ticker.get("sell_pct", 0)
+    buy_vol  = ticker.get("buy_volume", 0)
+    sell_vol = ticker.get("sell_volume", 0)
+    # Report where the number actually came from. This used to be hardcoded to
+    # "yahoo_finance_live" regardless of whether Yahoo, CoinGecko or Frankfurter
+    # served it, which made the provenance line actively misleading.
+    price_source = ticker.get("source") or "unknown"
+
+    ema50  = _ema(closes, 50)
+    ema200 = _ema(closes, 200)
+    rsi    = _rsi(closes, 14)
+    atr    = _atr(highs, lows, closes, 14)
+    # _ema falls back to the last close when the history is too short, which
+    # makes EMA200 identical to price and silently neuters every trend test.
+    # Track that so the read is qualified rather than quietly wrong.
+    ema200_valid = len(closes) >= 200
+
+    swing_high = max(highs[-20:])
+    swing_low  = min(lows[-20:])
+
+    if not ema200_valid:
+        trend = "ranging"
+    elif current > ema200 and ema50 > ema200:
+        trend = "uptrend"
+    elif current < ema200 and ema50 < ema200:
+        trend = "downtrend"
+    else:
+        trend = "ranging"
+
+    rsi_label = "overbought" if rsi > 70 else "oversold" if rsi < 30 else f"neutral ({rsi:.0f})"
+
+    bias, confidence, reasons = _directional_bias(
+        current, ema50, ema200 if ema200_valid else 0.0, rsi, trend, buy_pct, sell_pct,
+    )
+
+    setup = _build_setup(bias, current, swing_high, swing_low, atr)
+    side, side_label = ("long", "BUY") if bias == "long" else ("short", "SHORT")
+
+    volume_line = (
+        f"Live Volume Split: BUY {buy_pct:.0f}% ({buy_vol:,.0f}) / "
+        f"SELL {sell_pct:.0f}% ({sell_vol:,.0f})\n"
+    )
+    header = (
+        f"{symbol} | {trend.upper()} | RSI {rsi:.0f} ({rsi_label})\n"
+        f"EMA50={ema50:.4g}  EMA200={ema200:.4g}{'' if ema200_valid else ' (insufficient history)'}"
+        f"  Current={current:.4g}\n"
+        f"Swing Hi={swing_high:.4g}  Swing Lo={swing_low:.4g}  ATR14={atr:.4g}\n"
+        f"{volume_line}"
+        f"Bias: {side_label} · confidence {confidence:.0%}"
+        + (f" · {'; '.join(reasons)}" if reasons else "")
+        + "\n"
+    )
+
+    if not setup:
+        # No setup with the stop and both targets on the correct side of
+        # entry — say so instead of inventing one with a fabricated R:R.
+        msg = (
+            f"{header}\nNo clean {side_label} setup right now, Sir — the recent range is too "
+            f"tight relative to volatility for a stop and targets that make sense. "
+            f"I'd wait for a clearer structure."
+        )
+        return CommandResult(
+            ok=True, action="analyze", detail=msg,
+            speech=(
+                f"{symbol}: {trend}, RSI {rsi:.0f}. I have a {side_label.lower()} lean at "
+                f"{confidence:.0%} confidence, but no clean setup — the range is too tight "
+                f"for a sensible stop, Sir."
+            ),
+            order={
+                "symbol": symbol, "side": side, "setup": None,
+                "current_price": current, "rsi": rsi, "trend": trend,
+                "confidence": confidence,
+                "price_source": price_source,
+            },
+        )
+
+    entry, sl, tp1, tp2 = setup["entry"], setup["sl"], setup["tp1"], setup["tp2"]
+    rr1, rr2 = setup["rr1"], setup["rr2"]
+
+    confirm_cmd = (
+        f"execute {symbol} {side} 5 lot at {entry}; "
+        f"set SL {sl}; TP1 {tp1}; TP2 {tp2}"
+    )
+
+    # Macro context — the dollar/VIX weather this instrument trades in. Read
+    # here so /analyze, the analyze_symbol tool and Jarvis chat all state it,
+    # and so the journal can later learn whether it predicted anything.
+    macro_bias = None
+    try:
+        from app.services.macro_context import resolve_macro_bias
+
+        macro_bias = await resolve_macro_bias(symbol)
+    except Exception as _mexc:  # noqa: BLE001 — context is never a gate
+        logger.debug("[JARVIS] macro context skipped for {}: {}", symbol, _mexc)
+
+    macro_applies = bool(macro_bias is not None and getattr(macro_bias, "applicable", False))
+    macro_norm = float(getattr(macro_bias, "normalized", 0.0) or 0.0) if macro_applies else 0.0
+    # Signed for the side actually proposed, so a short with a bid dollar reads
+    # as aligned rather than opposed.
+    macro_aligned = macro_norm if side == "long" else -macro_norm
+    macro_reason = getattr(macro_bias, "reason", "") if macro_bias is not None else "not consulted"
+
+    # Journal the call so the learning loop can settle it against real candles
+    # later and hold this confidence figure to account. Best-effort by design —
+    # a journalling failure must never cost the user their analysis.
+    try:
+        from app.core.database import AsyncSessionLocal
+        from app.services import analysis_journal
+
+        async with AsyncSessionLocal() as _jdb:
+            await analysis_journal.record_proposal(
+                _jdb,
+                source="jarvis_command",
+                symbol=symbol,
+                asset_class=market_data.classify(symbol),
+                timeframe="4h",
+                side=side,
+                entry=entry, stop_loss=sl, take_profit=tp1, tp2=tp2,
+                rr1=rr1, confidence=confidence,
+                price_at_analysis=current, price_source=price_source,
+                features={
+                    "trend": trend, "rsi": round(rsi, 2), "atr": setup["atr"],
+                    "ema50": round(ema50, 6), "ema200": round(ema200, 6),
+                    "ema200_valid": ema200_valid,
+                    "buy_pct": buy_pct, "sell_pct": sell_pct,
+                    # Macro, recorded whether or not it applied. Settled rows
+                    # then answer the question the fixed 0.05 weight only
+                    # guesses at: did the dollar read actually predict anything?
+                    "macro_applied": macro_applies,
+                    "macro_aligned": round(macro_aligned, 4),
+                    "macro_regime": getattr(macro_bias, "regime", "UNKNOWN") if macro_bias else "UNKNOWN",
+                    "macro_usd_leg": getattr(macro_bias, "usd_leg", "none") if macro_bias else "none",
+                },
+            )
+    except Exception as _jexc:  # noqa: BLE001
+        logger.debug("[JARVIS] journal skipped for {}: {}", symbol, _jexc)
+
+    if macro_applies:
+        stance = (
+            "supports" if macro_aligned > 0.1
+            else "opposes" if macro_aligned < -0.1
+            else "is neutral for"
+        )
+        macro_line = f"\nMACRO: {macro_reason} — {stance} this {side_label.lower()}.\n"
+    else:
+        macro_line = f"\nMACRO: not applied ({macro_reason}).\n"
+
+    detail = (
+        f"{header}"
+        f"\nPROPOSED {side_label} SETUP (LIVE DATA via {price_source} — NOT EXECUTED)\n"
+        f"Entry : {entry}  |  SL : {sl}  |  TP1 : {tp1} (R:R {rr1}x)  |  TP2 : {tp2} (R:R {rr2}x)\n"
+        f"{macro_line}"
+        f"\nTo execute say:\n  \"{confirm_cmd}\""
+    )
+
+    speech = (
+        f"{symbol} live analysis: {trend}, RSI {rsi:.0f}, {rsi_label}. "
+        f"Current price {current}. Buy pressure {buy_pct:.0f}%, sell pressure {sell_pct:.0f}%. "
+        f"Proposed {side_label.lower()} entry at {entry}, SL {sl}, TP1 {tp1}, "
+        f"at {confidence:.0%} confidence. "
+        f"This is a proposal — say the execute command to confirm, Sir."
+    )
+
+    return CommandResult(
+        ok=True, action="analyze",
+        detail=detail,
+        speech=speech,
+        order={
+            "symbol": symbol, "side": side, "proposed_entry": entry,
+            "sl": sl, "tp1": tp1, "tp2": tp2,
+            "rr1": rr1, "rr2": rr2,
+            "current_price": current,
+            "rsi": rsi, "trend": trend,
+            "atr": setup["atr"],
+            "confidence": confidence,
+            "bias_reasons": reasons,
+            "ema50": round(ema50, 6), "ema200": round(ema200, 6),
+            "ema200_valid": ema200_valid,
+            "buy_volume_pct": buy_pct, "sell_volume_pct": sell_pct,
+            "buy_volume": buy_vol, "sell_volume": sell_vol,
+            "price_source": price_source,
+            "macro_applied": macro_applies,
+            "macro_aligned": round(macro_aligned, 4),
+            "macro_reason": macro_reason,
+            "confirm_command": confirm_cmd,
+            "WARNING": "NOT EXECUTED — say the confirm_command to place the order",
+        },
+    )
+
+
 async def _analyze_symbol(symbol: str, original_cmd: str, ex_name: Optional[str], deep: bool = False) -> CommandResult:
     """
     Real-data market analysis for `symbol`.
 
-    For crypto pairs: Fetches 4H OHLCV from Bitget.
-    For forex/metals (XAUUSD, XAGUSD, EURUSD …): Fetches from Yahoo Finance
-    via the ForexProvider so that live gold/silver prices are always current.
+    Non-crypto (XAUUSD, GBPUSD, US30, USOIL …) is served by the universal
+    market-data resolver: Yahoo covers every FX cross, metal, index and
+    commodity, with the forex/metals providers behind it.  Crypto goes to
+    Bitget via the pair catalog.
 
     IMPORTANT: This function NEVER places orders.  It returns a proposal
     with the exact Jarvis command the user must say to execute it.
     """
-    # ── Route: Forex / metals (XAUUSD, XAGUSD, etc.) ─────────────────────────
-    if is_forex_symbol(symbol):
+    # ── Route: FX, metals, indices, energy, softs ────────────────────────────
+    # Two-tier guard: the forex provider knows a few majors plus gold, Yahoo
+    # knows everything else.  Checking only the former is what previously sent
+    # GBPUSD and XAUUSD down the crypto path to die on a Bitget lookup.
+    if market_data.is_universal_symbol(symbol):
         try:
-            ohlcv, forex_ticker = await forex_fetch_ohlcv(symbol, timeframe="4h", limit=200)
+            ohlcv, ticker = await market_data.fetch_ohlcv_universal(
+                symbol, timeframe="4h", limit=200
+            )
         except Exception as e:
             if _is_network_error(e):
-                return _err("analyze", "Network unreachable — cannot fetch live gold/forex price.")
-            return _err("analyze", f"Forex price fetch failed: {e}")
+                return _err("analyze", "Network unreachable — cannot fetch live price.")
+            return _err("analyze", f"Price fetch failed: {e}")
 
         if not ohlcv or len(ohlcv) < 20:
             return _err("analyze", f"Not enough historical data for {symbol}.")
-
-        closes  = [float(c[4]) for c in ohlcv]
-        highs   = [float(c[2]) for c in ohlcv]
-        lows    = [float(c[3]) for c in ohlcv]
-        current = closes[-1]
-        buy_pct  = forex_ticker.get("buy_pct", 0)
-        sell_pct = forex_ticker.get("sell_pct", 0)
-        buy_vol  = forex_ticker.get("buy_volume", 0)
-        sell_vol = forex_ticker.get("sell_volume", 0)
-
-        ema50  = _ema(closes, 50)
-        ema200 = _ema(closes, 200)
-        rsi    = _rsi(closes, 14)
-        atr    = _atr(highs, lows, closes, 14)
-        # _ema falls back to the last close when the history is too short, which
-        # makes EMA200 identical to price and silently neuters every trend test.
-        # Track that so the read is qualified rather than quietly wrong.
-        ema200_valid = len(closes) >= 200
-
-        swing_high = max(highs[-20:])
-        swing_low  = min(lows[-20:])
-
-        if not ema200_valid:
-            trend = "ranging"
-        elif current > ema200 and ema50 > ema200:
-            trend = "uptrend"
-        elif current < ema200 and ema50 < ema200:
-            trend = "downtrend"
-        else:
-            trend = "ranging"
-
-        rsi_label = "overbought" if rsi > 70 else "oversold" if rsi < 30 else f"neutral ({rsi:.0f})"
-
-        bias, confidence, reasons = _directional_bias(
-            current, ema50, ema200 if ema200_valid else 0.0, rsi, trend, buy_pct, sell_pct,
-        )
-
-        setup = _build_setup(bias, current, swing_high, swing_low, atr)
-        side, side_label = ("long", "BUY") if bias == "long" else ("short", "SHORT")
-
-        volume_line = (
-            f"Live Volume Split: BUY {buy_pct:.0f}% ({buy_vol:,.0f}) / "
-            f"SELL {sell_pct:.0f}% ({sell_vol:,.0f})\n"
-        )
-        header = (
-            f"{symbol} | {trend.upper()} | RSI {rsi:.0f} ({rsi_label})\n"
-            f"EMA50={ema50:.4g}  EMA200={ema200:.4g}{'' if ema200_valid else ' (insufficient history)'}"
-            f"  Current={current:.4g}\n"
-            f"Swing Hi={swing_high:.4g}  Swing Lo={swing_low:.4g}  ATR14={atr:.4g}\n"
-            f"{volume_line}"
-            f"Bias: {side_label} · confidence {confidence:.0%}"
-            + (f" · {'; '.join(reasons)}" if reasons else "")
-            + "\n"
-        )
-
-        if not setup:
-            # No setup with the stop and both targets on the correct side of
-            # entry — say so instead of inventing one with a fabricated R:R.
-            msg = (
-                f"{header}\nNo clean {side_label} setup right now, Sir — the recent range is too "
-                f"tight relative to volatility for a stop and targets that make sense. "
-                f"I'd wait for a clearer structure."
-            )
-            return CommandResult(
-                ok=True, action="analyze", detail=msg,
-                speech=(
-                    f"{symbol}: {trend}, RSI {rsi:.0f}. I have a {side_label.lower()} lean at "
-                    f"{confidence:.0%} confidence, but no clean setup — the range is too tight "
-                    f"for a sensible stop, Sir."
-                ),
-                order={
-                    "symbol": symbol, "side": side, "setup": None,
-                    "current_price": current, "rsi": rsi, "trend": trend,
-                    "confidence": confidence,
-                    "price_source": "yahoo_finance_live",
-                },
-            )
-
-        entry, sl, tp1, tp2 = setup["entry"], setup["sl"], setup["tp1"], setup["tp2"]
-        rr1, rr2 = setup["rr1"], setup["rr2"]
-
-        confirm_cmd = (
-            f"execute {symbol} {side} 5 lot at {entry}; "
-            f"set SL {sl}; TP1 {tp1}; TP2 {tp2}"
-        )
-
-        detail = (
-            f"{header}"
-            f"\nPROPOSED {side_label} SETUP (LIVE YAHOO FINANCE DATA — NOT EXECUTED)\n"
-            f"Entry : {entry}  |  SL : {sl}  |  TP1 : {tp1} (R:R {rr1}x)  |  TP2 : {tp2} (R:R {rr2}x)\n"
-            f"\nTo execute say:\n  \"{confirm_cmd}\""
-        )
-
-        speech = (
-            f"{symbol} live analysis: {trend}, RSI {rsi:.0f}, {rsi_label}. "
-            f"Current price {current}. Buy pressure {buy_pct:.0f}%, sell pressure {sell_pct:.0f}%. "
-            f"Proposed {side_label.lower()} entry at {entry}, SL {sl}, TP1 {tp1}, "
-            f"at {confidence:.0%} confidence. "
-            f"This is a proposal — say the execute command to confirm, Sir."
-        )
-
-        return CommandResult(
-            ok=True, action="analyze",
-            detail=detail,
-            speech=speech,
-            order={
-                "symbol": symbol, "side": side, "proposed_entry": entry,
-                "sl": sl, "tp1": tp1, "tp2": tp2,
-                "rr1": rr1, "rr2": rr2,
-                "current_price": current,
-                "rsi": rsi, "trend": trend,
-                "atr": setup["atr"],
-                "confidence": confidence,
-                "bias_reasons": reasons,
-                "ema50": round(ema50, 6), "ema200": round(ema200, 6),
-                "ema200_valid": ema200_valid,
-                "buy_volume_pct": buy_pct, "sell_volume_pct": sell_pct,
-                "buy_volume": buy_vol, "sell_volume": sell_vol,
-                "price_source": "yahoo_finance_live",
-                "confirm_command": confirm_cmd,
-                "WARNING": "NOT EXECUTED — say the confirm_command to place the order",
-            },
-        )
+        return await _analysis_from_series(symbol, ohlcv, ticker, deep=deep)
 
     # ── Route: Crypto symbols via Bitget ─────────────────────────────────────
     # Resolve the token → canonical Bitget pair + REAL coin name so JARVIS can
@@ -4140,8 +4177,25 @@ async def _analyze_symbol(symbol: str, original_cmd: str, ex_name: Optional[str]
             token = symbol.replace("USDT", "").replace("USDC", "") or symbol
             if suggestion:
                 msg = f"I couldn't find a Bitget pair for {token}. Did you mean {suggestion}?"
-            else:
-                msg = f"I couldn't find a Bitget-tradeable pair for {token}, Sir."
+                return CommandResult(ok=False, action="analyze", detail=msg, speech=msg)
+
+            # Last resort before giving up: the catalog only knows Bitget's USDT
+            # swaps, so anything listed elsewhere — an index, a commodity, an FX
+            # cross the guard above didn't recognise — reaches here still
+            # perfectly priceable. Try the universal resolver on the bare token
+            # rather than declaring the instrument unsupported.
+            _bare = market_data.normalize_symbol(token)
+            try:
+                _ohlcv, _ticker = await market_data.fetch_ohlcv_universal(
+                    _bare, timeframe="4h", limit=200
+                )
+            except Exception:  # noqa: BLE001 — a failed rescue is just no rescue
+                _ohlcv, _ticker = [], {}
+            if len(_ohlcv) >= 20:
+                logger.info("[JARVIS] {} rescued from the Bitget dead-end", _bare)
+                return await _analysis_from_series(_bare, _ohlcv, _ticker, deep=deep)
+
+            msg = f"I couldn't find a Bitget-tradeable pair for {token}, Sir."
             return CommandResult(ok=False, action="analyze", detail=msg, speech=msg)
         coin_name = resolved_pair.name or resolved_pair.base
         # Canonical glued form for downstream ccxt normalisation (e.g. BTCUSDT).

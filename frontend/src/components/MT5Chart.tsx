@@ -91,6 +91,10 @@ const TF_MAP: Record<string, number> = {
 }
 
 // Crypto exchanges that trade USDT pairs, not USD
+/** Default framing applied whenever a new symbol/timeframe is loaded. */
+const VISIBLE_BARS = 60   // recent candles visible by default
+const RIGHT_PAD    = 5    // empty bars after the newest candle
+
 const CRYPTO_EXCHANGES = new Set(['bitget','binance','bybit','okx','kucoin','coinbase','huobi','gate'])
 
 // Known forex/commodity MT5 symbols that have a USDT equivalent on crypto exchanges
@@ -267,10 +271,25 @@ export default function MT5Chart({
       const precision = minP < 0.001 ? 6 : minP < 0.01 ? 5 : minP < 1 ? 4 : minP < 10 ? 3 : 2
       seriesRef.current.applyOptions({ priceFormat: { type: 'price', precision, minMove: Math.pow(10, -precision) } })
     }
-    // Only auto-fit the very first load for this symbol/timeframe — preserve the
-    // user's zoom/pan on subsequent background reloads.
+    // Only auto-frame the very first load for this symbol/timeframe — preserve
+    // the user's zoom/pan on subsequent background reloads.
     if (needsFitRef.current) {
-      chartRef.current?.timeScale().fitContent()
+      // Show the newest bars instead of all history, and re-enable vertical
+      // auto-scaling — lightweight-charts disables it permanently once the user
+      // drags the price axis, so the previous pair's range would otherwise
+      // stick and flatten the new symbol's candles.
+      const frame = () => {
+        try {
+          seriesRef.current?.priceScale().applyOptions({ autoScale: true })
+          chartRef.current?.timeScale().setVisibleLogicalRange({
+            from: Math.max(0, raw.length - VISIBLE_BARS),
+            to: raw.length - 1 + RIGHT_PAD,
+          })
+        } catch { /* chart disposed */ }
+      }
+      frame()
+      // setData restores the previous scroll position a frame later — re-pin it.
+      if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame)
       needsFitRef.current = false
     }
     setLastUpdate(new Date())

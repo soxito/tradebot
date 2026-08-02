@@ -2,6 +2,8 @@ import Head from 'next/head'
 import { useState, useEffect, useCallback } from 'react'
 import { apiClient } from '@/services/api'
 import KronosForecastCard from '@/components/KronosForecastCard'
+import ResearchEntries, { ResearchVerdictBadge } from '@/components/research/ResearchEntries'
+import { useResearchPlans } from '@/hooks/useResearchPlans'
 import {
   Crosshair,
   RefreshCw,
@@ -133,6 +135,10 @@ export default function SniperSignalsPage() {
   const [tab, setTab] = useState<'signals' | 'trades' | 'positions'>('signals')
   const [expandedSignal, setExpandedSignal] = useState<number | null>(null)
   const [expandedTrade, setExpandedTrade] = useState<number | null>(null)
+
+  // Every live signal on a pair is researched together, so one plan covers all
+  // of that pair's rows here — verdict on the header, entries in the detail.
+  const { planFor } = useResearchPlans(signals.map((s) => s.symbol))
 
   const fetchData = useCallback(async () => {
     setLoading(true)
@@ -329,6 +335,7 @@ export default function SniperSignalsPage() {
                       <span className="text-sm text-gray-400">
                         Conf: {fmt(sig.confidence ? sig.confidence * 100 : null, 0)}%
                       </span>
+                      <ResearchVerdictBadge plan={planFor(sig.symbol)} />
                     </div>
                     <div className="flex items-center gap-4">
                       {sig.trade ? (
@@ -351,6 +358,9 @@ export default function SniperSignalsPage() {
                       {/* Volume-gated Kronos forecast: shows the 24h/1h volume,
                           relative volume, regime and why the direction was
                           chosen — or NO_TRADE when volume can't be resolved. */}
+                      {/* The reconciled view of every live signal on this pair,
+                          with the two entries the research costed. */}
+                      <ResearchEntries plan={planFor(sig.symbol)} defaultOpen />
                       <KronosForecastCard symbol={sig.symbol} timeframe="15m" predLen={16} />
                       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                         {/* Entry Decision */}

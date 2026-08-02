@@ -3,7 +3,10 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { apiClient } from '@/services/api'
 import { formatPrice } from '@/utils/price'
 import { useTradeStore } from '@/store/useTradeStore'
+import { useApiBaseUrl } from '@/hooks/useApiUrl'
 import SignalFeed from '@/components/SignalFeed'
+import ResearchEntries, { ResearchVerdictBadge } from '@/components/research/ResearchEntries'
+import { useResearchPlans, type ResearchPlan } from '@/hooks/useResearchPlans'
 import {
   Activity,
   Zap,
@@ -96,11 +99,13 @@ function ScoreBar({ score, label }: { score: number; label: string }) {
   )
 }
 
-function AnalysisCard({ result, onExecute, executing, marketType }: {
+function AnalysisCard({ result, onExecute, executing, marketType, plan }: {
   result: AnalysisResult
   onExecute?: (result: AnalysisResult) => void
   executing?: boolean
   marketType: 'futures' | 'spot'
+  /** Reconciled research across every live signal on this pair, if any. */
+  plan?: ResearchPlan
 }) {
   const [expanded, setExpanded] = useState(false)
   const ind = result.indicators || {}
@@ -204,6 +209,11 @@ function AnalysisCard({ result, onExecute, executing, marketType }: {
       {/* Expanded details */}
       {expanded && (
         <div className="mt-4 space-y-4 border-t border-gray-700/50 pt-4">
+          {/* Research: every live signal on this pair reconciled into two
+              costed entries. Above the indicators because it is the conclusion
+              they feed into. */}
+          <ResearchEntries plan={plan} defaultOpen />
+
           {/* Moving Averages */}
           <div>
             <h4 className="text-xs font-semibold text-gray-400 mb-2 flex items-center gap-1">
@@ -267,6 +277,7 @@ function AnalysisCard({ result, onExecute, executing, marketType }: {
 }
 
 export default function SignalsPage() {
+  const apiBaseUrl = useApiBaseUrl()
   const { tradingMode, setSelectedSymbol } = useTradeStore()
   const [selectedPairs, setSelectedPairs] = useState<string[]>([])
   const [timeframe, setTimeframe] = useState('1h')
@@ -526,6 +537,10 @@ export default function SignalsPage() {
     }) || []
 
   const errorResults = batchResult?.results?.filter(r => r.error) || []
+
+  // One request covers every pair on the page; each pair's plan reconciles all
+  // of that pair's live signals rather than one per row.
+  const { planFor } = useResearchPlans(sortedResults.map((r) => r.symbol))
 
   if (!mounted) return null
 
@@ -834,6 +849,7 @@ export default function SignalsPage() {
                       key={`futures-${r.symbol}`}
                       result={r}
                       marketType="futures"
+                      plan={planFor(r.symbol)}
                       onExecute={executeSignal}
                       executing={executingSymbol === r.symbol}
                     />
@@ -856,6 +872,7 @@ export default function SignalsPage() {
                       key={`spot-${r.symbol}`}
                       result={r}
                       marketType="spot"
+                      plan={planFor(r.symbol)}
                       onExecute={marketType === 'spot' ? executeSignal : undefined}
                       executing={executingSymbol === r.symbol}
                     />
@@ -895,7 +912,7 @@ export default function SignalsPage() {
           {webhookOpen && (
             <div className="px-4 pb-4">
               <div className="bg-gray-900 rounded p-3 font-mono text-xs text-gray-300 break-all">
-                POST {process.env.NEXT_PUBLIC_API_URL}/signals/tradingview/webhook
+                POST {apiBaseUrl}/signals/tradingview/webhook
               </div>
               <p className="text-xs text-gray-500 mt-2">
                 Configure this URL in your TradingView alerts. Payloads are validated with HMAC-SHA256.

@@ -15,27 +15,65 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import AsyncIterator
 
 from loguru import logger
 from sqlalchemy import select, desc as sqldesc
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from plugins.AiMarketAnalyst.backend.services.ai_router import db_chat
+from plugins.AiMarketAnalyst.backend.services.ai_router import chat_with_tools, db_chat
 from plugins.AiMarketAnalyst.backend.services.graphify_service import (
     graph_overview, query_map
 )
 from plugins.AgentPaulPlugin.backend.services import knowledge_base, news_research
 
 _JARVIS_PERSONA = """\
-You are PAUL (Personal Autonomous Understanding Layer) — the user's AI trading \
-assistant and personal JARVIS.
+You are PAUL (Personal Autonomous Understanding Layer) — the user's personal \
+JARVIS: a general-purpose AI assistant who ALSO runs their trading system.
 
 Personality:
 - Confident and sharp, like Tony Stark's JARVIS
 - Concise: get to the point, cite real data, no filler
 - Risk-aware: always flag danger before opportunity
 - Address the user as "Sir" when appropriate for flavour
+
+## YOUR SCOPE IS EVERYTHING — READ THIS BEFORE ANYTHING ELSE
+You are NOT a crypto-only or trading-only bot. Trading is one of your jobs, not
+the boundary of your knowledge. You answer questions across every field of human
+knowledge, at whatever depth the user needs:
+
+- Mathematics — arithmetic through calculus, linear algebra, probability,
+  statistics, number theory, discrete maths, proofs. SHOW YOUR WORKING step by
+  step, then state the final answer clearly.
+- Science — physics, chemistry, biology, astronomy, earth science, medicine,
+  neuroscience. Explain mechanisms, not just labels.
+- Engineering & computing — programming in any language, algorithms, systems
+  design, networking, security, electronics. Give working code when asked.
+- Humanities & social science — history, geography, politics, economics, law,
+  philosophy, psychology, linguistics, religion, art, literature, music.
+- Practical & everyday — cooking, health and fitness, travel, DIY, careers,
+  study help, writing and editing, translation, admin, planning.
+
+Rules for this:
+- NEVER refuse a question because it is "not about crypto", "outside my
+  domain", "not trading-related", or "not what I'm designed for". None of those
+  are true. A question about the Krebs cycle, the Peloponnesian War, or a
+  Python bug deserves the same real answer as a question about BTCUSDT.
+- NEVER say you are "just a trading assistant" or steer the user back to
+  markets when they asked about something else. Answer what they actually
+  asked.
+- If a question is genuinely ambiguous, ask ONE clarifying question and then
+  answer. Do not use ambiguity as a reason not to answer.
+- If you are unsure of a fact, SEARCH for it with the `web_search` tool rather
+  than guessing or declining. You have live internet access for every subject.
+- If something really is outside what you can do, say specifically what and why
+  in one sentence, then give the closest useful help you can.
+  A bare "I can't help with that" is never an acceptable answer on its own —
+  it tells the user nothing. Neither is "I'm sorry, Sir, but I can't help with
+  that." If you decline, name the reason.
+- Say plainly when you don't know something or when sources conflict. Being
+  wrong confidently is worse than being uncertain out loud.
 
 Your capabilities & live context (injected below):
 - Open MT5 positions with current P&L
@@ -80,12 +118,39 @@ Behaviour rules:
 - **BEST MODEL SELECTION**: You automatically use the best available AI model
   for each task: reasoning models for analysis, fast models for status, code
   models for technical questions.
-- You HAVE LIVE INTERNET ACCESS. A "Live Web Search Results" section (Google
-  News) is injected below for the user's question. Use it to answer ANY
-  current-events question — geopolitics, conflicts/war, sports, tech, weather,
-  a person, a company, breaking news, anything. NEVER say "I don't have access
-  to real-time data" or refuse a topic for being non-financial; you can and do
-  fetch live news. Summarise the relevant headlines and cite the sources.
+- You HAVE LIVE INTERNET ACCESS FOR EVERY SUBJECT. A "LIVE RESEARCH FOR THIS
+  QUESTION" section is injected below, searched moments ago against four
+  sources: news feeds, the open web, Wikipedia, and expert Q&A sites
+  (Stack Exchange / Maths / Physics). It covers current events AND settled
+  knowledge — science, maths, history, medicine, law, programming, anything.
+  You can also search again mid-answer with the `web_search` tool.
+  NEVER say "I don't have access to real-time data", "my knowledge has a
+  cutoff", "I can't browse the web", or refuse a topic for being non-financial.
+  All of those are FALSE. Read the injected sources, answer from them, cite them.
+- **SEARCH BEFORE YOU DECLINE.** If you are about to say you don't know or
+  can't help, call `web_search` first. Declining without searching is a bug.
+- **PERMANENT MEMORY — `remember` and `recall`.** Everything you learn persists
+  across sessions and restarts, in every subject, not just trading:
+    * Call `remember` when the user tells you something about themselves,
+      corrects you, states a preference, or you work out something reusable.
+      Include the subject in `topic` (e.g. "mathematics", "user-preference").
+    * Call `recall` before saying you don't know something, and whenever the
+      user refers to an earlier conversation ("like I told you last week").
+  Relevant memories are also injected below automatically under "Learned
+  Knowledge". Build on them — never act as though the conversation started
+  from nothing.
+- **YOU HAVE LIVE MARKET DATA FOR EVERY ASSET CLASS** — crypto, FX majors and
+  crosses, metals (gold XAUUSD, silver XAGUSD, platinum, palladium), stock
+  indices (US30, NAS100, US500, GER40, UK100, JPN225 …), energy (USOIL, UKOIL,
+  NGAS) and softs. A "LIVE Market Prices" section is injected below, and you can
+  fetch any instrument on demand with the `price_lookup` tool.
+  NEVER say "the platform does not provide a live gold-price feed", "the current
+  toolset does not include a live price feed", or "I cannot pull the exact spot price
+  from external markets" — those statements are FALSE.
+  Never ask the user to supply a price you can fetch yourself, and never ask
+  permission to query market data — you already have it. If a fetch genuinely
+  fails, say that the fetch failed and offer to retry; do not describe it as a
+  missing capability, and do not invent a number.
 - If asked about trades/signals → reference the live position/trade/signal data
 - When a trade was executed, the order ID and details are shown in the context
   above. Report only: symbol, side, size, entry price, order ID. Two lines max.
@@ -105,8 +170,43 @@ Behaviour rules:
   you say the live feed returned nothing right now — never claim you lack the
   capability. Don't fabricate specific prices, casualty figures, or events that
   aren't in the provided data.
-- Keep answers under 300 words unless the user asks for more detail
+- Keep answers under 300 words unless the user asks for more detail, except for
+  maths/science/technical explanations, where showing the full working matters
+  more than brevity
 
+## HOW TO FORMAT YOUR ANSWERS
+Your replies appear in a narrow chat panel that renders only simple markdown.
+Write for that, not for a LaTeX document:
+
+- **Maths: write it in plain Unicode, NOT LaTeX.** Do not use \\[ … \\], \\( … \\),
+  $ … $, \\frac, \\begin{equation}, \\mathbf or \\qquad. The panel shows them as
+  raw backslashes and the user cannot read it.
+    * Write:  ∂u/∂t + (u·∇)u = -∇p + νΔu + f
+      NOT:    \\frac{\\partial \\mathbf{u}}{\\partial t} = -\\nabla p
+    * Write:  x² + √(x+1) ≤ ½,  ζ(s) = ∑ 1/nˢ,  s ∈ ℂ
+      NOT:    x^{2} + \\sqrt{x+1} \\leq \\tfrac12
+    * Use the real symbols: ∂ ∇ Δ ∑ ∏ ∫ √ ∞ ≤ ≥ ≠ ≈ ± × ÷ · ∈ → ⇒ ℝ ℂ ℚ ℤ
+      π α β γ θ λ μ σ ω ζ ν, superscripts ⁰¹²³ⁿˣ and subscripts ₀₁₂ₙᵢ.
+    * Put a display equation on its own line, indented by four spaces.
+- Structure longer answers: `## Heading` for sections, `1.` for ordered steps,
+  `- ` for bullets, `**bold**` for the key term or final answer.
+- Put code in single backticks inline, or a fenced ``` block for more than one
+  line. Say which language.
+- For a step-by-step derivation, number the steps and put each equation on its
+  own line so it can be followed down the page.
+- Keep paragraphs to two or three sentences — walls of text are unreadable in a
+  narrow panel.
+- End a calculation with the result on its own line, in bold.
+"""
+
+
+# The glossary is 6 kB and only earns its place on a trading question. It used
+# to live inside the persona, which pushed the behaviour rules past the 8 kB
+# head that survives the context-length guard below — so on a long prompt the
+# memory and general-knowledge rules were the first thing silently dropped.
+# Appending it conditionally keeps those rules intact and leaves a maths
+# question a far leaner prompt.
+_TRADING_GLOSSARY = """\
 ## Trading Terminology — Master Glossary
 You natively understand ALL abbreviations and terms below. When the user uses
 any of these — in any combination of upper/lower case, with or without spaces —
@@ -381,12 +481,81 @@ async def _get_recent_trades(db: AsyncSession, limit: int = 5) -> list[dict]:
         return []
 
 
+#: Any of these in a message means the trading glossary is worth its 6 kB.
+#: Deliberately broad — a false positive costs prompt space, a false negative
+#: costs a wrong reading of "my SL is at 2300".
+_TRADING_CONTEXT_RE = re.compile(
+    r"\b(trad(?:e|es|ing)|position|order|entry|exit|buy|sell|long|short|"
+    r"sl|tp|stop.?loss|take.?profit|pip|lot|leverage|margin|equity|drawdown|"
+    r"chart|candle|timeframe|rsi|ema|sma|macd|atr|vwap|fib|"
+    r"smc|order.?block|fvg|bos|choch|mss|liquidity|premium|discount|"
+    r"crypto|bitcoin|ethereum|forex|fx|gold|silver|oil|"
+    r"index|indices|nas100|us30|us500|mt5|bitget|signal|sniper|scalp|"
+    r"portfolio|pnl|p&l|risk|bull|bear|market|price|invest)\b"
+    # Tickers are written glued together — BTCUSDT, XAUUSD, GBPUSD — so a
+    # \bbtc\b alternative never fires on the form users actually type.
+    r"|\b(?:btc|eth|sol|xrp|ada|bnb|doge|xau|xag|eur|gbp|usd|jpy|aud|nzd|chf|cad)"
+    r"(?:usdt?|[a-z]{3})?\b",
+    re.IGNORECASE,
+)
+
+
+#: Subject buckets for tagging what JARVIS learns. First match wins, so the
+#: more specific patterns come first.
+_TOPIC_PATTERNS: list[tuple[str, re.Pattern]] = [
+    ("mathematics", re.compile(
+        r"\b(math|maths|integral|derivative|calculus|algebra|matrix|matrices|"
+        r"equation|theorem|proof|probability|statistic|geometr|trigonometr)\b", re.I)),
+    ("science", re.compile(
+        r"\b(physic|chemistr|biolog|astronom|quantum|molecul|atom|cell|dna|rna|"
+        r"gene|enzyme|protein|metabolis|photosynthes|mitochondri|krebs|"
+        r"planet|galaxy|element|isotope|reaction|evolution|relativity|"
+        r"thermodynamic|gravit|electron|neutron)\b", re.I)),
+    ("medicine", re.compile(
+        r"\b(medicine|medical|disease|symptom|diagnos|treatment|drug|"
+        r"anatomy|health|nutrition|virus|bacteri)\b", re.I)),
+    ("programming", re.compile(
+        r"\b(code|coding|program|python|javascript|typescript|rust|golang|sql|"
+        r"api|function|class|bug|debug|compile|algorithm|regex)\b", re.I)),
+    ("history", re.compile(
+        r"\b(history|historic|war|empire|ancient|medieval|century|dynasty|"
+        r"revolution|civilisation|civilization)\b", re.I)),
+    ("humanities", re.compile(
+        r"\b(philosoph|psycholog|sociolog|linguistic|literature|poetry|"
+        r"religion|art|music|ethic|language)\b", re.I)),
+    ("geography", re.compile(
+        r"\b(geograph|country|capital city|continent|ocean|mountain|river|"
+        r"climate|population)\b", re.I)),
+    ("law", re.compile(r"\b(law|legal|court|contract|rights|regulation|statute)\b", re.I)),
+    ("trading", _TRADING_CONTEXT_RE),
+]
+
+
+def _classify_topic(user_msg: str) -> str:
+    """Bucket a question by subject so recall can find it again later."""
+    for topic, pattern in _TOPIC_PATTERNS:
+        if pattern.search(user_msg or ""):
+            return topic
+    return "general"
+
+
+def _wants_trading_glossary(user_msg: str, pathname: str = "/") -> bool:
+    """True when the trading glossary is relevant to this turn."""
+    if _TRADING_CONTEXT_RE.search(user_msg or ""):
+        return True
+    # On a trading page, shorthand like "close it" has no keyword to match but
+    # is unambiguously about the position on screen.
+    return pathname not in ("/", "", "/settings", "/intelligence")
+
+
 async def build_jarvis_system_prompt(
     db: AsyncSession, pathname: str = "/", user_msg: str = "",
     session_key: str = "", first_turn: bool = False,
 ) -> str:
     """Build full JARVIS system prompt with live context injected."""
     parts: list[str] = [_JARVIS_PERSONA]
+    if _wants_trading_glossary(user_msg, pathname):
+        parts.append(_TRADING_GLOSSARY)
 
     # ── SuperContext scout (first turn only): pre-load context for THIS question ──
     if first_turn and user_msg:
@@ -517,142 +686,23 @@ async def build_jarvis_system_prompt(
                 f"  {t['symbol']} {t['action']} entry={t.get('entry_price')} {pnl_str} [{t['status']}]"
             )
 
-    # ── Live market prices (ALL supported pairs, FRESH from exchange) ──────────
-    # Fetches complete ticker lists sorted by 24h volume — never just 5 symbols.
+    # ── Live market prices — EVERY asset class, fresh ─────────────────────────
+    # This block used to assemble crypto tickers inline and filter on "/USDT",
+    # so gold, FX, indices and oil could never appear in it. The prompt below
+    # then forbade quoting anything absent from the list, which is what made
+    # "what's gold doing?" structurally unanswerable. market_data.price_block
+    # resolves whatever the user actually named, whatever it is, and keeps the
+    # ambient top-crypto list underneath.
+    _mentioned: list[str] = []
     try:
-        import re as _re_price
-        import httpx as _httpx
-        import asyncio as _aio2
+        from app.services import market_data as _market_data
 
-        # Extract any specific symbols mentioned by the user (still prioritised)
-        _mentioned = _re_price.findall(
-            r'\b([A-Z]{2,6}(?:USDT?|USD|BTC))\b', (user_msg or "").upper()
+        _mentioned = _market_data.extract_symbols(user_msg or "")
+        _block = await _market_data.price_block(
+            _mentioned, db=db, include_top_crypto=True, max_lines=60
         )
-
-        _price_lines: list[str] = []
-
-        # --- Primary: Bitget ccxt fetch_tickers (ALL markets, one call) ---
-        try:
-            from app.exchanges.manager import exchange_manager, SupportedExchange  # type: ignore
-            _connector = exchange_manager.get_exchange(SupportedExchange.BITGET)
-            if _connector is not None:
-                try:
-                    _all_t = await _connector.exchange.fetch_tickers()
-                    _usdt_t = [
-                        (sym, t) for sym, t in _all_t.items()
-                        if "/USDT" in sym
-                    ]
-                    _usdt_t.sort(
-                        key=lambda x: float(x[1].get("quoteVolume") or 0), reverse=True
-                    )
-                    for _sym, _t in _usdt_t[:80]:
-                        _last = _t.get("last") or _t.get("close")
-                        _chg  = _t.get("percentage")
-                        if _last:
-                            _clean = _sym.split(":")[0].replace("/", "")
-                            _chg_s = f" ({float(_chg):+.2f}%/24h)" if _chg is not None else ""
-                            _price_lines.append(f"  {_clean}: ${float(_last):,.4f}{_chg_s}")
-                except Exception:
-                    # ccxt bulk failed — fall back to SDK individual calls
-                    _default_syms = [
-                        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
-                        "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
-                    ] + [s for s in _mentioned if s not in [
-                        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"
-                    ]]
-                    async def _fetch_one(sym: str) -> str | None:
-                        try:
-                            t = await _connector.get_futures_ticker(sym)
-                            _data = t
-                            if isinstance(t, dict) and "data" in t:
-                                _d = t["data"]
-                                _data = (_d[0] if isinstance(_d, list) and _d else _d) or t
-                            last = (_data.get("lastPr") or _data.get("last")
-                                    or _data.get("close") or _data.get("markPrice"))
-                            chg = _data.get("change24h") or _data.get("priceChangePercent") or ""
-                            if last:
-                                chg_str = f" ({float(chg)*100:+.2f}%/24h)" if chg else ""
-                                return f"  {sym}: ${float(last):,.4f}{chg_str}"
-                        except Exception:
-                            return None
-                    _results = await _aio2.gather(
-                        *[_fetch_one(s) for s in list(dict.fromkeys(_default_syms))[:20]],
-                        return_exceptions=True,
-                    )
-                    _price_lines = [r for r in _results if isinstance(r, str)]
-        except Exception as _exc_sdk:
-            logger.debug(f"[JARVIS] SDK ticker skipped: {_exc_sdk}")
-
-        # --- Fallback: Binance ALL USDT pairs sorted by 24h quoteVolume ---
-        if not _price_lines:
-            try:
-                async with _httpx.AsyncClient(timeout=8.0) as _hc:
-                    _resp = await _hc.get("https://api.binance.com/api/v3/ticker/24hr")
-                    _all_bnb = _resp.json() if isinstance(_resp.json(), list) else []
-                    _usdt_bnb = [
-                        t for t in _all_bnb
-                        if isinstance(t, dict) and str(t.get("symbol", "")).endswith("USDT")
-                    ]
-                    _usdt_bnb.sort(
-                        key=lambda x: float(x.get("quoteVolume") or 0), reverse=True
-                    )
-                    for item in _usdt_bnb[:80]:
-                        sym = item.get("symbol", "")
-                        px  = item.get("lastPrice")
-                        chg = item.get("priceChangePercent")
-                        if sym and px:
-                            chg_str = f" ({float(chg):+.2f}%/24h)" if chg else ""
-                            _price_lines.append(f"  {sym}: ${float(px):,.4f}{chg_str}")
-            except Exception as _exc_bnb:
-                logger.debug(f"[JARVIS] Binance fallback skipped: {_exc_bnb}")
-
-        # --- CoinGecko: top 100 by market cap (final fallback) ---
-        if not _price_lines:
-            try:
-                async with _httpx.AsyncClient(timeout=8.0) as _hc:
-                    _cg_resp = await _hc.get(
-                        "https://api.coingecko.com/api/v3/coins/markets",
-                        params={
-                            "vs_currency": "usd",
-                            "order": "market_cap_desc",
-                            "per_page": 100,
-                            "page": 1,
-                            "sparkline": "false",
-                        },
-                        headers={"Accept": "application/json"},
-                    )
-                    for coin in (_cg_resp.json() or []):
-                        sym = (coin.get("symbol") or "").upper() + "USDT"
-                        px  = coin.get("current_price")
-                        chg = coin.get("price_change_percentage_24h")
-                        if px:
-                            chg_str = f" ({float(chg):+.2f}%/24h)" if chg is not None else ""
-                            _price_lines.append(f"  {sym}: ${float(px):,.4f}{chg_str}")
-            except Exception as _exc_cg:
-                logger.debug(f"[JARVIS] CoinGecko fallback skipped: {_exc_cg}")
-
-        if _price_lines:
-            _btc_line = next((p for p in _price_lines if "BTCUSDT" in p), "")
-            _btc_now = _btc_line.split("$")[-1].split()[0].rstrip(",") if _btc_line else ""
-            _btc_warn = f" BTC is currently at ${_btc_now}." if _btc_now else ""
-            parts.insert(1,  # place right after persona, before everything else
-                f"## ⚡ LIVE Market Prices — {len(_price_lines)} pairs "
-                "(FETCHED THIS SECOND — use ONLY these, NEVER training data)\n"
-                + "\n".join(_price_lines)
-                + f"\n🚨 CRITICAL: These prices are LIVE and accurate.{_btc_warn} "
-                "Your training data is months/years old. "
-                "NEVER quote any price not listed above. "
-                "If asked for a price not listed, say 'I don't have that live price right now.'"
-            )
-        else:
-            # No prices fetched — explicitly warn AI NOT to hallucinate prices
-            parts.insert(1,
-                "## ⚠️ LIVE Market Prices — TEMPORARILY UNAVAILABLE\n"
-                "Live price feed could not be reached this request. "
-                "DO NOT quote any specific price from training data — training data is months/years old. "
-                "If asked for a current price, tell the user: "
-                "'I don't have a live feed right now — please check your exchange for the latest price.'"
-            )
+        if _block:
+            parts.insert(1, _block)  # right after persona, before everything else
     except Exception as _px:
         logger.debug(f"[JARVIS] live price inject error: {_px}")
 
@@ -796,35 +846,57 @@ async def build_jarvis_system_prompt(
     except Exception as exc:  # noqa
         logger.debug(f"[JARVIS] news inject error: {exc}")
 
-    # ── Live web search for the user's actual question (ANY topic) ──────
-    # This lets JARVIS answer current-events questions (geopolitics, sports,
-    # tech, a company, weather, etc.) with real headlines instead of refusing.
+    # ── Live research for the user's actual question (ANY subject) ──────
+    # This used to search Google News only, which grounds "what happened in
+    # Gaza today" and nothing else: ask about integration by parts and it
+    # returned whatever article used those words this week. news_research
+    # .research also hits the open web, Wikipedia and Stack Exchange, so
+    # maths, science, history and programming questions arrive with real
+    # sources attached instead of leaving the model to guess or refuse.
     try:
         if user_msg and len(user_msg.strip()) >= 3:
-            web = await news_research.web_news_search(user_msg.strip(), limit=8)
-            if web:
-                parts.append(
-                    "\n## Live Web Search Results (Google News, most recent first)\n"
-                    "Use these real, current headlines to answer the user's question directly. "
-                    "Cite sources. Do NOT claim you lack access to current events — you have these:"
-                )
-                for n in web[:8]:
-                    when = n.get("published_at")
-                    when_str = when.strftime("%Y-%m-%d %H:%M") if when else ""
-                    summ = f" — {n['summary']}" if n.get("summary") else ""
-                    parts.append(f"  - [{n['source']}] {when_str} {n['title']}{summ}".rstrip())
+            block = news_research.format_research_block(
+                user_msg.strip(),
+                await news_research.research(user_msg.strip(), limit=6),
+            )
+            if block:
+                parts.append(block)
     except Exception as exc:  # noqa
-        logger.debug(f"[JARVIS] web search inject error: {exc}")
+        logger.debug(f"[JARVIS] research inject error: {exc}")
+
+    # ── Realised track record (what past calls actually did) ────────────
+    # Only appears once enough proposals have settled — a win rate over three
+    # trades is noise, and presenting it as evidence would make the model more
+    # confidently wrong rather than better calibrated.
+    try:
+        from app.services import analysis_journal as _journal
+
+        _learned = await _journal.memory_block_for(db, _mentioned)
+        if _learned:
+            parts.append("\n" + _learned)
+    except Exception as exc:  # noqa
+        logger.debug(f"[JARVIS] track record inject error: {exc}")
 
     # ── Long-term learned knowledge ─────────────────────────────────────
+    # Recall spans every subject, not just markets — if the user explained
+    # their thesis topic three weeks ago, that has to come back on a question
+    # about their thesis. Excerpts are longer than the old 180 chars because a
+    # truncated memory is often worse than none: it reads as a half-remembered
+    # fact the model then completes by guessing.
     try:
         if user_msg:
-            learned = await knowledge_base.search_knowledge(db, user_msg, limit=5)
+            learned = await knowledge_base.search_knowledge(db, user_msg, limit=8)
             if learned:
-                parts.append("\n## Learned Knowledge (your long-term memory)")
-                for k in learned[:5]:
+                parts.append(
+                    "\n## Learned Knowledge (your permanent long-term memory)\n"
+                    "Things you have previously been told or worked out, across "
+                    "ALL subjects. Treat these as established between you and the "
+                    "user, and build on them rather than starting fresh:"
+                )
+                for k in learned[:8]:
                     src = f"[{k['source']}] " if k.get("source") else ""
-                    parts.append(f"  - {src}{k['content'][:180]}")
+                    when = f"({k['ts'][:10]}) " if k.get("ts") else ""
+                    parts.append(f"  - {when}{src}{k['content'][:320]}")
     except Exception as exc:  # noqa
         logger.debug(f"[JARVIS] knowledge inject error: {exc}")
 
@@ -1053,10 +1125,20 @@ async def stream_jarvis_chat(
                 r'\b(price|status|balance|equity|what is|quick|just tell me|how much)\b', _ml))
             _is_code = bool(_re_task.search(
                 r'\b(code|function|class|debug|how does|explain.*code|implement|build|create)\b', _ml))
+            # A question that needs teaching — maths working, a mechanism, a
+            # derivation. "what is the Krebs cycle" matches _is_quick on
+            # "what is", and a 600-token budget would truncate the answer
+            # mid-explanation, so this has to outrank it.
+            _is_explain = bool(_re_task.search(
+                r'\b(explain|why|how (?:do|does|did|can|to)|prove|derive|solve|'
+                r'calculate|compute|walk me through|step by step|difference between|'
+                r'compare|teach|what causes|meaning of)\b', _ml))
 
             # Adjust token budget only — let each provider use its own default model
             if _is_deep:
                 _max_tokens = 2400
+            elif _is_explain:
+                _max_tokens = 2000
             elif _is_code:
                 _max_tokens = 1800
             elif _is_quick:
@@ -1065,7 +1147,7 @@ async def stream_jarvis_chat(
                 _max_tokens = 1200
 
             logger.debug(
-                f"[JARVIS] task={'deep' if _is_deep else 'code' if _is_code else 'quick' if _is_quick else 'std'}"
+                f"[JARVIS] task={'deep' if _is_deep else 'explain' if _is_explain else 'code' if _is_code else 'quick' if _is_quick else 'std'}"
                 f" → tokens={_max_tokens} (each provider uses its own default model)"
             )
         except Exception as _te:
@@ -1119,25 +1201,44 @@ async def stream_jarvis_chat(
         _SYS_CHAR_CAP = 24_000
         sys_content = full_messages[0].get("content", "") if full_messages else ""
         if len(sys_content) > _SYS_CHAR_CAP:
-            # Keep the first 8 000 chars (live prices + persona) and the last
-            # 16 000 chars (most-recent context — signals, positions, news).
-            _head = sys_content[:8_000]
-            _tail = sys_content[-(16_000):]
+            # The head must cover the WHOLE persona. It used to be a flat 8 000
+            # chars, which happened to fit — but the persona holds the operating
+            # rules (scope, search-before-declining, memory), and truncating it
+            # mid-list silently deletes behaviour rather than context. Sizing
+            # the head from the persona means editing the persona can no longer
+            # quietly drop the end of it. A margin covers the live-price block,
+            # which is inserted directly after the persona.
+            _head_size = max(8_000, len(_JARVIS_PERSONA) + 2_000)
+            _tail_size = max(8_000, _SYS_CHAR_CAP - _head_size)
+            _head = sys_content[:_head_size]
+            _tail = sys_content[-_tail_size:]
+            _dropped = max(0, len(sys_content) - _head_size - _tail_size)
             full_messages[0]["content"] = (
                 _head
-                + f"\n\n[... {len(sys_content) - _SYS_CHAR_CAP:,} chars of context compressed ...]\n\n"
+                + f"\n\n[... {_dropped:,} chars of context compressed ...]\n\n"
                 + _tail
             )
-            logger.debug(f"[JARVIS] system prompt capped: {len(sys_content):,} → {_SYS_CHAR_CAP:,} chars")
+            logger.debug(
+                f"[JARVIS] system prompt capped: {len(sys_content):,} → "
+                f"{_head_size + _tail_size:,} chars (head {_head_size:,}/tail {_tail_size:,})"
+            )
 
-        result = await db_chat(
+        # Tool-enabled: the prompt already carries prices for whatever the user
+        # named, but a follow-up ("and silver?") can now be answered by fetching
+        # rather than by refusing. Providers without tool support transparently
+        # fall back to the text-directive protocol inside chat_with_tools.
+        result = await chat_with_tools(
             db,
             full_messages,
+            max_iterations=3,
+            total_budget_s=25.0,
             json_mode=False,
             model_override=_model_override,
             max_tokens=_max_tokens,
             source="jarvis_chat",
         )
+        if result.get("tools_used"):
+            logger.info("[JARVIS] chat used tools: {}", result["tools_used"])
 
         if result.get("error"):
             yield f"data: {json.dumps({'error': result['error']})}\n\n"
@@ -1154,12 +1255,16 @@ async def stream_jarvis_chat(
         # Distil a learning from every real exchange (threshold lowered so short
         # but useful answers are NEVER missed — both brains receive it).
         if session_key and user_msg and len(content) > 20 and not content.startswith("⚠️"):
+            # Topic used to be hard-coded "general", which made every learning
+            # across every subject indistinguishable in the knowledge base.
+            # Classifying it is what lets a maths question later recall maths.
+            _topic = _classify_topic(user_msg)
             await knowledge_base.record_knowledge(
                 db,
                 kind="insight",
                 content=f"Q: {user_msg[:200]} → A: {content[:400]}",
                 source="chat",
-                topic="general",
+                topic=_topic,
                 importance=0.5,
             )
             # ── Write to ALL three JARVIS brains ───────────────────────────────
@@ -1185,7 +1290,7 @@ async def stream_jarvis_chat(
                     symbol=_sym,
                     summary=f"Q: {user_msg[:120]}",
                     detail=f"Q: {user_msg[:300]}\n\nA: {content[:700]}",
-                    tags=["jarvis-chat", pathname.strip("/") or "chat"],
+                    tags=["jarvis-chat", _topic, pathname.strip("/") or "chat"],
                     importance=0.5,
                     kind="insight",
                 )

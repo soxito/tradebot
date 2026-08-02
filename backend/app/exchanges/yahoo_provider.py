@@ -61,12 +61,28 @@ YAHOO_TICKERS: Dict[str, str] = {
     "ITA40": "FTSEMIB.MI",
     "AUS200": "^AXJO", "HK50": "^HSI",
     "CHINA50": "000001.SS",
+    # Macro gauges — read as context, never traded. Yahoo's chart endpoint 404s
+    # on both DX=F and VX=F, so the "prefer the future" rule above cannot apply
+    # here; DX-Y.NYB and ^VIX are the only series that serve. Both carry zero
+    # volume, like ^GDAXI/^FTSE above — which is fine, because nothing routes
+    # them through the volume gate: they are inputs to a signal, not the
+    # instrument being traded.
+    "DXY": "DX-Y.NYB", "USDX": "DX-Y.NYB", "DOLLARINDEX": "DX-Y.NYB",
+    "VIX": "^VIX", "VOLATILITYINDEX": "^VIX",
     # Energy & softs
+    #
+    # The XTI/XBR/XNG spellings are what most MT5 brokers actually list energy
+    # under — they look like FX pairs (three-letter base + USD) but no currency
+    # matches, so without these aliases they fell through the FX branch below
+    # and were treated as crypto.
     "USOIL": "CL=F", "WTI": "CL=F", "CRUDE": "CL=F",
-    "UKOIL": "BZ=F", "BRENT": "BZ=F",
-    "NGAS": "NG=F", "NATGAS": "NG=F",
+    "XTIUSD": "CL=F", "WTIUSD": "CL=F", "OILUSD": "CL=F",
+    "UKOIL": "BZ=F", "BRENT": "BZ=F", "XBRUSD": "BZ=F", "BRENTUSD": "BZ=F",
+    "NGAS": "NG=F", "NATGAS": "NG=F", "XNGUSD": "NG=F",
     "COCOA": "CC=F", "COFFEE": "KC=F", "SUGAR": "SB=F",
     "COTTON": "CT=F", "WHEAT": "ZW=F",
+    "CORN": "ZC=F", "SOYBEAN": "ZS=F", "SOYBEANS": "ZS=F",
+    "SOYBEANOIL": "ZL=F", "OATS": "ZO=F",
 }
 
 # Crypto bases quoted in USD/USDT map to Yahoo's `-USD` pairs.
@@ -125,11 +141,25 @@ _SUFFIXES = (".CASH", ".SPOT", ".PRO", ".ECN", ".RAW", ".MICRO", ".M", ".I", ".C
 
 def normalize(symbol: str) -> str:
     """Broker symbol → bare uppercase name (EUR/USD.m → EURUSD)."""
-    s = (symbol or "").upper().strip().replace("/", "").replace(" ", "").replace("-", "")
+    # Underscore is the other separator brokers decorate with (EURUSD_i,
+    # XAUUSD_pro). Fold it onto "." so one strip handles both — deleting it the
+    # way "-" is deleted would glue the marker on (EURUSD_I → EURUSDI) and leave
+    # a name nothing resolves.
+    s = (symbol or "").upper().strip().replace("/", "").replace(" ", "").replace("_", ".")
+    if "." not in s:
+        s = s.replace("-", "")
     for suf in _SUFFIXES:
         if s.endswith(suf):
             s = s[: -len(suf)]
             break
+    # Any remaining dot is a broker decoration this list hasn't seen — brokers
+    # invent their own (.STP, .SB, .PRIME). The name is what precedes it, so cut
+    # there rather than making the list chase every broker.
+    if "." in s:
+        head = s.split(".", 1)[0]
+        if 3 <= len(head) <= 12:
+            s = head
+    s = s.replace("-", "")
     # Trailing lowercase-origin markers already uppercased (EURUSDM, EURUSDPRO).
     for suf in ("MICRO", "PRO", "ECN"):
         if len(s) > 6 and s.endswith(suf):
@@ -153,6 +183,36 @@ def resolve_ticker(symbol: str) -> Optional[str]:
     if len(s) == 6 and s[:3] in _CURRENCIES and s[3:] in _CURRENCIES:
         return f"{s}=X"
     return None
+
+
+def supports(symbol: str) -> bool:
+    """True when ``fetch_candles`` can produce bars for *symbol*.
+
+    Wider than ``resolve_ticker`` on purpose: a cross like XAUEUR has no Yahoo
+    ticker of its own but is synthesised from its two USD legs by
+    ``_cross_legs``.
+    """
+    return bool(resolve_ticker(symbol) or _cross_legs(symbol))
+
+
+def supports_non_crypto(symbol: str) -> bool:
+    """True for a *non-crypto* instrument Yahoo can serve — the routing question.
+
+    This is what the forecast and analysis gates actually want to ask. Asking
+    ``resolve_ticker`` alone answered "unsupported" for synthesised crosses and
+    sent XAUEUR/XAGEUR down the crypto path, where no connector lists them, so
+    they died on a Bitget lookup with the data one division away.
+
+    Crypto is excluded on both branches — Yahoo's ``-USD`` names are its crypto
+    tickers, and a crypto cross (BTCEUR) synthesises from a ``-USD`` leg. Both
+    belong on the exchange connectors, which carry deeper history and real
+    traded volume.
+    """
+    ticker = resolve_ticker(symbol)
+    if ticker:
+        return not ticker.endswith("-USD")
+    legs = _cross_legs(symbol)
+    return bool(legs) and not legs[0].endswith("-USD")
 
 
 def _fx_volume_tickers(symbol: str) -> List[str]:
@@ -205,14 +265,27 @@ _TF_MAP: Dict[str, Tuple[str, str]] = {
     "M15": ("15m", "60d"),
     "M30": ("30m", "60d"),
     "H1":  ("60m", "730d"),
+    # H2/H4/H6/H12 all fold out of the same 60m series by _bucket(). Without
+    # them a "/forecast EURUSD 2h" found no Yahoo bar, fell back to the daily
+    # Frankfurter series and then failed the volume gate — the user asked for
+    # 2h and got NO_TRADE rather than a forecast.
+    "H2":  ("60m", "730d"),
     "H4":  ("60m", "730d"),
+    "H6":  ("60m", "730d"),
+    "H12": ("60m", "730d"),
     "D1":  ("1d",  "10y"),
     "W1":  ("1wk", "10y"),
 }
 _TF_SECONDS = {
     "M1": 60, "M5": 300, "M15": 900, "M30": 1800,
-    "H1": 3600, "H4": 14400, "D1": 86400, "W1": 604800,
+    "H1": 3600, "H2": 7200, "H4": 14400, "H6": 21600, "H12": 43200,
+    "D1": 86400, "W1": 604800,
 }
+
+#: Yahoo intervals that sit on a clean UTC grid, so _bucket() may fold them.
+#: Daily and weekly bars are stamped at each exchange's session open instead —
+#: bucketing those would merge sessions.
+_INTRADAY_INTERVALS = frozenset({"1m", "5m", "15m", "30m", "60m"})
 
 # ── Response cache (Yahoo rate-limits aggressively) ──────────────────────────
 _cache: Dict[str, Dict[str, Any]] = {}
@@ -363,6 +436,9 @@ async def fetch_candles(symbol: str, timeframe: str = "H1", limit: int = 400) ->
         return []
 
     bucket_seconds = _TF_SECONDS[tf]
+    # Fold on the *source* interval, not the target size: H6/H12 come out of the
+    # same 60m grid H4 does, so a size-based cut-off would leave them unbucketed.
+    may_bucket = interval in _INTRADAY_INTERVALS
     try:
         async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
             if ticker:
@@ -370,10 +446,7 @@ async def fetch_candles(symbol: str, timeframe: str = "H1", limit: int = 400) ->
                 alt = _TICKER_FALLBACKS.get(ticker)
                 if len(bars) < 40 and alt:
                     bars = await _fetch_series(client, alt, interval, rng)
-                # Daily/weekly bars are stamped at the exchange's session open,
-                # not on a UTC grid — bucketing those would merge sessions, so
-                # only snap intraday.
-                if bucket_seconds <= 14400:
+                if may_bucket:
                     bars = _bucket(bars, bucket_seconds)
                 # Spot FX prints no volume — borrow it from the currency futures.
                 vol_tickers = _fx_volume_tickers(symbol) if ticker.endswith("=X") else []
@@ -381,7 +454,7 @@ async def fetch_candles(symbol: str, timeframe: str = "H1", limit: int = 400) ->
                     legs = []
                     for vt in vol_tickers:
                         leg = await _fetch_series(client, vt, interval, rng)
-                        legs.append(_bucket(leg, bucket_seconds) if bucket_seconds <= 14400 else leg)
+                        legs.append(_bucket(leg, bucket_seconds) if may_bucket else leg)
                     bars = _attach_fx_volume(bars, legs)
             else:
                 assert legs is not None

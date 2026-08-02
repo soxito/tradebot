@@ -1,0 +1,13 @@
+# Isolated venv for the local Jarvis speech engine — deliberately NOT merged
+# into backend/requirements.txt (heavy ML deps would bloat/conflict with the
+# trading backend's env). Install with:
+#   python3 -m venv speech_engine/.venv
+#   speech_engine/.venv/bin/pip install -r speech_engine/requirements.txt
+#
+# On Apple Silicon, speech-to-speech resolves the mlx / mlx-audio backends for
+# Parakeet-TDT (STT) and Qwen3-TTS automatically via platform markers.
+fastapi
+uvicorn[standard]
+python-multipart
+loguru
+speech-to-speech

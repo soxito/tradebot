@@ -193,8 +193,32 @@ async def analyze_with_cascade(
             provider_health.mark_failure(p.label)
             await provider_health.publish_inflight(p.label, -1)
             msg = str(exc)[:300]
-            errors.append(f"{p.label}: {msg}")
-            ai_router._cb_trip(p.id)
+            # 401/403/404/410 will fail identically until a key or URL is fixed.
+            # Sitting those out for longer is what lets the cascade reach the
+            # providers that CAN answer, instead of spending its budget
+            # rediscovering the same misconfiguration on every request.
+            fault = ai_router.config_fault_status(exc)
+            if fault is not None:
+                # A service the vendor has switched off is not a key you can
+                # fix. Saying "needs configuring" about a retired endpoint sends
+                # people off regenerating tokens that were never the problem.
+                if ai_router.is_retired_upstream(exc):
+                    errors.append(f"{p.label}: retired upstream (HTTP {fault})")
+                    logger.warning(
+                        f"[analysis_router] {p.label} reports it has been retired by its "
+                        f"provider — no key or URL change will bring it back; use "
+                        f"another provider"
+                    )
+                else:
+                    errors.append(f"{p.label}: HTTP {fault} — needs configuring")
+                    logger.warning(
+                        f"[analysis_router] {p.label} returned {fault}; skipping it for "
+                        f"{ai_router._CB_CONFIG_COOLDOWN / 60:.0f} min — check its API key/base URL"
+                    )
+                ai_router._cb_trip(p.id, ai_router._CB_CONFIG_COOLDOWN)
+            else:
+                errors.append(f"{p.label}: {msg}")
+                ai_router._cb_trip(p.id)
             await _record_usage(db, p, model, None, agent_name, agent_role,
                                 source, success=False, error=msg)
             continue

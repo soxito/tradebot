@@ -1,12 +1,12 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useTranslation } from "next-i18next";
+import { getApiBaseUrl } from "@/services/api";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:1448/api/v1";
+// Resolved lazily — the desktop build picks the API port at launch.
+const API_URL = () => getApiBaseUrl();
 
 export default function WhatsAppSignalsPage({ onStatsChange }) {
-  const { t } = useTranslation("common");
   const [signals, setSignals] = useState([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState({ status: "", symbol: "" });
@@ -23,7 +23,7 @@ export default function WhatsAppSignalsPage({ onStatsChange }) {
       if (filter.symbol) params.append("symbol", filter.symbol);
       params.append("limit", "100");
       
-      const res = await fetch(`${API_URL}/plugins/whatsapp/signals?${params}`);
+      const res = await fetch(`${API_URL()}/plugins/whatsapp/signals?${params}`);
       const data = await res.json();
       setSignals(data);
       if (onStatsChange) onStatsChange({ active_signals: data.filter(s => s.status === "active").length });

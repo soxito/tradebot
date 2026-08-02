@@ -62,6 +62,10 @@ psutil==7.2.2  # live system CPU/RAM stats for the JARVIS Room HUD
 # AI / LLM
 openai==1.82.0
 
+# NVIDIA NIM hosted speech (Parakeet ASR via REST, Magpie TTS via Riva gRPC) —
+# fast cloud fallback ahead of the slow local MLX engine, see app/api/voice.py
+nvidia-riva-client==2.19.0
+
 # ngrok — tunneling for backend + frontend exposure
 ngrok==1.4.0
 # tradingagents is installed separately with --no-deps (see start.py) because its

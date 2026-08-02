@@ -1,0 +1,24 @@
+{
+  "name": "tradebot-desktop",
+  "productName": "TradeBot",
+  "version": "0.1.0",
+  "description": "AI-powered trading assistant — news sentiment, TradingView signals and multi-exchange execution",
+  "author": {
+    "name": "TradeBot"
+  },
+  "license": "UNLICENSED",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder"
+  },
+  "dependencies": {
+    "electron-updater": "^6.3.9"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  }
+}

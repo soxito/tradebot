@@ -84,6 +84,10 @@ const TF_MINUTES: Record<string, number> = {
   M1: 1, M5: 5, M15: 15, M30: 30, H1: 60, H4: 240, D1: 1440, W1: 10080,
 }
 
+/** Default framing applied whenever a new symbol/timeframe is loaded. */
+const VISIBLE_BARS = 60   // recent candles visible by default
+const RIGHT_PAD    = 5    // empty bars after the newest candle
+
 const CRYPTO_EXCHANGES = new Set(['bitget', 'binance', 'bybit', 'okx', 'kucoin', 'coinbase', 'huobi', 'gate'])
 
 const FOREX_TO_CRYPTO: Record<string, string> = {
@@ -393,6 +397,26 @@ export default function MT5AdvancedChart({
 
   // Toggle study pane visibility by resizing — handled in render via height.
 
+  /**
+   * Wipe every series when the new symbol has no data. Without this the
+   * previous pair's candles, EMAs and volume stay on screen — and keep their
+   * price scale — so a switch to a pair the source can't serve looks like the
+   * chart is still stuck on the old symbol.
+   */
+  const clearSeries = useCallback(() => {
+    candlesRef.current = []
+    liveBar.current = null
+    try {
+      candleSeries.current?.setData([])
+      lineSeries.current?.setData([])
+      volSeries.current?.setData([])
+      ema9Series.current?.setData([])
+      ema21Series.current?.setData([])
+      ema50Series.current?.setData([])
+      rsiSeries.current?.setData([])
+    } catch { /* chart disposed */ }
+  }, [])
+
   // ── Apply candle data + indicators ──────────────────────────────────────────
   const applyCandles = useCallback((raw: Candle[]) => {
     candlesRef.current = raw
@@ -424,8 +448,25 @@ export default function MT5AdvancedChart({
     rsiSeries.current?.setData(rsi(raw, 14))
 
     if (needsFit.current) {
-      priceChart.current?.timeScale().fitContent()
-      studyChart.current?.timeScale().fitContent()
+      // Frame the newest bars of the new symbol rather than all ~400 of them,
+      // and re-enable vertical auto-scaling: lightweight-charts switches
+      // autoScale off for good once the user drags the price axis, which would
+      // otherwise keep the previous pair's price range (e.g. XAUUSD's ~3300)
+      // and squash the incoming series into a flat line.
+      const frame = () => {
+        try {
+          candleSeries.current?.priceScale().applyOptions({ autoScale: true })
+          const range = {
+            from: Math.max(0, raw.length - VISIBLE_BARS),
+            to: raw.length - 1 + RIGHT_PAD,
+          }
+          // The panes are range-linked, so setting the price chart syncs the study one.
+          priceChart.current?.timeScale().setVisibleLogicalRange(range)
+        } catch { /* chart disposed */ }
+      }
+      frame()
+      // setData restores the old scroll position a frame later — re-pin it.
+      if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame)
       needsFit.current = false
     }
     setLastUpdate(new Date())
@@ -467,6 +508,7 @@ export default function MT5AdvancedChart({
     // 2) Exchange fallback (best available source)
     if (fallbackExchange) {
       if (isForexOnly(symbol) && CRYPTO_EXCHANGES.has(fallbackExchange.toLowerCase())) {
+        clearSeries()
         setSourceReason('forex-only')
         setError(`${symbol} is a forex/index pair — not available on ${fallbackExchange}. Try BTCUSDT or ETHUSDT.`)
         setLoading(false)
@@ -488,18 +530,21 @@ export default function MT5AdvancedChart({
           setLoading(false)
           return
         }
+        clearSeries()
         setSourceReason('fallback-empty')
         setError(`No data from ${fallbackExchange} for ${sym}.`)
       } catch (e: any) {
+        clearSeries()
         setSourceReason('fallback-error')
         setError(`MT5 unreachable — ${fallbackExchange} fallback failed: ${e?.response?.data?.detail ?? e?.message ?? 'unknown error'}`)
       }
     } else {
+      clearSeries()
       setSourceReason('no-source')
       setError('MT5 API unreachable. Configure mtapi-io or attach an exchange account for chart data.')
     }
     setLoading(false)
-  }, [accountId, symbol, timeframe, fallbackExchange, applyCandles])
+  }, [accountId, symbol, timeframe, fallbackExchange, applyCandles, clearSeries])
 
   useEffect(() => {
     setLoading(true)

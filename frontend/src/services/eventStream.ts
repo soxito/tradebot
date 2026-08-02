@@ -11,7 +11,7 @@
  * All polling in the app is kept as a fallback gated on `connected === false`.
  */
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:1448/api/v1';
+import { getApiBaseUrl } from './api';
 
 export const STREAM_TOPICS = [
   'signal.new',
@@ -119,7 +119,7 @@ class EventStreamManager {
     if (typeof window === 'undefined') return;
     this.setState('connecting');
 
-    const url = `${API_BASE_URL}/stream/events`; // no topic filter → receive all
+    const url = `${getApiBaseUrl()}/stream/events`; // no topic filter → receive all
     let es: EventSource;
     try {
       es = new EventSource(url);

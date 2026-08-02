@@ -29,9 +29,10 @@ import with ``forecast_service``.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import math
 import time
-from typing import Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 from loguru import logger
 
@@ -83,6 +84,68 @@ STALE_FLOOR_S = 900
 def stale_after_seconds(bar_seconds: int) -> int:
     """Age (from the close of the last complete hour) at which volume is stale."""
     return HOUR_S + max(STALE_BARS * bar_seconds, STALE_FLOOR_S)
+
+
+#: The weekly break for everything that is not crypto. Metals, FX, indices and
+#: energy stop trading Friday evening and resume Sunday evening; CME's own
+#: maintenance halt sits inside this window. Times are UTC, (weekday, hour) with
+#: Monday = 0, and are deliberately a little wide — the cost of being generous
+#: is forgiving a couple of quiet hours, while the cost of being tight is
+#: declaring a perfectly good feed dead every weekend.
+_WEEK_CLOSE = (4, 21)   # Friday 21:00 UTC
+_WEEK_OPEN = (6, 22)    # Sunday 22:00 UTC
+
+#: Guard on the hour-by-hour walk below, so a wildly out-of-date bar cannot spin.
+_MAX_GAP_HOURS = 24 * 14
+
+
+def _in_weekly_break(ts: int) -> bool:
+    """Is this instant inside the weekend market close (UTC)?"""
+    t = _dt.datetime.fromtimestamp(ts, _dt.timezone.utc)
+    wd, hour = t.weekday(), t.hour
+    if wd == 5:                                    # all of Saturday
+        return True
+    if wd == _WEEK_CLOSE[0] and hour >= _WEEK_CLOSE[1]:
+        return True
+    if wd == _WEEK_OPEN[0] and hour < _WEEK_OPEN[1]:
+        return True
+    return False
+
+
+def closed_market_seconds(start_ts: int, end_ts: int) -> int:
+    """Seconds between two instants that fall inside the weekend break.
+
+    Subtracting this turns wall-clock age into *trading-time* age, which is the
+    thing the staleness rule actually means to measure. Walked one hour at a
+    time because the gap is short and bounded, and the arithmetic for partial
+    weekends is far easier to get wrong in closed form than to read here.
+    """
+    if end_ts <= start_ts:
+        return 0
+    closed = 0
+    hours = min(int((end_ts - start_ts) // HOUR_S) + 1, _MAX_GAP_HOURS)
+    for i in range(hours):
+        window_start = start_ts + i * HOUR_S
+        window_end = min(window_start + HOUR_S, end_ts)
+        if window_end <= window_start:
+            break
+        if _in_weekly_break(window_start):
+            closed += window_end - window_start
+    return closed
+
+
+def _has_weekly_break(symbol: str) -> bool:
+    """True for instruments that stop trading at the weekend.
+
+    Crypto runs continuously, so a weekend gap there is a genuine outage and
+    must still be reported as stale — forgiving it would hide a dead feed.
+    """
+    try:
+        from app.services import market_data  # type: ignore
+
+        return market_data.classify(symbol) != market_data.CRYPTO
+    except Exception:  # noqa: BLE001 — unknown instrument: assume 24/7, stay strict
+        return False
 
 #: A full rolling day of *complete* hours is required before any of the 24h
 #: statistics are reported. Anything less is INSUFFICIENT, never extrapolated.
@@ -348,17 +411,36 @@ def build_volume_context(
         )
 
     stale_after = stale_after_seconds(bar_seconds)
-    if age_seconds > stale_after:
+
+    # Staleness is about a feed that stopped delivering, not about a market that
+    # is shut. Metals, FX and indices close Friday evening and reopen Sunday
+    # evening, so their wall-clock age exceeds any sane threshold all weekend —
+    # which used to take Kronos offline for gold every Saturday and Sunday with
+    # "NO_TRADE, volume stale" and no chart overlay. Discount the hours the
+    # market was closed and judge the feed on trading time instead; a genuine
+    # mid-session outage still trips the same rule.
+    closed_seconds = 0
+    if _has_weekly_break(symbol):
+        closed_seconds = closed_market_seconds(last.start + HOUR_S, int(now))
+    trading_age = max(0, age_seconds - closed_seconds)
+
+    if trading_age > stale_after:
+        detail = (
+            f"Latest complete hour for {symbol} closed {age_seconds}s ago "
+            f"(stale after {stale_after}s)."
+        )
+        if closed_seconds:
+            detail += (
+                f" {closed_seconds}s of that was the weekend close, leaving "
+                f"{trading_age}s of trading time unaccounted for."
+            )
         return VolumeContext(
             status="STALE", symbol=symbol, source=source, volume_unit=volume_unit,
             volume_24h=volume_24h, volume_1h=volume_1h,
             hourly_mean_24h=volume_24h / REQUIRED_HOURS,
             hours_covered=len(trailing),
             last_bar_time=last.start, age_seconds=age_seconds,
-            detail=(
-                f"Latest complete hour for {symbol} closed {age_seconds}s ago "
-                f"(stale after {stale_after}s)."
-            ),
+            detail=detail,
         )
 
     hourly_mean_24h = volume_24h / REQUIRED_HOURS
@@ -500,22 +582,56 @@ def is_reversal_risk(direction: str, ctx: VolumeContext) -> bool:
     return False
 
 
+#: Macro is context, not a gate. The multiplier is clamped hard on both sides
+#: because `decide()` turns a low enough confidence into LOW_CONFIDENCE and then
+#: NO_TRADE — an unbounded macro coefficient would quietly become the veto we
+#: deliberately did not build. ±10% moves a marginal call across the tradeable
+#: floor without ever being the sole reason a setup lives or dies.
+MACRO_MULT_MIN = 0.90
+MACRO_MULT_MAX = 1.10
+
+
+def macro_multiplier(direction: str, macro: Optional[Any]) -> float:
+    """Confidence coefficient from the dollar / VIX read, in [0.90, 1.10].
+
+    Returns exactly 1.0 — no effect — whenever the macro bias is missing or
+    reports itself inapplicable. A failed macro fetch must never read as a
+    bearish opinion; see app.services.macro_context.
+    """
+    if macro is None or not getattr(macro, "applicable", False):
+        return 1.0
+    normalized = float(getattr(macro, "normalized", 0.0) or 0.0)
+    if direction == "down":
+        normalized = -normalized          # the bias is signed for the long side
+    elif direction not in ("up", "down"):
+        return 1.0
+    span = (MACRO_MULT_MAX - MACRO_MULT_MIN) / 2.0
+    return max(MACRO_MULT_MIN, min(MACRO_MULT_MAX, 1.0 + normalized * span))
+
+
 def score_confidence(
-    direction: str, agreement: float, dispersion: float, ctx: VolumeContext
+    direction: str,
+    agreement: float,
+    dispersion: float,
+    ctx: VolumeContext,
+    macro: Optional[Any] = None,
 ) -> float:
     """Final confidence.
 
         confidence = clamp( base_model_confidence(agreement, dispersion)
-                            × volume_multiplier(direction, context),
+                            × volume_multiplier(direction, context)
+                            × macro_multiplier(direction, macro),
                             0, MAX_CONFIDENCE )
 
-    With a non-OK context the multiplier is 0 — a forecast without resolved
-    volume has no confidence at all, which is what forces the NO_TRADE branch.
-    The upper clamp is MAX_CONFIDENCE, not 1.0: volume may sharpen a call but it
-    can never turn a sampled forecast into a certainty.
+    With a non-OK context the volume multiplier is 0 — a forecast without
+    resolved volume has no confidence at all, which is what forces the NO_TRADE
+    branch. The macro multiplier defaults to 1.0, so every existing caller is
+    unaffected. The upper clamp is MAX_CONFIDENCE, not 1.0: neither volume nor
+    the dollar can turn a sampled forecast into a certainty.
     """
     return max(0.0, min(MAX_CONFIDENCE, base_model_confidence(agreement, dispersion)
-                        * volume_multiplier(direction, ctx)))
+                        * volume_multiplier(direction, ctx)
+                        * macro_multiplier(direction, macro)))
 
 
 def decide(confidence: float, ctx: VolumeContext) -> str:
@@ -578,10 +694,13 @@ def direction_rationale(
     dispersion: float,
     confidence: float,
     decision: str,
+    macro: Optional[Any] = None,
 ) -> List[str]:
-    """Why this direction was chosen, and what volume did to its confidence.
+    """Why this direction was chosen, and what volume and macro did to it.
 
-    Every emitted signal carries these lines so no call is unexplained.
+    Every emitted signal carries these lines so no call is unexplained. They
+    also propagate for free into every sniper entry's ``reasons``, which is how
+    the macro read reaches the user without a second assembly site.
     """
     if ctx.status != "OK":
         return [
@@ -612,7 +731,19 @@ def direction_rationale(
             f"×{mult:.2f}."
         )
 
-    lines.append(f"Final confidence {base:.2f} × {mult:.2f} = {confidence:.2f} → {decision}.")
+    macro_mult = macro_multiplier(direction, macro)
+    if macro is not None and getattr(macro, "applicable", False):
+        for line in getattr(macro, "lines", []) or []:
+            lines.append(line)
+        lines.append(f"Macro adjustment: ×{macro_mult:.2f}.")
+    else:
+        why = getattr(macro, "reason", "") if macro is not None else "not consulted"
+        lines.append(f"Macro context did not apply ({why}) — confidence unchanged by it.")
+
+    lines.append(
+        f"Final confidence {base:.2f} × {mult:.2f} (volume) × {macro_mult:.2f} "
+        f"(macro) = {confidence:.2f} → {decision}."
+    )
     if decision == "LOW_CONFIDENCE":
         lines.append(
             f"Below the {MIN_TRADEABLE_CONFIDENCE:.2f} tradeable floor — no entry emitted."

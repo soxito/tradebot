@@ -1009,8 +1009,31 @@ async def _collect_active_symbols() -> list[str]:
     return list(symbols)
 
 
-async def _fetch_one_price(symbol: str) -> tuple[str, float | None]:
-    """Best-effort live price: Bitget ticker first, sniper FX price fallback."""
+async def _fetch_one_price(symbol: str, db=None) -> tuple[str, float | None]:
+    """Best-effort live price, asked of the source that actually carries it.
+
+    Routed by asset class rather than "try the crypto exchange and see". Asking
+    Bitget for XAU/USD is not merely a wasted call — the connector logs it at
+    ERROR ("bitget does not have market symbol XAU/USD"), so every gold, FX and
+    index symbol on the watchlist produced an error line on every tick.
+
+    Non-crypto goes through ``market_data.get_quote``, which tries the live MT5
+    account FIRST: the broker's bid/ask is the price this user's orders actually
+    fill at, and a reference feed can sit a few pips away from it. That needs a
+    session — without ``db`` the MT5 leg is skipped and it silently falls back
+    to Yahoo, which is exactly what "use the source set in MT5 Live" rules out.
+    """
+    from app.services import market_data
+
+    if market_data.classify(market_data.normalize_symbol(symbol)) != market_data.CRYPTO:
+        try:
+            quote = await market_data.get_quote(symbol, db=db)
+            if quote and quote.price:
+                return symbol, float(quote.price)
+        except Exception:  # noqa: BLE001 — a tick is best-effort
+            pass
+        return symbol, None
+
     from app.exchanges.manager import exchange_manager, SupportedExchange
 
     try:
@@ -1071,9 +1094,27 @@ async def _price_tick_loop():
             if not symbols:
                 continue
 
-            results = await asyncio.gather(
-                *(_fetch_one_price(s) for s in symbols), return_exceptions=True
-            )
+            from app.services import market_data as _md
+
+            crypto = [s for s in symbols
+                      if _md.classify(_md.normalize_symbol(s)) == _md.CRYPTO]
+            broker = [s for s in symbols if s not in set(crypto)]
+
+            # Crypto needs no session, so it fans out. The rest run in sequence
+            # on ONE session: their MT5 leg queries the database, and an
+            # AsyncSession shared across concurrent coroutines is a race. The
+            # broker list is short (the FX/metal/index watchlist) and the quote
+            # layer caches, so serialising it costs nothing measurable.
+            results = list(await asyncio.gather(
+                *(_fetch_one_price(s) for s in crypto), return_exceptions=True
+            ))
+            if broker:
+                async with AsyncSessionLocal() as tick_db:
+                    for sym in broker:
+                        try:
+                            results.append(await _fetch_one_price(sym, tick_db))
+                        except Exception as exc:  # noqa: BLE001
+                            results.append(exc)
             prices = {
                 sym: px
                 for r in results
@@ -1139,6 +1180,157 @@ def get_price_tick_status() -> dict:
     }
 
 
+# ── JARVIS Learning Loop ───────────────────────────────────
+# Settles the trade proposals JARVIS published against what price actually did,
+# so its stated confidence is measured rather than asserted. Without this the
+# assistant makes calls forever and never finds out whether any of them worked.
+
+_jarvis_learning_task: asyncio.Task | None = None
+_jarvis_learning_running = False
+_jarvis_learning_started_at: str | None = None
+_jarvis_learning_last_run: dict | None = None
+
+
+async def _jarvis_learning_loop():
+    """Settle unresolved JARVIS proposals on a timer."""
+    global _jarvis_learning_running, _jarvis_learning_last_run
+
+    interval = getattr(settings, "JARVIS_LEARNING_INTERVAL_SECONDS", 900)
+    expiry_hours = getattr(settings, "JARVIS_JOURNAL_EXPIRY_HOURS", 72)
+    max_per_cycle = getattr(settings, "JARVIS_LEARNING_MAX_SETTLE_PER_CYCLE", 40)
+    logger.info(f"🎓 [JARVIS LEARNING] Started (every {interval}s)")
+
+    while _jarvis_learning_running:
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            break
+        if not _jarvis_learning_running:
+            break
+
+        try:
+            from app.core.database import AsyncSessionLocal
+            from app.services import analysis_journal, market_data
+
+            settled = 0
+            async with AsyncSessionLocal() as db:
+                pending = await analysis_journal.unsettled(db, limit=max_per_cycle)
+                if not pending:
+                    continue
+
+                # One candle fetch per (symbol, timeframe), shared across every
+                # row that needs it. Fetching per row would mean 40 upstream
+                # calls a cycle and a swift rate-limit ban.
+                groups: dict[tuple[str, str], list] = {}
+                for row in pending:
+                    groups.setdefault((row.symbol, row.timeframe or "4h"), []).append(row)
+
+                for (symbol, timeframe), rows in groups.items():
+                    try:
+                        ohlcv, _ticker = await market_data.fetch_ohlcv_universal(
+                            symbol, timeframe=timeframe, limit=1000
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug(f"🎓 [JARVIS LEARNING] {symbol} candles: {exc}")
+                        continue
+                    if not ohlcv:
+                        continue
+                    for row in rows:
+                        verdict = analysis_journal.evaluate(
+                            row, ohlcv, expiry_hours=expiry_hours
+                        )
+                        if verdict is not None:
+                            await analysis_journal.settle(db, row, verdict)
+                            settled += 1
+
+                stats = await analysis_journal.learned_stats(db)
+
+            _jarvis_learning_last_run = {
+                "at": now_sast().isoformat(),
+                "status": "ok",
+                "settled_this_cycle": settled,
+                "pending": len(pending),
+                "win_rate": stats.get("win_rate"),
+                "total_settled": stats.get("settled"),
+            }
+            if settled:
+                logger.info(
+                    f"🎓 [JARVIS LEARNING] Settled {settled} — lifetime "
+                    f"{stats.get('settled')} calls, {stats.get('win_rate', 0):.0%} win rate"
+                )
+                # One summary per cycle, not one per outcome — otherwise the
+                # knowledge vault fills with noise nobody can read.
+                try:
+                    from app.api.jarvis import jarvis_learn_all_brains
+
+                    await jarvis_learn_all_brains(
+                        kind="learning",
+                        title="JARVIS proposal outcomes",
+                        content=(
+                            f"Settled {settled} proposals. Lifetime: "
+                            f"{stats.get('wins')}W/{stats.get('losses')}L "
+                            f"({stats.get('win_rate', 0):.0%}), avg "
+                            f"{stats.get('avg_r', 0):+.2f}R, "
+                            f"{stats.get('no_fill', 0)} never filled."
+                        ),
+                    )
+                except Exception:  # noqa: BLE001 — fan-out is optional
+                    pass
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            err_safe = str(e).replace("{", "{{").replace("}", "}}")
+            logger.error(f"🎓 [JARVIS LEARNING] Cycle error: {err_safe}")
+            _jarvis_learning_last_run = {
+                "at": now_sast().isoformat(), "status": "error", "error": str(e),
+            }
+
+    _jarvis_learning_running = False
+    logger.info("🎓 [JARVIS LEARNING] Stopped")
+
+
+def start_jarvis_learning_loop():
+    """Start the JARVIS proposal-settlement loop (idempotent)."""
+    global _jarvis_learning_task, _jarvis_learning_running, _jarvis_learning_started_at
+
+    if _jarvis_learning_task is not None and not _jarvis_learning_task.done():
+        logger.warning("JARVIS learning loop already running")
+        return False
+
+    _jarvis_learning_running = True
+    _jarvis_learning_started_at = now_sast().isoformat()
+    _jarvis_learning_task = asyncio.create_task(_jarvis_learning_loop())
+    logger.info("🎓 JARVIS learning loop started")
+    return True
+
+
+def stop_jarvis_learning_loop():
+    """Stop the JARVIS proposal-settlement loop."""
+    global _jarvis_learning_running, _jarvis_learning_task, _jarvis_learning_started_at
+
+    if not _jarvis_learning_running and (
+        _jarvis_learning_task is None or _jarvis_learning_task.done()
+    ):
+        return False
+
+    _jarvis_learning_running = False
+    if _jarvis_learning_task:
+        _jarvis_learning_task.cancel()
+        _jarvis_learning_task = None
+    _jarvis_learning_started_at = None
+    logger.info("🎓 JARVIS learning loop stopped")
+    return True
+
+
+def get_jarvis_learning_status() -> dict:
+    """Return the current state of the JARVIS learning loop."""
+    return {
+        "running": _jarvis_learning_running,
+        "started_at": _jarvis_learning_started_at,
+        "last_run": _jarvis_learning_last_run,
+    }
+
+
 # ── SMC Background Research Loop ───────────────────────────
 # Pulls the economic calendar, news feeds and sentiment on a timer and writes
 # the findings into the three memories. Uses IDLE AI providers only — never the
@@ -1174,6 +1366,73 @@ def get_research_loop_status() -> dict:
     try:
         from plugins.MT5TradingPlugin.backend.services.research_loop import (
             get_research_loop_status as _status,
+        )
+    except Exception:  # noqa: BLE001
+        return {"running": False, "available": False}
+    return _status()
+
+
+# ── Signal Research Queue ──────────────────────────────────
+# Researches the app's OWN signals (Telegram, sniper, SMC, core) a bounded
+# number at a time, producing per-pair predictions with visible progress. Runs
+# alongside the ambient research loop above, not instead of it.
+
+def start_signal_research_queue(concurrency: int = 5, scan_interval: int = 180):
+    """Start the per-signal research queue (default: 5 signals at a time)."""
+    try:
+        from plugins.MT5TradingPlugin.backend.services.signal_research import (
+            start_signal_research_queue as _start,
+        )
+    except Exception as e:  # noqa: BLE001 — plugin may be absent in a trimmed deploy
+        logger.warning(f"Signal research queue unavailable: {e}")
+        return False
+    return _start(concurrency, scan_interval)
+
+
+def stop_signal_research_queue():
+    """Stop the per-signal research queue."""
+    try:
+        from plugins.MT5TradingPlugin.backend.services.signal_research import (
+            stop_signal_research_queue as _stop,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    return _stop()
+
+
+# ── Obsidian Vault Auto-Sync ───────────────────────────────
+# Exports signals, decisions and communities into the Obsidian vault on a timer,
+# so the knowledge base reflects what the desk has actually been doing rather
+# than whenever somebody last remembered to press Sync.
+
+def start_vault_sync_loop(interval: int = 300):
+    """Start the Obsidian vault auto-sync loop (default: every 5 min)."""
+    try:
+        from plugins.ObsidianKnowledgePlugin.backend.services.sync_orchestrator import (
+            start_vault_sync_loop as _start,
+        )
+    except Exception as e:  # noqa: BLE001 — plugin may be absent in a trimmed deploy
+        logger.warning(f"Vault sync loop unavailable: {e}")
+        return False
+    return _start(interval)
+
+
+def stop_vault_sync_loop():
+    """Stop the Obsidian vault auto-sync loop."""
+    try:
+        from plugins.ObsidianKnowledgePlugin.backend.services.sync_orchestrator import (
+            stop_vault_sync_loop as _stop,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    return _stop()
+
+
+def get_vault_sync_status() -> dict:
+    """Current state of the Obsidian vault auto-sync loop."""
+    try:
+        from plugins.ObsidianKnowledgePlugin.backend.services.sync_orchestrator import (
+            get_vault_sync_status as _status,
         )
     except Exception:  # noqa: BLE001
         return {"running": False, "available": False}

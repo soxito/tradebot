@@ -1,48 +1,72 @@
 # 🤖 TradeBot
 
-**AI-powered crypto trading bot** combining news-driven sentiment analysis with TradingView technical signals to generate actionable trades across multiple exchanges.
+**AI-powered multi-asset trading platform.** Combines news-driven sentiment analysis, TradingView technical signals, and a multi-agent AI orchestrator to generate and (optionally) execute trades across crypto exchanges and MetaTrader 5 (forex, metals, indices) — with a voice-controlled JARVIS/Paul assistant, a plugin ecosystem for ML forecasting and channel-based signal ingestion, and an Obsidian-backed "knowledge brain".
 
 ## 🏗️ Architecture
 
 - **Backend:** Python 3.13, FastAPI, `ccxt` + native Bitget v2 SDK, SQLAlchemy (async) + asyncpg, Redis
-- **Frontend:** Next.js 16, React 19, TypeScript, Tailwind, TradingView Lightweight Charts, Three.js, react-force-graph-3d
-- **Exchanges:** Binance, Bitget (spot + futures), Bybit, OKX, KuCoin, Coinbase
-- **Sentiment & news:** CryptoPanic, RSS feeds, Reddit → VADER + TextBlob scoring
+- **Frontend:** Next.js 16, React 19, TypeScript, Tailwind, TradingView Lightweight Charts, Three.js, react-force-graph-3d/2d
+- **Exchanges:** Binance, Bitget (spot + futures), Bybit, OKX, KuCoin, Coinbase — plus MetaTrader 5 (forex/metals/indices) via the `MT5TradingPlugin`
+- **AI agents:** multi-agent orchestrator (Market+Sentiment → Signal → Risk → Executor pipeline) with per-agent decision memory to skip redundant LLM calls, backed by OpenAI and a multi-provider LLM router (`AiMarketAnalyst`)
+- **Sentiment & news:** CryptoPanic, RSS feeds, Reddit, Telegram and WhatsApp channels → VADER + TextBlob scoring
 - **Realtime:** Server-Sent Events over a Redis pub/sub `EventBus` (in-memory fallback)
-- **Assistant:** JARVIS / Paul — global voice + chat widget with a WebGL S.O.X room
-- **Infrastructure:** PostgreSQL, Redis (Homebrew or Docker), Docker Compose
+- **Assistant:** JARVIS / Paul / S.O.X — global voice + chat widget, 3D robot avatar, WebGL command room, and live face-vision
+- **Background workers:** a central scheduler drives sentiment, signal generation, sim/live auto-trade loops, position monitoring, the crypto sniper (pump/rug detection), pair-catalog sync, research, and vault sync — all independently toggleable
+- **Infrastructure:** PostgreSQL, Redis (Homebrew or Docker), Docker Compose; optional Electron desktop packaging
 
 ## 📋 Features
 
 ### Core platform
-- ✅ Multi-exchange connectors (Binance, Bitget, Bybit, OKX, KuCoin, Coinbase) with a native Bitget v2 SDK for spot + futures
+- ✅ Multi-exchange connectors (Binance, Bitget, Bybit, OKX, KuCoin, Coinbase) with a native Bitget v2 SDK for spot + futures, plus dedicated spot-price providers for forex/metals (CoinGecko/Open Exchange Rates, Swissquote/gold-api)
 - ✅ TradingView webhook receiver with signature validation
-- ✅ News + sentiment pipeline (RSS + CryptoPanic → VADER + TextBlob)
-- ✅ Signal & decision engine with risk management (position sizing, stop-loss, take-profit, exposure limits)
+- ✅ News + sentiment pipeline (RSS + CryptoPanic → VADER + TextBlob), plus Telegram/WhatsApp channel ingestion with dedupe and structured signal extraction
+- ✅ Multi-agent AI orchestrator: collaborative Market+Sentiment → Signal → Risk → Executor pipeline with persisted decision history and per-agent learning stats
+- ✅ Signal & strategy engine: technical signals, Pine Script strategies, Smart Money Concepts (order blocks, fair value gaps, premium/discount zones), and a Strategy Lab for versioned strategy runs/promotions
+- ✅ Risk management (position sizing, stop-loss, take-profit, exposure limits) across both **simulated (paper)** and **live** trading engines
+- ✅ Crypto sniper: rug-pull and pump/pullback detection with an optional auto-trade sniper loop
 - ✅ Realtime dashboard: TradingView charts, wallet balances, trade history, live SSE stream (Live/Poll fallback)
 - ✅ Multi-account + unified-account Bitget balances/positions (USDT/USDC/COIN futures)
+- ✅ Economic calendar, research findings and a background research job queue
 
-### JARVIS / Paul assistant
-- 🎙️ Hands-free voice control (free Web Speech primary, cost-aware Deepgram STT fallback)
+### JARVIS / Paul / S.O.X assistant
+- 🎙️ Hands-free voice control (free Web Speech primary, cost-aware Deepgram STT fallback) with natural-language command dispatch
 - 🧠 Position-aware deep analysis (volume pressure + news + forecast + your open PnL)
-- 🤖 3D robot avatar + ~980-particle S.O.X orb rendered off-thread via Web Workers / OffscreenCanvas
+- 🤖 3D robot avatar that patrols the page + a ~960-particle S.O.X command-room orb rendered off-thread via Web Workers / OffscreenCanvas
+- 👁️ Live face-vision (identity enrollment + lip/face overlay) and a companion browser extension for desktop alerts and reliable mic capture outside the page
 - 🎚️ Adaptive graphics that auto-scale quality (low → ultra) to the device and live FPS
 
 ### Plugins (standalone — never modify core code, see `plugins/`)
-- `MT5TradingPlugin` — MetaTrader 5 REST bridge
-- `AiMarketAnalyst` — multi-provider LLM router (Groq, OpenRouter, Gemini, Mistral, Cerebras, DeepSeek, Together, OpenAI, custom) with failover
-- `KronosForecastPlugin` — Kronos ML candle forecasting (mini/small/base) with heuristic fallback
-- `TelegramSignalNewsPlugin` — Telegram signal ingestion, news→sentiment, and sniper auto-trade
-- `ObsidianKnowledgePlugin` — knowledge-base integration
-- `AgentPaulPlugin` — background "subconscious" agent
+- `MT5TradingPlugin` — MetaTrader 5 REST bridge: multi-account management, live positions/orders, SMC "sniper" charting, scalp-bot automation, copy-trading simulation and a backtesting bridge
+- `AiMarketAnalyst` — multi-provider LLM router (Groq, OpenRouter, Gemini, Mistral, Cerebras, DeepSeek, Together, OpenAI, custom) with failover, agent profiles, smart limit-order proposals and a risk policy engine
+- `KronosForecastPlugin` — Kronos ML candle forecasting (mini/small/base) with heuristic fallback, rendered as chart overlays
+- `TelegramSignalNewsPlugin` — Telegram channel ingestion for trading signals and news, with sniper auto-trade
+- `WhatsAppSignalNewsPlugin` — WhatsApp channel ingestion (via an OpenWA gateway) for trading signals and news, with sniper auto-trade
+- `ObsidianKnowledgePlugin` — syncs signals, agent decisions, strategy notes and code-community graphs into a local Obsidian vault
+- `AgentPaulPlugin` — a PAUL-loop (Plan → Apply/Qualify → Unify) background agent with an approval queue and paper/execute/direct trading modes
+- `OpenManusPlugin` — routes AI calls through an OpenManus MCP sidecar with phased fallback to `AiMarketAnalyst`, with compliance audit logging
+- `OpenHumanPlugin` — exposes TradeBot as an MCP tool server to a local-first OpenHuman "brain" with persistent memory
+- `VibeTradingPlugin` — natural-language backtesting sidecar with a 460-alpha "Alpha Zoo" and multi-agent swarm research
 
 ### Platform support
-- 🖥️ Cross-platform launcher (`start.py`) for macOS, Linux and Windows
+- 🖥️ Cross-platform launcher (`start.py`) for macOS, Linux and Windows, plus a standalone Electron **desktop app**
 - 🪟 Windows + low-end hardware auto-tuning (RAM/core detection, ML-thread caps, optional 3D kill-switch)
+
+## 🖥️ Desktop app (macOS / Windows / Linux)
+
+If you just want to *use* TradeBot, download the installer from the
+[Releases page](https://github.com/soxito/tradebot/releases) — it needs no
+Python, Node, PostgreSQL, Redis or Docker. Everything is bundled, and data lives
+in a per-user folder that survives updates.
+
+See **[docs/DESKTOP.md](docs/DESKTOP.md)** for install notes (the builds are not
+code-signed yet, so first launch needs one extra click), how it differs from the
+server setup, and how to build it yourself.
+
+The rest of this section is for running from source.
 
 ## 🚀 Quick Start
 
-The recommended way to run TradeBot locally is the cross-platform launcher
+The recommended way to run TradeBot from source is the cross-platform launcher
 `start.py`. It provisions PostgreSQL and Redis (Homebrew or Docker), builds the
 Python virtual environment, installs dependencies, and starts the backend and
 frontend with resource-aware tuning.
@@ -183,40 +207,49 @@ tradebot/
 ├── run-local.sh             # Bash launcher (macOS/Linux)
 ├── backend/                 # Python FastAPI
 │   ├── app/
-│   │   ├── agents/         # Background agents
-│   │   ├── api/            # API routes, webhooks, SSE stream
-│   │   ├── core/           # Config, security, EventBus
-│   │   ├── exchanges/      # Exchange connectors (ccxt + Bitget v2)
+│   │   ├── agents/         # Multi-agent orchestrator, specialists, decision memory
+│   │   ├── api/            # API routes (jarvis, signals, trading, exchanges, vision, ...)
+│   │   ├── core/           # Config, database, scheduler (background loops), EventBus
+│   │   ├── exchanges/      # Exchange connectors (ccxt + Bitget v2) + forex/metals providers
+│   │   ├── plugins/        # Plugin loader/contracts (mounts plugins/* routers)
 │   │   ├── sentiment/      # News & sentiment analysis
-│   │   ├── signals/        # Signal processing
-│   │   ├── trading/        # Order execution
-│   │   └── models/         # Database models
+│   │   ├── signals/        # Signal processing / technical analysis
+│   │   ├── trading/        # Simulation + live trade engines, risk, decisions
+│   │   ├── workers/        # Background worker entrypoint (runtime.py)
+│   │   └── models/         # Database models (ORM)
 │   ├── requirements.txt
 │   └── Dockerfile
 ├── frontend/               # Next.js 16 / React 19
 │   ├── src/
-│   │   ├── components/    # UI components (JARVIS, charts, orb)
-│   │   ├── pages/         # Next.js pages
+│   │   ├── components/    # UI components (JARVIS, MT5 charts, face-vision, orb)
+│   │   ├── pages/         # Next.js pages (dashboard, signals, mt5-live, jarvis-room, ...)
 │   │   ├── utils/         # Device performance / adaptive quality
 │   │   └── styles/        # CSS / Tailwind
 │   ├── package.json
 │   └── Dockerfile
-├── plugins/                # Standalone plugins (never modify core)
+├── plugins/                 # Standalone plugins (never modify core)
 │   ├── MT5TradingPlugin/
 │   ├── AiMarketAnalyst/
 │   ├── KronosForecastPlugin/
 │   ├── TelegramSignalNewsPlugin/
+│   ├── WhatsAppSignalNewsPlugin/
 │   ├── ObsidianKnowledgePlugin/
-│   └── AgentPaulPlugin/
-├── jarvis-extension/       # Browser extension for JARVIS voice
-├── scripts/                # Setup & diagnostic scripts
+│   ├── AgentPaulPlugin/
+│   ├── OpenManusPlugin/
+│   ├── OpenHumanPlugin/
+│   └── VibeTradingPlugin/
+├── jarvis-extension/        # Browser extension for JARVIS voice
+├── desktop/                 # Electron desktop app packaging
+├── obsidian-vault/          # Local Obsidian vault synced by ObsidianKnowledgePlugin
+├── scripts/                 # Setup & diagnostic scripts
+├── docs/                    # Desktop app, architecture and product-spec docs
 ├── docker-compose.yml
-├── .env.example           # Template (copy to .env)
+├── .env.example             # Template (copy to .env)
 ├── CHANGELOG.md
 └── README.md
 ```
 
-## � Obsidian Knowledge Base
+## 🧠 Obsidian Knowledge Base
 
 TradeBot ships an `ObsidianKnowledgePlugin` that syncs signals, agent decisions,
 strategy notes and code-community graphs into a local Obsidian vault, and can
@@ -320,7 +353,7 @@ LIMIT 20
 
 ---
 
-## �🛠️ Development
+## 🛠️ Development
 
 ### Backend Development
 ```bash
@@ -354,13 +387,22 @@ docker exec -it tradebot-redis redis-cli
 ### Trading & data
 - `POST /api/v1/webhooks/tradingview` - TradingView alerts
 - `GET /api/v1/signals` - Recent trading signals
+- `POST /api/v1/signals/generate` - Run signal generation (technical + SMC)
 - `GET /api/v1/sentiment/{symbol}` - Asset sentiment score
 - `GET /api/v1/trades` - Trade history
 - `POST /api/v1/orders` - Manual order execution
+- `GET /api/v1/exchanges/{exchange}/...` - Balances, tickers, OHLCV, order placement per exchange
+- `GET /api/v1/simulation/*` - Paper-trading account, orders, positions, auto-trade loop
+- `GET /api/v1/live-trade/*` - Live-trading settings, SL/TP, auto-trade loop
+- `GET /api/v1/agents/*` - AI agent CRUD, analyze, decision history & learning stats
+- `GET /api/v1/rug-pulls/*` / `GET /api/v1/pump-monitor/*` - Rug-pull & pump sniper detection/auto-trade
+- `GET /api/v1/research/*` - Research findings, economic calendar, trading plans
+- `GET /api/v1/strategy-lab/*` - Strategy versions, runs, promotions
+- `WS /api/v1/vision/face-stream` - Face-vision WebSocket for JARVIS face tracking
 - `GET /api/v1/stream/events` - Realtime SSE stream (signals, trades, sniper, ticks, alerts)
 
 > The interactive OpenAPI docs at `/docs` list the full, live endpoint set
-> (including plugin routes for MT5, Kronos, Telegram signals and the AI analyst).
+> (including plugin routes for MT5, Kronos, Telegram/WhatsApp signals, Agent Paul and the AI analyst).
 
 ## 🧪 Testing & Verification
 
@@ -514,15 +556,19 @@ the JARVIS settings panel (and on the Voice Agent tab as a cost warning).
 
 - [x] Core platform: infrastructure, multi-exchange connectors, TradingView webhooks
 - [x] News & sentiment pipeline
-- [x] Signal & decision engine with risk management
+- [x] Multi-agent AI orchestrator with decision memory and risk management
 - [x] Realtime dashboard (SSE) with charts, balances and trade history
-- [x] JARVIS voice assistant + adaptive 3D graphics
-- [x] Plugin ecosystem (MT5, AI analyst, Kronos, Telegram, Obsidian, Agent Paul)
-- [x] Cross-platform + low-end hardware support (Windows, `start.py` auto-tuning)
+- [x] JARVIS/S.O.X voice assistant + face-vision + adaptive 3D graphics
+- [x] MetaTrader 5 integration (forex/metals/indices) with SMC sniper charting & scalp-bot
+- [x] Crypto rug-pull & pump sniper detection with auto-trade loop
+- [x] Telegram & WhatsApp channel signal ingestion
+- [x] Plugin ecosystem (MT5, AI analyst, Kronos, Telegram, WhatsApp, Obsidian, Agent Paul, OpenManus, OpenHuman, Vibe-Trading)
+- [x] Strategy Lab (versioned strategies, runs, promotions)
+- [x] Cross-platform + low-end hardware support (Windows, `start.py` auto-tuning) + Electron desktop app
 - [x] Auto-trading execution with background scheduler (simulation + live loops)
 - [x] Alerting (Telegram, Discord, email) + Prometheus monitoring & metrics
 - [ ] Fully automated trade execution across all plugins
-- [ ] Backtesting engine
+- [ ] Expanded backtesting engine coverage across all strategy types
 
 See [CHANGELOG.md](CHANGELOG.md) for a detailed history of changes.
 

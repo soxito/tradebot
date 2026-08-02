@@ -12,10 +12,14 @@
  *   REST http(s)://<api-host>/api/v1/vision/{enroll-face,profile}
  */
 import React, { useCallback, useEffect, useRef, useState } from 'react'
+import { getApiBaseUrl, getApiWsUrl } from '../services/api'
 
-// ── Resolve backend base + WS URL from the same env the app uses ─────────────
-const API_BASE = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:1448/api/v1').replace(/\/$/, '')
-const WS_URL = API_BASE.replace(/^http/, 'ws') + '/vision/face-stream'
+// ── Resolve backend base + WS URL the same way the rest of the app does ──────
+// Called lazily rather than captured in a module constant: in the desktop build
+// the API port is chosen at launch and injected once the page loads, so a value
+// read at module-evaluation time can be stale.
+const apiBase = () => getApiBaseUrl().replace(/\/$/, '')
+const wsUrl = () => getApiWsUrl() + '/api/v1/vision/face-stream'
 
 const CAPTURE_FPS = 10
 const CAPTURE_W = 320
@@ -49,7 +53,7 @@ export default function FaceVisionPanel() {
 
   // ── Load enrollment status once ────────────────────────────────────────
   useEffect(() => {
-    fetch(`${API_BASE}/vision/profile`, { signal: AbortSignal.timeout(2500) })
+    fetch(`${apiBase()}/vision/profile`, { signal: AbortSignal.timeout(2500) })
       .then(r => r.ok ? r.json() : null)
       .then(j => { if (j) setEnrolled(!!j.enrolled) })
       .catch(() => {})
@@ -164,7 +168,7 @@ export default function FaceVisionPanel() {
   const connectWs = useCallback(() => {
     if (wsRef.current && wsRef.current.readyState <= 1) return
     let ws: WebSocket
-    try { ws = new WebSocket(WS_URL) } catch { return }
+    try { ws = new WebSocket(wsUrl()) } catch { return }
     wsRef.current = ws
     ws.onopen = () => { setWsOk(true); inFlight.current = 0 }
     ws.onmessage = (ev) => {
@@ -237,7 +241,7 @@ export default function FaceVisionPanel() {
     setEnrolling(true); setErr('')
     try {
       const frame = await captureJpeg()
-      const r = await fetch(`${API_BASE}/vision/enroll-face`, {
+      const r = await fetch(`${apiBase()}/vision/enroll-face`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ frame }),
@@ -254,7 +258,7 @@ export default function FaceVisionPanel() {
   }, [active, captureJpeg])
 
   const clearEnroll = useCallback(async () => {
-    await fetch(`${API_BASE}/vision/profile`, { method: 'DELETE' }).catch(() => {})
+    await fetch(`${apiBase()}/vision/profile`, { method: 'DELETE' }).catch(() => {})
     setEnrolled(false)
   }, [])
 

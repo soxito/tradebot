@@ -1,6 +1,6 @@
 import Head from 'next/head'
 import { useState, useEffect, useCallback } from 'react'
-import { apiClient } from '@/services/api'
+import { apiClient, getApiBaseUrl } from '@/services/api'
 import { useZarRate } from '@/hooks/useZarRate'
 import {
   RefreshCw, Brain, Newspaper, BarChart3, MessageSquare,
@@ -88,7 +88,7 @@ export default function InsightsPage() {
         apiClient.getAgentDecisions({ limit: 20 }),
         apiClient.getNewsArticles({ limit: 10 }),
         // @ts-ignore — paul knowledge stats
-        fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:1448/api/v1'}/plugins/agent-paul/knowledge/stats`).then(r => r.json()),
+        fetch(`${getApiBaseUrl()}/plugins/agent-paul/knowledge/stats`).then(r => r.json()),
       ])
       if (statsRes.status === 'fulfilled') setNewsStats(statsRes.value.data)
       const sentData = sentRes.status === 'fulfilled' ? (sentRes.value.data?.sentiments || []) : []

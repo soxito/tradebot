@@ -379,6 +379,9 @@ class MT5SmcSignal(BaseModel):
     # ── Kronos ML fusion (optional; populated when a forecast is available) ──
     kronos_aligned: Optional[bool] = None   # True=agrees, False=opposes, None=n/a
     fusion_score: Optional[float] = None     # 0..1 blended SMC + Kronos quality
+    # Plain-English reason the forecast moved (or did not move) this setup, so
+    # the ranking is auditable instead of an unexplained reshuffle.
+    kronos_note: Optional[str] = None
     # Numeric audit trail for `confidence`: which factors contributed and by how
     # much, plus the volume-confirmation and HTF-gate outcomes.
     # See services/smc_scoring.py.
@@ -411,7 +414,16 @@ class MT5SmcAnalyzeResponse(BaseModel):
     liquidity: Dict[str, List[float]] = {}
     zones: List[MT5SmcZone] = []
     signals: List[MT5SmcSignal] = []
+    # Setups the hard gates rejected, with the gate that stopped each one. Lets
+    # the UI distinguish "no structure found" from "structure found, and refused
+    # on risk grounds" — without it an empty panel looks like a broken sniper.
+    rejected_signals: List[Dict[str, Any]] = []
     us_session: Optional[Dict[str, Any]] = None
+    # Dollar-index / VIX context used to score these setups. Present even when
+    # it did not apply — `applied: false` with the reason is the honest answer
+    # for a pair the dollar says nothing about, and the endpoints splat the
+    # analysis dict into this model, so an unmodelled key would be dropped.
+    macro: Optional[Dict[str, Any]] = None
     ai: Optional[Dict[str, Any]] = None
     kronos: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
@@ -535,6 +547,16 @@ class ScalpStartRequest(BaseModel):
 class ScalpStopRequest(BaseModel):
     account_id: int
     symbol: str = Field(..., max_length=30)
+
+
+class ScalpPauseRequest(BaseModel):
+    """Pause or resume without rebuilding the bot.
+
+    ``symbols`` omitted means every session on the account in the relevant
+    state — which is the common case: pause the lot, come back, resume the lot.
+    """
+    account_id: int
+    symbols: Optional[List[str]] = Field(default=None, max_length=60)
 
 
 class ScalpTradeInfo(BaseModel):

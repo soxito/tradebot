@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';" />
+    <title>Starting TradeBot</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 18px;
+        background: radial-gradient(circle at 50% 30%, #16233c 0%, #0b1220 70%);
+        color: #e2e8f0;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+      .mark { font-size: 30px; font-weight: 700; letter-spacing: -0.4px; }
+      .mark span { color: #38bdf8; }
+      .hint { font-size: 12.5px; color: #7e8ba3; }
+      .bar {
+        width: 190px;
+        height: 3px;
+        border-radius: 2px;
+        background: #1e293b;
+        overflow: hidden;
+      }
+      .bar::after {
+        content: "";
+        display: block;
+        width: 40%;
+        height: 100%;
+        border-radius: 2px;
+        background: linear-gradient(90deg, transparent, #38bdf8, transparent);
+        animation: sweep 1.25s ease-in-out infinite;
+      }
+      @keyframes sweep {
+        from { transform: translateX(-110%); }
+        to   { transform: translateX(360%); }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .bar::after { animation: none; width: 100%; opacity: 0.5; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="mark">Trade<span>Bot</span></div>
+    <div class="bar"></div>
+    <!-- First launch builds the database and loads the plugins, which is the
+         slow part; later launches skip most of it. -->
+    <div class="hint">Starting engine — first launch takes a moment…</div>
+  </body>
+</html>

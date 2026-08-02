@@ -41,26 +41,38 @@ BOS_VOLUME_CONFIRM_RATIO = 1.15
 VOLUME_LOOKBACK = 20
 
 # ── Default factor weights ───────────────────────────────────────────────────
+#: The macro family was added by taking 0.05 proportionally from the other four
+#: rather than appending on top, because the weights must sum to 1.00. Every
+#: historical score therefore moves by roughly 5% — intended, and worth knowing
+#: before comparing a score taken today against one recorded last week.
 DEFAULT_WEIGHTS: Dict[str, float] = {
-    # volume — 0.32
-    "relative_volume": 0.13,
+    # volume — 0.30
+    "relative_volume": 0.12,
     "volume_at_price": 0.07,
     "delta_imbalance": 0.06,
-    "bos_volume_confirmation": 0.06,
-    # structure — 0.42
+    "bos_volume_confirmation": 0.05,
+    # structure — 0.40
     "htf_alignment": 0.10,
     "structure_aligned": 0.07,
     "zone_quality": 0.06,
-    "premium_discount_depth": 0.07,
+    "premium_discount_depth": 0.06,
     "liquidity_sweep": 0.06,
-    "choch_context": 0.06,
-    # movement — 0.20
+    "choch_context": 0.05,
+    # movement — 0.19
     "displacement_magnitude": 0.07,
     "wick_rejection": 0.05,
-    "atr_momentum": 0.04,
-    "candle_velocity": 0.04,
+    "atr_momentum": 0.035,
+    "candle_velocity": 0.035,
     # risk — 0.06
     "risk_reward": 0.06,
+    # macro — 0.05
+    #
+    # The dollar and the fear gauge. Small on purpose: macro is the weather a
+    # setup trades in, not the setup. It is also the one family that routinely
+    # does not apply — a pair with no USD leg redistributes this weight rather
+    # than scoring a zero, so the instrument's currency composition never costs
+    # it confidence. See app.services.macro_context.
+    "macro_context": 0.05,
 }
 
 FACTOR_FAMILY: Dict[str, str] = {
@@ -79,6 +91,7 @@ FACTOR_FAMILY: Dict[str, str] = {
     "atr_momentum": "movement",
     "candle_velocity": "movement",
     "risk_reward": "risk",
+    "macro_context": "macro",
 }
 
 #: Confidence is capped below 1.0 — a deterministic model should never claim
@@ -88,6 +101,29 @@ MAX_CONFIDENCE = 0.98
 
 def _clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, value))
+
+
+def _redistribute(w: Dict[str, float], family: str) -> None:
+    """Move an unmeasurable family's weight onto the factors that *can* be scored.
+
+    Mutates ``w`` in place. Without this, an instrument that simply cannot carry
+    a family — spot FX with no volume feed, a cross with no dollar leg — would
+    be capped below an otherwise identical setup that can. That is a penalty for
+    the instrument's data or currency composition, not for the setup, and it
+    makes confidence incomparable across a watchlist.
+    """
+    forfeited = sum(w[k] for k in w if FACTOR_FAMILY.get(k) == family)
+    if forfeited <= 0:
+        return
+    rest = {k: v for k, v in w.items() if FACTOR_FAMILY.get(k) != family}
+    rest_total = sum(rest.values())
+    if rest_total > 0:
+        scale = (rest_total + forfeited) / rest_total
+        for k in rest:
+            w[k] = w[k] * scale
+    for k in w:
+        if FACTOR_FAMILY.get(k) == family:
+            w[k] = 0.0
 
 
 @dataclass
@@ -262,12 +298,18 @@ def bos_volume_confirmed(
 
     Returns ``(confirmed, measured_ratio)``. A break on thin volume is the
     classic false break, so this gates the signal rather than merely scoring it.
+
+    A ratio of exactly zero means the bar reported no volume at all. In a series
+    that does carry volume that is a gap in the feed, not a thin break, and the
+    gate has nothing to measure — so it abstains (``True``) rather than
+    condemning the break on missing data. The ratio is still returned as 0.0, so
+    the factor score gives it no credit either way.
     """
     if event_index < 0 or event_index >= len(candles):
         return False, 0.0
     ratio = relative_volume(candles, event_index, lookback)
     if ratio <= 0:
-        return False, 0.0
+        return rolling_mean_volume(candles, event_index, lookback) > 0, 0.0
     return ratio >= threshold, ratio
 
 
@@ -338,12 +380,19 @@ def score_signal(
     choch_index: int = -1,
     htf_bias: Optional[str] = None,
     weights: Optional[Dict[str, float]] = None,
+    macro: Optional[Any] = None,
 ) -> ScoreBreakdown:
     """Score one candidate setup. Pure function of the inputs — no I/O.
 
     ``weights`` overrides the defaults per factor (Phase 3 recalibration feeds
     learned weights in here); unknown keys are ignored and missing keys fall
     back to ``DEFAULT_WEIGHTS``.
+
+    ``macro`` is an ``app.services.macro_context.MacroBias`` — resolved by the
+    caller, never fetched here, because this function is pure and is re-entered
+    once per bar by ``SMCStrategyEngine.backtest``. ``None``, or a bias that
+    reports itself inapplicable, redistributes the macro weight instead of
+    scoring a zero.
     """
     w = dict(DEFAULT_WEIGHTS)
     if weights:
@@ -355,18 +404,33 @@ def score_signal(
     # volume-bearing instrument — a penalty for the data feed, not the setup.
     # Redistribute that weight proportionally over the factors that *can* be
     # measured, so confidence stays comparable across instruments.
-    structure_only = rolling_mean_volume(candles, zone_index) <= 0
+    #
+    # The same reasoning applies one bar at a time. A bar reporting *zero*
+    # volume inside a series that otherwise reports volume is a hole in the
+    # feed, not evidence that nobody traded: Yahoo's 60m gold series carries 15
+    # such bars in 400 (thin hours, rollover, holidays), while its 15m series
+    # has none. Scoring that as thin participation gave rel_vol = 0/mean = 0 and
+    # hard-rejected the setup, which is why H1 gold could publish no setups at
+    # all while M15 on the same instrument published several. Volume that was
+    # never reported is unknown, so the setup falls back to structure scoring
+    # and is surfaced as structure_only rather than silently binned.
+    zone_volume = (
+        float(getattr(candles[zone_index], "volume", 0.0) or 0.0)
+        if 0 <= zone_index < len(candles) else 0.0
+    )
+    series_has_volume = rolling_mean_volume(candles, zone_index) > 0
+    volume_gap_at_zone = series_has_volume and zone_volume <= 0
+    structure_only = (not series_has_volume) or volume_gap_at_zone
     if structure_only:
-        vol_weight = sum(w[k] for k in w if FACTOR_FAMILY.get(k) == "volume")
-        rest = {k: v for k, v in w.items() if FACTOR_FAMILY.get(k) != "volume"}
-        rest_total = sum(rest.values())
-        if rest_total > 0:
-            scale = (rest_total + vol_weight) / rest_total
-            for k in rest:
-                w[k] = w[k] * scale
-        for k in w:
-            if FACTOR_FAMILY.get(k) == "volume":
-                w[k] = 0.0
+        _redistribute(w, "volume")
+
+    # The macro family is the other one that routinely cannot be measured: the
+    # dollar says nothing about EURGBP, and a dead Yahoo feed says nothing about
+    # anything. Same treatment, same reason — the setup is scored on what *can*
+    # be measured rather than docked for what cannot.
+    macro_applicable = bool(macro is not None and getattr(macro, "applicable", False))
+    if not macro_applicable:
+        _redistribute(w, "macro")
 
     factors: List[Factor] = []
 
@@ -386,7 +450,10 @@ def score_signal(
 
     # ── Volume ───────────────────────────────────────────────────────────────
     rel_vol = relative_volume(candles, zone_index)
-    volume_data_available = rolling_mean_volume(candles, zone_index) > 0
+    # False when the bar itself has no reported volume, even if the series does —
+    # the measurement is unavailable for THIS setup, which is what callers care
+    # about when deciding whether the volume gate is applicable.
+    volume_data_available = series_has_volume and not volume_gap_at_zone
     # 1.0× = neutral (0.0), 2.0× or better = full credit.
     add("relative_volume", rel_vol, (rel_vol - 1.0) if rel_vol > 0 else 0.0)
 
@@ -463,6 +530,16 @@ def score_signal(
     else:
         choch_norm = 0.0
     add("choch_context", float(choch_index), choch_norm)
+
+    # ── Macro ────────────────────────────────────────────────────────────────
+    # The bias arrives signed for the long side, so a short reads the same
+    # dollar with the sign flipped. Skipped entirely when inapplicable — its
+    # weight has already been redistributed above, and emitting a zero-weight
+    # factor would put a meaningless "macro_context +0.000" row in the UI
+    # breakdown and in describe().
+    if macro_applicable:
+        macro_norm = float(getattr(macro, "normalized", 0.0) or 0.0)
+        add("macro_context", macro_norm, macro_norm if want_bull else -macro_norm)
 
     # ── Movement ─────────────────────────────────────────────────────────────
     disp = displacement_magnitude(candles, zone_index, atr)

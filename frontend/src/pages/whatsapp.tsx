@@ -1,19 +1,24 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useTranslation } from "next-i18next";
+import { getApiBaseUrl } from "@/services/api";
 import Link from "next/link";
 import dynamic from "next/dynamic";
 
 import Layout from "@/components/Layout";
 import ConnectionStatus from "@/components/ConnectionStatus";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:1448/api/v1";
+// Resolved lazily — the desktop build picks the API port at launch.
+const API_URL = () => getApiBaseUrl();
 
-const WhatsAppSettings = dynamic(() => import("./settings"), { ssr: false });
-const WhatsAppChannels = dynamic(() => import("./channels"), { ssr: false });
-const WhatsAppSignals = dynamic(() => import("./signals"), { ssr: false });
-const WhatsAppSniper = dynamic(() => import("./sniper"), { ssr: false });
+// These live in `pages/whatsapp/`, not alongside this file. Relative to
+// `pages/whatsapp.tsx`, "./settings" and "./signals" resolved to the app's main
+// Settings and Signals pages — wrong component, no error — while "./channels"
+// and "./sniper" had no top-level sibling and failed the production build.
+const WhatsAppSettings = dynamic(() => import("./whatsapp/settings"), { ssr: false });
+const WhatsAppChannels = dynamic(() => import("./whatsapp/channels"), { ssr: false });
+const WhatsAppSignals = dynamic(() => import("./whatsapp/signals"), { ssr: false });
+const WhatsAppSniper = dynamic(() => import("./whatsapp/sniper"), { ssr: false });
 
 const Tabs = [
   { id: "dashboard", label: "Dashboard", icon: "📱" },
@@ -24,7 +29,6 @@ const Tabs = [
 ];
 
 export default function WhatsAppPage() {
-  const { t } = useTranslation("common");
   const [activeTab, setActiveTab] = useState("dashboard");
   const [connected, setConnected] = useState(false);
   const [session, setSession] = useState(null);
@@ -43,7 +47,7 @@ export default function WhatsAppPage() {
 
   const checkConnection = async () => {
     try {
-      const res = await fetch(`${API_URL}/plugins/whatsapp/test-connection`);
+      const res = await fetch(`${API_URL()}/plugins/whatsapp/test-connection`);
       const data = await res.json();
       setConnected(data.any_ok || false);
     } catch {
@@ -54,9 +58,9 @@ export default function WhatsAppPage() {
   const fetchStats = async () => {
     try {
       const [channelsRes, signalsRes, tradesRes] = await Promise.all([
-        fetch(`${API_URL}/plugins/whatsapp/channels`),
-        fetch(`${API_URL}/plugins/whatsapp/signals?status=active&limit=1`),
-        fetch(`${API_URL}/plugins/whatsapp/sniper/trades?status=placed,filled&limit=1`),
+        fetch(`${API_URL()}/plugins/whatsapp/channels`),
+        fetch(`${API_URL()}/plugins/whatsapp/signals?status=active&limit=1`),
+        fetch(`${API_URL()}/plugins/whatsapp/sniper/trades?status=placed,filled&limit=1`),
       ]);
       const channels = await channelsRes.json();
       const signals = await signalsRes.json();
@@ -75,7 +79,7 @@ export default function WhatsAppPage() {
 
   const fetchSession = async () => {
     try {
-      const res = await fetch(`${API_URL}/plugins/whatsapp/session/default/status`);
+      const res = await fetch(`${API_URL()}/plugins/whatsapp/session/default/status`);
       const data = await res.json();
       setSession(data);
     } catch {

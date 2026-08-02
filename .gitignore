@@ -98,3 +98,10 @@ keys/
 
 # MediaPipe face vision model (auto-downloaded by scripts/setup-face-vision.sh)
 backend/app/api/models/*.task
+
+# Desktop app build artifacts (scripts/build-desktop.mjs)
+# resources/ is the staged payload — a full CPython plus the exported frontend,
+# rebuilt from source on every run. .build-cache holds the downloaded runtime.
+desktop/resources/
+dist-desktop/
+.build-cache/

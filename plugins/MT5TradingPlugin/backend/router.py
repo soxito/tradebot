@@ -12,6 +12,7 @@ from sqlalchemy import select, delete
 from loguru import logger
 
 from app.core.database import AsyncSessionLocal
+from app.services.macro_context import resolve_macro_bias
 from plugins.MT5TradingPlugin.backend.models import (
     MT5Base, MT5Account, MT5AccountGroup, MT5AccountGroupMember,
     MT5Order, MT5Position, MT5Deal, MT5CopyProfile, MT5CopySimTrade,
@@ -31,7 +32,8 @@ from plugins.MT5TradingPlugin.backend.schemas import (
     MT5SymbolInfo, MT5EquityPoint,
     MT5SmcAnalyzeResponse, MT5BacktestRequest, MT5BacktestResponse,
     MT5SmcPlaceRequest, MT5SmcAnalyzeDataRequest, MT5BacktestDataRequest,
-    ScalpStartRequest, ScalpStopRequest, ScalpStatusResponse, ScalpTradeInfo,
+    ScalpStartRequest, ScalpStopRequest, ScalpPauseRequest,
+    ScalpStatusResponse, ScalpTradeInfo,
     ScalpSymbolResult, ScalpTradeRow, ScalpUpdateRequest,
 )
 from plugins.MT5TradingPlugin.backend.services.mt5_client import mt5_client, is_pending_order
@@ -1099,6 +1101,31 @@ async def _exchange_candles_fallback(symbol: str, timeframe: str, count: int):
     try:
         from app.exchanges.manager import exchange_manager, SupportedExchange  # type: ignore
 
+        # Non-crypto first. The map below sends XAUUSD to "XAU/USDT", which
+        # Bitget does not list at all — so gold, silver and every FX pair fell
+        # through to an empty chart. market_data serves them properly, and it
+        # anchors metals to spot rather than leaving them on COMEX futures.
+        try:
+            from app.services import market_data  # type: ignore
+
+            if market_data.is_universal_symbol(symbol):
+                ex_tf = _MT5_TF_TO_EX.get((timeframe or "").upper(), "1h")
+                rows, _ticker = await market_data.fetch_ohlcv_universal(
+                    symbol, timeframe=ex_tf, limit=count
+                )
+                if rows:
+                    return candles_from_payload([
+                        {
+                            "time": int(c[0] / 1000),
+                            "open": float(c[1]), "high": float(c[2]),
+                            "low": float(c[3]), "close": float(c[4]),
+                            "volume": float(c[5] or 0),
+                        }
+                        for c in rows
+                    ])
+        except Exception as exc:  # noqa: BLE001 — fall through to the exchanges
+            logger.debug(f"[MT5/strategy] universal candles for {symbol}: {exc}")
+
         ex_symbol = _symbol_to_exchange(symbol)
         if not ex_symbol:
             return []
@@ -1227,6 +1254,15 @@ async def _kronos_from_candles(candles, symbol: str, timeframe: str):
         return None
 
 
+#: Below this predicted move (percent) the forecast is treated as pure noise and
+#: contributes nothing. Deliberately far under the forecast service's own
+#: ``_FLAT_PCT`` of 0.15% — see the note in ``_apply_kronos_to_signals``.
+_KRONOS_NOISE_PCT = 0.02
+
+#: Most a forecast may move a signal's score, at full conviction.
+_KRONOS_MAX_ADJ = 0.25
+
+
 def _apply_kronos_to_signals(analysis: dict, kronos_block: Optional[dict]) -> None:
     """Fuse the Kronos ML forecast into the SMC sniper signals (in place).
 
@@ -1236,31 +1272,56 @@ def _apply_kronos_to_signals(analysis: dict, kronos_block: Optional[dict]) -> No
     Kronos-aligned, high-conviction setups rank first — turning Kronos into an
     active input for *selecting* sniper setups, not just a chart overlay.
 
-    Fully additive and graceful: when no forecast is available the signals keep
-    their original order and the new fields stay ``None``.
+    Why the signed move rather than the up/down/flat label: the forecast service
+    labels anything under ±0.15% as "flat", and over a 12-bar M15 horizon gold
+    is under that almost every cycle. Keying off the label alone therefore threw
+    Kronos away on the very timeframes the live sniper trades — a measured
+    forecast of −0.07% at 65% confidence, against two sell setups it actually
+    agreed with, contributed exactly nothing. "Flat" means *weak*, not *unknown*,
+    so a small lean now nudges the ranking in proportion to its size rather than
+    being discarded.
+
+    Fully additive and graceful: with no forecast, or one that is genuine noise,
+    signals keep their original order and ``kronos_aligned`` stays ``None``.
     """
     signals = analysis.get("signals") if isinstance(analysis, dict) else None
     if not signals:
         return
 
-    direction = (kronos_block or {}).get("direction")  # up | down | flat | None
+    pct = float((kronos_block or {}).get("pct_change", 0.0) or 0.0)
     kconf = float((kronos_block or {}).get("confidence", 0.0) or 0.0)
-    have_dir = direction in ("up", "down")
+    direction = (kronos_block or {}).get("direction")  # up | down | flat | None
+
+    # A lean exists whenever the move clears the noise floor, whatever the label.
+    lean = "up" if pct > _KRONOS_NOISE_PCT else "down" if pct < -_KRONOS_NOISE_PCT else None
+
+    # Conviction: how decisive the move is, scaled by the model's own confidence.
+    # A labelled up/down forecast is by definition past the flat threshold, so it
+    # starts from a meaningful magnitude; a flat-but-leaning one stays gentle.
+    decisive = min(1.0, abs(pct) / 0.45)
+    conviction = decisive * (0.5 + 0.5 * max(0.0, min(1.0, kconf)))
 
     for sig in signals:
         conf = float(sig.get("confidence", 0.0) or 0.0)
-        if not have_dir:
+        if lean is None:
             # No usable forecast — fusion score == SMC confidence, no alignment.
             sig["kronos_aligned"] = None
             sig["fusion_score"] = round(conf, 3)
+            sig["kronos_note"] = (
+                "no Kronos forecast" if not kronos_block
+                else f"Kronos flat ({pct:+.2f}%) — no directional input"
+            )
             continue
         side = sig.get("side")
-        aligned = (side == "buy" and direction == "up") or (side == "sell" and direction == "down")
+        aligned = (side == "buy" and lean == "up") or (side == "sell" and lean == "down")
         sig["kronos_aligned"] = bool(aligned)
-        # Agreement contributes up to +0.25, opposition subtracts up to −0.25,
-        # scaled by the forecast confidence. SMC confidence remains the anchor.
-        adj = (kconf * 0.25) if aligned else -(kconf * 0.25)
-        sig["fusion_score"] = round(max(0.0, min(1.0, conf + adj)), 3)
+        adj = conviction * _KRONOS_MAX_ADJ
+        sig["fusion_score"] = round(max(0.0, min(1.0, conf + (adj if aligned else -adj))), 3)
+        sig["kronos_note"] = (
+            f"Kronos {direction or lean} {pct:+.2f}% @ {kconf:.0%} conf — "
+            f"{'agrees' if aligned else 'opposes'} this {side} "
+            f"({'+' if aligned else '-'}{adj:.3f})"
+        )
 
     # Re-rank: aligned first, then by fusion score (opposed setups sink).
     signals.sort(
@@ -1313,7 +1374,11 @@ async def smc_analyze(
         contract_size=contract_size_for_symbol(symbol),
         factor_weights=weights,
     )
-    analysis = engine.analyze(candles, htf_candles=htf_candles)
+    # Dollar / VIX context. Resolved here rather than inside the engine because
+    # analyze() is synchronous and backtest() re-enters it once per bar; a
+    # failure returns an inapplicable bias, which scores the setup without it.
+    macro = await resolve_macro_bias(symbol)
+    analysis = engine.analyze(candles, htf_candles=htf_candles, macro=macro)
 
     kronos_block = await _kronos_from_candles(candles, symbol, timeframe)
     # Fuse Kronos into signal selection (tags alignment, re-ranks setups).
@@ -1398,7 +1463,8 @@ async def smc_analyze_data(data: MT5SmcAnalyzeDataRequest):
         us_session_only=data.us_session_only,
         factor_weights=weights,
     )
-    analysis = engine.analyze(candles, htf_candles=htf_candles)
+    macro = await resolve_macro_bias(data.symbol)
+    analysis = engine.analyze(candles, htf_candles=htf_candles, macro=macro)
 
     kronos_block = await _kronos_from_candles(candles, data.symbol, data.timeframe)
     # Fuse Kronos into signal selection (tags alignment, re-ranks setups).
@@ -2134,6 +2200,81 @@ async def scalp_stop(data: ScalpStopRequest):
     for s in sessions:
         await scalp_bot_manager.stop(s.id)
     return {"stopped": [s.id for s in sessions]}
+
+
+@router.post("/scalp/pause")
+async def scalp_pause(data: ScalpPauseRequest):
+    """Pause running bots without tearing them down.
+
+    Distinct from /scalp/stop: the session rows survive with their symbol and
+    settings intact, so /scalp/resume puts the same bots back with no pair
+    re-selection. Open positions are left alone — pausing stops the bot
+    deciding, it does not liquidate.
+    """
+    wanted = {s.upper() for s in (data.symbols or [])}
+    async with AsyncSessionLocal() as db:
+        rows = await db.execute(
+            select(MT5ScalpSession).where(
+                MT5ScalpSession.account_id == data.account_id,
+                MT5ScalpSession.status == MT5ScalpSessionStatus.ACTIVE,
+            )
+        )
+        sessions = [
+            s for s in rows.scalars().all()
+            if not wanted or str(s.symbol).upper() in wanted
+        ]
+    if not sessions:
+        raise HTTPException(404, "No active scalp session to pause")
+    for s in sessions:
+        await scalp_bot_manager.pause(s.id)
+    return {"paused": [{"id": s.id, "symbol": s.symbol} for s in sessions]}
+
+
+@router.post("/scalp/resume", response_model=List[ScalpStatusResponse])
+async def scalp_resume(data: ScalpPauseRequest):
+    """Resume paused bots from their own stored settings.
+
+    Everything needed is already on the row — symbol, lot, risk, timeframe and
+    the full original request in ``raw_settings`` — so resuming needs nothing
+    from the client but the account. This is what makes "unpause" a single
+    click instead of stop-all-and-rebuild.
+    """
+    wanted = {s.upper() for s in (data.symbols or [])}
+    async with AsyncSessionLocal() as db:
+        rows = await db.execute(
+            select(MT5ScalpSession).where(
+                MT5ScalpSession.account_id == data.account_id,
+                MT5ScalpSession.status == MT5ScalpSessionStatus.PAUSED,
+            )
+        )
+        sessions = [
+            s for s in rows.scalars().all()
+            if not wanted or str(s.symbol).upper() in wanted
+        ]
+        if not sessions:
+            raise HTTPException(404, "No paused scalp session to resume")
+        session_ids = []
+        for s in sessions:
+            s.status = MT5ScalpSessionStatus.ACTIVE
+            s.phase = "analyzing"
+            s.error_msg = None
+            # The restart notice is what told the user to click Start; leaving
+            # it would keep the warning banner up on a bot that is now running.
+            if s.ai_note and "restart" in str(s.ai_note).lower():
+                s.ai_note = None
+            session_ids.append(s.id)
+        await db.commit()
+
+    for sid in session_ids:
+        scalp_bot_manager.start(sid)
+
+    async with AsyncSessionLocal() as db:
+        out = []
+        for sid in session_ids:
+            session = await db.get(MT5ScalpSession, sid)
+            if session is not None:
+                out.append(await _scalp_status_payload(db, session))
+        return out
 
 
 @router.get("/scalp/status/{account_id}", response_model=List[ScalpStatusResponse])

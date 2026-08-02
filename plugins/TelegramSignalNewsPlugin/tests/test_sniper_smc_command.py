@@ -309,3 +309,58 @@ def test_ai_text_is_html_escaped():
 def test_help_documents_the_new_form():
     text, _ = asyncio.run(cs._handle_help("", _FakeDB()))
     assert "/sniper XAUUSD 1h" in text
+
+
+# ── Macro context reaches the Telegram card ──────────────────────────────────
+# The card used to print no reason at all — only the AI block's prose — so every
+# deterministic factor behind the score was invisible here.
+
+def _resp_with(macro, reason="Discount, order block, macro DXY -0.20% risk-on (+0.31); RR 2.0; score 0.71"):
+    class _Sig:
+        side, order_type, entry, stop_loss, take_profit = "buy", "limit", 100.0, 98.0, 104.0
+        rr, confidence, zone_kind = 2.0, 0.71, "order_block"
+        kronos_aligned, fusion_score = True, 0.8
+
+    _Sig.reason = reason
+
+    class _Resp:
+        symbol, timeframe, error = "XAUUSD", "1h", None
+        bias, momentum, last_price = "bullish", "up", 4107.0
+        atr, atr_pct, rsi, volume_z = 5.0, 0.1, 52.0, 0.3
+        equilibrium, range = 4100.0, {"low": 4050.0, "high": 4150.0}
+        structure_events, zones, liquidity = [], [], {}
+        signals = [_Sig()]
+        kronos, ai = None, None
+
+    _Resp.macro = macro
+    return _Resp()
+
+
+def test_the_card_states_the_macro_read_when_it_applied():
+    card = cs._fmt_sniper_analysis(_resp_with({
+        "applied": True,
+        "regime": "RISK_ON",
+        "reason": "DXY -0.20% / VIX 15.9 risk-on (+0.31)",
+        "lines": ["DXY 99.803 (-0.20%) is offered; USD is the quote leg of XAUUSD."],
+    }))
+
+    assert "Macro" in card
+    assert "DXY" in card
+    assert "quote leg" in card
+
+
+def test_the_card_says_so_when_macro_did_not_apply():
+    """A pair with no USD leg still signals — and still explains itself."""
+    card = cs._fmt_sniper_analysis(_resp_with({
+        "applied": False,
+        "reason": "macro n/a (no USD leg)",
+        "lines": [],
+    }))
+
+    assert "not applied" in card
+    assert "no USD leg" in card
+
+
+def test_the_per_signal_reason_now_reaches_the_user():
+    card = cs._fmt_sniper_analysis(_resp_with({"applied": False, "reason": "x", "lines": []}))
+    assert "order block" in card and "score 0.71" in card

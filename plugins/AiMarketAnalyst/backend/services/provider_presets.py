@@ -448,10 +448,11 @@ PROVIDER_PRESETS: list[dict[str, Any]] = [
         "type": "openai_compatible",
         "base_url": "https://api.groq.com/openai/v1",
         "default_model": "llama-3.3-70b-versatile",
+        # Verified against the live API. Removed: qwen/qwen3-32b and
+        # meta-llama/llama-4-scout-17b-16e-instruct — both 404 "does not exist".
         "models": [
-            "llama-3.3-70b-versatile", "llama-3.1-8b-instant", "qwen/qwen3-32b",
+            "llama-3.3-70b-versatile", "llama-3.1-8b-instant",
             "openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b",
-            "meta-llama/llama-4-scout-17b-16e-instruct",
         ],
         "free_tier": True,
         "daily_limit": 1000,
@@ -465,13 +466,12 @@ PROVIDER_PRESETS: list[dict[str, Any]] = [
         "type": "openai_compatible",
         "base_url": "https://openrouter.ai/api/v1",
         "default_model": "google/gemma-4-31b-it:free",
+        # Verified against the live API. Removed four ids that now answer
+        # 404 "This model is unavailable for free. The paid version is
+        # available" — OpenRouter moves models off the free tier over time.
         "models": [
             "google/gemma-4-31b-it:free",
             "google/gemma-4-26b-a4b-it:free",
-            "meta-llama/llama-3.3-70b-instruct:free",
-            "qwen/qwen3-next-80b-a3b-instruct:free",
-            "nousresearch/hermes-3-llama-3.1-405b:free",
-            "qwen/qwen3-coder:free",
         ],
         "free_tier": True,
         "daily_limit": 50,
@@ -485,9 +485,14 @@ PROVIDER_PRESETS: list[dict[str, Any]] = [
         "type": "openai_compatible",
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
         "default_model": "gemini-3.1-flash-lite",
+        # Verified against the live API. Removed gemini-3.1-flash and
+        # gemini-3-flash — both 404 "is not found for API version v1beta".
+        # The 2.x entries could only be seen rate-limited, not absent, so they
+        # stay: a 429 says nothing about whether a model exists.
         "models": [
-            "gemini-3.1-flash-lite", "gemini-3.1-flash", "gemini-3-flash",
-            "gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-lite",
+            "gemini-3.1-flash-lite",
+            "gemini-2.5-flash-lite", "gemini-2.5-flash",
+            "gemini-2.0-flash", "gemini-2.0-flash-lite",
         ],
         "free_tier": True,
         "daily_limit": 500,
@@ -565,19 +570,27 @@ PROVIDER_PRESETS: list[dict[str, Any]] = [
         "label": "NVIDIA NIM",
         "type": "openai_compatible",
         "base_url": "https://integrate.api.nvidia.com/v1",
+        # NVIDIA lists models in /v1/models that have no inference function
+        # deployed: they answer 404 "Function '<uuid>': Not found" on
+        # /chat/completions while looking perfectly available in the catalog.
+        # Every id below was verified against a live account by calling
+        # /chat/completions, and the first two additionally return parseable
+        # output under `response_format: json_object`, which is what the
+        # research path needs. Undeployed ids that used to be listed here
+        # (llama-3.1-nemotron-ultra-253b-v1, -70b-instruct, -51b-instruct,
+        # nemotron-4-340b-instruct) are removed — a catalog listing is not
+        # evidence that a model will serve.
         "default_model": "nvidia/nemotron-3-super-120b-a12b",
         "models": [
             "nvidia/nemotron-3-super-120b-a12b",
-            "nvidia/llama-3.1-nemotron-ultra-253b-v1",
-            "nvidia/llama-3.3-nemotron-super-49b-v1",
-            "meta/llama-3.1-405b-instruct",
+            "nvidia/nemotron-3-ultra-550b-a55b",
+            "deepseek-ai/deepseek-v4-flash",
             "meta/llama-3.3-70b-instruct",
-            "deepseek-ai/deepseek-r1-distill-llama-70b",
-            "mistralai/mistral-large-2411",
-            "mistralai/mixtral-8x22b-instruct-v0.1",
-            "qwen/qwen2.5-72b-instruct",
-            "google/gemma-3-27b-it",
-            "moonshotai/kimi-k2-instruct",
+            "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+            "nvidia/llama-3.3-nemotron-super-49b-v1",
+            "nvidia/nemotron-3-nano-30b-a3b",
+            "nvidia/nvidia-nemotron-nano-9b-v2",
+            "nvidia/nemotron-mini-4b-instruct",
         ],
         "free_tier": True,
         "daily_limit": None,
@@ -591,15 +604,11 @@ PROVIDER_PRESETS: list[dict[str, Any]] = [
         "type": "openai_compatible",
         "base_url": "https://api.sambanova.ai/v1",
         "default_model": "Meta-Llama-3.3-70B-Instruct",
+        # Verified against the live API: only this one still serves. The other
+        # seven answer 410 "not available on SambaNova Cloud" (or 404), which is
+        # the platform having retired them, not a credential problem.
         "models": [
             "Meta-Llama-3.3-70B-Instruct",
-            "Meta-Llama-3.1-405B-Instruct",
-            "DeepSeek-V3-0324",
-            "DeepSeek-R1",
-            "Llama-4-Scout-17B-16E-Instruct",
-            "Llama-4-Maverick-17B-128E-Instruct",
-            "Qwen3-32B",
-            "Qwen3-72B",
         ],
         "free_tier": True,
         "daily_limit": None,
@@ -667,22 +676,26 @@ PROVIDER_PRESETS: list[dict[str, Any]] = [
         "key": "github_models",
         "label": "GitHub Models",
         "type": "openai_compatible",
-        "base_url": "https://models.inference.ai.azure.com",
-        "default_model": "gpt-4o",
+        # `models.inference.ai.azure.com` is the retired preview host and now
+        # answers 401 regardless of how good the token is. The current endpoint
+        # is models.github.ai, and it requires the `publisher/model` form —
+        # sending a bare `gpt-4o` there 404s.
+        "base_url": "https://models.github.ai/inference",
+        "default_model": "openai/gpt-4o",
         "models": [
-            "o3",
-            "o3-mini",
-            "gpt-4o",
-            "gpt-4o-mini",
-            "Llama-4-Scout-17B-16E-Instruct",
-            "DeepSeek-R1",
-            "Ministral-3B",
+            "openai/o3",
+            "openai/o3-mini",
+            "openai/gpt-4o",
+            "openai/gpt-4o-mini",
+            "meta/Llama-4-Scout-17B-16E-Instruct",
+            "deepseek/DeepSeek-R1",
+            "mistral-ai/Ministral-3B",
         ],
         "free_tier": False,
         "daily_limit": None,
         "monthly_limit": None,
         "signup_url": "https://github.com/settings/tokens",
-        "notes": "GitHub Models subscription — OpenAI o3, o3-mini, GPT-4o, Llama-4-Scout, DeepSeek-R1. Use GitHub PAT as API key. Note: Anthropic Claude and Grok models were removed from GitHub Models catalog in July 2026.",
+        "notes": "RETIRED BY GITHUB — every endpoint, including the model catalog, answers HTTP 410 `github_models_retirement_brownout`. No API key, base URL or model id restores it, so none of the models below can be verified or used. Kept only so an existing install shows why it stopped rather than silently losing its configuration. The same models are available elsewhere: GPT-4o/o3 via OpenAI, DeepSeek-R1 via NVIDIA NIM, Llama via Groq or NVIDIA NIM.",
     },
     {
         "key": "hyperbolic",

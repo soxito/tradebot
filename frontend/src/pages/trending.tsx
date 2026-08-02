@@ -13,6 +13,8 @@ import {
   Flame,
 } from 'lucide-react'
 import { formatTimeZA } from '@/utils/datetime'
+import ResearchEntries, { ResearchVerdictBadge } from '@/components/research/ResearchEntries'
+import { useResearchPlans } from '@/hooks/useResearchPlans'
 
 interface TrendingCoin {
   id: string
@@ -45,6 +47,10 @@ export default function TrendingPage() {
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [lastUpdated, setLastUpdated] = useState<string | null>(null)
+
+  // Research is per pair, not per signal — one plan covers whatever signals the
+  // app currently holds on this coin.
+  const { planFor } = useResearchPlans(trending.map((c) => c.symbol))
 
   const fetchData = useCallback(async (showRefresh = false) => {
     if (showRefresh) setRefreshing(true)
@@ -218,6 +224,7 @@ export default function TrendingPage() {
                         <span className="text-[10px] text-gray-500">#{coin.market_cap_rank}</span>
                       )}
                       {getStatusBadge(coin.symbol)}
+                      <ResearchVerdictBadge plan={planFor(coin.symbol)} />
                     </div>
                   </div>
 
@@ -251,6 +258,14 @@ export default function TrendingPage() {
                         className="w-full h-8 opacity-50"
                         style={{ filter: isPositive ? 'hue-rotate(100deg) brightness(1.5)' : 'hue-rotate(0deg) brightness(1.2)' }}
                       />
+                    </div>
+                  )}
+
+                  {/* Every live signal on this pair, reconciled into two
+                      costed entries. Absent until the pair has been researched. */}
+                  {planFor(coin.symbol) && (
+                    <div className="mt-2">
+                      <ResearchEntries plan={planFor(coin.symbol)} compact />
                     </div>
                   )}
 
@@ -301,6 +316,7 @@ export default function TrendingPage() {
                           <span className="text-white font-medium">{coin.symbol}</span>
                           <span className="text-gray-500 text-xs">{coin.name}</span>
                           {getStatusBadge(coin.symbol)}
+                      <ResearchVerdictBadge plan={planFor(coin.symbol)} />
                         </div>
                       </td>
                       <td className="py-2 px-4 text-right text-white">{formatPrice(coin.price_usd)}</td>
@@ -346,6 +362,7 @@ export default function TrendingPage() {
                           <span className="text-white font-medium">{coin.symbol}</span>
                           <span className="text-gray-500 text-xs">{coin.name}</span>
                           {getStatusBadge(coin.symbol)}
+                      <ResearchVerdictBadge plan={planFor(coin.symbol)} />
                         </div>
                       </td>
                       <td className="py-2 px-4 text-right text-white">{formatPrice(coin.price_usd)}</td>

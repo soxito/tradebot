@@ -19,7 +19,7 @@ import math
 import os
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -57,9 +57,9 @@ def _is_forex(symbol: str) -> bool:
 
     ``forex_provider`` only knows seven majors plus gold/silver, so Yahoo's
     resolver is consulted too: it covers every FX cross, index and commodity in
-    ``yahoo_provider.YAHOO_TICKERS``. Yahoo's ``-USD`` spellings are its *crypto*
-    tickers and are deliberately excluded — crypto stays on the exchange
-    connectors, which carry deeper history and real traded volume.
+    ``yahoo_provider.YAHOO_TICKERS`` plus the crosses it synthesises from two
+    USD legs (XAUEUR). Crypto is excluded on both branches — it stays on the
+    exchange connectors, which carry deeper history and real traded volume.
     """
     try:
         from app.exchanges.forex_provider import is_forex_symbol
@@ -69,17 +69,19 @@ def _is_forex(symbol: str) -> bool:
         pass
     try:
         from app.exchanges import yahoo_provider
-        ticker = yahoo_provider.resolve_ticker(symbol)
-        return bool(ticker) and not ticker.endswith("-USD")
+        return yahoo_provider.supports_non_crypto(symbol)
     except Exception:
         return False
 
 
 #: ccxt timeframe → the MT5-style timeframe ``yahoo_provider`` speaks. Anything
-#: absent here (3m, 2h, 6h, 12h, 3d) has no Yahoo bar and falls back.
+#: absent here (3m, 3d) has no Yahoo bar and falls back: Yahoo serves no 3m
+#: interval, and folding 3d out of daily bars would merge sessions that are
+#: stamped at each exchange's own open rather than on a UTC grid.
 _YF_TIMEFRAME: Dict[str, str] = {
     "1m": "M1", "5m": "M5", "15m": "M15", "30m": "M30",
-    "1h": "H1", "4h": "H4", "1d": "D1", "1w": "W1",
+    "1h": "H1", "2h": "H2", "4h": "H4", "6h": "H6", "12h": "H12",
+    "1d": "D1", "1w": "W1",
 }
 
 
@@ -163,6 +165,17 @@ def _symbol_variants(symbol: str) -> List[str]:
             if s.endswith(q) and len(s) > len(q):
                 _add(f"{s[:-len(q)]}/{q}")
                 break
+
+    # MT5 lists its crypto CFDs against USD (BTCUSD), but the connectors quote
+    # USDT — none of them has a BTC/USD market, so /forecast BTCUSD from a
+    # Telegram user reading their MT5 watchlist found no candles at all. The
+    # stablecoin pair is the same instrument for forecasting purposes, so try it
+    # after the literal spelling rather than instead of it.
+    for base_sym in list(variants):
+        if base_sym.endswith("/USD"):
+            _add(f"{base_sym[:-4]}/USDT")
+        elif base_sym.endswith("USD") and not base_sym.endswith("USDT"):
+            _add(f"{base_sym}T")
     return variants
 
 
@@ -394,6 +407,7 @@ def _volume_gated_signal(
     *,
     symbol: str,
     horizon_label: str,
+    macro: Any = None,
 ) -> ForecastSignal:
     """Build the forecast signal *after* the volume gate.
 
@@ -408,7 +422,7 @@ def _volume_gated_signal(
     if ctx.status != "OK":
         rationale = volctx.direction_rationale(
             direction, ctx, agreement=agree, dispersion=dispersion,
-            confidence=0.0, decision="NO_TRADE",
+            confidence=0.0, decision="NO_TRADE", macro=macro,
         )
         return ForecastSignal(
             direction="no_trade", pct_change=0.0, confidence=0.0,
@@ -420,11 +434,11 @@ def _volume_gated_signal(
             rationale=rationale,
         )
 
-    confidence = volctx.score_confidence(direction, agree, dispersion, ctx)
+    confidence = volctx.score_confidence(direction, agree, dispersion, ctx, macro)
     decision = volctx.decide(confidence, ctx)
     rationale = volctx.direction_rationale(
         direction, ctx, agreement=agree, dispersion=dispersion,
-        confidence=confidence, decision=decision,
+        confidence=confidence, decision=decision, macro=macro,
     )
     arrow = "▲" if direction == "up" else ("▼" if direction == "down" else "→")
     summary = (
@@ -535,6 +549,23 @@ async def _fetch_volume_ohlcv(
     if _is_forex(symbol):
         return await _fetch_yahoo_ohlcv(symbol, timeframe, limit)
     return await _fetch_ohlcv(exchange, symbol, timeframe, limit)
+
+
+async def _resolve_macro(symbol: str) -> Any:
+    """The dollar / VIX read for *symbol*, or an inapplicable bias.
+
+    Never raises and never gates: macro shapes confidence by at most ±10% (see
+    ``volume_context.macro_multiplier``) and an outage leaves it untouched. The
+    snapshot underneath is cached for 15 minutes, so a batch of forecasts costs
+    one fetch.
+    """
+    try:
+        from app.services.macro_context import resolve_macro_bias
+
+        return await resolve_macro_bias(symbol)
+    except Exception as exc:  # noqa: BLE001 — context is a bonus, never a gate
+        logger.debug(f"[Kronos] macro context unavailable for {symbol}: {exc}")
+        return None
 
 
 async def _resolve_volume(
@@ -693,6 +724,10 @@ async def run_forecast(
     # ── Volume gate: resolved BEFORE inference. No forecast is emitted without
     # it, and there is no silent fallback to a price-only prediction. ──────────
     vol_ctx = await _resolve_volume(exchange, symbol, timeframe, rows)
+    # Macro context — the dollar and the fear gauge this instrument trades in.
+    # Resolved next to the volume gate but never gating: an unavailable read
+    # returns an inapplicable bias and leaves confidence untouched.
+    macro_bias = await _resolve_macro(symbol)
     if vol_ctx.status != "OK":
         logger.info(
             f"[Kronos] NO_TRADE {symbol} {timeframe} — volume {vol_ctx.status}: {vol_ctx.detail}"
@@ -742,7 +777,7 @@ async def run_forecast(
     horizon_label = f"{pred_len}×{timeframe}"
     signal = _volume_gated_signal(
         paths, anchor_price, pred_len, vol_ctx,
-        symbol=symbol, horizon_label=horizon_label,
+        symbol=symbol, horizon_label=horizon_label, macro=macro_bias,
     )
     overlays, markers = _build_overlays(
         forecast, upper, lower, anchor_unix, anchor_price, signal.direction
@@ -832,18 +867,24 @@ async def forecast_from_rows(
     y_ts, future_unix = _future_timestamps(anchor_unix, step, pred_len)
 
     # ── Volume gate (before inference) ───────────────────────────────────────
-    # The caller's rows are the only guaranteed source here (MT5 symbols are not
-    # listed on the crypto connectors), so the exchange refetch is only offered
-    # for symbols the connectors can actually price.
-    _fetcher = None
-    if exchange != "mt5":
-        async def _fetcher(sym: str, tf: str, limit: int) -> List[list]:  # noqa: F811
-            return await _fetch_volume_ohlcv(exchange, sym, tf, limit)
+    # The 24h volume statistics are built from whole clock hours, so bars longer
+    # than an hour (H4, D1) cannot back the gate on their own and the resolver
+    # re-fetches at 1h. That re-fetch used to be withheld whenever the caller
+    # said "mt5", on the reasoning that MT5 symbols are not listed on the crypto
+    # connectors — but _fetch_volume_ohlcv already routes FX, metals and indices
+    # to Yahoo, which prices them hourly perfectly well. Withholding it meant the
+    # MT5 sniper chart — which always passes exchange="mt5" — could never resolve
+    # volume above H1, so gold on H4 was a permanent NO_TRADE with no forecast
+    # and no chart overlay. Offer the fetcher and let it decide by symbol; a
+    # symbol nothing can price still returns [] and the gate still refuses.
+    async def _fetcher(sym: str, tf: str, limit: int) -> List[list]:
+        return await _fetch_volume_ohlcv(exchange, sym, tf, limit)
 
     vol_ctx = await volctx.resolve_volume_context(
         symbol=symbol, timeframe=timeframe, rows=rows, fetcher=_fetcher,
         volume_unit=_volume_unit(exchange, symbol),
     )
+    macro_bias = await _resolve_macro(symbol)
     if vol_ctx.status != "OK":
         logger.info(
             f"[Kronos] NO_TRADE {symbol} {timeframe} (rows) — volume "
@@ -879,7 +920,7 @@ async def forecast_from_rows(
     horizon_label = f"{pred_len}\u00d7{timeframe}"
     signal = _volume_gated_signal(
         paths, anchor_price, pred_len, vol_ctx,
-        symbol=symbol, horizon_label=horizon_label,
+        symbol=symbol, horizon_label=horizon_label, macro=macro_bias,
     )
     overlays, markers = _build_overlays(
         forecast, upper, lower, anchor_unix, anchor_price, signal.direction

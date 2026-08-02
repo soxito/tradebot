@@ -18,10 +18,22 @@
         "--loop", "asyncio",
         "--reload",
         "--reload-dir", "app",
-        "--reload-dir", "../plugins"
+        "--reload-dir", "../plugins",
+        "--timeout-graceful-shutdown", "5"
       ],
       "cwd": "backend",
       "port": 1448
+    },
+    {
+      "name": "speech-engine",
+      "runtimeExecutable": ".venv/bin/uvicorn",
+      "runtimeArgs": [
+        "main:app",
+        "--host", "0.0.0.0",
+        "--port", "8790"
+      ],
+      "cwd": "speech_engine",
+      "port": 8790
     }
   ]
 }

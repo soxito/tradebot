@@ -171,14 +171,13 @@ class SimulationEngine:
             )
         )
         positions = result.scalars().all()
-        connector = exchange_manager.get_exchange(SupportedExchange.BITGET)
+        from app.services import market_data
 
         for pos in positions:
             try:
-                if not connector:
-                    continue
-                ticker = await connector.get_ticker(pos.symbol)
-                current_price = ticker.get("last") or ticker.get("close")
+                # Routed by asset class: a gold or FX position must not be
+                # priced off a crypto exchange that has never listed it.
+                current_price = await market_data.live_price(pos.symbol, db=db)
                 if not current_price:
                     continue
                 pos.current_price = current_price
@@ -642,9 +641,12 @@ class SimulationEngine:
         if position:
             # Fetch current price for PnL calculation
             try:
-                connector = exchange_manager.get_exchange(SupportedExchange.BITGET)
-                ticker = await connector.get_ticker(position.symbol)
-                current_price = ticker.get("last", position.entry_price)
+                from app.services import market_data
+
+                current_price = (
+                    await market_data.live_price(position.symbol, db=db)
+                    or position.entry_price
+                )
             except Exception:
                 current_price = position.entry_price
 
@@ -692,9 +694,12 @@ class SimulationEngine:
 
         # Fetch current price
         try:
-            connector = exchange_manager.get_exchange(SupportedExchange.BITGET)
-            ticker = await connector.get_ticker(position.symbol)
-            current_price = ticker.get("last", position.entry_price)
+            from app.services import market_data
+
+            current_price = (
+                await market_data.live_price(position.symbol, db=db)
+                or position.entry_price
+            )
         except Exception:
             current_price = position.entry_price
 
@@ -763,9 +768,11 @@ class SimulationEngine:
         results = []
         for pos in positions:
             try:
-                connector = exchange_manager.get_exchange(SupportedExchange.BITGET)
-                ticker = await connector.get_ticker(pos.symbol)
-                current_price = ticker.get("last", pos.entry_price)
+                from app.services import market_data
+
+                current_price = (
+                    await market_data.live_price(pos.symbol, db=db) or pos.entry_price
+                )
             except Exception:
                 current_price = pos.entry_price
 
@@ -816,14 +823,14 @@ class SimulationEngine:
         closed = []
 
         for pos in positions:
-            # Fetch current price — try Bitget first, fall back to sniper price service
-            # (which handles forex pairs like XAUUSD, EURUSD via the free FX API).
+            # Priced by asset class: crypto off the exchange, everything else
+            # off the live MT5 account first. Asking the exchange for XAUUSD or
+            # EURUSD only produces an ERROR log line before the fallback runs.
             current_price = None
             try:
-                connector = exchange_manager.get_exchange(SupportedExchange.BITGET)
-                if connector:
-                    ticker = await connector.get_ticker(pos.symbol)
-                    current_price = ticker.get("last") or ticker.get("close")
+                from app.services import market_data
+
+                current_price = await market_data.live_price(pos.symbol, db=db)
             except Exception:
                 pass
 
@@ -1175,12 +1182,11 @@ class SimulationEngine:
             # Fetch current market price to decide order type
             current_market_price = price  # fallback to signal price
             try:
-                connector_check = exchange_manager.get_exchange(SupportedExchange.BITGET)
-                if connector_check:
-                    ticker = await connector_check.get_ticker(symbol)
-                    mkt = float(ticker.get("last") or ticker.get("close") or 0)
-                    if mkt > 0:
-                        current_market_price = mkt
+                from app.services import market_data
+
+                mkt = await market_data.live_price(symbol, db=db)
+                if mkt and mkt > 0:
+                    current_market_price = mkt
             except Exception:
                 pass
 

@@ -249,8 +249,12 @@ export default function Layout({ children }: { children: React.ReactNode }) {
           <ConnectionStatus />
         </header>
 
-        {/* Page Content */}
-        <main className="flex-1 p-4 md:p-6 overflow-auto">{children}</main>
+        {/* Page Content.
+            `data-jarvis-stage` marks this as the roaming area for the floating
+            JARVIS robot: it is the centre column between the sidebar and the
+            viewport edge, and its rect tracks the sidebar collapse animation,
+            so the robot never has to guess where the content starts. */}
+        <main data-jarvis-stage className="flex-1 p-4 md:p-6 overflow-auto">{children}</main>
       </div>
 
       {/* PAUL JARVIS — global floating assistant (available on every page) */}

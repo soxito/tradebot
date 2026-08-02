@@ -1195,7 +1195,12 @@ async def crypto_smc_analyze(
         contract_size=contract_size_for_symbol(symbol),
         factor_weights=weights,
     )
-    analysis = engine.analyze(candles, htf_candles=htf_candles)
+    # Same dollar/VIX context the MT5 path scores with — this endpoint runs the
+    # same engine on crypto candles, and the two must not diverge.
+    from app.services.macro_context import resolve_macro_bias
+
+    macro = await resolve_macro_bias(symbol)
+    analysis = engine.analyze(candles, htf_candles=htf_candles, macro=macro)
 
     if use_ai:
         try:

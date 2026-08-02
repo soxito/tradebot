@@ -2,63 +2,95 @@ import { test, expect } from '@playwright/test'
 
 test.describe('JARVIS Robot Improvements', () => {
   test.beforeEach(async ({ page }) => {
+    // PaulChat only mounts the WebGL robot on a high/ultra GPU tier. Headless CI
+    // never qualifies, so without this override every robot assertion below is
+    // silently vacuous.
+    await page.addInitScript(() => localStorage.setItem('paul.forceRobot', '1'))
     await page.goto('/')
     await page.waitForLoadState('networkidle')
     // Wait for PaulChat to mount
-    await page.waitForSelector('[title*="JARVIS"], [data-testid="jarvis-robot"]', { timeout: 10000 })
+    await page.waitForSelector('[data-testid="jarvis-robot"]', { timeout: 10000 })
   })
 
-  test('Robot spawns at bottom center', async ({ page }) => {
-    const robot = page.locator('[title*="JARVIS"]').first()
+  test('Robot walks the bottom band of the content area', async ({ page }) => {
+    const robot = page.locator('[data-testid="jarvis-robot"]')
     const box = await robot.boundingBox()
-    const viewport = page.viewportSize()
-    
+    const stage = await page.locator('[data-jarvis-stage]').boundingBox()
+
     expect(box).toBeTruthy()
-    if (!box || !viewport) return
-    
-    // Bottom 15% of screen
-    expect(box.y).toBeGreaterThan(viewport.height * 0.85)
-    // Center horizontally (±10%)
-    expect(box.x + box.width / 2).toBeCloseTo(viewport.width / 2, -1)
+    expect(stage).toBeTruthy()
+    if (!box || !stage) return
+
+    // Inside the content column, not the viewport corner…
+    expect(box.x).toBeGreaterThanOrEqual(stage.x - 1)
+    expect(box.x + box.width).toBeLessThanOrEqual(stage.x + stage.width + 1)
+    // …and standing on the bottom band.
+    expect(box.y + box.height).toBeGreaterThan(stage.y + stage.height - 80)
   })
 
   test('Robot roams horizontally only', async ({ page }) => {
-    const robot = page.locator('[title*="JARVIS"]').first()
+    const robot = page.locator('[data-testid="jarvis-robot"]')
     const positions: { x: number; y: number }[] = []
-    
+
     // Track position for 5 seconds
     for (let i = 0; i < 25; i++) {
       const box = await robot.boundingBox()
       if (box) positions.push({ x: box.x, y: box.y })
       await page.waitForTimeout(200)
     }
-    
+
     // Y variance should be minimal (< 30px)
     const ys = positions.map(p => p.y)
     const yVariance = Math.max(...ys) - Math.min(...ys)
     expect(yVariance).toBeLessThan(30)
-    
+
     // X should vary (horizontal roaming)
     const xs = positions.map(p => p.x)
     const xVariance = Math.max(...xs) - Math.min(...xs)
     expect(xVariance).toBeGreaterThan(50)
   })
 
-  test('Robot stays within center 80% horizontally', async ({ page }) => {
-    const robot = page.locator('[title*="JARVIS"]').first()
-    const viewport = page.viewportSize()
-    if (!viewport) return
-    
-    const leftBound = viewport.width * 0.1
-    const rightBound = viewport.width * 0.9
-    
-    for (let i = 0; i < 20; i++) {
+  test('Robot never touches a chat widget', async ({ page }) => {
+    const robot = page.locator('[data-testid="jarvis-robot"]')
+
+    // Open the chat so both the button AND the 380px panel are on screen — the
+    // panel is what the old hard-coded 88px clearance failed to account for.
+    await page.locator('[aria-label="Open PAUL JARVIS assistant"]').click()
+    await page.waitForTimeout(300)
+
+    for (let i = 0; i < 50; i++) {
       const box = await robot.boundingBox()
-      if (box) {
-        expect(box.x).toBeGreaterThan(leftBound - 20)
-        expect(box.x + box.width).toBeLessThan(rightBound + 20)
+      const avoid = await page.locator('[data-jarvis-avoid]').all()
+      for (const el of avoid) {
+        const a = await el.boundingBox()
+        if (!box || !a) continue
+        const hit =
+          box.x < a.x + a.width && box.x + box.width > a.x &&
+          box.y < a.y + a.height && box.y + box.height > a.y
+        expect(hit, `robot overlapped a chat widget at sample ${i}`).toBe(false)
       }
       await page.waitForTimeout(200)
+    }
+  })
+
+  test('Robot does not jump when it starts talking', async ({ page }) => {
+    const robot = page.locator('[data-testid="jarvis-robot"]')
+    const before = await robot.boundingBox()
+
+    // The emerge keyframes used to run on the wrapper and animate `transform`,
+    // beating the inline transform and teleporting the robot to (0,0).
+    await page.evaluate(() => {
+      window.postMessage({ __jarvisPage: true, type: 'jarvis-speak', text: 'Hello there.' },
+        window.location.origin)
+    })
+
+    for (let i = 0; i < 10; i++) {
+      await page.waitForTimeout(50)
+      const box = await robot.boundingBox()
+      if (!box || !before) continue
+      // A teleport is hundreds of pixels; a walk step is a couple.
+      expect(Math.abs(box.x - before.x)).toBeLessThan(60)
+      expect(Math.abs(box.y - before.y)).toBeLessThan(60)
     }
   })
 

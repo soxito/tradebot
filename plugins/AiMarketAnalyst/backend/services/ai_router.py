@@ -113,22 +113,127 @@ async def _notify_headroom_proxy(model: str, provider_label: str,
         pass
 
 
+#: Cached probe of the headroom compression proxy: (checked_at, reachable).
+#:
+#: OpenAI and NVIDIA calls are routed through it for compression. When it is not
+#: running, that routing sent every one of their requests to a dead local port,
+#: which answered 401 — indistinguishable, from the outside, from a bad NVIDIA
+#: key. Probed rather than assumed, and cached so it costs one request a minute.
+_headroom_state: tuple[float, bool] = (0.0, False)
+_HEADROOM_PROBE_TTL = 60.0
+
+
+async def _headroom_available() -> bool:
+    global _headroom_state
+    checked_at, reachable = _headroom_state
+    now = time.time()
+    if now - checked_at < _HEADROOM_PROBE_TTL:
+        return reachable
+    try:
+        async with httpx.AsyncClient(timeout=1.5) as c:
+            resp = await c.get(f"{_HEADROOM_PROXY.rstrip('/')}/health")
+        reachable = resp.status_code < 500
+    except Exception:  # noqa: BLE001 — not running is the common case
+        reachable = False
+    if not reachable and _headroom_state[1]:
+        logger.info(
+            "[ai_router] headroom proxy unreachable — sending OpenAI/NVIDIA "
+            "traffic direct (compression off, calls still work)"
+        )
+    _headroom_state = (now, reachable)
+    return reachable
+
+
 _TIMEOUT = 40.0
 # Short circuit breaker so a failing provider is skipped briefly
 _circuits: dict[int, float] = {}
 _CB_COOLDOWN = 120.0
+
+#: A provider answering 401/403/404/410 is misconfigured or retired, not having
+#: a bad minute. Two minutes means every request keeps paying for it — it is
+#: re-tried, fails, and consumes a slot in the cascade that a working provider
+#: needed. Sit it out for long enough that the rest of the list gets the budget,
+#: but not so long that fixing the key goes unnoticed.
+_CB_CONFIG_COOLDOWN = 1800.0
+#: HTTP statuses that mean "this will fail again until a human changes something".
+CONFIG_FAULT_STATUS = {401, 403, 404, 410}
 
 
 def _cb_open(pid: int) -> bool:
     return time.time() < _circuits.get(pid, 0)
 
 
-def _cb_trip(pid: int) -> None:
-    _circuits[pid] = time.time() + _CB_COOLDOWN
+def _cb_trip(pid: int, cooldown: float | None = None) -> None:
+    """Skip this provider for a while. Later trips never shorten an open breaker."""
+    until = time.time() + (cooldown if cooldown is not None else _CB_COOLDOWN)
+    _circuits[pid] = max(_circuits.get(pid, 0.0), until)
+
+
+def config_fault_status(exc: Exception) -> int | None:
+    """The HTTP status when `exc` means the provider needs fixing, else None."""
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None) if response is not None else None
+    return status if status in CONFIG_FAULT_STATUS else None
+
+
+#: Markers a provider uses to say it has been shut down for good, rather than
+#: that our credential is wrong. GitHub Models emits the first of these during
+#: its scheduled retirement brownouts.
+_RETIREMENT_MARKERS = (
+    "retirement_brownout",
+    "has been retired",
+    "no longer available",
+    "service has been discontinued",
+    "endpoint has been deprecated",
+)
+
+
+def is_retired_upstream(exc: Exception) -> bool:
+    """True when the provider is telling us it is gone, not that we are wrong.
+
+    Worth separating: no API key or base URL change recovers a retired service,
+    so presenting it as a configuration fault costs people real time.
+    """
+    text = str(exc).lower()
+    response = getattr(exc, "response", None)
+    if response is not None:
+        try:
+            text += " " + str(response.text).lower()
+        except Exception:  # noqa: BLE001 — body may not be readable
+            pass
+    return any(marker in text for marker in _RETIREMENT_MARKERS)
+
+
+# Which providers accept OpenAI-style `tools`. Learned at runtime from the 400
+# a non-supporting provider returns, and kept in memory alongside _circuits —
+# it is a property of the endpoint, not of the account, so it costs nothing to
+# rediscover after a restart.
+_tool_support: dict[int, bool] = {}
+
+
+def _supports_tools(pid: int) -> bool:
+    """Assume yes until a provider proves otherwise.
+
+    Optimistic on purpose: guessing wrong costs one extra request (the retry in
+    _do_request strips the tools key), whereas a pessimistic default would leave
+    capable models unable to fetch anything until someone hand-maintained a list.
+    """
+    return _tool_support.get(pid, True)
 
 
 def _chars(messages: list[dict[str, str]]) -> int:
     return sum(len(str(m.get("content", ""))) for m in messages)
+
+
+def _is_tool_plumbing(message: dict) -> bool:
+    """True for messages that must reach the provider byte-for-byte.
+
+    Headroom rewrites message content to save tokens. Doing that to a tool
+    result — or to the assistant turn carrying tool_calls — breaks the
+    tool_call_id pairing, and the provider answers with a 400 that looks like a
+    model bug rather than a compression bug.
+    """
+    return message.get("role") == "tool" or bool(message.get("tool_calls"))
 
 
 async def get_router_settings(db: AsyncSession) -> AIRouterSettings:
@@ -271,24 +376,63 @@ async def _call_openai_compatible(
     max_tokens: int,
     json_mode: bool,
 ) -> tuple[str, dict[str, int], str | None]:
-    """Call an OpenAI-compatible chat endpoint.
+    """Call an OpenAI-compatible chat endpoint. Returns (content, usage, routed_via).
+
+    Kept at three return values because callers outside this module — jarvis.py,
+    analysis_router.py and four monkeypatch sites in the MT5 plugin's tests —
+    unpack exactly three. Tool-aware callers use
+    :func:`_call_openai_compatible_msg`, which this thin wrapper delegates to.
+    """
+    content, usage, routed_via, _msg = await _call_openai_compatible_msg(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        json_mode=json_mode,
+    )
+    return content, usage, routed_via
+
+
+async def _call_openai_compatible_msg(
+    *,
+    base_url: str,
+    api_key: str,
+    model: str,
+    messages: list[dict[str, Any]],
+    temperature: float,
+    max_tokens: int,
+    json_mode: bool,
+    tools: list[dict] | None = None,
+    tool_choice: str | None = None,
+    provider_id: int | None = None,
+) -> tuple[str, dict[str, int], str | None, dict]:
+    """Call an OpenAI-compatible chat endpoint, returning the full message.
 
     For OpenAI (base_url with "openai.com") or NVIDIA (base_url with "nvidia.com" or "integrate.api.nvidia.com"),
     routes through the headroom proxy for compression. For other providers (Groq, Mistral, Cerebras, OpenRouter),
     calls them directly to avoid 401 errors.
 
-    Returns (content, usage, routed_via).
+    Returns (content, usage, routed_via, message) — ``message`` carries any
+    ``tool_calls`` the model asked for.
     """
-    # ── Determine routing: OpenAI/NVIDIA through proxy, others direct ──────────────
+    # ── Determine routing: OpenAI through the proxy, everything else direct ──
+    #
+    # ONLY OpenAI. The headroom proxy has a single upstream — OpenAI — so it
+    # forwards whatever key it is handed there. NVIDIA used to be routed through
+    # it too, which meant an `nvapi-…` key was presented to OpenAI and came back
+    # as "Incorrect API key provided: nvapi-… find your API key at
+    # platform.openai.com". NVIDIA could never authenticate that way, and the
+    # error pointed at the wrong provider entirely.
     is_openai = "openai.com" in base_url
-    is_nvidia = "nvidia.com" in base_url or "integrate.api.nvidia.com" in base_url
-    if is_openai or is_nvidia:
-        # Route OpenAI/NVIDIA through headroom proxy for compression
+    if is_openai and await _headroom_available():
         # Use /v1/chat/completions (local headroom binary) not /p/project/v1/ (Cloudflare Workers)
-        headroom_proxy = os.getenv("HEADROOM_PROXY_URL", "http://127.0.0.1:8787")
-        url = f"{headroom_proxy.rstrip('/')}/v1/chat/completions"
+        url = f"{_HEADROOM_PROXY.rstrip('/')}/v1/chat/completions"
     else:
-        # Direct endpoint for other providers
+        # Direct endpoint — every non-OpenAI provider, plus OpenAI itself when
+        # the proxy is down. Compression is an optimisation; losing it beats
+        # every call failing against a proxy that cannot serve them.
         url = f"{base_url.rstrip('/')}/chat/completions"
     
     headers = {
@@ -314,8 +458,12 @@ async def _call_openai_compatible(
         payload["max_tokens"] = max_tokens
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
+    if tools:
+        payload["tools"] = tools
+        if tool_choice:
+            payload["tool_choice"] = tool_choice
 
-    async def _do_request(current_payload: dict) -> tuple[str, dict[str, int], str | None]:
+    async def _do_request(current_payload: dict) -> tuple[str, dict[str, int], str | None, dict]:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             resp = await client.post(url, headers=headers, json=current_payload)
             if resp.status_code >= 400:
@@ -323,6 +471,26 @@ async def _call_openai_compatible(
                 if json_mode and "response_format" in current_payload:
                     current_payload.pop("response_format", None)
                     resp = await client.post(url, headers=headers, json=current_payload)
+                # Several providers in the catalog are aggregator proxies with no
+                # tool support and 400 on the `tools` key. Drop it and retry HERE,
+                # before raise_for_status, so this never reaches the retry/circuit
+                # layer — otherwise the first tool-bearing call would trip the
+                # breaker and take that provider out for the full cooldown.
+                if resp.status_code >= 400 and "tools" in current_payload:
+                    body = (resp.text or "")[:400].lower()
+                    if any(
+                        kw in body
+                        for kw in ("tool", "function", "unsupported", "not supported")
+                    ):
+                        current_payload.pop("tools", None)
+                        current_payload.pop("tool_choice", None)
+                        if provider_id is not None:
+                            _tool_support[provider_id] = False
+                            logger.info(
+                                "[AIRouter] provider {} rejected tools — "
+                                "falling back to text directives", provider_id,
+                            )
+                        resp = await client.post(url, headers=headers, json=current_payload)
             resp.raise_for_status()
             data = resp.json()
             # FreeLLMAPI (and similar proxies) report the upstream they routed to.
@@ -333,19 +501,115 @@ async def _call_openai_compatible(
             choices = data.get("choices") or []
             if not choices:
                 raise RuntimeError("No choices in response")
-            content = (choices[0].get("message") or {}).get("content") or ""
+            message = (choices[0].get("message") or {})
+            content = message.get("content") or ""
             raw_usage = data.get("usage") or {}
             usage = {
                 "prompt_tokens": int(raw_usage.get("prompt_tokens") or 0),
                 "completion_tokens": int(raw_usage.get("completion_tokens") or 0),
                 "total_tokens": int(raw_usage.get("total_tokens") or 0),
             }
-            return content, usage, routed_via
+            return content, usage, routed_via, message
 
     return await _retry_with_backoff(_do_request, payload)
 
 
+#: Endpoints that have been retired upstream, and what replaced them.
+#:
+#: A provider pointed at a retired host answers 401/404 no matter how good the
+#: credential is, which reads as "your key is wrong" and sends people off
+#: regenerating a perfectly good token. Repairing the stored row means the fix
+#: reaches every existing install without anyone having to know the endpoint
+#: moved.
+RETIRED_BASE_URLS: dict[str, str] = {
+    # GitHub Models left the Azure preview host for models.github.ai.
+    "https://models.inference.ai.azure.com": "https://models.github.ai/inference",
+}
+
+#: Publisher prefixes models.github.ai requires but the old host did not.
+_GITHUB_MODEL_PUBLISHERS: dict[str, str] = {
+    "o3": "openai", "o3-mini": "openai", "o1": "openai", "o1-mini": "openai",
+    "gpt-4o": "openai", "gpt-4o-mini": "openai", "gpt-4.1": "openai",
+    "Llama-4-Scout-17B-16E-Instruct": "meta", "Llama-3.3-70B-Instruct": "meta",
+    "DeepSeek-R1": "deepseek", "DeepSeek-V3": "deepseek",
+    "Ministral-3B": "mistral-ai", "Mistral-large": "mistral-ai",
+}
+
+_endpoints_repaired = False
+
+
+def normalise_model_list(value: Any) -> list[str]:
+    """A provider's model list, whatever shape it got stored in.
+
+    ``models_json`` is a JSON column, so it should always come back as a list.
+    A string means something wrote ``json.dumps(...)`` into it and double
+    encoded the value — repair that rather than propagating a str to callers
+    that will treat it as a sequence of characters, or hand it to a response
+    model that expects a list and 500s.
+    """
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    if isinstance(value, str) and value.strip():
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError):
+            return []
+        if isinstance(decoded, list):
+            return [str(v) for v in decoded]
+    return []
+
+
+def _github_model_id(model: str) -> str:
+    """Add the publisher prefix models.github.ai needs, if it is missing."""
+    if not model or "/" in model:
+        return model
+    publisher = _GITHUB_MODEL_PUBLISHERS.get(model)
+    return f"{publisher}/{model}" if publisher else model
+
+
+async def repair_retired_endpoints(db: AsyncSession) -> int:
+    """Point providers at their current endpoints. Idempotent, once per process."""
+    global _endpoints_repaired
+    if _endpoints_repaired:
+        return 0
+    _endpoints_repaired = True
+
+    try:
+        rows = list((await db.execute(select(AILLMProvider))).scalars().all())
+        fixed = 0
+        for p in rows:
+            replacement = RETIRED_BASE_URLS.get((p.base_url or "").rstrip("/"))
+            if not replacement:
+                continue
+            p.base_url = replacement
+            if "models.github.ai" in replacement:
+                p.default_model = _github_model_id(p.default_model or "")
+                # models_json is a JSON column: SQLAlchemy serialises it for us.
+                # Assigning json.dumps(...) here stores a JSON *string* inside
+                # the JSON value, and everything downstream that expects a list
+                # then breaks on a str.
+                models = normalise_model_list(p.models_json)
+                if models:
+                    p.models_json = [_github_model_id(m) for m in models]
+            fixed += 1
+            logger.warning(
+                f"[ai_router] {p.label}: endpoint had been retired — repointed to "
+                f"{replacement}. Its existing API key should work again."
+            )
+        if fixed:
+            await db.commit()
+        return fixed
+    except Exception as exc:  # noqa: BLE001 — never block provider lookup
+        logger.debug(f"[ai_router] endpoint repair skipped: {exc}")
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return 0
+
+
 async def get_enabled_providers(db: AsyncSession) -> list[AILLMProvider]:
+    await repair_retired_endpoints(db)
     res = await db.execute(
         select(AILLMProvider)
         .where(AILLMProvider.enabled.is_(True))
@@ -497,6 +761,9 @@ async def db_chat(
     source: str = "chat",
     bypass_circuits: bool = False,
     preferred_providers: list[str] | None = None,
+    tools: list[dict] | None = None,
+    tool_choice: str | None = None,
+    bypass_openmanus: bool = False,
 ) -> dict[str, Any]:
     """Call the next provider chosen by the load-balancing strategy; failover on error.
 
@@ -510,10 +777,13 @@ async def db_chat(
     standard provider loop on failure (phased fallback strategy).
     """
     # ── OpenManus MCP primary route (transparent to callers) ─────────────────
+    # Skipped for tool-calling turns: OpenManus returns early on success and has
+    # no tool support, so leaving it in front would make every tool call quietly
+    # do nothing — the worst kind of failure, because nothing errors.
     try:
         import os as _os
         _om_enabled = _os.getenv("OPENMANUS_ENABLED", "true").lower() not in ("0", "false", "no", "off")
-        if _om_enabled:
+        if _om_enabled and not bypass_openmanus and not tools:
             from plugins.OpenManusPlugin.backend.services.openmanus_client import (
                 mcp_health as _om_health,
                 mcp_chat as _om_chat,
@@ -583,7 +853,27 @@ async def db_chat(
     send_messages = messages
     if settings.headroom_enabled and _headroom_compress is not None:
         try:
-            send_messages = _headroom_compress(messages, caller=agent_name or source)
+            # Tool plumbing is passed through untouched and spliced back in
+            # order; compressing it would break the tool_call_id pairing.
+            plumbing = {i for i, m in enumerate(messages) if _is_tool_plumbing(m)}
+            if plumbing:
+                compressible = [m for i, m in enumerate(messages) if i not in plumbing]
+                compressed = list(
+                    _headroom_compress(compressible, caller=agent_name or source)
+                )
+                if len(compressed) == len(compressible):
+                    it = iter(compressed)
+                    send_messages = [
+                        messages[i] if i in plumbing else next(it)
+                        for i in range(len(messages))
+                    ]
+                else:
+                    # Compression changed the message count, so positions no
+                    # longer line up — send the originals rather than risk
+                    # splicing a tool result next to the wrong call.
+                    send_messages = messages
+            else:
+                send_messages = _headroom_compress(messages, caller=agent_name or source)
         except Exception:
             send_messages = messages
     comp_chars = _chars(send_messages)
@@ -628,7 +918,10 @@ async def db_chat(
             continue
         model = model_override or p.default_model or "fable-5-high"
         try:
-            content, usage, routed_via = await _call_openai_compatible(
+            # Only offer tools to a provider not already known to reject them,
+            # so a repeat call costs no wasted round trip.
+            _send_tools = tools if (tools and _supports_tools(p.id)) else None
+            content, usage, routed_via, message = await _call_openai_compatible_msg(
                 base_url=p.base_url,
                 api_key=p.api_key,
                 model=model,
@@ -636,6 +929,9 @@ async def db_chat(
                 temperature=temperature,
                 max_tokens=max_tokens,
                 json_mode=json_mode,
+                tools=_send_tools,
+                tool_choice=tool_choice if _send_tools else None,
+                provider_id=p.id,
             )
             p.total_calls = (p.total_calls or 0) + 1
             p.daily_calls = (p.daily_calls or 0) + 1
@@ -687,6 +983,11 @@ async def db_chat(
                 "model": model,
                 "routed_via": routed_via,
                 "usage": usage,
+                # Additive: existing callers ignore these, the tool loop needs them.
+                "message": message,
+                "tool_calls": message.get("tool_calls") or [],
+                "tools_supported": _supports_tools(p.id) if tools else None,
+                "provider_id": p.id,
             }
         except Exception as exc:  # noqa: BLE001
             msg = str(exc)[:300]
@@ -749,6 +1050,119 @@ async def test_provider(provider: AILLMProvider) -> dict[str, Any]:
         return {"ok": False, "error": str(exc)[:300]}
 
 
+async def chat_with_tools(
+    db: AsyncSession,
+    messages: list[dict[str, Any]],
+    *,
+    tools: list[dict] | None = None,
+    max_iterations: int = 3,
+    total_budget_s: float = 25.0,
+    **db_chat_kwargs: Any,
+) -> dict[str, Any]:
+    """Chat, letting the model fetch live data mid-answer.
+
+    Two paths, chosen per provider:
+
+    * Providers that accept OpenAI-style ``tools`` run a normal call/execute/
+      call loop.
+    * Providers that don't (several in the catalog are aggregator proxies) get
+      the same capability through a text protocol — the model emits a
+      ``<<TOOL: …>>`` directive, we run it, and hand the result back for exactly
+      one more turn. One extra round trip, no loop.
+
+    ``total_budget_s`` exists because ``_TIMEOUT`` is *per request*: three
+    iterations of a slow provider could otherwise run past two minutes, long
+    after the user's client has given up.
+    """
+    from plugins.AiMarketAnalyst.backend.services import ai_tools
+
+    schemas = tools if tools is not None else ai_tools.TOOL_SCHEMAS
+    convo: list[dict[str, Any]] = list(messages)
+    deadline = time.monotonic() + total_budget_s
+    executed: list[str] = []
+
+    async def _run_calls(calls: list[dict[str, Any]]) -> list[str]:
+        """Execute tool calls concurrently; each returns text, never raises."""
+        sem = asyncio.Semaphore(4)
+
+        async def _one(name: str, args: Any) -> str:
+            async with sem:
+                return await ai_tools.execute_tool(name, args)
+
+        return list(await asyncio.gather(*[_one(n, a) for n, a in calls]))
+
+    last: dict[str, Any] = {}
+    for iteration in range(max_iterations):
+        remaining = deadline - time.monotonic()
+        if remaining <= 1.0:
+            logger.info("[AIRouter] tool loop out of budget after {} calls", len(executed))
+            break
+
+        last = await db_chat(
+            db, convo, tools=schemas, bypass_openmanus=True, **db_chat_kwargs
+        )
+        if not last.get("ok"):
+            return last
+
+        # ── Text-directive path (provider has no native tool support) ────────
+        if last.get("tools_supported") is False:
+            directives = ai_tools.parse_text_directives(last.get("content") or "")
+            if not directives:
+                return last
+            results = await _run_calls(
+                [(d["name"], d["arguments"]) for d in directives]
+            )
+            executed.extend(d["name"] for d in directives)
+            convo = convo + [
+                {"role": "assistant", "content": last.get("content") or ""},
+                {
+                    "role": "user",
+                    "content": "Results of the data you requested:\n\n"
+                    + "\n\n".join(
+                        f"{d['name']}:\n{r}" for d, r in zip(directives, results)
+                    )
+                    + "\n\nNow answer my original question using these.",
+                },
+            ]
+            final = await db_chat(db, convo, bypass_openmanus=True, **db_chat_kwargs)
+            if final.get("ok"):
+                final["tools_used"] = executed
+            return final
+
+        # ── Native tool-calling path ─────────────────────────────────────────
+        tool_calls = last.get("tool_calls") or []
+        if not tool_calls:
+            last["tools_used"] = executed
+            return last
+
+        pending = [
+            (
+                (c.get("function") or {}).get("name") or "",
+                (c.get("function") or {}).get("arguments") or "{}",
+            )
+            for c in tool_calls
+        ]
+        results = await _run_calls(pending)
+        executed.extend(name for name, _ in pending)
+
+        convo = convo + [last.get("message") or {"role": "assistant", "content": ""}]
+        for call, result in zip(tool_calls, results):
+            convo.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.get("id") or "",
+                    "content": result,
+                }
+            )
+
+    # Iteration cap or budget reached with tools still pending — ask once more
+    # with tools switched off so the model has to answer from what it has.
+    final = await db_chat(db, convo, bypass_openmanus=True, **db_chat_kwargs)
+    if final.get("ok"):
+        final["tools_used"] = executed
+    return final if final.get("ok") else (last or final)
+
+
 def parse_json_content(content: str | None) -> dict[str, Any] | None:
     """Best-effort JSON extraction from an LLM response."""
     if not content:
@@ -786,6 +1200,7 @@ async def agent_chat(
     agent_name: str | None = None,
     agent_role: str | None = None,
     source: str = "agent",
+    tools: list[dict] | None = None,
 ) -> dict[str, Any]:
     """LLM call for AI trading agents, routed through the connected DB providers.
 
@@ -809,6 +1224,7 @@ async def agent_chat(
         agent_name=agent_name,
         agent_role=agent_role,
         source=source,
+        tools=tools,
     )
     if not res.get("ok"):
         return {"ok": False, "error": res.get("error"), "content": None}

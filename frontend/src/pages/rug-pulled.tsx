@@ -2,6 +2,8 @@ import Head from 'next/head'
 import { useState, useEffect, useCallback } from 'react'
 import { apiClient } from '@/services/api'
 import { useZarRate } from '@/hooks/useZarRate'
+import ResearchEntries, { ResearchVerdictBadge } from '@/components/research/ResearchEntries'
+import { useResearchPlans } from '@/hooks/useResearchPlans'
 import { formatPrice } from '@/utils/price'
 import {
   RefreshCw, Skull, TrendingUp, TrendingDown, AlertTriangle,
@@ -82,6 +84,10 @@ export default function RugPulledPage() {
   const [sniperStatus, setSniperStatus] = useState<SniperStatus | null>(null)
   const [sniperToggling, setSniperToggling] = useState(false)
   const [pumpThreshold, setPumpThreshold] = useState<number>(30)
+
+  // Research is batched per token, so one plan covers every live signal on it —
+  // the same plan the crypto sniper reads when it builds a setup.
+  const { planFor } = useResearchPlans(tokens.map((t) => t.symbol))
 
   const fetchTokens = useCallback(async () => {
     setLoading(true)
@@ -408,6 +414,7 @@ export default function RugPulledPage() {
                       <div>
                         <span className="font-mono font-bold text-sm text-white">{token.symbol}</span>
                         <span className="text-[10px] text-gray-600 block truncate w-28">{token.name}</span>
+                        <ResearchVerdictBadge plan={planFor(token.symbol)} />
                       </div>
                     </div>
 
@@ -488,6 +495,10 @@ export default function RugPulledPage() {
                   {/* Expanded Details */}
                   {isExpanded && (
                     <div className="px-3 pb-3 pt-1 border-t border-gray-800/50 space-y-3">
+                      {/* Every live signal on this token, reconciled into two
+                          costed entries — the same plan the sniper reads. */}
+                      <ResearchEntries plan={planFor(token.symbol)} defaultOpen />
+
                       {/* Price Info Grid */}
                       <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
                         <div className="bg-gray-900/50 rounded p-2">

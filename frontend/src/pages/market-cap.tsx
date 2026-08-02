@@ -13,6 +13,7 @@ import {
 } from 'recharts'
 import { apiClient } from '@/services/api'
 import { Activity, ChevronRight, RefreshCw } from 'lucide-react'
+import MacroContextPanel from '@/components/MacroContextPanel'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -183,6 +184,9 @@ export default function MarketCapPage() {
   const [loading, setLoading]     = useState(true)
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null)
   const [tvSymbol, setTvSymbol]   = useState<ChartSymbol>('CRYPTOCAP:TOTAL3')
+  // One counter drives the macro panel's refetch, so the page keeps a single
+  // timer rather than each panel running its own.
+  const [refreshNonce, setRefreshNonce] = useState(0)
 
   const fetchOverview = useCallback(async () => {
     try {
@@ -203,14 +207,19 @@ export default function MarketCapPage() {
     }
   }, [])
 
+  const tick = useCallback(() => {
+    fetchOverview()
+    setRefreshNonce(n => n + 1)
+  }, [fetchOverview])
+
   useEffect(() => {
     setLoading(true)
     Promise.all([fetchOverview(), fetchHistory()]).finally(() => setLoading(false))
 
-    // auto-refresh overview every 60 s
-    const interval = setInterval(fetchOverview, 60_000)
+    // auto-refresh overview + macro every 60 s, on one timer
+    const interval = setInterval(tick, 60_000)
     return () => clearInterval(interval)
-  }, [fetchOverview, fetchHistory])
+  }, [fetchOverview, fetchHistory, tick])
 
   const sc       = overview ? (SENTIMENT_CONFIG[overview.sentiment] ?? SENTIMENT_CONFIG.NEUTRAL) : null
   const chgColor = !overview
@@ -238,7 +247,7 @@ export default function MarketCapPage() {
             </p>
           </div>
           <button
-            onClick={fetchOverview}
+            onClick={tick}
             className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-gray-800/60 border border-gray-700 text-sm text-gray-400 hover:text-white transition"
           >
             <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
@@ -317,6 +326,11 @@ export default function MarketCapPage() {
             </div>
           </div>
         )}
+
+        {/* ── Macro context ──
+            Above the deep-dive charts on purpose: the dollar and the fear gauge
+            frame the sentiment call rather than following it. */}
+        <MacroContextPanel refreshNonce={refreshNonce} />
 
         {/* ── TradingView Chart ── */}
         <div className="bg-gray-800/30 border border-gray-700/60 rounded-xl p-4">

@@ -1,6 +1,6 @@
 import Head from 'next/head'
 import { useCallback, useEffect, useState } from 'react'
-import { apiClient, api } from '@/services/api'
+import { apiClient, api, getApiBaseUrl } from '@/services/api'
 import {
   Workflow,
   Play,
@@ -915,7 +915,7 @@ function AIProvidersPanel() {
     try {
       const b = JSON.stringify({})
       const req_: any = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: b }
-      const resp = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:1448/api/v1'}/plugins/ai-analyst/ai/providers/${id}/test`, req_)
+      const resp = await fetch(`${getApiBaseUrl()}/plugins/ai-analyst/ai/providers/${id}/test`, req_)
       const d = await resp.json()
       setTestResults(prev => ({ ...prev, [id]: d }))
       setExpandedId(id)
@@ -929,7 +929,7 @@ function AIProvidersPanel() {
     setTestingAll(true)
     try {
       const b = JSON.stringify({})
-      const resp = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:1448/api/v1'}/plugins/ai-analyst/ai/providers/test-all`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: b })
+      const resp = await fetch(`${getApiBaseUrl()}/plugins/ai-analyst/ai/providers/test-all`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: b })
       const d = await resp.json()
       const newResults: typeof testResults = {}
       for (const r of d?.results || []) {

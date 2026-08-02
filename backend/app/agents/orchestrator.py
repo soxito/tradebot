@@ -25,6 +25,7 @@ from app.agents.memory import get_past_decisions, build_memory_prompt, try_local
 from app.signals.technical import analyze as technical_analyze
 from app.exchanges.manager import exchange_manager, SupportedExchange
 from app.exchanges.forex_provider import is_forex_symbol, fetch_ohlcv as forex_fetch_ohlcv
+from app.services import market_data
 
 
 def _is_quota_error_decision(decision: Dict[str, Any]) -> bool:
@@ -249,6 +250,7 @@ class AgentOrchestrator:
         symbol: str,
         timeframe: str = "1h",
         exchange: SupportedExchange = SupportedExchange.BITGET,
+        db: Optional[AsyncSession] = None,
     ) -> Dict[str, Any]:
         """Build market context dict for agents.
 
@@ -258,10 +260,13 @@ class AgentOrchestrator:
         """
         context: Dict[str, Any] = {"symbol": symbol, "timeframe": timeframe}
 
-        # ── Branch: Forex / metals symbols (e.g. XAUUSD, XAGUSD) ─────────────
-        if is_forex_symbol(symbol):
+        # ── Branch: FX, metals, indices, energy, softs ───────────────────────
+        # Two-tier guard via market_data: is_forex_symbol alone knows only a few
+        # majors plus gold, so every cross, index and commodity used to fall
+        # through to the crypto branch and fail there.
+        if market_data.is_universal_symbol(symbol):
             try:
-                ohlcv, forex_ticker = await forex_fetch_ohlcv(
+                ohlcv, forex_ticker = await market_data.fetch_ohlcv_universal(
                     symbol, timeframe=timeframe, limit=200
                 )
                 if ohlcv:
@@ -276,8 +281,8 @@ class AgentOrchestrator:
                     context["ticker"] = forex_ticker  # includes buy_volume, sell_volume
                     context["price_source"] = forex_ticker.get("source", "forex_provider")
                     logger.info(
-                        f"[Orchestrator] Forex/metal {symbol} — live price "
-                        f"${context['current_price']:.2f} (CoinGecko/ForexProvider)"
+                        f"[Orchestrator] {symbol} — live price "
+                        f"{context['current_price']:.4g} via {context['price_source']}"
                     )
             except Exception as e:
                 logger.warning(f"[Orchestrator] Forex OHLCV failed for {symbol}: {e}")
@@ -324,18 +329,42 @@ class AgentOrchestrator:
             logger.warning(f"[Orchestrator] Sentiment setup failed for {symbol}: {e}")
             context["sentiment"] = {"error": str(e)}
 
-        # Ticker
+        # Ticker — the crypto connector only for crypto. A gold or FX symbol
+        # sent there answers with an ERROR log and no data; the universal
+        # resolver serves it from the live MT5 account instead.
         try:
-            ticker = await connector.get_ticker(symbol)
-            context["ticker"] = {
-                "last": ticker.get("last"),
-                "bid": ticker.get("bid"),
-                "ask": ticker.get("ask"),
-                "high": ticker.get("high"),
-                "low": ticker.get("low"),
-                "volume": ticker.get("quoteVolume"),
-                "change_pct": ticker.get("percentage"),
-            }
+            from app.services import market_data
+
+            is_crypto = (
+                market_data.classify(market_data.normalize_symbol(symbol))
+                == market_data.CRYPTO
+            )
+            if is_crypto:
+                ticker = await connector.get_ticker(symbol)
+                context["ticker"] = {
+                    "last": ticker.get("last"),
+                    "bid": ticker.get("bid"),
+                    "ask": ticker.get("ask"),
+                    "high": ticker.get("high"),
+                    "low": ticker.get("low"),
+                    "volume": ticker.get("quoteVolume"),
+                    "change_pct": ticker.get("percentage"),
+                    "source": "bitget",
+                }
+            else:
+                # No OHLC/volume from a broker quote — say so rather than
+                # implying zeros the agent might reason from.
+                quote = await market_data.get_quote(symbol, db=db)
+                context["ticker"] = {
+                    "last": quote.price if quote else None,
+                    "bid": quote.bid if quote else None,
+                    "ask": quote.ask if quote else None,
+                    "high": None,
+                    "low": None,
+                    "volume": None,
+                    "change_pct": quote.change_pct if quote else None,
+                    "source": quote.source if quote else "unavailable",
+                }
         except Exception:
             pass
 
@@ -460,6 +489,21 @@ class AgentOrchestrator:
             except Exception as _vault_exc:
                 logger.debug(f"[Orchestrator] Vault context skipped: {_vault_exc}")
 
+        # ── Agent-Reach live research (plugin-optional) ────────────────────────
+        # market_analyst/sentiment_analyst only: the other 4 roles already see
+        # this indirectly via signal_context["agent_analyses"], so injecting it
+        # again downstream would just add latency without new information.
+        if settings.AGENT_REACH_INJECT_CONTEXT and agent.role in ("market_analyst", "sentiment_analyst"):
+            try:
+                from app.services import agent_reach_client
+                research_summary = await agent_reach_client.research_summary_for_symbol(
+                    symbol, token_budget=settings.AGENT_REACH_CONTEXT_TOKEN_BUDGET,
+                )
+                if research_summary:
+                    memory_prompt += "\n\n## Agent-Reach Live Research\n" + research_summary
+            except Exception as _ar_exc:
+                logger.debug(f"[Orchestrator] Agent-Reach context skipped: {_ar_exc}")
+
         # Try local decision first (no LLM call)
         local = try_local_decision(past, agent.role)
         if local is not None:
@@ -565,7 +609,7 @@ class AgentOrchestrator:
             agents_by_role.setdefault(row.role, []).append(agent_from_db(row))
 
         # ── Gather market context ──
-        context = await AgentOrchestrator._gather_context(symbol, timeframe)
+        context = await AgentOrchestrator._gather_context(symbol, timeframe, db=db)
         if "error" in context and "technical" not in context:
             return {"error": context["error"], "symbol": symbol}
 
@@ -803,7 +847,7 @@ class AgentOrchestrator:
         if not settings.ENABLE_AI_AGENTS:
             from app.agents.custom_agents import are_custom_agents_enabled, custom_validate_trade
             if are_custom_agents_enabled():
-                context = await AgentOrchestrator._gather_context(symbol, timeframe)
+                context = await AgentOrchestrator._gather_context(symbol, timeframe, db=db)
                 context["pipeline_signal"] = signal_data
                 pos_ctx = {"open_positions": 0, "max_positions": 5, "available_balance": 1000, "total_exposure": 0, "max_exposure": 5000, "is_dca": False}
                 return await custom_validate_trade(db, symbol, signal_data, pos_ctx, context)
@@ -813,7 +857,7 @@ class AgentOrchestrator:
         if _circuit_is_open():
             from app.agents.custom_agents import are_custom_agents_enabled, custom_validate_trade
             if are_custom_agents_enabled():
-                context = await AgentOrchestrator._gather_context(symbol, timeframe)
+                context = await AgentOrchestrator._gather_context(symbol, timeframe, db=db)
                 context["pipeline_signal"] = signal_data
                 pos_ctx = {"open_positions": 0, "max_positions": 5, "available_balance": 1000, "total_exposure": 0, "max_exposure": 5000, "is_dca": False}
                 return await custom_validate_trade(db, symbol, signal_data, pos_ctx, context)
@@ -836,7 +880,7 @@ class AgentOrchestrator:
             agents_by_role.setdefault(row.role, []).append(agent_from_db(row))
 
         # Build context from signal data + fresh market data
-        context = await AgentOrchestrator._gather_context(symbol, timeframe)
+        context = await AgentOrchestrator._gather_context(symbol, timeframe, db=db)
         context["pipeline_signal"] = signal_data
 
         decisions: List[Dict[str, Any]] = []
@@ -960,7 +1004,7 @@ class AgentOrchestrator:
             # Check if custom agents are enabled as fallback
             from app.agents.custom_agents import are_custom_agents_enabled, custom_validate_trade
             if are_custom_agents_enabled():
-                context = await AgentOrchestrator._gather_context(symbol, timeframe)
+                context = await AgentOrchestrator._gather_context(symbol, timeframe, db=db)
                 context["signal"] = signal
                 context["positions"] = position_context
                 return await custom_validate_trade(db, symbol, signal, position_context, context)
@@ -971,7 +1015,7 @@ class AgentOrchestrator:
             # Use custom agents when circuit breaker is open
             from app.agents.custom_agents import are_custom_agents_enabled, custom_validate_trade
             if are_custom_agents_enabled():
-                context = await AgentOrchestrator._gather_context(symbol, timeframe)
+                context = await AgentOrchestrator._gather_context(symbol, timeframe, db=db)
                 context["signal"] = signal
                 context["positions"] = position_context
                 return await custom_validate_trade(db, symbol, signal, position_context, context)
@@ -1106,7 +1150,7 @@ class AgentOrchestrator:
                     continue
             agents_by_role.setdefault(row.role, []).append(agent_from_db(row))
 
-        context = await AgentOrchestrator._gather_context(symbol, timeframe)
+        context = await AgentOrchestrator._gather_context(symbol, timeframe, db=db)
         context["signal"] = signal
         context["positions"] = position_context
 
@@ -1351,7 +1395,7 @@ class AgentOrchestrator:
             }
 
             # Gather market context — multi-timeframe for reversal detection
-            context = await AgentOrchestrator._gather_context(symbol, "1h")
+            context = await AgentOrchestrator._gather_context(symbol, "1h", db=db)
             context["position"] = position_context
 
             # Add multi-TF analysis for reversal detection
@@ -1695,7 +1739,7 @@ class AgentOrchestrator:
                 "mode": "simulation",
             }
 
-            context = await AgentOrchestrator._gather_context(symbol, "1h")
+            context = await AgentOrchestrator._gather_context(symbol, "1h", db=db)
             context["position"] = position_context
 
             # Add multi-TF analysis for reversal detection (sim)

@@ -226,6 +226,12 @@ async def market_candles(
     symbol: str = Query(..., min_length=2, max_length=24),
     timeframe: str = Query(default="H1"),
     limit: int = Query(default=400, ge=10, le=1000),
+    basis: str = Query(
+        default="spot",
+        pattern="^(spot|futures)$",
+        description="Metals only: 'spot' anchors to the spot price (default), "
+                    "'futures' returns the raw COMEX contract series.",
+    ),
 ):
     """
     Broker-independent OHLCV for any FX pair, metal, index, commodity or crypto.
@@ -238,11 +244,42 @@ async def market_candles(
     close, volume}]}`` — an empty ``candles`` list means no source carries it.
     """
     candles = await yahoo_candles(symbol, timeframe, limit)
+    source = "yahoo" if candles else "none"
+
+    # Metals arrive from Yahoo as COMEX futures, ~1.4% above spot. Anchor them
+    # so the chart, the live line and every quoted price agree; without this the
+    # chart would sit a visible $58 above the price shown everywhere else.
+    # basis=futures skips that for callers who genuinely want the contract.
+    from app.services import market_data
+
+    is_metal = market_data.classify(symbol) == market_data.METAL
+    if candles and is_metal:
+        if basis == market_data.FUTURES:
+            source = f"yahoo:{resolve_ticker(symbol)} (futures)"
+        else:
+            rows = [
+                [c["time"] * 1000, c["open"], c["high"], c["low"], c["close"],
+                 c.get("volume") or 0.0]
+                for c in candles
+            ]
+            rows, source = await market_data.anchor_metal_series_to_spot(
+                market_data.normalize_symbol(symbol), rows, resolve_ticker(symbol) or symbol
+            )
+            candles = [
+                {"time": int(r[0] / 1000), "open": r[1], "high": r[2],
+                 "low": r[3], "close": r[4], "volume": r[5]}
+                for r in rows
+            ]
+
     return {
         "symbol": symbol.upper(),
         "timeframe": timeframe.upper(),
-        "source": "yahoo" if candles else "none",
+        "source": source,
         "ticker": resolve_ticker(symbol),
+        # Tells the client whether the basis toggle is meaningful for this
+        # instrument, so the UI can hide it for everything that has one series.
+        "basis": basis if is_metal else None,
+        "supports_basis": is_metal,
         "candles": candles,
     }
 
@@ -250,6 +287,11 @@ async def market_candles(
 @router.get("/price")
 async def market_price(
     symbol: str = Query(..., min_length=2, max_length=24),
+    basis: str = Query(
+        default="spot",
+        pattern="^(spot|futures)$",
+        description="Metals only: 'spot' (default) or the COMEX 'futures' contract.",
+    ),
 ):
     """
     Live quote for any FX pair, metal, index, commodity or crypto.
@@ -261,13 +303,33 @@ async def market_price(
     Returns ``{symbol, ticker, source, price}``; ``price`` is null when no
     source carries the symbol.
     """
-    quote = await yahoo_quote(symbol)
+    # Routed through market_data rather than straight to Yahoo so metals get
+    # genuine spot: Yahoo prices gold and silver off the COMEX future, which
+    # sits ~1.4% above spot, and a chart's live line must match the price the
+    # rest of the app quotes.
+    from app.services import market_data
+
+    is_metal = market_data.classify(symbol) == market_data.METAL
+    quote = await market_data.get_quote(symbol, basis=basis)
+    if quote is not None:
+        return {
+            "symbol": quote.symbol,
+            "ticker": resolve_ticker(symbol) or quote.symbol,
+            "source": quote.source,
+            "price": quote.price,
+            "bid": quote.bid,
+            "ask": quote.ask,
+            "time": quote.ts,
+            "basis": basis if is_metal else None,
+            "supports_basis": is_metal,
+        }
+    fallback = await yahoo_quote(symbol)
     return {
         "symbol": symbol.upper(),
-        "ticker": (quote or {}).get("ticker") or resolve_ticker(symbol),
-        "source": "yahoo" if quote else "none",
-        "price": (quote or {}).get("price"),
-        "time": (quote or {}).get("time"),
+        "ticker": (fallback or {}).get("ticker") or resolve_ticker(symbol),
+        "source": "yahoo" if fallback else "none",
+        "price": (fallback or {}).get("price"),
+        "time": (fallback or {}).get("time"),
     }
 
 

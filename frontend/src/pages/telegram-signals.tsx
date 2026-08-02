@@ -2657,11 +2657,11 @@ function ConnectAIView(props: {
     error?: string
   }
   const RECOMMENDED_MODELS: Omit<RecommendedResult, 'status'>[] = [
-    { task: 'Market Analysis',  provider: 'NVIDIA NIM',           model: 'Nemotron Super 120B (frontier free)',  presetKey: 'nvidia',        modelId: 'nvidia/nemotron-3-super-120b-a12b' },
-    { task: 'News Context',     provider: 'GitHub Models',        model: 'GPT-4o (flagship, news synthesis)',    presetKey: 'github_models', modelId: 'gpt-4o' },
+    { task: 'Market Analysis',  provider: 'NVIDIA NIM',           model: 'Nemotron 3 Ultra 550B (deepest free)', presetKey: 'nvidia',        modelId: 'nvidia/nemotron-3-ultra-550b-a55b' },
+    { task: 'News Context',     provider: 'NVIDIA NIM',           model: 'Nemotron 3 Ultra 550B (deepest free)', presetKey: 'nvidia',        modelId: 'nvidia/nemotron-3-ultra-550b-a55b' },
     { task: 'Volume Analysis',  provider: 'Cerebras',             model: 'GPT-OSS 120B (wafer speed)',           presetKey: 'cerebras',      modelId: 'gpt-oss-120b' },
-    { task: 'Final Synthesis',  provider: 'NVIDIA NIM',           model: 'Nemotron Super 120B (frontier free)',  presetKey: 'nvidia',        modelId: 'nvidia/nemotron-3-super-120b-a12b' },
-    { task: 'News → Positions', provider: 'Gemini (AI Studio)',   model: 'Gemini 2.5 Flash (1M ctx, high quality)', presetKey: 'gemini', modelId: 'gemini-2.5-flash' },
+    { task: 'Final Synthesis',  provider: 'NVIDIA NIM',           model: 'Nemotron 3 Ultra 550B (deepest free)', presetKey: 'nvidia',        modelId: 'nvidia/nemotron-3-ultra-550b-a55b' },
+    { task: 'News → Positions', provider: 'NVIDIA NIM',           model: 'Nemotron 3 Ultra 550B (deepest free)', presetKey: 'nvidia',        modelId: 'nvidia/nemotron-3-ultra-550b-a55b' },
   ]
   const [showRecommendedModal, setShowRecommendedModal] = useState(false)
   const [recommendedResults, setRecommendedResults] = useState<RecommendedResult[]>([])
@@ -2997,20 +2997,20 @@ function ConnectAIView(props: {
           {[
             {
               task: 'Market Analysis',
-              provider: 'GitHub Models',
-              model: 'OpenAI o3 (strongest reasoning)',
-              why: 'OpenAI’s most powerful reasoning model — deep SMC analysis, bias reads, and market structure with your GitHub subscription',
-              signupUrl: 'https://github.com/settings/tokens',
-              presetKey: 'github_models',
+              provider: 'NVIDIA NIM',
+              model: 'Nemotron 3 Ultra 550B (deepest free)',
+              why: 'NVIDIA’s deepest free model, no per-minute cap — deep SMC analysis, bias reads and market structure',
+              signupUrl: 'https://build.nvidia.com',
+              presetKey: 'nvidia',
               color: 'green',
             },
             {
               task: 'News Context',
-              provider: 'GitHub Models',
-              model: 'GPT-4o (flagship)',
-              why: 'OpenAI flagship — excellent news synthesis, market sentiment, and RAG-style summarization',
-              signupUrl: 'https://github.com/settings/tokens',
-              presetKey: 'github_models',
+              provider: 'NVIDIA NIM',
+              model: 'Nemotron 3 Ultra 550B (deepest free)',
+              why: 'NVIDIA’s deepest free model, 128K context, no per-minute cap — news synthesis and market sentiment. Falls back to Cohere Command A (256K) then Gemini (1M).',
+              signupUrl: 'https://build.nvidia.com',
+              presetKey: 'nvidia',
               color: 'sky',
             },
             {
@@ -3025,19 +3025,19 @@ function ConnectAIView(props: {
             {
               task: 'Final Synthesis',
               provider: 'NVIDIA NIM',
-              model: 'Nemotron Super 120B',
-              why: 'Frontier-class free model — deepest reasoning for decisive JARVIS narratives. Claude was removed from GitHub Models in July 2026.',
+              model: 'Nemotron 3 Ultra 550B',
+              why: 'NVIDIA’s deepest free model — deepest reasoning for decisive JARVIS narratives',
               signupUrl: 'https://build.nvidia.com',
               presetKey: 'nvidia',
               color: 'orange',
             },
             {
               task: 'News → Positions',
-              provider: 'Gemini (AI Studio)',
-              model: 'Gemini 3.1 Flash-Lite (1M, 500/day)',
-              why: '1M-token window maps many headlines to positions · 500 req/day free',
-              signupUrl: 'https://aistudio.google.com/apikey',
-              presetKey: 'gemini',
+              provider: 'NVIDIA NIM',
+              model: 'Nemotron 3 Ultra 550B (deepest free)',
+              why: 'NVIDIA’s deepest free model maps headlines onto open positions. Its 128K window covers a normal book; a very large one falls through to Gemini 2.5 Flash (1M).',
+              signupUrl: 'https://build.nvidia.com',
+              presetKey: 'nvidia',
               color: 'blue',
             },
           ].map((item) => {

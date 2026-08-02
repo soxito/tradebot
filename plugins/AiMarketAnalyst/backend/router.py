@@ -31,7 +31,7 @@ from plugins.AiMarketAnalyst.backend.services.llm_usage import get_usage_snapsho
 from plugins.AiMarketAnalyst.backend.services.overlay_service import build_overlay
 from plugins.AiMarketAnalyst.backend.services.provider_presets import PROVIDER_PRESETS, get_preset, get_model_info
 from plugins.AiMarketAnalyst.backend.services.ai_router import db_chat, test_provider, get_router_settings
-from plugins.AiMarketAnalyst.backend.services import usage_service, knowledge_service, graphify_service
+from plugins.AiMarketAnalyst.backend.services import ai_router, usage_service, knowledge_service, graphify_service
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/plugins/ai-analyst", tags=["AI Analyst"])
@@ -54,7 +54,12 @@ async def get_db():
 # ── Multi-provider AI accounts ─────────────────────────────
 
 def _provider_to_response(p: AILLMProvider) -> AIProviderResponse:
-    models = p.models_json or []
+    # Tolerate a double-encoded model list. `models_json` is a JSON column and
+    # should always be a list, but anything that ever wrote json.dumps(...) into
+    # it leaves a str behind — and a single bad row used to fail response
+    # validation and 500 the entire providers page, hiding every healthy
+    # provider along with it.
+    models = ai_router.normalise_model_list(p.models_json)
     model_info = {m: info for m in models if (info := get_model_info(m))}
     return AIProviderResponse(
         id=p.id,

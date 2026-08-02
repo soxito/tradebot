@@ -152,12 +152,30 @@ async def _load_tf_candles(login: str, server: str, password: str, symbol: str,
     ])
 
 
+#: A predicted move of this size (in percent) is treated as a fully decisive
+#: forecast — it maps to a score of ±1.0 before the confidence weighting.
+#:
+#: Anchored on the forecast service's own ``_FLAT_PCT`` (0.15%), the threshold
+#: below which it says the paths are not directional at all. Three times that is
+#: a move the model is clearly committing to. Using an absolute percentage keeps
+#: this readable, and the scalp timeframes (M1–M15) all live in the same range.
+_KRONOS_DECISIVE_PCT = 0.45
+
+
 async def _kronos_direction(candles: List[Candle], symbol: str, timeframe: str) -> float:
     """
     Optional Kronos ML directional score (-1..1). 0 when unavailable.
 
     Positive → forecast up, negative → down. Fully graceful: any failure or a
     missing plugin returns 0 so the scalp engine's SMC decision stands alone.
+
+    Scaling note — this used to be ``pct / 100.0 * (0.5 + conf)``, which converted
+    the percentage to a fraction and left the score ~100× smaller than the scale
+    it is measured against. The engine's veto thresholds are 0.25–0.70, so a veto
+    needed a *21.8% move on a 5-minute horizon* — unreachable — and the alignment
+    bonus came out around 0.0001. Kronos was wired in everywhere but could never
+    change a single decision. The move is now normalised against a decisive move
+    for these timeframes, so the score actually spans the range the engine uses.
     """
     try:
         from plugins.KronosForecastPlugin.backend.services import forecast_service as _kronos  # type: ignore
@@ -176,11 +194,28 @@ async def _kronos_direction(candles: List[Candle], symbol: str, timeframe: str) 
             return 0.0
         pct = float(getattr(signal, "pct_change", 0.0) or 0.0)
         conf = float(getattr(signal, "confidence", 0.5) or 0.5)
-        # Normalise into a small directional score bounded to [-1, 1].
-        return max(-1.0, min(1.0, pct / 100.0 * (0.5 + conf)))
+        return kronos_score_from(pct, conf)
     except Exception as exc:  # noqa: BLE001
         logger.debug(f"[ScalpBot] kronos direction {symbol}: {exc}")
         return 0.0
+
+
+def kronos_score_from(pct_change: float, confidence: float) -> float:
+    """Map a Kronos forecast onto the engine's -1..1 conviction scale.
+
+    Magnitude carries the direction and how far the move is toward a decisive
+    one; confidence scales it, so a hesitant forecast of a large move and a
+    confident forecast of a small one both land mid-scale rather than at an
+    extreme. Confidence alone can never create conviction out of a zero move.
+    """
+    if not pct_change:
+        return 0.0
+    magnitude = min(1.0, abs(pct_change) / _KRONOS_DECISIVE_PCT)
+    # Map confidence 0..1 onto 0.5..1.0 — an uncertain forecast still counts for
+    # something, since the model has committed to a side.
+    weight = 0.5 + 0.5 * max(0.0, min(1.0, confidence))
+    score = magnitude * weight
+    return round(max(-1.0, min(1.0, score if pct_change > 0 else -score)), 4)
 
 
 async def _ai_gate(symbol: str, side: str, bias_reason: str, confidence: float) -> Dict[str, Any]:
@@ -530,6 +565,28 @@ class ScalpBotManager:
                 pass
         await self._set_status(session_id, MT5ScalpSessionStatus.STOPPED, phase="stopped")
         logger.info(f"[ScalpBot] session {session_id} stopped")
+
+    async def pause(self, session_id: int) -> None:
+        """Halt a session loop but leave it resumable, and leave trades alone.
+
+        The difference from ``stop`` is the whole point of this method: STOPPED
+        is terminal and the user has to rebuild the bot from the pair picker,
+        whereas PAUSED keeps the row — symbol, lot, risk, strictness, direction,
+        every setting in ``raw_settings`` — so ``resume`` can put the same bot
+        back without the user re-selecting anything.
+
+        Open positions are NOT closed. A paused bot stops *deciding*, it does
+        not liquidate; closing is what ``stop`` and close-all are for.
+        """
+        task = self._tasks.pop(session_id, None)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        await self._set_status(session_id, MT5ScalpSessionStatus.PAUSED, phase="paused")
+        logger.info(f"[ScalpBot] session {session_id} paused (trades left open)")
 
     async def resume_active_sessions(self) -> int:
         """Restart loops for sessions left ACTIVE after a backend restart."""

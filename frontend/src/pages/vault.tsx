@@ -18,6 +18,16 @@ import {
   FolderOpen, Users, TrendingUp, Activity, Database, Network, MessageSquareText, Monitor,
 } from 'lucide-react'
 
+/** "3m ago" / "in 4m" — a sync's recency is easier to judge than a timestamp. */
+function relativeTime(iso: string): string {
+  const deltaMs = new Date(iso).getTime() - Date.now()
+  const future = deltaMs > 0
+  const mins = Math.round(Math.abs(deltaMs) / 60_000)
+  if (mins < 1) return future ? 'in <1m' : 'just now'
+  const body = mins < 60 ? `${mins}m` : `${Math.floor(mins / 60)}h ${mins % 60}m`
+  return future ? `in ${body}` : `${body} ago`
+}
+
 // ─── VaultLiveFeed — compact live action strip for the vault page ─────────────
 function VaultLiveFeed() {
   const [feed, setFeed]   = useState<any[]>([])
@@ -90,6 +100,26 @@ interface VaultStatus {
   last_sync_at: string | null
   obsidian_rest_connected: boolean
   obsidian_rest_url: string
+}
+
+/** The auto-sync loop's own record of when a sync actually ran.
+ *  `VaultStatus.last_sync_at` is only the newest note's timestamp, so a cycle
+ *  that finds nothing to write leaves it drifting ever older. */
+interface VaultSyncStatus {
+  running: boolean
+  interval_seconds: number
+  started_at: string | null
+  next_run_at: string | null
+  last_run: {
+    at: string
+    status: 'ok' | 'partial' | 'error'
+    written?: number
+    skipped?: number
+    errors?: number
+    duration_ms?: number
+    trigger?: 'auto' | 'manual'
+    error?: string
+  } | null
 }
 
 interface VaultNote {
@@ -202,6 +232,7 @@ export default function VaultPage() {
   const [filterSymbol, setFilterSymbol] = useState<string>('')
   const [syncing, setSyncing]         = useState(false)
   const [syncResult, setSyncResult]   = useState<string | null>(null)
+  const [syncStatus, setSyncStatus]   = useState<VaultSyncStatus | null>(null)
   const [loading, setLoading]         = useState(true)
 
   // ── Data fetching ──────────────────────────────────────────────────────────
@@ -211,6 +242,10 @@ export default function VaultPage() {
       const { data } = await apiClient.obsidian.status()
       setStatus(data)
     } catch { /* ignore */ }
+    try {
+      const { data } = await apiClient.obsidian.syncStatus()
+      setSyncStatus(data)
+    } catch { /* the loop is optional — the page still works without it */ }
   }, [])
 
   const fetchNotes = useCallback(async () => {
@@ -262,6 +297,13 @@ export default function VaultPage() {
       await apiClient.obsidian.openInObsidian(path)
     } catch { /* ignore */ }
   }, [])
+
+  // Keep the auto-sync panel current while the page sits open — a stale
+  // "last sync: 40m ago" on a loop that runs every 5 minutes is worse than none.
+  useEffect(() => {
+    const t = setInterval(fetchStatus, 30_000)
+    return () => clearInterval(t)
+  }, [fetchStatus])
 
   // ── Sync ───────────────────────────────────────────────────────────────────
 
@@ -336,6 +378,54 @@ export default function VaultPage() {
               {syncing ? 'Syncing…' : 'Sync Now'}
             </button>
           </div>
+        </div>
+
+        {/* ── Auto-sync state ─────────────────────────────────────────────
+            The vault is only worth anything if it is current, so when it last
+            synced is a first-class fact on this page rather than something you
+            infer from note timestamps. */}
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2 px-3 py-2 bg-gray-800/40 border border-gray-700/40 rounded-lg text-xs">
+          <span className="flex items-center gap-2">
+            <span className={`w-2 h-2 rounded-full ${
+              syncStatus?.running ? 'bg-emerald-400 animate-pulse' : 'bg-gray-500'
+            }`} />
+            <span className={syncStatus?.running ? 'text-emerald-300' : 'text-gray-400'}>
+              {syncStatus?.running
+                ? `Auto-sync every ${Math.round((syncStatus.interval_seconds || 300) / 60)} min`
+                : 'Auto-sync off'}
+            </span>
+          </span>
+
+          <span className="text-gray-500">
+            Last sync:{' '}
+            <span className={
+              syncStatus?.last_run?.status === 'error' ? 'text-red-400'
+              : syncStatus?.last_run ? 'text-gray-200' : 'text-gray-600'
+            }>
+              {syncStatus?.last_run ? relativeTime(syncStatus.last_run.at) : 'not yet this session'}
+            </span>
+            {syncStatus?.last_run?.trigger === 'manual' && (
+              <span className="text-gray-600"> (manual)</span>
+            )}
+          </span>
+
+          {syncStatus?.last_run && syncStatus.last_run.status !== 'error' && (
+            <span className="text-gray-600">
+              {syncStatus.last_run.written ?? 0} written · {syncStatus.last_run.skipped ?? 0} unchanged
+              {(syncStatus.last_run.errors ?? 0) > 0 && (
+                <span className="text-amber-400"> · {syncStatus.last_run.errors} error(s)</span>
+              )}
+              {syncStatus.last_run.duration_ms != null && ` · ${syncStatus.last_run.duration_ms}ms`}
+            </span>
+          )}
+
+          {syncStatus?.last_run?.status === 'error' && (
+            <span className="text-red-400 truncate max-w-md">{syncStatus.last_run.error}</span>
+          )}
+
+          {syncStatus?.running && syncStatus.next_run_at && (
+            <span className="text-gray-600 ml-auto">next {relativeTime(syncStatus.next_run_at)}</span>
+          )}
         </div>
 
         {syncResult && (

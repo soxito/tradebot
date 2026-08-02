@@ -135,8 +135,11 @@ async def test_crypto_signals_carry_the_same_score_breakdown(db):
 
     for sig in analysis["signals"]:
         bd = sig["score_breakdown"]
+        # macro_context is absent unless a macro bias was resolved for the
+        # symbol; its weight is redistributed rather than scored as zero.
+        # Everything else must be scored, identically to the MT5 path.
         assert sorted(f["name"] for f in bd["factors"]) == sorted(
-            smc_scoring.DEFAULT_WEIGHTS
+            set(smc_scoring.DEFAULT_WEIGHTS) - {"macro_context"}
         )
         assert bd["volume_confirmed"] is True
 

@@ -459,6 +459,54 @@ class AgentDecision(Base):
         return False
 
 
+class JarvisAnalysisJournal(Base):
+    """Every trade proposal JARVIS made, and what price actually did next.
+
+    Why this exists
+    ---------------
+    ``agent_decisions`` has outcome columns but nothing fills them — an outcome
+    is only ever written by a manual API call, so in practice the crypto side of
+    the assistant never learned anything. The MT5/SMC path *does* close its loop
+    (see ``smc_memory``), and this is the equivalent for everything JARVIS
+    proposes: record the setup, let a background loop settle it against real
+    candles, and feed the realised hit rate back into the prompt.
+
+    ``outcome`` is one of win / loss / break_even / expired / no_fill / NULL.
+    ``no_fill`` and ``expired`` are kept out of the win rate but reported
+    alongside it: proposing entries that price never reaches is a real failure
+    mode, and hiding it would make the statistics flattering instead of useful.
+    """
+
+    __tablename__ = "jarvis_analysis_journal"
+
+    id = Column(Integer, primary_key=True, index=True)
+    created_at = Column(DateTime, default=_utcnow, nullable=False, index=True)
+    source = Column(String, nullable=False, index=True)   # jarvis_command, telegram, paul_chat
+    symbol = Column(String, nullable=False, index=True)
+    asset_class = Column(String, nullable=True)           # crypto|fx|metal|index|energy|soft
+    timeframe = Column(String, nullable=True)
+    side = Column(String, nullable=False)                 # long | short
+    # ── The proposal as published to the user ──
+    entry = Column(Float, nullable=False)
+    stop_loss = Column(Float, nullable=False)
+    take_profit = Column(Float, nullable=False)
+    tp2 = Column(Float, nullable=True)
+    rr1 = Column(Float, nullable=True)
+    confidence = Column(Float, nullable=True)
+    price_at_analysis = Column(Float, nullable=True)
+    price_source = Column(String, nullable=True)
+    features = Column(Text, nullable=True)                # JSON: trend, rsi, atr, ema…
+    # ── What actually happened ──
+    outcome = Column(String, nullable=True, index=True)
+    outcome_r = Column(Float, nullable=True)              # realised R multiple
+    mfe = Column(Float, nullable=True)                    # max favourable excursion
+    mae = Column(Float, nullable=True)                    # max adverse excursion
+    exit_price = Column(Float, nullable=True)
+    exit_reason = Column(String, nullable=True)           # sl | tp | expiry | no_fill
+    bars_to_outcome = Column(Integer, nullable=True)
+    settled_at = Column(DateTime, nullable=True)
+
+
 # ─── Rug Pull / Pump Detection ──────────────────────────────
 
 

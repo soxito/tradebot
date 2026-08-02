@@ -34,7 +34,13 @@ from plugins.ObsidianKnowledgePlugin.backend.schemas import (
 from plugins.ObsidianKnowledgePlugin.backend.services.vault_writer import VaultWriter
 from plugins.ObsidianKnowledgePlugin.backend.services.vault_reader import VaultReader
 from plugins.ObsidianKnowledgePlugin.backend.services.obsidian_rest import get_bridge
-from plugins.ObsidianKnowledgePlugin.backend.services.sync_orchestrator import run_sync
+from plugins.ObsidianKnowledgePlugin.backend.services.sync_orchestrator import (
+    get_vault_sync_status,
+    record_manual_sync,
+    run_sync,
+    start_vault_sync_loop,
+    stop_vault_sync_loop,
+)
 
 router = APIRouter(prefix="/plugins/obsidian-knowledge", tags=["Obsidian Knowledge"])
 
@@ -215,10 +221,34 @@ async def trigger_sync(
         export_communities=body.export_communities,
         limit=body.limit,
     )
+    # A manual run is still the most recent sync, so the page's "last sync"
+    # must reflect it rather than only ever tracking the timer.
+    record_manual_sync(result)
     return SyncResponse(
         success=result["errors"] == 0,
         result=SyncResult(**result),
     )
+
+
+@router.get("/sync/status", summary="Auto-sync loop state and last run")
+async def sync_status():
+    """When the vault last actually synced, and when it will next.
+
+    Distinct from `/status`, whose `last_sync_at` is the newest note timestamp:
+    a cycle that finds nothing new does not move that, so it drifts ever older
+    while the sync is in fact running fine every few minutes.
+    """
+    return get_vault_sync_status()
+
+
+@router.post("/sync/start", summary="Start the vault auto-sync loop")
+async def sync_start(interval: int = Query(300, ge=60, le=86400)):
+    return {"started": start_vault_sync_loop(interval), "interval": interval}
+
+
+@router.post("/sync/stop", summary="Stop the vault auto-sync loop")
+async def sync_stop():
+    return {"stopped": stop_vault_sync_loop()}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

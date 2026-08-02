@@ -2,7 +2,7 @@
 Forex / Metals price provider — uses CoinGecko (API key already in .env).
 
 Gold (XAUUSD)  → PAX Gold (PAXG)   — 1 PAXG = 1 troy oz of gold, Brink's-vaulted
-Silver (XAGUSD)→ Tether Gold/Silver proxy via CoinGecko
+Silver (XAGUSD)→ NOT served here — see the note on _CG_COIN_MAP below
 Forex pairs    → Open Exchange Rates (free, no key) for FX-only pairs
 
 Why CoinGecko for gold instead of Bitget?
@@ -26,14 +26,18 @@ CG_PRO  = "https://pro-api.coingecko.com/api/v3"
 
 # Map Jarvis / TradingView symbol → CoinGecko coin id
 # PAXG (PAX Gold) = 1 troy oz physical gold, Brink's-vaulted, price ≈ spot XAU
+#
+# Silver is deliberately ABSENT. It used to map to "pax-gold" as a "fallback",
+# which meant /analyze XAGUSD reported the GOLD price (~$4,000) as silver
+# (~$57) — a wrong number presented with full confidence, which is worse than
+# no number at all. CoinGecko has no liquid, reliably-pegged silver token, so
+# silver is served by yahoo_provider's SI=F front-month future instead; the
+# two-tier guard in market_data.is_universal_symbol routes it there.
 _CG_COIN_MAP: Dict[str, str] = {
     "XAUUSD":   "pax-gold",
     "XAU/USDT": "pax-gold",
     "XAU/USD":  "pax-gold",
     "GOLD":     "pax-gold",
-    "XAGUSD":   "pax-gold",    # fallback to gold if silver not available
-    "XAG/USD":  "pax-gold",
-    "SILVER":   "pax-gold",
 }
 
 # Forex symbols handled via frankfurter.app (free, no auth) — FX only, not metals

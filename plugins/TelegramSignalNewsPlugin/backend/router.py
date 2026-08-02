@@ -725,8 +725,8 @@ async def list_signals(
 
 @router.post("/signals/rebuild")
 async def rebuild_signals(db: AsyncSession = Depends(get_db)):
-    """Re-scan stored messages and (re)create signals. Idempotent."""
-    stats = await create_signals_from_messages(db, limit=500)
+    """Re-scan ALL stored messages and (re)create signals. Idempotent."""
+    stats = await create_signals_from_messages(db, limit=5000, since_hours=None)
     return stats
 
 

@@ -9,7 +9,7 @@
 import { useCallback, useEffect, useRef, useState, memo } from 'react'
 import { useRouter } from 'next/router'
 import dynamic from 'next/dynamic'
-import { apiClient } from '@/services/api'
+import { apiClient, getApiBaseUrl } from '@/services/api'
 import { interpretVoiceCommand, phoneticWakeMatch, stripWakePhrase, type VoiceAction } from '@/utils/voiceCommands'
 import {
   AUDIO_BANDS, ECHO_REF_THRESHOLD, ECHO_SELF_MARGIN,
@@ -25,6 +25,8 @@ import {
 import type { RobotState, AvatarStyle } from './JarvisRobot'
 import { useVoiceTurn, type BargeInReason, type VoiceTurnState } from '@/hooks/useDeepgramAgent'
 import { detectStaticTier, threeDisabled, pollMultiplier } from '@/utils/devicePerformance'
+import { flattenMath } from '@/utils/mathText'
+import { renderMarkdown } from '@/utils/renderMarkdown'
 
 // 3D robot avatar — loaded client-side only (Three.js needs the DOM/WebGL).
 const JarvisRobotAvatar = dynamic(() => import('./JarvisRobotAvatar'), { ssr: false })
@@ -52,10 +54,20 @@ function isSniperIntent(text: string): boolean {
     && /(setup|entr|analy|signal|scan|read|trade|idea|opportunit)/.test(s)
 }
 
-// True when the user is issuing a direct Bitget crypto trade command or asking
-// for market analysis — these MUST be routed to the real /jarvis/command backend
-// endpoint and NEVER to the AI chat (which would hallucinate fake order IDs).
-function isBitgetCommand(text: string): boolean {
+// Words that follow "analyze"/"check" but are not instruments. Without this the
+// analysis pattern below fires on "check the market" and routes a conversational
+// question to the command endpoint, which answers it with a symbol error.
+const NON_SYMBOL_WORDS =
+  'the|my|this|that|it|a|an|market|markets|news|portfolio|chart|charts|' +
+  'position|positions|price|prices|trade|trades|everything|things|stuff|us|out|on|for'
+
+// True when the user is issuing a direct trade command or asking for market
+// analysis — these MUST be routed to the real /jarvis/command backend endpoint
+// and NEVER to the AI chat (which would hallucinate fake order IDs).
+//
+// The analysis pattern mirrors the backend dispatcher in
+// backend/app/api/jarvis.py (see the `_ana_m` regex) — keep the two in step.
+function isTradingCommand(text: string): boolean {
   const s = text.toLowerCase()
   return (
     // Direct execute: "execute SOLUSDT long 5 lot at 68.2; set SL 67.11; TP1 74.873"
@@ -64,8 +76,11 @@ function isBitgetCommand(text: string): boolean {
     /^(?:long|short|buy|sell)\s+\w{3,15}\s+[\d$]/.test(s) ||
     // Go long/short: "go long SOLUSDT"
     /go\s+(?:long|short)(?:\s+on)?\s+\w{3,15}/.test(s) ||
-    // Monitor / analysis: "monitor SOL", "analyze BTCUSDT", "find buy entries"
-    /(?:monitor|watch|analyze|analyse|scan|sniper?|check)\s+\w{2,12}/.test(s) ||
+    // Monitor / analysis: "monitor SOL", "analyze XAUUSD", "find buy entries".
+    // The token must look like an instrument, not an ordinary English word.
+    new RegExp(
+      `(?:monitor|watch|analyze|analyse|scan|sniper?|check)\\s+(?!(?:${NON_SYMBOL_WORDS})\\b)[a-z0-9]{2,12}\\b`,
+    ).test(s) ||
     /find\s+(?:(?:more|a|some)\s+)?(?:buy|sell|long|short)\s+entr(?:y|ies)/.test(s) ||
     // Position management: "close GWEIUSDT", "how is SOLUSDT doing", "set SL..."
     /close(?:\s+my)?\s+[a-z]{3,15}(?:usdt?)?(?:\s+position)?/.test(s) ||
@@ -607,87 +622,27 @@ const MOUTH_WINDOW_MS = 1500 // keep hearing briefly after the last mouth motion
 type SpeechRecognitionLike = any
 function getSpeechRecognition(): (new () => SpeechRecognitionLike) | null {
   if (typeof window === 'undefined') return null
+
+  // Electron exposes `webkitSpeechRecognition`, but it never produces a result:
+  // Chromium's speech backend calls a Google service keyed to an API key that
+  // Electron builds don't ship, so recognition constructs fine and then fails
+  // silently. Reporting it as unsupported routes voice straight to the Deepgram
+  // STT fallback (`sttFallback` below) instead of waiting on a dead recognizer.
+  if ((window as any).__TRADEBOT_DESKTOP__) return null
+
   return (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition || null
 }
 
 // Strip emoji / markdown so TTS reads cleanly.
 function cleanForSpeech(text: string): string {
-  return text
+  // Maths is flattened to Unicode first, so the voice says "∂u/∂t" rather than
+  // spelling out "backslash frac backslash partial".
+  return flattenMath(text)
     .replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}]/gu, '')  // emoji
     .replace(/[*_`#>]/g, '')                                   // markdown
     .replace(/\[(.*?)\]\(.*?\)/g, '$1')                        // links
     .replace(/\s+/g, ' ')
     .trim()
-}
-
-// Render assistant message content with minimal markdown:
-//   **text** → <strong>, lines with •/─ indented as bullets, ⚠️ lines styled.
-//   Keeps the rest as plain pre-wrapped text.
-function renderMarkdown(text: string): React.ReactNode {
-  const segments: React.ReactNode[] = []
-  const lines = text.split('\n')
-  lines.forEach((line, i) => {
-    // Parse inline **bold** within a single line
-    const parseBold = (raw: string): React.ReactNode => {
-      const parts = raw.split(/(\*\*[^*]+\*\*)/)
-      if (parts.length === 1) return raw
-      return parts.map((p, j) =>
-        p.startsWith('**') && p.endsWith('**')
-          ? <strong key={j} className="font-semibold text-white">{p.slice(2, -2)}</strong>
-          : p
-      )
-    }
-
-    const trimmed = line.trimStart()
-    const indent = line.length - trimmed.length
-
-    // AI verdict lines: "   AI: ✅ TAKE — note"
-    if (/^\s+AI:\s/.test(line)) {
-      const isGood = /✅|TAKE/.test(line)
-      const isBad  = /❌|SKIP/.test(line)
-      segments.push(
-        <div key={i} className={`mt-0.5 ml-${Math.min(indent, 6)} text-[12px] font-medium ${
-          isGood ? 'text-green-400' : isBad ? 'text-red-400' : 'text-yellow-400'
-        }`}>{trimmed}</div>
-      )
-      return
-    }
-
-    // Bullet lines: "   • " or "   - "
-    if (/^\s+[•\-]\s/.test(line)) {
-      segments.push(
-        <div key={i} className="flex gap-1.5 ml-2 mt-0.5">
-          <span className="text-cyan-500 shrink-0">•</span>
-          <span>{parseBold(trimmed.replace(/^[•\-]\s/, ''))}</span>
-        </div>
-      )
-      return
-    }
-
-    // Warning lines: start with ⚠️
-    if (trimmed.startsWith('⚠️')) {
-      segments.push(
-        <div key={i} className="mt-1.5 text-amber-400 text-[12px]">{parseBold(trimmed)}</div>
-      )
-      return
-    }
-
-    // Bold-only header lines (entire line is **...**)
-    if (/^\*\*[^*]+\*\*$/.test(trimmed)) {
-      segments.push(
-        <div key={i} className="mt-2 font-semibold text-cyan-300 text-[13px]">{trimmed.slice(2, -2)}</div>
-      )
-      return
-    }
-
-    // Normal line — parse inline bold
-    segments.push(
-      i === 0
-        ? <span key={i}>{parseBold(line)}</span>
-        : <div key={i} className={line.trim() === '' ? 'h-1.5' : 'mt-0.5'}>{parseBold(line)}</div>
-    )
-  })
-  return <>{segments}</>
 }
 
 // Detect a deliberate wake phrase. By default the bare name ("Jarvis, ...")
@@ -1268,7 +1223,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
       })
       // Use sendBeacon to guarantee delivery even as the page is closing
       if (typeof navigator !== 'undefined' && navigator.sendBeacon) {
-        const url = `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:1448/api/v1'}/jarvis/voice-brain/sync`
+        const url = `${getApiBaseUrl()}/jarvis/voice-brain/sync`
         navigator.sendBeacon(url, new Blob([payload], { type: 'application/json' }))
       }
     }
@@ -1347,7 +1302,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     // Route to the real /jarvis/command backend.  NEVER let the AI respond to
     // these — it will fabricate fake order IDs and claim SUCCESS without placing
     // any orders.  This fires for both typed AND voice-transcribed commands.
-    if (isBitgetCommand(text)) {
+    if (isTradingCommand(text)) {
       const userMsg: Message = { id: nanoid(), role: 'user', content: text }
       // Empty content → renders the animated "⚡ Thinking…" indicator while the
       // backend fetches live data / runs the analysis.
@@ -1356,104 +1311,116 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
       try {
         const res = await apiClient.jarvis.executeCommand(text)
         const d = res.data
-        let reply: string
-        if (d.ok) {
-          const o = d.order || {}
-          if (d.action === 'analyze') {
-            // Rich analysis card — prefer JARVIS's AI-composed human narrative,
-            // then layer in Kronos forecast, volume flow, news headlines and the
-            // proposed trade levels.
-            const lines: string[] = []
-            if (o.narrative) {
-              lines.push(o.narrative)
-            } else {
-              lines.push(`**${o.symbol || 'Analysis'}** — Live Bitget Data`)
-              if (o.trend)  lines.push(`Trend: ${o.trend.toUpperCase()}`)
-              if (o.rsi)    lines.push(`RSI: ${Number(o.rsi).toFixed(0)}`)
-              if (o.ema50)  lines.push(`EMA 50: ${o.ema50}  |  EMA 200: ${o.ema200}`)
-            }
-            // Sox ML forecast
-            if (o.kronos && o.kronos.direction) {
-              const pct = Number(o.kronos.pct_change)
-              lines.push('')
-              lines.push(`🔮 Sox ML: ${String(o.kronos.direction).toUpperCase()} ${pct >= 0 ? '+' : ''}${pct.toFixed(2)}% → ${o.kronos.target_price} (${Math.round((o.kronos.confidence || 0) * 100)}% conf)`)
-            }
-            // Volume flow
-            if (o.volume && typeof o.volume.buy_pressure_pct === 'number') {
-              lines.push(`📊 Volume: ${o.volume.buy_pressure_pct.toFixed(0)}% buy / ${o.volume.sell_pressure_pct.toFixed(0)}% sell (${Number(o.volume.volume_spike_x).toFixed(1)}× avg)`)
-            }
-            // Your open position on this pair
-            if (o.position && o.position.side) {
-              const pnl = Number(o.position.pnl || 0)
-              const pnlPct = Number(o.position.pnl_pct || 0)
-              const arrow = pnl >= 0 ? '▲' : '▼'
-              lines.push(`📌 Your position: ${String(o.position.side).toUpperCase()} ${o.position.size} @ ${o.position.entry_price} · PnL ${arrow} ${Math.abs(pnl).toFixed(2)} USDT (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%)`)
-            }
-            // News headlines + sentiment
-            if (Array.isArray(o.news) && o.news.length) {
-              lines.push('')
-              lines.push(`📰 News (${o.news_count || o.news.length} · ${(o.sentiment_label || 'neutral').toUpperCase()})`)
-              o.news.slice(0, 4).forEach((n: any) => {
-                const sc = n.sentiment_score
-                const lbl = n.sentiment_label || (sc > 0.1 ? 'BULLISH' : sc < -0.1 ? 'BEARISH' : 'NEUTRAL')
-                lines.push(`• [${String(lbl).toUpperCase()}] ${n.title}${n.source ? ` — ${n.source}` : ''}`)
-              })
-            }
-            // Proposed trade levels
-            if (o.proposed_entry) {
-              lines.push('')
-              lines.push(`Entry:  ${o.proposed_entry}  (${o.side?.toUpperCase()})`)
-              if (o.sl)             lines.push(`SL:     ${o.sl}`)
-              if (o.tp1)            lines.push(`TP1:    ${o.tp1}`)
-              if (o.tp2)            lines.push(`TP2:    ${o.tp2}`)
-            }
-            if (o.confirm_command) {
-              lines.push('')
-              lines.push(`To trade, type:`)
-              lines.push(`\`${o.confirm_command}\``)
-            }
-            reply = lines.join('\n')
-          } else if (d.action === 'execute') {
-            // Clean order confirmation card
-            const sym    = o.symbol  || ''
-            const side   = (o.side   || '').toUpperCase()
-            const sz     = o.size    || ''
-            const px     = o.price   ? `@ ${o.price}` : '@ market'
-            const oid    = o.id      || '—'
-            const lines  = [
-              `**${sym} ${side}**  ${sz} contracts ${px}`,
-            ]
-            if (o.sl)  lines.push(`SL   ${o.sl}`)
-            if (o.tp1) lines.push(`TP1  ${o.tp1}`)
-            if (o.tp2) lines.push(`TP2  ${o.tp2}${o.tp2_id === 'pending' ? '  (being set)' : ''}`)
-            lines.push('')
-            lines.push(`Order ID: ${oid}`)
-            if (d.detail && d.detail.includes('Auto-resized')) {
-              // Show auto-resize note if it happened
-              const noteMatch = d.detail.match(/Auto-resized[^.]+\.$/)
-              if (noteMatch) lines.push(noteMatch[0])
-            }
-            reply = lines.join('\n')
-          } else {
-            // set_tp / set_sl / close / list_positions / analyze
-            reply = d.speech || d.detail || 'Done.'
-          }
+
+        // A failed *analysis* is not a failed command — the regex above may
+        // simply have matched an ordinary question. Drop the placeholder and
+        // let the AI chat answer instead of showing a dead-end error card.
+        // Order placement still surfaces its error: silently rerouting a trade
+        // to a chatbot would be far worse than an error message.
+        if (!d.ok && (d.action === 'unknown' || d.action === 'analyze')) {
+          setMessages(prev => prev.filter(m => m.id !== loadingMsg.id && m.id !== userMsg.id))
         } else {
-          // Error — clean, no raw code dump
-          const msg = d.speech || d.detail || 'Unknown error'
-          reply = `Could not execute: ${msg}`
+          let reply: string
+          if (d.ok) {
+            const o = d.order || {}
+            if (d.action === 'analyze') {
+              // Rich analysis card — prefer JARVIS's AI-composed human narrative,
+              // then layer in Kronos forecast, volume flow, news headlines and the
+              // proposed trade levels.
+              const lines: string[] = []
+              if (o.narrative) {
+                lines.push(o.narrative)
+              } else {
+                lines.push(`**${o.symbol || 'Analysis'}** — Live Bitget Data`)
+                if (o.trend)  lines.push(`Trend: ${o.trend.toUpperCase()}`)
+                if (o.rsi)    lines.push(`RSI: ${Number(o.rsi).toFixed(0)}`)
+                if (o.ema50)  lines.push(`EMA 50: ${o.ema50}  |  EMA 200: ${o.ema200}`)
+              }
+              // Sox ML forecast
+              if (o.kronos && o.kronos.direction) {
+                const pct = Number(o.kronos.pct_change)
+                lines.push('')
+                lines.push(`🔮 Sox ML: ${String(o.kronos.direction).toUpperCase()} ${pct >= 0 ? '+' : ''}${pct.toFixed(2)}% → ${o.kronos.target_price} (${Math.round((o.kronos.confidence || 0) * 100)}% conf)`)
+              }
+              // Volume flow
+              if (o.volume && typeof o.volume.buy_pressure_pct === 'number') {
+                lines.push(`📊 Volume: ${o.volume.buy_pressure_pct.toFixed(0)}% buy / ${o.volume.sell_pressure_pct.toFixed(0)}% sell (${Number(o.volume.volume_spike_x).toFixed(1)}× avg)`)
+              }
+              // Your open position on this pair
+              if (o.position && o.position.side) {
+                const pnl = Number(o.position.pnl || 0)
+                const pnlPct = Number(o.position.pnl_pct || 0)
+                const arrow = pnl >= 0 ? '▲' : '▼'
+                lines.push(`📌 Your position: ${String(o.position.side).toUpperCase()} ${o.position.size} @ ${o.position.entry_price} · PnL ${arrow} ${Math.abs(pnl).toFixed(2)} USDT (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%)`)
+              }
+              // News headlines + sentiment
+              if (Array.isArray(o.news) && o.news.length) {
+                lines.push('')
+                lines.push(`📰 News (${o.news_count || o.news.length} · ${(o.sentiment_label || 'neutral').toUpperCase()})`)
+                o.news.slice(0, 4).forEach((n: any) => {
+                  const sc = n.sentiment_score
+                  const lbl = n.sentiment_label || (sc > 0.1 ? 'BULLISH' : sc < -0.1 ? 'BEARISH' : 'NEUTRAL')
+                  lines.push(`• [${String(lbl).toUpperCase()}] ${n.title}${n.source ? ` — ${n.source}` : ''}`)
+                })
+              }
+              // Proposed trade levels
+              if (o.proposed_entry) {
+                lines.push('')
+                lines.push(`Entry:  ${o.proposed_entry}  (${o.side?.toUpperCase()})`)
+                if (o.sl)             lines.push(`SL:     ${o.sl}`)
+                if (o.tp1)            lines.push(`TP1:    ${o.tp1}`)
+                if (o.tp2)            lines.push(`TP2:    ${o.tp2}`)
+              }
+              if (o.confirm_command) {
+                lines.push('')
+                lines.push(`To trade, type:`)
+                lines.push(`\`${o.confirm_command}\``)
+              }
+              reply = lines.join('\n')
+            } else if (d.action === 'execute') {
+              // Clean order confirmation card
+              const sym    = o.symbol  || ''
+              const side   = (o.side   || '').toUpperCase()
+              const sz     = o.size    || ''
+              const px     = o.price   ? `@ ${o.price}` : '@ market'
+              const oid    = o.id      || '—'
+              const lines  = [
+                `**${sym} ${side}**  ${sz} contracts ${px}`,
+              ]
+              if (o.sl)  lines.push(`SL   ${o.sl}`)
+              if (o.tp1) lines.push(`TP1  ${o.tp1}`)
+              if (o.tp2) lines.push(`TP2  ${o.tp2}${o.tp2_id === 'pending' ? '  (being set)' : ''}`)
+              lines.push('')
+              lines.push(`Order ID: ${oid}`)
+              if (d.detail && d.detail.includes('Auto-resized')) {
+                // Show auto-resize note if it happened
+                const noteMatch = d.detail.match(/Auto-resized[^.]+\.$/)
+                if (noteMatch) lines.push(noteMatch[0])
+              }
+              reply = lines.join('\n')
+            } else {
+              // set_tp / set_sl / close / list_positions / analyze
+              reply = d.speech || d.detail || 'Done.'
+            }
+          } else {
+            // Error — clean, no raw code dump
+            const msg = d.speech || d.detail || 'Unknown error'
+            reply = `Could not execute: ${msg}`
+          }
+          setMessages(prev => prev.map(m =>
+            m.id === loadingMsg.id ? { ...m, content: reply, pending: false } : m
+          ))
+          return
         }
-        setMessages(prev => prev.map(m =>
-          m.id === loadingMsg.id ? { ...m, content: reply, pending: false } : m
-        ))
       } catch (err: any) {
         setMessages(prev => prev.map(m =>
           m.id === loadingMsg.id
             ? { ...m, content: `Could not reach backend: ${err?.message || err}`, pending: false }
             : m
         ))
+        return
       }
-      return
+      // Fell through from a failed analysis — continue into the AI chat below.
     }
 
     const userMsg: Message = { id: nanoid(), role: 'user', content: text }
@@ -1474,7 +1441,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
       // not even started being spoken yet.
       turnRef.current.beginThinking({ streamAbort: abortRef.current })
       const resp = await fetch(
-        `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:1448/api/v1'}/plugins/agent-paul/chat`,
+        `${getApiBaseUrl()}/plugins/agent-paul/chat`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -2124,7 +2091,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
         formData.append('voice', aiVoice)
 
         const resp = await fetch(
-          `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:1448/api/v1'}/voice/tts`,
+          `${getApiBaseUrl()}/voice/tts`,
           {
             method: 'POST',
             body: formData,
@@ -3739,7 +3706,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
             formData.append('file', blob, 'audio.webm')
 
             try {
-              const resp = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:1448/api/v1'}/voice/stt`, {
+              const resp = await fetch(`${getApiBaseUrl()}/voice/stt`, {
                 method: 'POST',
                 body: formData
               })
@@ -4433,6 +4400,9 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
         onClick={() => setOpen(o => !o)}
         style={{ display: robotLocked ? 'none' : undefined, width: 52, height: 52 }}
         aria-label="Open PAUL JARVIS assistant"
+        // The roaming robot measures every [data-jarvis-avoid] rect and walks
+        // around it, so the chat controls are never covered or blocked.
+        data-jarvis-avoid
         className={`fixed bottom-5 right-5 z-50 w-13 h-13 rounded-full shadow-lg flex items-center justify-center transition-all duration-200 border ${
           open
             ? 'bg-gray-800 border-gray-600 scale-95'
@@ -4450,7 +4420,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
 
       {/* ── Chat panel — hidden when robot holds exclusive mic/speaker ─────── */}
       {open && !robotLocked && (
-        <div className="fixed bottom-20 right-5 z-50 w-[380px] max-h-[600px] flex flex-col bg-gray-900 border border-gray-700 rounded-2xl shadow-2xl overflow-hidden">
+        <div data-jarvis-avoid className="fixed bottom-20 right-5 z-50 w-[380px] max-h-[600px] flex flex-col bg-gray-900 border border-gray-700 rounded-2xl shadow-2xl overflow-hidden">
 
           {/* Header */}
           <div className="flex items-center gap-2.5 px-4 py-3 border-b border-gray-700/50 bg-gray-900/90 shrink-0">

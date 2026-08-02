@@ -151,6 +151,51 @@ async def collect_news(limit: int = 25) -> List[agent_bus.ResearchFindingMessage
     return out
 
 
+async def collect_agent_reach(
+    symbols: Sequence[str], limit_per_symbol: int = 3
+) -> List[agent_bus.ResearchFindingMessage]:
+    """Web research per watchlist symbol via Agent-Reach (Exa search).
+
+    Off (returns []) unless AGENT_REACH_ENABLED is set — see
+    backend/app/services/agent_reach_client.py. Real source URLs from the
+    search results classify these as non-speculative on the same basis as any
+    other sourced headline.
+    """
+    from app.core.config import settings
+
+    if not settings.AGENT_REACH_ENABLED:
+        return []
+
+    from app.services import agent_reach_client
+
+    out: List[agent_bus.ResearchFindingMessage] = []
+    for symbol in symbols:
+        try:
+            items = await agent_reach_client.web_search(
+                f"{symbol} latest news analysis", limit=limit_per_symbol
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[research] agent-reach fetch failed for {symbol}: {exc}")
+            continue
+        for item in (items or [])[:limit_per_symbol]:
+            title = str(item.get("title") or "").strip()
+            if not title:
+                continue
+            url = item.get("url")
+            out.append(agent_bus.ResearchFindingMessage(
+                kind="news",
+                symbol=symbol,
+                headline=title[:400],
+                body=str(item.get("summary") or "")[:1000],
+                source=f"Agent-Reach ({item.get('source') or 'web'})",
+                source_url=url,
+                confidence=SOURCE_CONFIDENCE["news"],
+                speculative=not _has_source(url),
+                decay_at=_decay_at("news").isoformat(),
+            ))
+    return out
+
+
 async def collect_sentiment() -> List[agent_bus.ResearchFindingMessage]:
     """Fear & Greed snapshots — the FOMO / capitulation gauge."""
     try:
@@ -410,7 +455,10 @@ async def run_research_cycle(
     idle = await idle_provider_labels(db)
 
     collected: List[agent_bus.ResearchFindingMessage] = []
-    for coro in (collect_calendar(symbols), collect_news(), collect_sentiment()):
+    for coro in (
+        collect_calendar(symbols), collect_news(), collect_sentiment(),
+        collect_agent_reach(symbols),
+    ):
         try:
             collected.extend(await coro)
         except Exception as exc:  # noqa: BLE001 — one dead source must not stop the tick

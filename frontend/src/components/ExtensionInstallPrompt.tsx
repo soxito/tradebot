@@ -15,6 +15,7 @@
  */
 import { useEffect, useState, useCallback } from 'react'
 import { Download, X, Mic, Bell, Zap, ShieldCheck, CheckCircle2 } from 'lucide-react'
+import { getApiBaseUrl } from '../services/api'
 
 type Browser = 'chrome' | 'edge' | 'brave' | 'firefox' | 'safari' | 'other'
 
@@ -38,13 +39,13 @@ function cmpVersions(a: string, b: string): number {
 // Resolve the backend base from the configured API URL (e.g. the backend runs
 // on :1448, not :8000) so the version check and download always hit the live
 // server instead of a hardcoded, possibly-dead address.
-const API_BASE = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:1448/api/v1').replace(/\/$/, '')
+const apiBase = () => getApiBaseUrl().replace(/\/$/, '')
 // Dynamic backend endpoint — always serves the latest extension files with the
 // version baked into the filename (e.g. jarvis-extension-v3.0.0.zip).
 // Falls back to the static file if the backend is not running.
-const ZIP_URL = `${API_BASE}/jarvis/extension-download`
+const zipUrl = () => `${apiBase()}/jarvis/extension-download`
 const ZIP_URL_FALLBACK = '/jarvis-extension.zip'
-const VERSION_URL = `${API_BASE}/jarvis/extension-version`
+const versionUrl = () => `${apiBase()}/jarvis/extension-version`
 
 function detectBrowser(): Browser {
   if (typeof navigator === 'undefined') return 'other'
@@ -124,7 +125,7 @@ export default function ExtensionInstallPrompt() {
   // the correct version and uses the versioned filename.
   // Use a short 1.5s timeout so the version resolves well before the 3s banner.
   useEffect(() => {
-    fetch(VERSION_URL, {
+    fetch(versionUrl(), {
       signal: AbortSignal.timeout(1500),
     })
       .then(r => r.ok ? r.json() : null)
@@ -217,7 +218,7 @@ export default function ExtensionInstallPrompt() {
     const filename = `jarvis-extension-v${latestVersion}.zip`
     try {
       // Try dynamic backend endpoint first (always current files + versioned name)
-      const res = await fetch(`${ZIP_URL}?v=${latestVersion}`, {
+      const res = await fetch(`${zipUrl()}?v=${latestVersion}`, {
         signal: AbortSignal.timeout(15000),
       })
       if (!res.ok) throw new Error('backend unavailable')

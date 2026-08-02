@@ -190,15 +190,19 @@ class MT5Client:
     @staticmethod
     def _resolve_url(base_url: Optional[str]) -> str:
         """Return a valid absolute URL.  Falls back to env → default in that order."""
-        raw = base_url or os.environ.get("MT5_API_URL", "") or ""
-        raw = raw.strip()
-        if raw.startswith("http://") or raw.startswith("https://"):
-            return raw.rstrip("/")
-        # Empty or schemeless — try the config module's validated value
+        raw = (base_url or "").strip()
+        # Always go through the config validator: it adds a missing scheme and
+        # rejects URLs pointing at TradeBot's own API port (a bad auto-detect
+        # used to write those, turning every MT5 call into a self-404).
         try:
-            from plugins.MT5TradingPlugin.backend.config import _validated_mt5_url
-            return _validated_mt5_url(raw).rstrip("/")
+            from plugins.MT5TradingPlugin.backend.config import (
+                _load_mt5_api_url, _validated_mt5_url,
+            )
+            resolved = _validated_mt5_url(raw) if raw else _load_mt5_api_url()
+            return resolved.rstrip("/")
         except Exception:
+            if raw.startswith("http://") or raw.startswith("https://"):
+                return raw.rstrip("/")
             return "http://localhost:8092"
 
     def _maybe_reheal_url(self) -> bool:

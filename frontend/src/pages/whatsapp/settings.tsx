@@ -1,12 +1,12 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useTranslation } from "next-i18next";
+import { getApiBaseUrl } from "@/services/api";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:1448/api/v1";
+// Resolved lazily — the desktop build picks the API port at launch.
+const API_URL = () => getApiBaseUrl();
 
 export default function WhatsAppSettings({ onSessionChange }) {
-  const { t } = useTranslation("common");
   const [config, setConfig] = useState({
     openwa_base_url: "http://localhost:2785",
     openwa_api_key: "",
@@ -27,7 +27,7 @@ export default function WhatsAppSettings({ onSessionChange }) {
 
   const fetchConfig = async () => {
     try {
-      const res = await fetch(`${API_URL}/plugins/whatsapp/settings`);
+      const res = await fetch(`${API_URL()}/plugins/whatsapp/settings`);
       const data = await res.json();
       if (data.openwa_base_url) {
         setConfig({
@@ -45,7 +45,7 @@ export default function WhatsAppSettings({ onSessionChange }) {
 
   const fetchSession = async () => {
     try {
-      const res = await fetch(`${API_URL}/plugins/whatsapp/session/default/status`);
+      const res = await fetch(`${API_URL()}/plugins/whatsapp/session/default/status`);
       const data = await res.json();
       setSession(data);
       if (onSessionChange) onSessionChange(data);
@@ -58,7 +58,7 @@ export default function WhatsAppSettings({ onSessionChange }) {
     setSaving(true);
     setMessage({ type: "", text: "" });
     try {
-      const res = await fetch(`${API_URL}/plugins/whatsapp/settings`, {
+      const res = await fetch(`${API_URL()}/plugins/whatsapp/settings`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(config),
@@ -81,7 +81,7 @@ export default function WhatsAppSettings({ onSessionChange }) {
     setLoading(true);
     setMessage({ type: "", text: "" });
     try {
-      const res = await fetch(`${API_URL}/plugins/whatsapp/session/create`, {
+      const res = await fetch(`${API_URL()}/plugins/whatsapp/session/create`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: config.default_session_name }),
@@ -102,7 +102,7 @@ export default function WhatsAppSettings({ onSessionChange }) {
 
   const fetchQrCode = async () => {
     try {
-      const res = await fetch(`${API_URL}/plugins/whatsapp/session/default/qr`);
+      const res = await fetch(`${API_URL()}/plugins/whatsapp/session/default/qr`);
       const data = await res.json();
       if (data.qr_code) {
         setQrCode(data.qr_code);
@@ -118,7 +118,7 @@ export default function WhatsAppSettings({ onSessionChange }) {
     setLoading(true);
     setMessage({ type: "", text: "" });
     try {
-      const res = await fetch(`${API_URL}/plugins/whatsapp/test-connection`, { method: "POST" });
+      const res = await fetch(`${API_URL()}/plugins/whatsapp/test-connection`, { method: "POST" });
       const data = await res.json();
       if (data.any_ok) {
         setMessage({ type: "success", text: "Connection test passed!" });
@@ -135,7 +135,7 @@ export default function WhatsAppSettings({ onSessionChange }) {
 
   const handleStopSession = async () => {
     try {
-      await fetch(`${API_URL}/plugins/whatsapp/session/default/stop`, { method: "POST" });
+      await fetch(`${API_URL()}/plugins/whatsapp/session/default/stop`, { method: "POST" });
       fetchSession();
     } catch (e) {
       console.error("Failed to stop session:", e);
@@ -251,7 +251,10 @@ export default function WhatsAppSettings({ onSessionChange }) {
               </p>
               <code className="block bg-gray-100 dark:bg-gray-800 p-3 rounded text-sm text-blue-600 dark:text-blue-400">
                 {typeof window !== "undefined" ? window.location.origin : "https://your-domain.com"}
-                /api/plugins/whatsapp/webhook/{{session_id}}
+                {/* Literal placeholder text. Bare `{{session_id}}` is an object
+                    literal in JSX, not an escaped brace — it referenced an
+                    undefined variable and crashed the page at render. */}
+                /api/plugins/whatsapp/webhook/{"{session_id}"}
               </code>
               <p className="text-xs text-gray-500 dark:text-gray-400 mt-2">
                 Set this in OpenWA Dashboard → Sessions → Webhooks, or via API.

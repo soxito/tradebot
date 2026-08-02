@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import AsyncGenerator
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy import text, event, select, func
+from sqlalchemy import text, event, select, func, inspect as sa_inspect
 from sqlalchemy.orm import Session as SyncSession
 from sqlalchemy.pool import NullPool
 from app.core.config import settings
@@ -17,7 +17,7 @@ from loguru import logger
 # Create async engine
 engine = create_async_engine(
     settings.DATABASE_URL,
-    echo=settings.DEBUG,
+    echo=settings.SQL_ECHO,
     poolclass=NullPool,  # Use NullPool for better async compatibility
 )
 
@@ -143,6 +143,19 @@ async def _ensure_seed_pinescripts() -> None:
             logger.info(f"✅ Seeded {created_count} Pine script(s) from {PINE_SCRIPT_SEED_FILE.name}")
 
 
+def _reflect_columns(sync_conn) -> dict[str, set[str]]:
+    """Map every existing table to its column names, for any SQL dialect.
+
+    Runs against a sync connection because SQLAlchemy's Inspector API is
+    sync-only; callers reach it through ``conn.run_sync``.
+    """
+    inspector = sa_inspect(sync_conn)
+    return {
+        table: {col["name"] for col in inspector.get_columns(table)}
+        for table in inspector.get_table_names()
+    }
+
+
 async def init_db():
     """Initialize database tables and migrate new columns"""
     try:
@@ -208,7 +221,19 @@ async def init_db():
         ]
         _VALID_TABLES.add("signal_monitor_pairs")
         _VALID_TABLES.add("ngrok_config")
+        # Created by create_all above; whitelisted so later columns can be added
+        # through this same list rather than needing a schema drop.
+        _VALID_TABLES.add("jarvis_analysis_journal")
         async with engine.begin() as conn:
+            # Read the live schema once and only ALTER what is genuinely missing.
+            # SQLite (the desktop build's database) has no
+            # `ADD COLUMN IF NOT EXISTS`, so the guard has to live here rather
+            # than in the DDL. Checking up front is better than catching the
+            # error anyway: on PostgreSQL a failed statement aborts the whole
+            # transaction, which would have silently skipped every remaining
+            # migration in this batch.
+            existing = await conn.run_sync(_reflect_columns)
+
             for table, column, col_type in migrations:
                 # Validate identifiers against whitelist
                 base_type = col_type.split()[0].upper()
@@ -218,12 +243,17 @@ async def init_db():
                 if not column.isidentifier():
                     logger.warning(f"Skipping invalid column name: {column}")
                     continue
+                if table not in existing:
+                    continue  # table not created by this build — nothing to migrate
+                if column in existing[table]:
+                    continue  # already present
                 try:
                     await conn.execute(
-                        text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {col_type}")
+                        text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
                     )
-                except Exception:
-                    pass  # Column already exists
+                    existing[table].add(column)
+                except Exception as exc:
+                    logger.warning(f"Migration failed: {table}.{column} {col_type} — {exc}")
 
         # Backfill NULL values for enable_ai columns (first-time migration only)
         async with engine.begin() as conn:
@@ -316,14 +346,18 @@ async def init_db():
             except Exception:
                 pass
 
-        # Add COOLING value to rugpullstatus enum if not exists
-        async with engine.begin() as conn:
-            try:
-                await conn.execute(text(
-                    "ALTER TYPE rugpullstatus ADD VALUE IF NOT EXISTS 'COOLING'"
-                ))
-            except Exception:
-                pass
+        # Add COOLING value to rugpullstatus enum if not exists.
+        # PostgreSQL-only: SQLite has no native enum type — it stores enums as
+        # plain VARCHAR, so any value is already accepted and there is nothing
+        # to migrate.
+        if engine.dialect.name == "postgresql":
+            async with engine.begin() as conn:
+                try:
+                    await conn.execute(text(
+                        "ALTER TYPE rugpullstatus ADD VALUE IF NOT EXISTS 'COOLING'"
+                    ))
+                except Exception:
+                    pass
 
         # Update Position Reviewer prompt to enhanced reversal-detection version
         async with engine.begin() as conn:

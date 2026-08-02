@@ -38,6 +38,17 @@ def _research_loop():
         return None
 
 
+def _signal_research():
+    """The per-signal research queue, or None when the MT5 plugin is absent."""
+    try:
+        from plugins.MT5TradingPlugin.backend.services import signal_research
+
+        return signal_research
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[research-api] signal_research unavailable: {exc}")
+        return None
+
+
 def _economic_calendar():
     """The calendar module, or None when the MT5 plugin is not installed."""
     try:
@@ -194,3 +205,147 @@ async def stop_loop():
     from app.core.scheduler import stop_research_loop
 
     return {"stopped": stop_research_loop()}
+
+
+# ── Per-signal research queue ────────────────────────────────────────────────
+# The loop above researches the *ambient* background. These routes drive the
+# queue that researches the app's own signals — Telegram, sniper, SMC and core —
+# a bounded number at a time, and expose the per-pair progress the UI renders.
+
+
+class EnqueueJobRequest(BaseModel):
+    symbol: str
+    source: str = "manual"
+    direction: Optional[str] = None
+    entry: Optional[float] = None
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+
+
+class StartQueueRequest(BaseModel):
+    """Concurrency is capped inside the queue — research must not starve the desk."""
+    concurrency: int = 5
+    scan_interval: int = 180
+
+
+@router.get("/jobs")
+async def get_jobs(
+    status: Optional[str] = Query(None, description="Comma-separated: queued,researching,done,failed"),
+    symbol: Optional[str] = Query(None),
+    limit: int = Query(40, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+):
+    """Research jobs, newest first, with their per-step progress."""
+    sr = _signal_research()
+    if sr is None:
+        return {"jobs": [], "count": 0, "available": False}
+
+    jobs = await sr.list_jobs(db, status=status, symbol=symbol, limit=limit)
+    return {"jobs": jobs, "count": len(jobs), "steps": list(sr.STEPS), "available": True}
+
+
+@router.get("/jobs/{job_id}")
+async def get_job(job_id: int, db: AsyncSession = Depends(get_db)):
+    """One job, including the full step log."""
+    sr = _signal_research()
+    if sr is None:
+        raise HTTPException(status_code=503, detail="Research subsystem not available")
+
+    from plugins.MT5TradingPlugin.backend.models import SignalResearchJob
+
+    job = await db.get(SignalResearchJob, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Research job not found")
+    return sr.serialize_job(job)
+
+
+@router.post("/jobs")
+async def create_job(request: EnqueueJobRequest, db: AsyncSession = Depends(get_db)):
+    """Queue one pair for research by hand."""
+    sr = _signal_research()
+    if sr is None:
+        raise HTTPException(status_code=503, detail="Research subsystem not available")
+
+    job = await sr.enqueue(
+        db, symbol=request.symbol, source=request.source, direction=request.direction,
+        entry=request.entry, stop_loss=request.stop_loss, take_profit=request.take_profit,
+        # A person asking for this pair now outranks the re-research cooldown,
+        # which exists to stop the automatic sweep from looping.
+        force=True,
+    )
+    if job is None:
+        # Already queued or in flight — not an error, just nothing new to do.
+        return {"queued": False, "reason": "already in the queue"}
+    return {"queued": True, "job": sr.serialize_job(job)}
+
+
+@router.get("/plan/{symbol}")
+async def get_plan(symbol: str, db: AsyncSession = Depends(get_db)):
+    """The current research plan for one instrument: verdict + two entries.
+
+    Every live signal on the pair is researched together, so this is one
+    reconciled view rather than one answer per signal. Returns
+    ``{"plan": null}`` when nothing current exists — an expired plan is worse
+    than none, because it still reads as authoritative.
+    """
+    sr = _signal_research()
+    if sr is None:
+        return {"plan": None, "available": False}
+
+    return {"plan": await sr.latest_plan(db, symbol), "available": True}
+
+
+@router.get("/plans")
+async def get_plans(
+    symbols: str = Query(..., description="Comma-separated instruments"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Research plans for many instruments at once, keyed by symbol.
+
+    The signal, trending, sniper and rug-pull pages each render dozens of pairs;
+    this is one request instead of one per row.
+    """
+    sr = _signal_research()
+    if sr is None:
+        return {"plans": {}, "available": False}
+
+    wanted = [s.strip() for s in symbols.split(",") if s.strip()][:80]
+    return {"plans": await sr.plans_for(db, wanted), "available": True}
+
+
+@router.get("/queue/status")
+async def get_queue_status(db: AsyncSession = Depends(get_db)):
+    """Queue state: running, slots in use, backlog, last sweep."""
+    sr = _signal_research()
+    if sr is None:
+        return {"running": False, "available": False}
+
+    return {**await sr.queue_status(db), "available": True}
+
+
+@router.post("/queue/start")
+async def start_queue(request: StartQueueRequest):
+    """Start the signal-research queue."""
+    from app.core.scheduler import start_signal_research_queue
+
+    started = start_signal_research_queue(request.concurrency, request.scan_interval)
+    return {"started": started, "concurrency": request.concurrency}
+
+
+@router.post("/queue/stop")
+async def stop_queue():
+    """Stop the signal-research queue."""
+    from app.core.scheduler import stop_signal_research_queue
+
+    return {"stopped": stop_signal_research_queue()}
+
+
+@router.post("/scan")
+async def scan_signals(db: AsyncSession = Depends(get_db)):
+    """Sweep every signal source now and queue whatever is not already in flight."""
+    sr = _signal_research()
+    if sr is None:
+        raise HTTPException(status_code=503, detail="Research subsystem not available")
+
+    queued = await sr.scan_and_enqueue(db)
+    return {"queued": queued, **await sr.queue_status(db)}
