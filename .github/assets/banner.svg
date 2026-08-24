@@ -1,0 +1,169 @@
+<svg width="1200" height="420" viewBox="0 0 1200 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="TradeBot — AI-powered multi-asset trading platform. Download free today.">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#070b16"/>
+      <stop offset="45%" stop-color="#0d1428"/>
+      <stop offset="100%" stop-color="#1a1033"/>
+    </linearGradient>
+    <linearGradient id="glowGreen" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#00e676"/>
+      <stop offset="100%" stop-color="#69f0ae"/>
+    </linearGradient>
+    <linearGradient id="glowPurple" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7c4dff"/>
+      <stop offset="100%" stop-color="#b388ff"/>
+    </linearGradient>
+    <linearGradient id="ctaGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#00c853"/>
+      <stop offset="100%" stop-color="#00e676"/>
+    </linearGradient>
+    <linearGradient id="robotBody" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#2b3856"/>
+      <stop offset="100%" stop-color="#141c30"/>
+    </linearGradient>
+    <filter id="softGlow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="10" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="tinyBlur" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="6"/>
+    </filter>
+    <pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse">
+      <path d="M 48 0 L 0 0 0 48" fill="none" stroke="#ffffff" stroke-opacity="0.05" stroke-width="1"/>
+    </pattern>
+  </defs>
+
+  <!-- background -->
+  <rect width="1200" height="420" rx="18" fill="url(#bg)"/>
+  <rect width="1200" height="420" rx="18" fill="url(#grid)"/>
+  <rect x="1.5" y="1.5" width="1197" height="417" rx="17" fill="none" stroke="#7c4dff" stroke-opacity="0.35" stroke-width="3"/>
+
+  <!-- ambient glows -->
+  <ellipse cx="920" cy="210" rx="250" ry="180" fill="#7c4dff" opacity="0.10" filter="url(#tinyBlur)"/>
+  <ellipse cx="240" cy="380" rx="280" ry="70" fill="#00e676" opacity="0.06" filter="url(#tinyBlur)"/>
+
+  <!-- stars -->
+  <circle cx="90" cy="52" r="2" fill="#b388ff" opacity="0.8"/>
+  <circle cx="330" cy="40" r="1.8" fill="#ffffff" opacity="0.55"/>
+  <circle cx="520" cy="70" r="1.6" fill="#b388ff" opacity="0.65"/>
+  <circle cx="640" cy="380" r="1.8" fill="#69f0ae" opacity="0.6"/>
+  <circle cx="60" cy="330" r="1.6" fill="#ffffff" opacity="0.45"/>
+  <g filter="url(#softGlow)" opacity="0.9">
+    <path d="M560 330 l4 10 10 4 -10 4 -4 10 -4 -10 -10 -4 10 -4 z" fill="#69f0ae"/>
+  </g>
+
+  <!-- ===== right chart panel ===== -->
+  <g>
+    <rect x="680" y="55" width="470" height="310" rx="22" fill="#0b1226" stroke="#7c4dff" stroke-opacity="0.45" stroke-width="2"/>
+    <!-- panel header dots -->
+    <circle cx="706" cy="79" r="5" fill="#ff5252" opacity="0.85"/>
+    <circle cx="724" cy="79" r="5" fill="#ffd740" opacity="0.85"/>
+    <circle cx="742" cy="79" r="5" fill="#00e676" opacity="0.85"/>
+    <text x="1136" y="85" font-family="Arial, Helvetica, sans-serif" font-size="15" fill="#64789c" text-anchor="end">LIVE</text>
+    <circle cx="1078" cy="80" r="4" fill="#00e676" filter="url(#softGlow)"/>
+
+    <!-- candles -->
+    <g stroke="#00e676" fill="#00e676">
+      <line x1="742" y1="270" x2="742" y2="320" stroke-width="3"/>
+      <rect x="730" y="280" width="24" height="28" rx="3"/>
+      <line x1="796" y1="248" x2="796" y2="300" stroke-width="3"/>
+      <rect x="784" y="256" width="24" height="30" rx="3"/>
+      <line x1="850" y1="226" x2="850" y2="278" stroke-width="3"/>
+      <rect x="838" y="232" width="24" height="30" rx="3"/>
+      <line x1="958" y1="196" x2="958" y2="250" stroke-width="3"/>
+      <rect x="946" y="202" width="24" height="32" rx="3"/>
+      <line x1="1012" y1="176" x2="1012" y2="230" stroke-width="3"/>
+      <rect x="1000" y="182" width="24" height="32" rx="3"/>
+      <line x1="1066" y1="158" x2="1066" y2="212" stroke-width="3"/>
+      <rect x="1054" y="164" width="24" height="32" rx="3"/>
+    </g>
+    <g stroke="#ff5252" fill="#ff5252">
+      <line x1="904" y1="240" x2="904" y2="284" stroke-width="3"/>
+      <rect x="892" y="246" width="24" height="26" rx="3"/>
+    </g>
+    <!-- trend line -->
+    <path d="M715 330 C 790 318, 860 290, 940 258 S 1080 210, 1115 190"
+          fill="none" stroke="url(#glowGreen)" stroke-width="4" stroke-linecap="round" filter="url(#softGlow)"/>
+    <circle cx="1115" cy="190" r="6" fill="#69f0ae" filter="url(#softGlow)"/>
+  </g>
+
+  <!-- floating coins (on panel edges for depth) -->
+  <g font-family="Arial, Helvetica, sans-serif" font-weight="bold" text-anchor="middle" filter="url(#softGlow)">
+    <circle cx="688" cy="120" r="27" fill="#f7931a"/>
+    <text x="688" y="131" font-size="30" fill="#fff">&#8383;</text>
+    <circle cx="1148" cy="150" r="22" fill="#26a17b"/>
+    <text x="1148" y="159" font-size="24" fill="#fff">$</text>
+    <circle cx="1136" cy="330" r="16" fill="#627eea"/>
+    <text x="1136" y="337" font-size="17" fill="#fff">&#926;</text>
+  </g>
+
+  <!-- ===== robot (in front of panel) ===== -->
+  <g transform="translate(838,88)">
+    <!-- antenna -->
+    <line x1="77" y1="6" x2="77" y2="30" stroke="#69f0ae" stroke-width="4"/>
+    <circle cx="77" cy="0" r="9" fill="#00e676" filter="url(#softGlow)">
+      <animate attributeName="opacity" values="1;0.35;1" dur="2s" repeatCount="indefinite"/>
+    </circle>
+    <!-- head -->
+    <rect x="2" y="30" width="150" height="110" rx="26" fill="url(#robotBody)" stroke="#7c4dff" stroke-width="3"/>
+    <!-- eyes -->
+    <g filter="url(#softGlow)">
+      <circle cx="50" cy="78" r="13" fill="#00e676"/>
+      <circle cx="104" cy="78" r="13" fill="#00e676"/>
+    </g>
+    <circle cx="53" cy="75" r="4.5" fill="#eafff2"/>
+    <circle cx="107" cy="75" r="4.5" fill="#eafff2"/>
+    <!-- smile -->
+    <path d="M54 108 Q77 126 100 108" fill="none" stroke="#b388ff" stroke-width="5" stroke-linecap="round"/>
+    <!-- ear pods -->
+    <rect x="-14" y="68" width="14" height="36" rx="7" fill="#7c4dff"/>
+    <rect x="154" y="68" width="14" height="36" rx="7" fill="#7c4dff"/>
+    <!-- body -->
+    <rect x="24" y="148" width="106" height="42" rx="16" fill="url(#robotBody)" stroke="#7c4dff" stroke-width="2.5"/>
+    <rect x="44" y="160" width="66" height="10" rx="5" fill="#00e676" opacity="0.85">
+      <animate attributeName="width" values="66;30;52;66" dur="3s" repeatCount="indefinite"/>
+    </rect>
+    <rect x="44" y="176" width="44" height="8" rx="4" fill="#b388ff" opacity="0.8">
+      <animate attributeName="width" values="44;60;36;44" dur="3s" repeatCount="indefinite"/>
+    </rect>
+  </g>
+
+  <!-- particle orb nod (S.O.X command room) -->
+  <g transform="translate(712,340)" opacity="0.9">
+    <circle r="4" cx="0" cy="0" fill="#69f0ae"/>
+    <circle r="3" cx="16" cy="8" fill="#b388ff"/>
+    <circle r="3" cx="-14" cy="12" fill="#69f0ae"/>
+    <circle r="3" cx="10" cy="-14" fill="#82b1ff"/>
+    <circle r="2.5" cx="-18" cy="-8" fill="#b388ff"/>
+  </g>
+
+  <!-- ===== left column: headline ===== -->
+  <g font-family="Arial, Helvetica, sans-serif">
+    <text x="60" y="105" font-size="84" font-weight="900" fill="#ffffff" letter-spacing="1">Trade<tspan fill="#00e676">Bot</tspan></text>
+    <rect x="62" y="122" width="290" height="6" rx="3" fill="url(#glowPurple)"/>
+
+    <text x="62" y="168" font-size="26" font-weight="700" fill="#b388ff">AI-Powered Multi-Asset Trading Platform</text>
+
+    <!-- feature pills -->
+    <g font-size="18" font-weight="700">
+      <rect x="60" y="196" rx="17" width="176" height="34" fill="#101a33" stroke="#69f0ae" stroke-opacity="0.55"/>
+      <text x="148" y="219" fill="#69f0ae" text-anchor="middle">Multi-Agent AI</text>
+
+      <rect x="248" y="196" rx="17" width="164" height="34" fill="#101a33" stroke="#b388ff" stroke-opacity="0.55"/>
+      <text x="330" y="219" fill="#b388ff" text-anchor="middle">JARVIS Voice</text>
+
+      <rect x="424" y="196" rx="17" width="160" height="34" fill="#101a33" stroke="#82b1ff" stroke-opacity="0.55"/>
+      <text x="504" y="219" fill="#82b1ff" text-anchor="middle">Crypto + MT5</text>
+    </g>
+
+    <!-- CTA button -->
+    <g filter="url(#softGlow)">
+      <rect x="60" y="258" rx="31" width="320" height="62" fill="url(#ctaGrad)"/>
+    </g>
+    <text x="220" y="299" font-size="26" font-weight="900" fill="#04240f" text-anchor="middle">&#11015; DOWNLOAD FREE</text>
+
+    <!-- sub note -->
+    <text x="60" y="362" font-size="18" fill="#9fb0d0">Crypto &#183; Forex &#183; Metals &#183; Indices</text>
+    <text x="60" y="388" font-size="16" fill="#64789c">Paper-trade first &#183; Go live when ready &#183; Win / macOS / Linux</text>
+  </g>
+</svg>

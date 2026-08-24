@@ -1,6 +1,20 @@
-# 🤖 TradeBot
+<p align="center">
+  <img src=".github/assets/banner.svg" alt="TradeBot — AI-powered multi-asset trading platform. Multi-Agent AI · JARVIS Voice · Crypto + MT5. Download free." width="100%"/>
+</p>
 
-**AI-powered multi-asset trading platform.** Combines news-driven sentiment analysis, TradingView technical signals, and a multi-agent AI orchestrator to generate and (optionally) execute trades across crypto exchanges and MetaTrader 5 (forex, metals, indices) — with a voice-controlled JARVIS/Paul assistant, a plugin ecosystem for ML forecasting and channel-based signal ingestion, and an Obsidian-backed "knowledge brain".
+<h1 align="center">🤖 TradeBot</h1>
+
+<p align="center">
+  <strong>AI-powered multi-asset trading platform.</strong> Combines news-driven sentiment analysis, TradingView technical signals, and a multi-agent AI orchestrator to generate and (optionally) execute trades across crypto exchanges and MetaTrader 5 (forex, metals, indices) — with a voice-controlled JARVIS/Paul assistant, a plugin ecosystem for ML forecasting and channel-based signal ingestion, and an Obsidian-backed "knowledge brain".
+</p>
+
+<p align="center">
+  <a href="#-quick-start">🚀 Quick Start</a> •
+  <a href="#%EF%B8%8F-desktop-app">🖥️ Desktop App</a> •
+  <a href="#-complete-ui-guide--every-menu-tab">📖 UI Guide</a> •
+  <a href="#-features">✨ Features</a> •
+  <a href="#-donate--support-the-project">💝 Donate</a>
+</p>
 
 > [!TIP]
 > ### 💝 Love TradeBot? Keep it alive!
@@ -19,6 +33,7 @@
   <a href="#%EF%B8%8F-troubleshooting">Troubleshooting</a> •
   <a href="#-donate--support-the-project">💝 Donate</a>
 </p>
+
 
 ---
 
