@@ -143,6 +143,24 @@ async def _fetch_forex_ohlcv(symbol: str, timeframe: str, limit: int) -> List[li
         return []
 
 
+async def _anchor_to_swissquote(symbol: str, rows: List[list]) -> List[list]:
+    """Put FX / metals bars on Swissquote's price scale — the broker the user
+    trades — so the chart, the forecast and the sniper levels all agree with it.
+
+    Matters most for gold: Yahoo prices XAUUSD off ``GC=F``, the COMEX future,
+    which carried a ~$61 (1.4%) cost-of-carry premium over spot XAU/USD when
+    this was written, so the chart's Friday close sat $61 above the broker's.
+    The rescale is multiplicative and leaves bar-to-bar returns — what the model
+    actually reads — untouched. Any failure returns the rows as fetched.
+    """
+    try:
+        from app.exchanges.forex_provider import anchor_ohlcv_to_swissquote
+        return await anchor_ohlcv_to_swissquote(symbol, rows)
+    except Exception as exc:  # never lose a series over the anchor
+        logger.warning(f"[Kronos] Swissquote anchor failed for {symbol}: {exc}")
+        return rows
+
+
 _OHLCV_QUOTES = ("USDT", "USDC", "USD", "BTC", "ETH", "EUR", "DAI", "TUSD")
 
 
@@ -182,14 +200,24 @@ def _symbol_variants(symbol: str) -> List[str]:
 # Keyless public exchanges tried as a last resort so a forecast always has
 # candles even when NO exchange is configured with API keys (the usual cause of
 # "No OHLCV data available"). ccxt public OHLCV endpoints need no credentials.
-_PUBLIC_CCXT_EXCHANGES = ("binance", "bybit", "okx", "kucoin", "gateio", "mexc")
+#
+# Bitget leads: it is the page's default venue and the one the chart endpoint
+# draws, so it must also be the first keyless source the forecast reads. While
+# it was missing from this list, an uncredentialed Bitget forecast quietly ran
+# on Binance candles under a chart labelled BITGET.
+_PUBLIC_CCXT_EXCHANGES = ("bitget", "binance", "bybit", "okx", "kucoin", "gateio", "mexc")
 
 
-async def _fetch_public_ccxt_ohlcv(symbol: str, timeframe: str, limit: int) -> List[list]:
+async def _fetch_public_ccxt_ohlcv(
+    symbol: str, timeframe: str, limit: int, only: Optional[str] = None
+) -> List[list]:
     """Fetch OHLCV from a keyless public ccxt exchange (no API keys required).
 
     Creates a short-lived async client per exchange, tries each symbol spelling,
     and always closes the client to avoid leaking aiohttp sessions.
+
+    ``only`` restricts the attempt to a single exchange id — used to give the
+    requested venue its keyless try *before* any other venue is considered.
     """
     try:
         import ccxt.async_support as ccxt_async  # ccxt is a core backend dep
@@ -201,7 +229,8 @@ async def _fetch_public_ccxt_ohlcv(symbol: str, timeframe: str, limit: int) -> L
     if not variants:
         return []
 
-    for ex_id in _PUBLIC_CCXT_EXCHANGES:
+    ex_ids = (only,) if only else _PUBLIC_CCXT_EXCHANGES
+    for ex_id in ex_ids:
         if not hasattr(ccxt_async, ex_id):
             continue
         client = None
@@ -236,33 +265,18 @@ async def _fetch_ohlcv(exchange: str, symbol: str, timeframe: str, limit: int) -
     if _is_forex(symbol):
         rows = await _fetch_yahoo_ohlcv(symbol, timeframe, limit)
         if rows and len(rows) >= 5:
-            return rows
+            return await _anchor_to_swissquote(symbol, rows)
         rows = await _fetch_forex_ohlcv(symbol, timeframe, limit)
         if rows:
-            return rows
-
-    # Build the ordered list of exchanges to try: the requested one first, then
-    # every other initialised exchange as a fallback. A symbol the primary
-    # exchange doesn't list (which otherwise yields "No OHLCV data available")
-    # can still resolve on another exchange that does.
-    candidates: List = []
-    try:
-        req = exchange_manager.get_exchange(SupportedExchange(exchange))
-        if req is not None:
-            candidates.append(req)
-    except (ValueError, Exception):
-        pass
-    for ex_id in exchange_manager.get_all_exchanges():
-        ex = exchange_manager.get_exchange(ex_id)
-        if ex is not None and ex not in candidates:
-            candidates.append(ex)
-    if not candidates:
-        logger.warning(f"[Kronos] No exchanges initialised — trying keyless public OHLCV for {symbol}")
-        return await _fetch_public_ccxt_ohlcv(symbol, timeframe, limit)
+            return await _anchor_to_swissquote(symbol, rows)
 
     variants = _symbol_variants(symbol)
+    requested = (exchange or "").strip().lower()
     last_err: Optional[Exception] = None
-    for ex in candidates:
+
+    async def _try(ex) -> List[list]:
+        """Every symbol spelling on one connector; [] if none resolve."""
+        nonlocal last_err
         ex_name = getattr(ex, "exchange_name", ex.__class__.__name__)
         for sym in variants:
             try:
@@ -272,15 +286,51 @@ async def _fetch_ohlcv(exchange: str, symbol: str, timeframe: str, limit: int) -
             except Exception as e:  # try the next spelling / exchange
                 last_err = e
                 logger.debug(f"[Kronos] OHLCV {ex_name} {sym} {timeframe} failed: {e}")
-                continue
-    # Last resort: keyless public ccxt fetch (no API keys / configured exchanges needed).
+        return []
+
+    # 1) The requested exchange, credentialed.
+    requested_conn = None
+    try:
+        requested_conn = exchange_manager.get_exchange(SupportedExchange(exchange))
+    except (ValueError, Exception):
+        pass
+    if requested_conn is not None:
+        rows = await _try(requested_conn)
+        if rows:
+            return rows
+
+    # 2) The requested exchange again, keyless — before any other venue. The
+    #    chart endpoint (/exchanges/{exchange}/ohlcv) falls back to a keyless
+    #    public instance of the *same* exchange, so a forecast that skipped
+    #    straight to another venue here would price one venue's candles under a
+    #    chart drawn from another's.
+    if requested:
+        rows = await _fetch_public_ccxt_ohlcv(symbol, timeframe, limit, only=requested)
+        if rows:
+            return rows
+
+    # 3) Every other initialised exchange. A symbol the requested venue doesn't
+    #    list (which otherwise yields "No OHLCV data available") can still
+    #    resolve on an exchange that does.
+    others: List = []
+    for ex_id in exchange_manager.get_all_exchanges():
+        ex = exchange_manager.get_exchange(ex_id)
+        if ex is not None and ex is not requested_conn and ex not in others:
+            others.append(ex)
+    for ex in others:
+        rows = await _try(ex)
+        if rows:
+            return rows
+
+    # 4) Last resort: keyless public ccxt fetch across the whole list.
     public_rows = await _fetch_public_ccxt_ohlcv(symbol, timeframe, limit)
     if public_rows:
         return public_rows
     if last_err:
+        tried = len(others) + (1 if requested_conn is not None else 0)
         logger.warning(
             f"[Kronos] OHLCV unavailable for {symbol} {timeframe} on all "
-            f"{len(candidates)} exchange(s); last error: {last_err}"
+            f"{tried} exchange(s); last error: {last_err}"
         )
     return []
 
@@ -408,6 +458,7 @@ def _volume_gated_signal(
     symbol: str,
     horizon_label: str,
     macro: Any = None,
+    cycle: Any = None,
 ) -> ForecastSignal:
     """Build the forecast signal *after* the volume gate.
 
@@ -419,10 +470,10 @@ def _volume_gated_signal(
     """
     direction, pct, target, agree, dispersion = _model_direction(paths, anchor, horizon)
 
-    if ctx.status != "OK":
+    if ctx.status not in ("OK", "NOT_APPLICABLE"):
         rationale = volctx.direction_rationale(
             direction, ctx, agreement=agree, dispersion=dispersion,
-            confidence=0.0, decision="NO_TRADE", macro=macro,
+            confidence=0.0, decision="NO_TRADE", macro=macro, cycle=cycle,
         )
         return ForecastSignal(
             direction="no_trade", pct_change=0.0, confidence=0.0,
@@ -434,17 +485,21 @@ def _volume_gated_signal(
             rationale=rationale,
         )
 
-    confidence = volctx.score_confidence(direction, agree, dispersion, ctx, macro)
+    confidence = volctx.score_confidence(direction, agree, dispersion, ctx, macro, cycle)
     decision = volctx.decide(confidence, ctx)
     rationale = volctx.direction_rationale(
         direction, ctx, agreement=agree, dispersion=dispersion,
-        confidence=confidence, decision=decision, macro=macro,
+        confidence=confidence, decision=decision, macro=macro, cycle=cycle,
     )
     arrow = "▲" if direction == "up" else ("▼" if direction == "down" else "→")
+    if ctx.relative_volume is not None:
+        vol_phrase = f"on {ctx.regime} volume ×{ctx.relative_volume:.2f}."
+    else:
+        vol_phrase = "on price/structure (volume not required for this market)."
     summary = (
         f"Kronos projects {symbol} {direction} {arrow} {pct:+.2f}% over the next "
         f"{horizon_label} (target {target:.6g}, {int(confidence * 100)}% confidence) "
-        f"on {ctx.regime} volume ×{ctx.relative_volume:.2f}."
+        + vol_phrase
     )
     if decision == "LOW_CONFIDENCE":
         summary += " Below the tradeable confidence floor — no entry."
@@ -565,6 +620,22 @@ async def _resolve_macro(symbol: str) -> Any:
         return await resolve_macro_bias(symbol)
     except Exception as exc:  # noqa: BLE001 — context is a bonus, never a gate
         logger.debug(f"[Kronos] macro context unavailable for {symbol}: {exc}")
+        return None
+
+
+async def _resolve_cycle(symbol: str) -> Any:
+    """The Bitcoin 1064-day calendar read for *symbol*, or silence.
+
+    Same contract as macro: shapes confidence by at most −15%/+5% on cycle-
+    driven symbols (see ``volume_context.cycle_multiplier``), never raises,
+    never gates. The snapshot underneath is cached, so a batch costs one read.
+    """
+    try:
+        from app.services.market_cycle import resolve_cycle_bias
+
+        return await resolve_cycle_bias(symbol)
+    except Exception as exc:  # noqa: BLE001 — context is a bonus, never a gate
+        logger.debug(f"[Kronos] cycle context unavailable for {symbol}: {exc}")
         return None
 
 
@@ -728,7 +799,9 @@ async def run_forecast(
     # Resolved next to the volume gate but never gating: an unavailable read
     # returns an inapplicable bias and leaves confidence untouched.
     macro_bias = await _resolve_macro(symbol)
-    if vol_ctx.status != "OK":
+    # The Bitcoin 1064-day calendar — the season this instrument trades in.
+    cycle_bias = await _resolve_cycle(symbol)
+    if vol_ctx.status not in ("OK", "NOT_APPLICABLE"):
         logger.info(
             f"[Kronos] NO_TRADE {symbol} {timeframe} — volume {vol_ctx.status}: {vol_ctx.detail}"
         )
@@ -777,7 +850,7 @@ async def run_forecast(
     horizon_label = f"{pred_len}×{timeframe}"
     signal = _volume_gated_signal(
         paths, anchor_price, pred_len, vol_ctx,
-        symbol=symbol, horizon_label=horizon_label, macro=macro_bias,
+        symbol=symbol, horizon_label=horizon_label, macro=macro_bias, cycle=cycle_bias,
     )
     overlays, markers = _build_overlays(
         forecast, upper, lower, anchor_unix, anchor_price, signal.direction
@@ -885,7 +958,8 @@ async def forecast_from_rows(
         volume_unit=_volume_unit(exchange, symbol),
     )
     macro_bias = await _resolve_macro(symbol)
-    if vol_ctx.status != "OK":
+    cycle_bias = await _resolve_cycle(symbol)
+    if vol_ctx.status not in ("OK", "NOT_APPLICABLE"):
         logger.info(
             f"[Kronos] NO_TRADE {symbol} {timeframe} (rows) — volume "
             f"{vol_ctx.status}: {vol_ctx.detail}"
@@ -920,7 +994,7 @@ async def forecast_from_rows(
     horizon_label = f"{pred_len}\u00d7{timeframe}"
     signal = _volume_gated_signal(
         paths, anchor_price, pred_len, vol_ctx,
-        symbol=symbol, horizon_label=horizon_label, macro=macro_bias,
+        symbol=symbol, horizon_label=horizon_label, macro=macro_bias, cycle=cycle_bias,
     )
     overlays, markers = _build_overlays(
         forecast, upper, lower, anchor_unix, anchor_price, signal.direction
@@ -1166,7 +1240,7 @@ def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = N
 
     # ── Volume gate ──────────────────────────────────────────────────────────
     vol = resp.volume
-    if vol is None or vol.status != "OK":
+    if vol is None or vol.status not in ("OK", "NOT_APPLICABLE"):
         return []
     if sig.decision != "OK":
         return []

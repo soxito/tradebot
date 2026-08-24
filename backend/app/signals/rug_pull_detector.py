@@ -6,6 +6,7 @@ Tracks them, monitors price action, and uses sniper entries
 (Fibonacci retracements, support/resistance, momentum) for pullback shorts.
 Most of these tokens are pump-and-dump / rug pulls.
 """
+import asyncio
 import json
 import math
 import aiohttp
@@ -32,6 +33,20 @@ TRAILING_BUFFER_ROE = 250.0     # Lock in current_profit − 250% (min 250% at t
 SNIPER_BASE_MARGIN_USDT = 5.0   # Open with $5 margin
 SNIPER_MAX_MARGIN_USDT = 15.0   # Scale in to max $15 total margin per token
 _NON_FUTURES_CLEANUP_DONE = False  # One-time runtime cleanup of legacy non-futures watch rows
+
+#: CoinGecko's free tier rate-limits hard; a small semaphore keeps concurrent
+#: OHLC fetches inside its comfort zone while still overlapping the round-trips.
+_OHLC_SEM = asyncio.Semaphore(5)
+
+
+async def _fetch_ohlc_bounded(coin_id: str, days: int = 1) -> list[list] | None:
+    """``_fetch_ohlc`` under the shared concurrency cap."""
+    async with _OHLC_SEM:
+        try:
+            return await _fetch_ohlc(coin_id, days=days)
+        except Exception as exc:  # noqa: BLE001 — one token failing must not sink the batch
+            logger.debug(f"[SNIPER] OHLC fetch failed for {coin_id}: {exc}")
+            return None
 
 
 async def _fetch_markets_sorted_by_gain(min_pump_pct: float = MIN_PUMP_PCT) -> list[dict]:
@@ -1285,6 +1300,13 @@ async def run_sniper_cycle(db: AsyncSession) -> dict:
         coin_ids = [t.coin_id for t in tokens]
         prices = await _fetch_prices(coin_ids)
 
+        # Prefetch every token's OHLC concurrently instead of serially —
+        # a dozen tokens at ~400ms each used to stall the whole sniper cycle.
+        ohlc_map: dict[str, list[list] | None] = dict(zip(
+            coin_ids,
+            await asyncio.gather(*(_fetch_ohlc_bounded(cid) for cid in coin_ids)),
+        ))
+
         for token in tokens:
             scanned += 1
             price = prices.get(token.coin_id)
@@ -1299,8 +1321,8 @@ async def run_sniper_cycle(db: AsyncSession) -> dict:
                 if token.price_at_detection > 0:
                     token.peak_change_pct = ((price - token.price_at_detection) / token.price_at_detection) * 100
 
-            # Fetch OHLC for momentum analysis
-            ohlc = await _fetch_ohlc(token.coin_id, days=1)
+            # Momentum analysis against the prefetched series
+            ohlc = ohlc_map.get(token.coin_id)
 
             # Detect buying power decrease
             bp = _detect_buying_power_decrease(ohlc, token)

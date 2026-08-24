@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from typing import Any
 
 import httpx
@@ -17,21 +18,26 @@ DIRECTION_PATTERNS = {
     "sell": re.compile(r"\b(short|sell|bear(?:ish)?)\b", re.IGNORECASE),
 }
 SYMBOL_PATTERN = re.compile(r"\b([A-Z]{2,12}(?:USDT|USD|BTC|ETH|EUR|GBP|JPY)?)\b")
-LEVEL_PATTERN = re.compile(r"\b(entry|sl|stop\s*loss|tp\d*|take\s*profit)\s*[:=@\-]?\s*(\d+(?:\.\d+)?)\b", re.IGNORECASE)
+# [\W_]{0,5} spans the gap between the TP/SL label and the price so emoji
+# (🔼), underscores ("TP___4368"), colons and dashes are all skipped without
+# the tp\d* → backtrack-to-bare-tp bug (letters/digits are NOT consumed).
+LEVEL_PATTERN = re.compile(
+    r"\b(entry|sl|stop\s*loss|tp\d*|take\s*profit)[\W_]{0,5}(\d+(?:\.\d+)?)\b",
+    re.IGNORECASE,
+)
 
 SIGNAL_KEYWORDS = ["entry", "sl", "stop loss", "tp", "target", "setup", "signal", "long", "short"]
 NEWS_KEYWORDS = ["breaking", "announced", "report", "fed", "sec", "etf", "inflation", "cpi", "earnings"]
 
 SYMBOL_STOPWORDS = {
-    "BUY",
-    "SELL",
-    "LONG",
-    "SHORT",
-    "TP",
-    "ENTRY",
-    "SL",
-    "USD",
-    "USDT",
+    "BUY", "SELL", "LONG", "SHORT", "TP", "ENTRY", "SL",
+    "USD", "USDT", "NOW", "ALL", "ARE", "IS", "AT", "BE",
+}
+
+# Named commodity symbols → canonical Forex pair (mirrors signal_parser._SYMBOL_ALIASES).
+_EXTRACTOR_SYMBOL_ALIASES: dict[str, str] = {
+    "GOLD": "XAUUSD",
+    "SILVER": "XAGUSD",
 }
 
 
@@ -77,16 +83,22 @@ def _rule_extract(text: str, source_kind: str) -> TelegramExtractionResult:
             break
 
     symbols = [
-        token
+        _EXTRACTOR_SYMBOL_ALIASES.get(token, token)
         for token in sorted(set(SYMBOL_PATTERN.findall(text)))
         if token not in SYMBOL_STOPWORDS
     ]
 
     levels: dict[str, float] = {}
+    tp_index = 0
     for key, value in LEVEL_PATTERN.findall(text):
         normalized_key = key.lower().replace(" ", "")
         if normalized_key in {"stoploss", "sl"}:
             normalized_key = "sl"
+        elif normalized_key in {"takeprofit", "tp"}:
+            # Bare TP with no index (e.g. repeated "TP 4354" gold lines) — number
+            # them so every level is kept instead of overwriting the same key.
+            tp_index += 1
+            normalized_key = f"tp{tp_index}"
         elif normalized_key.startswith("takeprofit"):
             normalized_key = normalized_key.replace("takeprofit", "tp")
         elif normalized_key == "entry":
@@ -214,5 +226,8 @@ def _build_summary(direction: str, symbols: list[str], levels: dict[str, float])
 
 
 def _normalize_text(text: str) -> str:
-    compact = re.sub(r"\s+", " ", text or "")
+    # NFKC folds Unicode "fancy" letters/digits (Mathematical Bold 𝗫𝗠𝖨…, 𝙽𝙼…)
+    # to plain ASCII so symbol/level detection works on styled channel posts.
+    compact = unicodedata.normalize("NFKC", text or "")
+    compact = re.sub(r"\s+", " ", compact)
     return compact.strip()

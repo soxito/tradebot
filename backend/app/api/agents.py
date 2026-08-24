@@ -5,7 +5,7 @@ analysis endpoints require the toggle to be ON.
 """
 import json
 import os
-from typing import Optional, List
+from typing import Literal, Optional, List
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,9 +14,10 @@ from loguru import logger
 
 from app.core.database import get_db
 from app.core.config import settings
-from app.models.database import Agent, AgentDecision
+from app.models.database import Agent, AgentDecision, RoomAgentProfile
 from app.agents.specialists import DEFAULT_AGENTS
 from app.agents.orchestrator import AgentOrchestrator
+from app.agents import room
 from app.agents.memory import get_learning_stats
 from app.core.timezone import now_sast
 
@@ -172,6 +173,696 @@ async def seed_default_agents(db: AsyncSession = Depends(get_db)):
         "agents": created,
         "existing": len(existing),
     }
+
+
+# ─── Trading Room ────────────────────────────────────────────
+
+
+@router.get("/room/state")
+async def room_state(db: AsyncSession = Depends(get_db)):
+    """Live snapshot of the trading room — seats, personas and recent sessions.
+
+    Lets a client that opens the room mid-flight (or after background work)
+    render the current picture without waiting for the next SSE event.
+    """
+    result = await db.execute(select(Agent).where(Agent.is_active == True))
+    rows = result.scalars().all()
+
+    snap = room.snapshot()
+    live = {a["role"]: a for a in snap["agents"]}
+    seats = []
+    for r in rows:
+        persona = room.persona_for(r.role)
+        seats.append({
+            **persona,
+            "agent_id": r.id,
+            "agent_name": r.name,
+            "description": r.description,
+            "pairs": r.pairs,
+            "state": room.IDLE,
+            **{k: v for k, v in live.get(r.role, {}).items() if k not in persona},
+        })
+    seats.sort(key=lambda s: s["seat"])
+
+    return {
+        "focus_symbol": snap["focus_symbol"],
+        "focus_symbols": snap.get("focus_symbols", []),
+        "ceo": snap["ceo"],
+        "seats": seats,
+        "sessions": snap["sessions"],
+        "server_time": snap["server_time"],
+    }
+
+
+class FocusRequest(BaseModel):
+    # Back-compat: a single `symbol`, or a list of `symbols`. Null/empty clears.
+    symbol: Optional[str] = None
+    symbols: Optional[List[str]] = None
+
+
+@router.post("/room/focus")
+async def set_room_focus(data: FocusRequest, db: AsyncSession = Depends(get_db)):
+    """Pin every agent to one or more pairs. Pass nothing to resume free roaming."""
+    if data.symbols is not None:
+        chosen: Optional[object] = data.symbols
+    elif data.symbol is not None:
+        chosen = data.symbol
+    else:
+        chosen = None
+
+    await room.set_focus(chosen)
+    symbols = room.get_focus_symbols()
+
+    # Persist as a comma-joined string so the pin(s) survive a restart.
+    try:
+        from app.agents.execution import get_settings
+        s = await get_settings(db)
+        s.focus_symbol = ",".join(symbols) if symbols else None
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001 - the live pin still took effect
+        logger.warning(f"[room] focus set to {symbols} but could not be persisted: {exc}")
+
+    return {"focus_symbol": room.get_focus_symbol(), "focus_symbols": symbols}
+
+
+class ProfileUpdate(BaseModel):
+    """Who an agent is in the room, plus the config the orchestrator runs on."""
+    agent_id: int
+    human_name: Optional[str] = None
+    title: Optional[str] = None
+    color: Optional[str] = None
+    seat: Optional[int] = None
+    gender: Optional[Literal["male", "female"]] = None
+    tasks: Optional[str] = None
+    # Passed straight through to the Agent row
+    name: Optional[str] = None
+    role: Optional[str] = None
+    system_prompt: Optional[str] = None
+    model: Optional[str] = None
+    is_active: Optional[bool] = None
+    pairs: Optional[str] = None
+
+
+async def refresh_persona_overrides(db: AsyncSession) -> None:
+    """Push saved profiles into the in-memory persona table the room emits with."""
+    rows = (await db.execute(
+        select(RoomAgentProfile, Agent).join(Agent, Agent.id == RoomAgentProfile.agent_id)
+    )).all()
+    room.set_persona_overrides({
+        agent.role: {
+            "human_name": profile.human_name,
+            "title": profile.title,
+            "color": profile.color,
+            "seat": profile.seat,
+            "gender": profile.gender,
+            "tasks": profile.tasks,
+        }
+        for profile, agent in rows
+    })
+
+
+@router.get("/room/profiles")
+async def list_room_profiles(db: AsyncSession = Depends(get_db)):
+    """Every agent with its room identity — the settings page's source of truth."""
+    agents = (await db.execute(select(Agent).order_by(Agent.id))).scalars().all()
+    profiles = {
+        p.agent_id: p
+        for p in (await db.execute(select(RoomAgentProfile))).scalars().all()
+    }
+
+    out = []
+    for a in agents:
+        persona = room.persona_for(a.role)
+        p = profiles.get(a.id)
+        out.append({
+            "agent_id": a.id,
+            "name": a.name,
+            "role": a.role,
+            "description": a.description,
+            "system_prompt": a.system_prompt,
+            "model": a.model,
+            "is_active": a.is_active,
+            "pairs": a.pairs,
+            "human_name": p.human_name if p else persona["human_name"],
+            "title": p.title if p else persona["title"],
+            "color": p.color if p else persona["color"],
+            "seat": p.seat if p else persona["seat"],
+            "gender": p.gender if p else persona["gender"],
+            "tasks": p.tasks if p else None,
+            "customised": p is not None,
+        })
+    out.sort(key=lambda r: r["seat"])
+    return {"profiles": out}
+
+
+@router.put("/room/profiles")
+async def save_room_profiles(
+    updates: List[ProfileUpdate], db: AsyncSession = Depends(get_db)
+):
+    """Rename, reseat, recolour and re-task the agents in one save."""
+    saved = 0
+    for u in updates:
+        agent = await db.get(Agent, u.agent_id)
+        if not agent:
+            continue
+
+        for field in ("name", "role", "system_prompt", "model", "is_active", "pairs"):
+            value = getattr(u, field)
+            if value is not None:
+                setattr(agent, field, value)
+
+        profile = (await db.execute(
+            select(RoomAgentProfile).where(RoomAgentProfile.agent_id == u.agent_id)
+        )).scalar_one_or_none()
+        if profile is None:
+            persona = room.persona_for(agent.role)
+            profile = RoomAgentProfile(
+                agent_id=u.agent_id,
+                human_name=persona["human_name"],
+                title=persona["title"],
+                color=persona["color"],
+                seat=persona["seat"],
+                gender=persona["gender"],
+            )
+            db.add(profile)
+
+        for field in ("human_name", "title", "color", "seat", "gender", "tasks"):
+            value = getattr(u, field)
+            if value is not None:
+                setattr(profile, field, value)
+        saved += 1
+
+    await db.commit()
+    await refresh_persona_overrides(db)
+    return {"saved": saved}
+
+
+@router.post("/room/profiles/seed-instructions")
+async def seed_room_instructions(
+    overwrite: bool = False, db: AsyncSession = Depends(get_db)
+):
+    """Fill each agent's standing instructions with the worked example for its role.
+
+    Only writes into an empty brief unless ``overwrite`` is set, so a desk that
+    has already written its own instructions (or had them improved) is never
+    silently reset.
+    """
+    from app.agents.room import DEFAULT_TASKS
+
+    agents = (await db.execute(select(Agent))).scalars().all()
+    profiles = {
+        p.agent_id: p
+        for p in (await db.execute(select(RoomAgentProfile))).scalars().all()
+    }
+
+    seeded = []
+    for a in agents:
+        sample = DEFAULT_TASKS.get(a.role)
+        if not sample:
+            continue
+
+        profile = profiles.get(a.id)
+        if profile is None:
+            persona = room.persona_for(a.role)
+            profile = RoomAgentProfile(
+                agent_id=a.id,
+                human_name=persona["human_name"],
+                title=persona["title"],
+                color=persona["color"],
+                seat=persona["seat"],
+                gender=persona["gender"],
+            )
+            db.add(profile)
+
+        if profile.tasks and not overwrite:
+            continue
+        profile.tasks = sample
+        seeded.append(a.role)
+
+    await db.commit()
+    await refresh_persona_overrides(db)
+    return {"seeded": seeded, "count": len(seeded)}
+
+
+@router.get("/room/self-improve/history")
+async def self_improve_history(
+    role: Optional[str] = None, limit: int = 25, db: AsyncSession = Depends(get_db)
+):
+    """Past instruction rewrites, newest first — the audit trail."""
+    from app.models.database import AgentInstructionRevision
+
+    stmt = select(AgentInstructionRevision).order_by(AgentInstructionRevision.id.desc()).limit(limit)
+    if role:
+        stmt = stmt.where(AgentInstructionRevision.role == role)
+
+    return {
+        "revisions": [
+            {
+                "id": r.id,
+                "role": r.role,
+                "agent_id": r.agent_id,
+                "previous_instructions": r.previous_instructions,
+                "new_instructions": r.new_instructions,
+                "rationale": r.rationale,
+                "decisions_reviewed": r.decisions_reviewed,
+                "win_rate": r.win_rate,
+                "avg_pnl": r.avg_pnl,
+                "applied": r.applied,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in (await db.execute(stmt)).scalars().all()
+        ]
+    }
+
+
+@router.get("/room/self-improve/scores")
+async def self_improve_scores(db: AsyncSession = Depends(get_db)):
+    """How each agent is actually performing — the input to the next rewrite."""
+    from app.agents.self_improve import MIN_DECISIONS, score_agent
+
+    agents = (await db.execute(select(Agent).where(Agent.is_active == True))).scalars().all()  # noqa: E712
+    out = []
+    for a in agents:
+        s = await score_agent(db, a)
+        out.append({
+            "role": s.role,
+            "agent_name": s.agent_name,
+            "total": s.total,
+            "resolved": s.resolved,
+            "wins": s.wins,
+            "losses": s.losses,
+            "break_even": s.break_even,
+            "win_rate": s.win_rate,
+            "avg_pnl": s.avg_pnl,
+            "avg_conf_win": round(s.avg_conf_win, 3),
+            "avg_conf_loss": round(s.avg_conf_loss, 3),
+            "enough_history": s.enough_history,
+        })
+    return {"scores": out, "min_decisions": MIN_DECISIONS}
+
+
+@router.post("/room/self-improve/run")
+async def self_improve_run(
+    role: Optional[str] = None,
+    force: bool = False,
+    db: AsyncSession = Depends(get_db),
+):
+    """Score the agents and rewrite the instructions of those with the history for it.
+
+    ``force`` runs the rewrite even below the minimum sample size — useful for
+    trying it out, but a rewrite from a handful of trades is noise-fitting.
+    """
+    from app.agents.self_improve import improve_agent, improve_all
+
+    if role:
+        agent = (
+            await db.execute(select(Agent).where(Agent.role == role))
+        ).scalars().first()
+        if agent is None:
+            raise HTTPException(status_code=404, detail=f"No agent with role {role}")
+        result = await improve_agent(db, agent, force=force)
+        await refresh_persona_overrides(db)
+        return {"results": [result]}
+
+    return {"results": await improve_all(db, force=force)}
+
+
+@router.post("/room/self-improve/revert/{revision_id}")
+async def self_improve_revert(revision_id: int, db: AsyncSession = Depends(get_db)):
+    """Put back the instructions a given revision replaced."""
+    from app.agents.self_improve import revert_revision
+
+    result = await revert_revision(db, revision_id)
+    if not result.get("reverted"):
+        raise HTTPException(status_code=404, detail=result.get("reason", "revert failed"))
+    return result
+
+
+class RoomSettingsUpdate(BaseModel):
+    execution_enabled: Optional[bool] = None
+    dry_run: Optional[bool] = None
+    allow_sim: Optional[bool] = None
+    allow_crypto: Optional[bool] = None
+    allow_mt5: Optional[bool] = None
+    mt5_account_id: Optional[int] = None
+    mt5_live_mode: Optional[bool] = None
+    mt5_demo_account_id: Optional[int] = None
+    risk_pct: Optional[float] = None
+    max_open_positions: Optional[int] = None
+    min_consensus: Optional[float] = None
+    min_confidence: Optional[float] = None
+    max_trades_per_day: Optional[int] = None
+    max_leverage: Optional[int] = None
+    focus_interval_s: Optional[int] = None
+    focus_timeframe: Optional[str] = None
+    worker_enabled: Optional[bool] = None
+    # Bitcoin 1064-day cycle — anchors are cycle-bottom ISO dates.
+    cycle_anchors: Optional[List[str]] = None
+    cycle_bull_days: Optional[int] = None
+    cycle_bear_days: Optional[int] = None
+    cycle_auto_risk: Optional[bool] = None
+    cycle_risk_multiplier: Optional[float] = None
+
+
+def _settings_payload(s, db_extra: dict | None = None) -> dict:
+    return {
+        "execution_enabled": s.execution_enabled,
+        "dry_run": s.dry_run,
+        "allow_sim": s.allow_sim,
+        "allow_crypto": s.allow_crypto,
+        "allow_mt5": s.allow_mt5,
+        "mt5_account_id": s.mt5_account_id,
+        "mt5_live_mode": getattr(s, "mt5_live_mode", False),
+        "mt5_demo_account_id": getattr(s, "mt5_demo_account_id", None),
+        "risk_pct": s.risk_pct,
+        "max_open_positions": s.max_open_positions,
+        "min_consensus": s.min_consensus,
+        "min_confidence": s.min_confidence,
+        "max_trades_per_day": s.max_trades_per_day,
+        "max_leverage": s.max_leverage,
+        "focus_interval_s": getattr(s, "focus_interval_s", 300),
+        "focus_timeframe": getattr(s, "focus_timeframe", "1h") or "1h",
+        "worker_enabled": getattr(s, "worker_enabled", True),
+        "focus_symbol": getattr(s, "focus_symbol", None),
+        # Cycle settings — anchors come back as a list regardless of storage.
+        "cycle_anchors": _cycle_anchors_out(getattr(s, "cycle_anchors", None)),
+        "cycle_bull_days": getattr(s, "cycle_bull_days", 1064) or 1064,
+        "cycle_bear_days": getattr(s, "cycle_bear_days", 365) or 365,
+        "cycle_auto_risk": getattr(s, "cycle_auto_risk", False),
+        "cycle_risk_multiplier": getattr(s, "cycle_risk_multiplier", 0.5),
+        **(db_extra or {}),
+    }
+
+
+def _cycle_anchors_out(raw) -> list[str]:
+    """Persisted anchor JSON → list of ISO dates for the client."""
+    import json
+
+    from app.services.market_cycle import DEFAULT_ANCHORS
+
+    if not raw:
+        return list(DEFAULT_ANCHORS)
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return [str(a) for a in parsed]
+    except (ValueError, TypeError):
+        pass
+    return list(DEFAULT_ANCHORS)
+
+
+@router.get("/room/settings")
+async def get_room_settings(db: AsyncSession = Depends(get_db)):
+    """Execution policy, plus the context the settings page needs to render it."""
+    from app.agents.execution import get_settings, trades_today
+
+    s = await get_settings(db)
+
+    mt5_accounts = []
+    try:
+        from plugins.MT5TradingPlugin.backend.models import MT5Account
+        mt5_accounts = [
+            {"id": a.id, "name": a.name, "login": a.login,
+             "balance": a.balance, "equity": a.equity, "currency": a.currency}
+            for a in (await db.execute(select(MT5Account))).scalars().all()
+        ]
+    except Exception:  # noqa: BLE001 - plugin-optional
+        pass
+
+    return _settings_payload(s, {
+        "trades_today": trades_today(),
+        "mt5_accounts": mt5_accounts,
+        # The .env master switch still outranks everything on this page.
+        "global_auto_trading_enabled": settings.ENABLE_AUTO_TRADING,
+    })
+
+
+@router.put("/room/settings")
+async def update_room_settings(data: RoomSettingsUpdate, db: AsyncSession = Depends(get_db)):
+    """Update the execution policy.
+
+    Going live is deliberately awkward: turning ``dry_run`` off while the global
+    ENABLE_AUTO_TRADING flag is unset is rejected rather than silently ignored,
+    so nobody believes they armed something they did not.
+    """
+    from app.agents.execution import get_settings
+
+    s = await get_settings(db)
+
+    if data.dry_run is False and not settings.ENABLE_AUTO_TRADING:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Live execution needs ENABLE_AUTO_TRADING=true in your .env. "
+                "Dry run stays on until then."
+            ),
+        )
+    if data.risk_pct is not None and not (0 < data.risk_pct <= 10):
+        raise HTTPException(status_code=400, detail="risk_pct must be between 0 and 10")
+    if data.max_open_positions is not None and not (0 < data.max_open_positions <= 50):
+        raise HTTPException(status_code=400, detail="max_open_positions must be between 1 and 50")
+
+    from app.workers.room_worker import FOCUS_INTERVAL_CHOICES, FOCUS_TIMEFRAME_CHOICES
+
+    if data.focus_interval_s is not None and data.focus_interval_s not in FOCUS_INTERVAL_CHOICES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"focus_interval_s must be one of {list(FOCUS_INTERVAL_CHOICES)}",
+        )
+    if data.focus_timeframe is not None:
+        data.focus_timeframe = data.focus_timeframe.strip().lower()
+        if data.focus_timeframe not in FOCUS_TIMEFRAME_CHOICES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"focus_timeframe must be one of {list(FOCUS_TIMEFRAME_CHOICES)}",
+            )
+
+    # ── Cycle settings validation ──
+    # Anchors must be real ISO dates in the past; the calendar cannot anchor a
+    # cycle to a day that has not happened.
+    if data.cycle_anchors is not None:
+        from datetime import date as _date
+
+        cleaned: list[str] = []
+        for raw in data.cycle_anchors:
+            try:
+                parsed = _date.fromisoformat(str(raw).strip()[:10])
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"cycle anchor '{raw}' is not an ISO date (YYYY-MM-DD)",
+                )
+            if parsed >= _date.today():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"cycle anchor '{raw}' must be in the past",
+                )
+            cleaned.append(parsed.isoformat())
+        if not cleaned:
+            raise HTTPException(status_code=400, detail="at least one cycle anchor is required")
+        data.cycle_anchors = sorted(cleaned)
+    if data.cycle_bull_days is not None and not (200 <= data.cycle_bull_days <= 2000):
+        raise HTTPException(status_code=400, detail="cycle_bull_days must be 200–2000")
+    if data.cycle_bear_days is not None and not (60 <= data.cycle_bear_days <= 1200):
+        raise HTTPException(status_code=400, detail="cycle_bear_days must be 60–1200")
+    if data.cycle_risk_multiplier is not None and not (0 < data.cycle_risk_multiplier <= 1):
+        raise HTTPException(
+            status_code=400, detail="cycle_risk_multiplier must be between 0 and 1"
+        )
+
+    # Boolean fields must be settable to False, not just truthy values.
+    _bool_fields = {
+        "execution_enabled", "dry_run", "allow_sim", "allow_crypto",
+        "allow_mt5", "worker_enabled", "mt5_live_mode", "cycle_auto_risk",
+    }
+    updates = data.model_dump(exclude_unset=True)
+    # The anchors column is TEXT; the API contract is a list.
+    if "cycle_anchors" in updates and updates["cycle_anchors"] is not None:
+        updates["cycle_anchors"] = json.dumps(updates["cycle_anchors"])
+    for field, value in updates.items():
+        if value is not None or field in _bool_fields:
+            setattr(s, field, value)
+
+    await db.commit()
+    await db.refresh(s)
+
+    # The cached snapshot was built from the previous anchors — drop it so the
+    # next read (and every agent seat) sees the new calendar immediately.
+    if any(k.startswith("cycle_") for k in updates):
+        try:
+            from app.services import market_cycle
+
+            market_cycle.reset_cache()
+        except Exception:  # noqa: BLE001 - cache invalidation is best-effort
+            pass
+
+    # Push the cadence into the live worker so a change takes effect on the very
+    # next cycle rather than at the next restart.
+    if data.focus_interval_s is not None:
+        from app.workers.room_worker import set_focus_interval
+        set_focus_interval(data.focus_interval_s)
+
+    # Same for the timeframe: the next meeting analyses on it, and the room's
+    # chart draws it, without waiting for a restart.
+    if data.focus_timeframe is not None:
+        from app.workers.room_worker import set_focus_timeframe
+        set_focus_timeframe(data.focus_timeframe)
+
+    # Arming/disarming the 24/7 board from the same switch that persists it.
+    if data.worker_enabled is not None:
+        from app.workers.room_worker import start_room_worker, stop_room_worker
+        if data.worker_enabled:
+            start_room_worker(
+                settings.ROOM_WORKER_INTERVAL_SECONDS,
+                settings.ROOM_WORKER_COOLDOWN_SECONDS,
+                focus_interval=s.focus_interval_s,
+            )
+        else:
+            stop_room_worker()
+    logger.warning(
+        f"[room] execution policy updated — enabled={s.execution_enabled} "
+        f"dry_run={s.dry_run} risk={s.risk_pct}% venues="
+        f"{[v for v, on in (('sim', s.allow_sim), ('crypto', s.allow_crypto), ('mt5', s.allow_mt5)) if on]}"
+    )
+    return _settings_payload(s)
+
+
+class RoomBriefRequest(BaseModel):
+    symbol: str
+    timeframe: Optional[str] = None
+    #: Re-run the seats rather than describing the last meeting. The room is
+    #: expensive, so the default is to report what it already concluded.
+    analyse: bool = True
+
+
+@router.post("/room/brief")
+async def room_brief(data: RoomBriefRequest, db: AsyncSession = Depends(get_db)):
+    """Everything the ``/room`` command sends on Telegram, as JSON.
+
+    The web room showed seats, states and a verdict; the Telegram command sent
+    the verdict *plus* the structural read, the plan's levels, the copyable
+    signal card, the forecast and a drawn chart. Two surfaces of the same desk
+    should not deliver different amounts of the same analysis, so this is the
+    one builder both of them call.
+    """
+    from app.agents.orchestrator import AgentOrchestrator
+    from app.workers.room_worker import get_focus_timeframe
+
+    symbol = (data.symbol or "").strip().upper()
+    if not symbol:
+        raise HTTPException(status_code=400, detail="symbol is required")
+    # The room's own timeframe unless the caller asked for another, so a brief
+    # opened from the room describes the same bars the board just argued over.
+    timeframe = (data.timeframe or get_focus_timeframe()).strip().lower()
+
+    result: dict = {}
+    if data.analyse:
+        result = await AgentOrchestrator.analyze_symbol(
+            db, symbol, timeframe=timeframe, trigger="manual"
+        )
+    else:
+        # Describe the most recent meeting on this pair instead of convening.
+        for session in reversed(room.snapshot().get("sessions") or []):
+            if str(session.get("symbol") or "").upper() == symbol:
+                result = {
+                    "symbol": symbol,
+                    "timeframe": session.get("timeframe") or timeframe,
+                    "final_action": session.get("final_action"),
+                    "final_confidence": session.get("final_confidence"),
+                    "final_reasoning": session.get("final_reasoning"),
+                    "decisions": session.get("decisions") or [],
+                }
+                break
+        if not result:
+            raise HTTPException(
+                status_code=404, detail=f"The room has not met on {symbol} yet"
+            )
+
+    payload: dict = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "result": result,
+        "consensus": room.consensus_from(result.get("decisions") or []),
+        "forecast": result.get("kronos_forecast"),
+        "momentum": result.get("momentum"),
+        # The season and the whale flow the verdict was made under — the same
+        # snapshot the seats received, so the web brief matches the /room card.
+        "btc_cycle": result.get("btc_cycle"),
+        "btc_whales": result.get("btc_whales"),
+    }
+
+    # The narrative half — best-effort, and each piece independently: a missing
+    # chart must not cost the levels, and missing levels must not cost the read.
+    try:
+        import base64
+
+        from app.services import candles as candle_source
+        from plugins.TelegramSignalNewsPlugin.backend.services import room_bridge
+
+        candles = await candle_source.fetch(symbol, timeframe)
+        payload["candles_available"] = len(candles)
+        price = float(result.get("price") or (candles[-1][4] if candles else 0) or 0)
+        overlay, chart = await room_bridge.room_plan(symbol, timeframe, result, price)
+        payload["plan"] = {
+            "direction": getattr(overlay, "direction", None),
+            "entry": getattr(overlay, "entry", None),
+            "stop_loss": getattr(overlay, "stop_loss", None),
+            "take_profits": list(getattr(overlay, "take_profits", []) or []),
+        } if overlay else None
+        payload["plan_levels_text"] = room_bridge.plan_levels_text(overlay)
+        payload["market_read"] = (
+            await room_bridge.market_read_text(symbol, timeframe, candles)
+            if candles else ""
+        )
+        payload["signal_card"] = await room_bridge.signal_card_for(
+            result, symbol, overlay, candles=candles,
+        )
+        payload["chart_png_base64"] = (
+            base64.b64encode(chart).decode("ascii") if chart else None
+        )
+    except Exception as exc:  # noqa: BLE001 — the verdict is the deliverable
+        logger.warning(f"[Agents] room brief extras unavailable for {symbol}: {exc}")
+        payload.setdefault("chart_png_base64", None)
+
+    # How earlier plans on this pair are tracking — the follow-up the Telegram
+    # command leads with, and the web room never had at all.
+    try:
+        from app.services.scenario_tracker import scenario_narrative, track_symbol
+
+        payload["scenario_follow_up"] = scenario_narrative(await track_symbol(db, symbol))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[Agents] scenario follow-up skipped for {symbol}: {exc}")
+        payload["scenario_follow_up"] = ""
+
+    return payload
+
+
+@router.get("/room/worker")
+async def room_worker_state():
+    """Whether the room keeps meeting while nobody is watching."""
+    from app.workers.room_worker import room_worker_status
+    return room_worker_status()
+
+
+@router.post("/room/worker/start")
+async def room_worker_start(db: AsyncSession = Depends(get_db)):
+    from app.agents.execution import get_settings
+    from app.workers.room_worker import room_worker_status, start_room_worker
+
+    s = await get_settings(db)
+    started = start_room_worker(
+        settings.ROOM_WORKER_INTERVAL_SECONDS,
+        settings.ROOM_WORKER_COOLDOWN_SECONDS,
+        focus_interval=getattr(s, "focus_interval_s", 300),
+    )
+    return {"started": started, **room_worker_status()}
+
+
+@router.post("/room/worker/stop")
+async def room_worker_stop():
+    from app.workers.room_worker import room_worker_status, stop_room_worker
+    stopped = stop_room_worker()
+    return {"stopped": stopped, **room_worker_status()}
 
 
 # ─── Status & Toggle ─────────────────────────────────────────
@@ -379,46 +1070,56 @@ async def get_decision_stats(db: AsyncSession = Depends(get_db)):
     """
     Aggregate decision statistics broken down by agent_role and action.
     Returned as a summary for the Insights → AI Decisions tab.
+
+    Uses grouped SQL aggregates instead of loading the whole AgentDecision
+    table into Python.
     """
-    from sqlalchemy import case, Float
+    from sqlalchemy import func, case
 
-    result = await db.execute(select(AgentDecision))
-    decisions = result.scalars().all()
+    total = (await db.execute(select(func.count(AgentDecision.id)))).scalar() or 0
 
+    _act = func.lower(func.coalesce(AgentDecision.action, "hold"))
+
+    role_rows = (await db.execute(
+        select(
+            AgentDecision.agent_role,
+            func.count(AgentDecision.id),
+            func.sum(case((AgentDecision.ai_called == True, 1), else_=0)),  # noqa: E712
+            func.sum(case((AgentDecision.outcome == "win", 1), else_=0)),
+        ).group_by(AgentDecision.agent_role)
+    )).all()
     by_role: dict = {}
-    by_action: dict = {}
+    for role, count, ai_calls, wins in role_rows:
+        r = role or "unknown"
+        cnt = int(count or 0)
+        ai = int(ai_calls or 0)
+        by_role[r] = {"count": cnt, "ai_calls": ai, "local": cnt - ai, "wins": int(wins or 0)}
+
+    action_rows = (await db.execute(
+        select(_act, func.count(AgentDecision.id)).group_by(_act)
+    )).all()
+    by_action: dict = {a: int(c or 0) for a, c in action_rows}
+
+    sym_rows = (await db.execute(
+        select(
+            func.coalesce(AgentDecision.symbol, "unknown"),
+            func.count(AgentDecision.id),
+            func.sum(case((_act.in_(("buy", "long")), 1), else_=0)),
+            func.sum(case((_act.in_(("sell", "short")), 1), else_=0)),
+        ).group_by(func.coalesce(AgentDecision.symbol, "unknown"))
+    )).all()
     by_symbol: dict = {}
-
-    for d in decisions:
-        role = d.agent_role or "unknown"
-        action = (d.action or "hold").lower()
-        symbol = d.symbol or "unknown"
-
-        by_role.setdefault(role, {"count": 0, "ai_calls": 0, "local": 0, "wins": 0})
-        by_role[role]["count"] += 1
-        if d.ai_called:
-            by_role[role]["ai_calls"] += 1
-        else:
-            by_role[role]["local"] += 1
-        if d.outcome == "win":
-            by_role[role]["wins"] += 1
-
-        by_action[action] = by_action.get(action, 0) + 1
-
-        by_symbol.setdefault(symbol, {"count": 0, "buy": 0, "sell": 0, "hold": 0})
-        by_symbol[symbol]["count"] += 1
-        if action in ("buy", "long"):
-            by_symbol[symbol]["buy"] += 1
-        elif action in ("sell", "short"):
-            by_symbol[symbol]["sell"] += 1
-        else:
-            by_symbol[symbol]["hold"] += 1
+    for symbol, count, buy, sell in sym_rows:
+        cnt = int(count or 0)
+        b = int(buy or 0)
+        s = int(sell or 0)
+        by_symbol[symbol] = {"count": cnt, "buy": b, "sell": s, "hold": cnt - b - s}
 
     # Top 10 symbols by decision count
     top_symbols = sorted(by_symbol.items(), key=lambda x: -x[1]["count"])[:10]
 
     return {
-        "total": len(decisions),
+        "total": int(total),
         "by_role": by_role,
         "by_action": by_action,
         "top_symbols": [{"symbol": s, **v} for s, v in top_symbols],

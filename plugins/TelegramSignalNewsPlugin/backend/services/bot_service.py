@@ -12,13 +12,18 @@ structured dict so callers can inspect ``ok`` without try/except.
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any
 
 import httpx
 from loguru import logger
 
 BOT_API_BASE = "https://api.telegram.org/bot{token}"
+#: File downloads live on a different path than the method API — /file/bot<token>/
+#: — and are plain GETs, so they cannot go through ``_call``.
+FILE_API_BASE = "https://api.telegram.org/file/bot{token}"
 _HTTP_TIMEOUT = 15  # seconds
+_DOWNLOAD_TIMEOUT = 30  # seconds — a photo is bigger than a JSON reply
 
 
 def _base(token: str) -> str:
@@ -33,6 +38,14 @@ async def _call(
     timeout: float = _HTTP_TIMEOUT,
 ) -> dict[str, Any]:
     """POST to the Bot API and return the parsed JSON (always a dict)."""
+    if _under_test():
+        # Every outbound call funnels through here, so this is the one place a
+        # test cannot get past. It exists because it already happened: a guard
+        # fixture nobody had written let a suite send a run of trade updates to
+        # the user's phone, for a position that only existed in a fixture.
+        logger.debug("[BotService] {} suppressed under test", method)
+        return {"ok": False, "description": "suppressed: test environment"}
+
     url = f"{_base(token)}/{method}"
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -42,6 +55,15 @@ async def _call(
     except Exception as exc:  # noqa: BLE001
         logger.warning("[BotService] {} failed: {}", method, exc)
         return {"ok": False, "description": str(exc)}
+
+
+def _under_test() -> bool:
+    """True when pytest is running this process.
+
+    Telegram is the one side effect in this app that reaches a person directly,
+    and a message about a trade is acted on. No test may produce one.
+    """
+    return bool(os.environ.get("PYTEST_CURRENT_TEST"))
 
 
 # ── Public helpers ────────────────────────────────────────────────────────────
@@ -69,6 +91,34 @@ async def send_message(
     return await _call("sendMessage", token, payload)
 
 
+async def send_photo(
+    token: str,
+    chat_id: str | int,
+    photo: bytes,
+    caption: str = "",
+    parse_mode: str = "HTML",
+    filename: str = "chart.png",
+) -> dict[str, Any]:
+    """Send an image to chat_id (multipart, so no upload round trip is needed)."""
+    if _under_test():
+        logger.debug("[BotService] sendPhoto suppressed under test")
+        return {"ok": False, "description": "suppressed: test environment"}
+
+    url = f"{_base(token)}/sendPhoto"
+    data: dict[str, Any] = {"chat_id": str(chat_id), "parse_mode": parse_mode}
+    if caption:
+        data["caption"] = caption[:1024]  # Telegram caption limit
+    try:
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+            resp = await client.post(
+                url, data=data, files={"photo": (filename, photo, "image/png")}
+            )
+            return resp.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[BotService] sendPhoto failed: {}", exc)
+        return {"ok": False, "description": str(exc)}
+
+
 async def answer_callback_query(
     token: str,
     callback_query_id: str,
@@ -80,6 +130,50 @@ async def answer_callback_query(
     if text:
         payload["text"] = text[:200]
     return await _call("answerCallbackQuery", token, payload)
+
+
+async def get_file(token: str, file_id: str) -> str | None:
+    """Resolve a ``file_id`` to the relative path used for downloading.
+
+    Returns None rather than raising — a photo we cannot fetch should degrade to
+    a normal "couldn't read that" reply, not a 500 on the webhook.
+    """
+    resp = await _call("getFile", token, {"file_id": file_id})
+    if not resp.get("ok"):
+        logger.warning("[BotService] getFile failed: {}", resp.get("description"))
+        return None
+    return (resp.get("result") or {}).get("file_path")
+
+
+async def download_file(
+    token: str,
+    file_path: str,
+    *,
+    max_bytes: int = 8 * 1024 * 1024,
+) -> bytes | None:
+    """Download a file resolved by :func:`get_file`.
+
+    ``max_bytes`` guards the LLM call downstream as much as memory here: base64
+    inflates by a third, and a large screenshot can outgrow the model's image
+    budget long before it troubles the process.
+    """
+    url = f"{FILE_API_BASE.format(token=token)}/{file_path.lstrip('/')}"
+    try:
+        async with httpx.AsyncClient(timeout=_DOWNLOAD_TIMEOUT) as client:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                logger.warning("[BotService] file download HTTP {}", resp.status_code)
+                return None
+            data = resp.content
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[BotService] file download failed: {}", exc)
+        return None
+    if len(data) > max_bytes:
+        logger.warning(
+            "[BotService] file too large: {} bytes > {} limit", len(data), max_bytes
+        )
+        return None
+    return data
 
 
 async def get_webhook_info(token: str) -> dict[str, Any]:
@@ -157,6 +251,7 @@ JARVIS_COMMANDS: list[dict[str, str]] = [
     {"command": "order",      "description": "Execute Kronos signal — /order [live] long BTCUSDT 100"},
     {"command": "analyze",    "description": "Deep AI analysis (Kronos+news+position) — /analyze BTCUSDT"},
     {"command": "mt5",        "description": "MT5 accounts/positions/scalp — /mt5 status|positions|scalp|close"},
+    {"command": "room",       "description": "Trading room agents — /room BTCUSDT 4h, a question, or a chart image"},
 ]
 
 

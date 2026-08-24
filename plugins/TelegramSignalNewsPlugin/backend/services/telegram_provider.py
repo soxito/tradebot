@@ -30,6 +30,56 @@ _ACCOUNT_INFO_CACHE: dict[str, tuple[float, dict | None]] = {}
 _ACCOUNT_INFO_TTL = 300.0  # seconds
 
 
+# ── Canonical Telethon session path ────────────────────────────────────────────
+# The session name was passed bare to Telethon and resolved against os.getcwd(),
+# so any change to how the backend was launched silently swapped the session file
+# and flipped the UI back to "Connect Telegram Account" with no error. Pin it to
+# one absolute data dir and migrate the newest existing (cwd-relative) session in
+# once so the live login survives.
+import os as _os
+import shutil as _shutil
+from pathlib import Path as _Path
+
+_REPO_ROOT = _Path(__file__).resolve().parents[4]
+_SESSION_DIR = _REPO_ROOT / "data" / "telegram"
+_resolved_session_paths: dict[str, str] = {}
+
+
+def _resolve_session_path(session_name: str) -> str:
+    """Absolute Telethon session base (no .session suffix); cached, migrates once."""
+    cached = _resolved_session_paths.get(session_name)
+    if cached is not None:
+        return cached
+    if _os.path.isabs(session_name):
+        _resolved_session_paths[session_name] = session_name
+        return session_name
+    target_dir = _SESSION_DIR
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        target_dir = _REPO_ROOT / "backend"
+    target = target_dir / session_name
+    target_session = _Path(f"{target}.session")
+    if not target_session.exists():
+        candidates = [
+            _REPO_ROOT / "backend" / f"{session_name}.session",
+            _REPO_ROOT / f"{session_name}.session",
+        ]
+        existing = [p for p in candidates if p.exists()]
+        if existing:
+            newest = max(existing, key=lambda p: p.stat().st_mtime)
+            try:
+                _shutil.copy2(newest, target_session)
+                journal = newest.with_name(newest.name + "-journal")
+                if journal.exists():
+                    _shutil.copy2(journal, _Path(f"{target}.session-journal"))
+            except Exception:
+                pass
+    result = str(target)
+    _resolved_session_paths[session_name] = result
+    return result
+
+
 CORE_METHODS_URL = "https://core.telegram.org/methods"
 METHOD_TEST_MODE_BINDING: Literal["binding"] = "binding"
 METHOD_TEST_MODE_INVOKE_READONLY: Literal["invoke_readonly"] = "invoke_readonly"
@@ -93,10 +143,14 @@ class TelethonProvider:
         return True
 
     # ── internal helper ───────────────────────────────────────────────────
+    def _session_base(self) -> str:
+        """Absolute session base path — never cwd-relative (see _resolve_session_path)."""
+        return _resolve_session_path(self._cfg.session_name)
+
     def _make_client(self):
         """Return an uninitialised TelegramClient (not yet connected)."""
         client_cls = self._get_client_cls()
-        return client_cls(self._cfg.session_name, self._cfg.api_id, self._cfg.api_hash)
+        return client_cls(self._session_base(), self._cfg.api_id, self._cfg.api_hash)
 
     @asynccontextmanager
     async def _connected_client(self):
@@ -168,7 +222,7 @@ class TelethonProvider:
     async def ping(self) -> str:
         """Quick connectivity check: returns account first_name via get_me()."""
         import os
-        session_path = f"{self._cfg.session_name}.session"
+        session_path = f"{self._session_base()}.session"
         if not os.path.exists(session_path):
             raise RuntimeError("Telethon: no session file — not authenticated")
         async with self._connected_client() as client:
@@ -193,7 +247,7 @@ class TelethonProvider:
         if not (self._cfg.api_id and self._cfg.api_hash):
             return False
         # Fast-path: no session file means definitely not authenticated
-        session_path = f"{self._cfg.session_name}.session"
+        session_path = f"{self._session_base()}.session"
         if not os.path.exists(session_path):
             return False
         try:
@@ -211,24 +265,24 @@ class TelethonProvider:
         import os
         if not (self._cfg.api_id and self._cfg.api_hash):
             return None
-        session_path = f"{self._cfg.session_name}.session"
+        session_path = f"{self._session_base()}.session"
         if not os.path.exists(session_path):
-            _ACCOUNT_INFO_CACHE.pop(self._cfg.session_name, None)
+            _ACCOUNT_INFO_CACHE.pop(self._session_base(), None)
             return None
 
         # Serve from cache when fresh
-        cached = _ACCOUNT_INFO_CACHE.get(self._cfg.session_name)
+        cached = _ACCOUNT_INFO_CACHE.get(self._session_base())
         if not force and cached is not None and (_time.time() - cached[0]) < _ACCOUNT_INFO_TTL:
             return cached[1]
 
         try:
             async with self._connected_client() as client:
                 if not await client.is_user_authorized():
-                    _ACCOUNT_INFO_CACHE[self._cfg.session_name] = (_time.time(), None)
+                    _ACCOUNT_INFO_CACHE[self._session_base()] = (_time.time(), None)
                     return None
                 me = await client.get_me()
                 if me is None:
-                    _ACCOUNT_INFO_CACHE[self._cfg.session_name] = (_time.time(), None)
+                    _ACCOUNT_INFO_CACHE[self._session_base()] = (_time.time(), None)
                     return None
                 info = {
                     "id": getattr(me, "id", None),
@@ -236,7 +290,7 @@ class TelethonProvider:
                     "first_name": getattr(me, "first_name", None),
                     "username": getattr(me, "username", None),
                 }
-                _ACCOUNT_INFO_CACHE[self._cfg.session_name] = (_time.time(), info)
+                _ACCOUNT_INFO_CACHE[self._session_base()] = (_time.time(), info)
                 return info
         except Exception:
             # Don't poison the cache on transient errors; return last good value
@@ -285,13 +339,13 @@ class TelethonProvider:
                 "username": getattr(me, "username", None),
             }
             # Refresh the cache so /auth/status reflects the new login immediately
-            _ACCOUNT_INFO_CACHE[self._cfg.session_name] = (_time.time(), info)
+            _ACCOUNT_INFO_CACHE[self._session_base()] = (_time.time(), info)
             return info
 
     async def disconnect(self) -> None:
         """Log out and remove the local session file."""
         import os
-        _ACCOUNT_INFO_CACHE.pop(self._cfg.session_name, None)
+        _ACCOUNT_INFO_CACHE.pop(self._session_base(), None)
         try:
             async with self._connected_client() as client:
                 if await client.is_user_authorized():
@@ -300,7 +354,7 @@ class TelethonProvider:
             pass
         # Remove the .session file so is_authenticated() returns False cleanly
         for ext in (".session", ".session-journal"):
-            path = f"{self._cfg.session_name}{ext}"
+            path = f"{self._session_base()}{ext}"
             try:
                 if os.path.exists(path):
                     os.remove(path)
@@ -463,7 +517,7 @@ class TelethonProvider:
 
         client_cls = self._get_client_cls()
         try:
-            async with client_cls(self._cfg.session_name, self._cfg.api_id, self._cfg.api_hash) as client:
+            async with client_cls(self._session_base(), self._cfg.api_id, self._cfg.api_hash) as client:
                 await client(request)
         except Exception as exc:
             return False, f"Invocation failed: {exc}"

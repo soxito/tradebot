@@ -22,7 +22,7 @@ from loguru import logger
 from sqlalchemy import select, desc as sqldesc
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from plugins.AiMarketAnalyst.backend.services.ai_router import chat_with_tools, db_chat
+from plugins.AiMarketAnalyst.backend.services.ai_router import chat_turn, db_chat
 from plugins.AiMarketAnalyst.backend.services.graphify_service import (
     graph_overview, query_map
 )
@@ -102,6 +102,55 @@ Behaviour rules:
   When you do confirm a trade, state only: symbol, side, size, price, order ID.
   Keep it to two or three lines. No Position Summary blocks, no fake status fields.
   Fabricated trade confirmations cause real financial harm.
+- **HOW TO DELIVER A MARKET READ.** When you analyse a specific instrument,
+  answer in the trading room's voice, in this order, and skip any part you have
+  no real data for rather than padding it:
+    1. 👁‍🗨 Structure — the timeframe and what price is doing: trending with
+       higher lows / lower highs, or consolidating and waiting for a break of
+       structure.
+    2. ⚖️ Momentum — MACD relative to the zero line and the RSI value, read as
+       conviction or indecision.
+    3. Volatility and participation — where price sits against the Bollinger
+       Bands, whether volume is drying up or expanding versus average, and the
+       Stochastic.
+    4. 🔔 Key Levels — the level that ignites upside and the level whose loss
+       opens the door to a correction. When a plan exists, give entry, stop and
+       targets here too.
+    5. A one-line bias with the vote tally, e.g. 🟡 Bias: Neutral (Buy 3/6 |
+       Sell 3/6).
+  QUOTE THE NUMBERS YOU WERE GIVEN — never invent an RSI, a level, a volume
+  ratio or a vote tally. If an indicator is missing from your context, leave it
+  out; a number you made up is worse than a shorter answer. When a "Key levels"
+  or analysis block appears in your context, those figures are authoritative:
+  repeat them exactly rather than rounding or re-deriving them.
+- **STUDY THE CANDLES BEFORE JUDGING A MOVE.** Any read on where a market is
+  going comes from the closed candles behind it, never from the current price
+  alone. Call the `candles` tool and CHOOSE THE DEPTH yourself: 28 closed
+  candles is the floor, and you should ask for many more — 100, 200, 500 — when
+  the question is about structure, a trend, or where a move might run to. There
+  is no cap; pick what the analysis actually needs. The tool separates closed
+  candles from the bar still forming and returns the measured movement across
+  the window. Never call a breakout on a candle that has not closed, and never
+  say you lack the data to judge a move — fetch more candles instead.
+- **HOW TO REPORT ON A PLAN ALREADY PUBLISHED.** Call `scenario_check` before
+  claiming anything about an earlier call, and report exactly what it returns:
+  whether price reached the entry, what share of the mapped move has completed,
+  and whether the invalidation was hit. When a plan is running to schedule you
+  may say so with confidence — "price reached and reacted at the zone we mapped,
+  X% of the plan completed, target still Y" — and add the teaching point: that
+  reading structure and liquidity beforehand is what makes a level meaningful,
+  not the entry itself. When a plan was invalidated, say so just as plainly.
+  NEVER claim a previous call worked, or that a level was called earlier at all,
+  unless `scenario_check` returned it. A congratulatory follow-up on a call that
+  did not happen, or on a losing one, is the worst thing you can say — the user
+  will size their next trade on it.
+- **HOW TO REPORT ECONOMIC DATA.** For CPI, PPI, NFP, claims or any release,
+  call `economic_release` and report only figures it returns, in its shape:
+  the release name and date, each line as `actual vs forecast vs previous`, a
+  one-line read of each, then the overall insight — hawkish or dovish, the
+  currency direction, and gold's direction (gold moves inversely to the dollar).
+  Never state a number that has not printed, never guess a forecast, and if
+  nothing has been released say exactly that.
 - You LEARN: every conversation is stored, so build on prior context naturally
 - **SELF-IMPROVEMENT**: You can permanently improve yourself by calling:
   POST /api/v1/plugins/agent-paul/jarvis-improve
@@ -548,14 +597,61 @@ def _wants_trading_glossary(user_msg: str, pathname: str = "/") -> bool:
     return pathname not in ("/", "", "/settings", "/intelligence")
 
 
+async def _news_headlines(user_msg: str) -> list[dict]:
+    """Headlines for whatever the message names, else the general feed."""
+    if user_msg:
+        import re as _re
+        tokens = [t for t in _re.split(r"[^A-Za-z]", user_msg.upper()) if 2 < len(t) <= 6]
+        for tok in tokens[:3]:
+            hits = await news_research.news_for_symbol(tok, limit=4)
+            if hits:
+                return hits
+    return (await news_research.fetch_news())[:8]
+
+
+async def _research_block(user_msg: str, limit: int) -> str:
+    """Open-web / Wikipedia / Stack Exchange grounding for the question."""
+    query = (user_msg or "").strip()
+    if len(query) < 3:
+        return ""
+    return news_research.format_research_block(
+        query, await news_research.research(query, limit=limit)
+    )
+
+
 async def build_jarvis_system_prompt(
     db: AsyncSession, pathname: str = "/", user_msg: str = "",
-    session_key: str = "", first_turn: bool = False,
+    session_key: str = "", first_turn: bool = False, deep: bool = False,
 ) -> str:
-    """Build full JARVIS system prompt with live context injected."""
+    """Build full JARVIS system prompt with live context injected.
+
+    ``deep`` is how hard this turn is going to work. On a fast turn the live
+    blocks that leave the machine — Bitget balances, RSS, the open-web research
+    pass — are started together and given a short shared deadline instead of
+    being awaited one after another. They used to run in series before the model
+    was called at all, so "what's my balance" paid for a full web search first;
+    whatever has not landed by the deadline is simply left out of the prompt.
+    """
     parts: list[str] = [_JARVIS_PERSONA]
     if _wants_trading_glossary(user_msg, pathname):
         parts.append(_TRADING_GLOSSARY)
+
+    _net_budget = 12.0 if deep else 4.0
+
+    async def _capped(coro, label: str):
+        try:
+            return await asyncio.wait_for(coro, _net_budget)
+        except asyncio.TimeoutError:
+            logger.debug(f"[JARVIS] {label} context dropped (> {_net_budget:.0f}s)")
+        except Exception as exc:  # noqa: BLE001 — context is a bonus, not a gate
+            logger.debug(f"[JARVIS] {label} context failed: {exc}")
+        return None
+
+    _crypto_task = asyncio.create_task(_capped(_get_crypto_summary(), "crypto"))
+    _news_task = asyncio.create_task(_capped(_news_headlines(user_msg), "news"))
+    _research_task = asyncio.create_task(
+        _capped(_research_block(user_msg, 6 if deep else 3), "research")
+    )
 
     # ── SuperContext scout (first turn only): pre-load context for THIS question ──
     if first_turn and user_msg:
@@ -628,7 +724,7 @@ async def build_jarvis_system_prompt(
 
     # ── Crypto (Bitget) balances + open futures positions ──────────────
     try:
-        crypto = await _get_crypto_summary()
+        crypto = await _crypto_task or {}
         if crypto.get("available"):
             parts.append("\n## Crypto Account (Bitget)")
             fb = crypto.get("futures")
@@ -828,17 +924,9 @@ async def build_jarvis_system_prompt(
 
     # ── Live news (RSS, internet) ───────────────────────────────────────
     try:
-        # If the user mentioned a specific instrument, prefer targeted news.
-        symbol_news: list[dict] = []
-        if user_msg:
-            import re as _re
-            tokens = [t for t in _re.split(r"[^A-Za-z]", user_msg.upper()) if 2 < len(t) <= 6]
-            for tok in tokens[:3]:
-                hits = await news_research.news_for_symbol(tok, limit=4)
-                if hits:
-                    symbol_news = hits
-                    break
-        headlines = symbol_news or (await news_research.fetch_news())[:8]
+        # Targeted when the message named an instrument, general otherwise —
+        # already in flight since the top of this function.
+        headlines = await _news_task or []
         if headlines:
             parts.append("\n## Live News (public RSS, with sentiment -1..+1)")
             for n in headlines[:8]:
@@ -854,13 +942,9 @@ async def build_jarvis_system_prompt(
     # maths, science, history and programming questions arrive with real
     # sources attached instead of leaving the model to guess or refuse.
     try:
-        if user_msg and len(user_msg.strip()) >= 3:
-            block = news_research.format_research_block(
-                user_msg.strip(),
-                await news_research.research(user_msg.strip(), limit=6),
-            )
-            if block:
-                parts.append(block)
+        block = await _research_task
+        if block:
+            parts.append(block)
     except Exception as exc:  # noqa
         logger.debug(f"[JARVIS] research inject error: {exc}")
 
@@ -919,11 +1003,60 @@ async def build_jarvis_system_prompt(
     return "\n".join(parts)
 
 
+def _decode_data_uri(uri: str) -> tuple[bytes, str] | None:
+    """Split a ``data:<mime>;base64,<payload>`` URI into bytes and mime type."""
+    import base64 as _b64
+
+    if not uri.startswith("data:") or ";base64," not in uri:
+        return None
+    header, _, payload = uri.partition(";base64,")
+    try:
+        return _b64.b64decode(payload), header[5:] or "image/png"
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _levels_block(overlay) -> str:
+    """The room's levels as prompt text, so Paul quotes what the chart drew."""
+    if overlay is None or not overlay.entry:
+        return ""
+    parts = [f"entry {overlay.entry:.6g}"]
+    if overlay.stop_loss:
+        parts.append(f"stop {overlay.stop_loss:.6g}")
+    if overlay.take_profits:
+        parts.append("targets " + ", ".join(f"{t:.6g}" for t in overlay.take_profits))
+    if zone := overlay.fib_golden_zone:
+        parts.append(f"fib golden zone {zone['low']:.6g}–{zone['high']:.6g}")
+    if overlay.support_zones:
+        s = overlay.support_zones[0]
+        parts.append(f"nearest support {s['low']:.6g}–{s['high']:.6g}")
+    if overlay.resistance_zones:
+        r = overlay.resistance_zones[0]
+        parts.append(f"nearest resistance {r['low']:.6g}–{r['high']:.6g}")
+    return "\n🔔 Key levels — " + " · ".join(parts) + "\n"
+
+
+async def _room_plan(symbol: str, result: dict):
+    """The room's ``(overlay, chart)`` for ``symbol``; ``(None, None)`` if not drawable.
+
+    One call for both, so the levels Paul describes and the levels on the
+    picture beside them are the same numbers.
+    """
+    from plugins.TelegramSignalNewsPlugin.backend.services.room_bridge import room_plan
+
+    try:
+        return await room_plan(symbol, "1h", result)
+    except Exception as exc:  # noqa: BLE001 — a missing chart must not kill the answer
+        logger.debug(f"[JARVIS] room plan skipped for {symbol}: {exc}")
+        return None, None
+
+
 async def stream_jarvis_chat(
     db: AsyncSession,
     messages: list[dict],
     pathname: str = "/",
     session_key: str = "",
+    image: str | None = None,
 ) -> AsyncIterator[str]:
     """Yield SSE-formatted data chunks for the JARVIS chat response.
 
@@ -1027,9 +1160,62 @@ async def stream_jarvis_chat(
             except Exception as te:
                 logger.debug(f"[JARVIS] auto-trade error: {te}")
 
+        vision_note = ""
+
+        # ── Attached screenshot / chart ───────────────────────────────────────
+        # Read it before the answer is composed so the model treats what is on
+        # screen as observed fact. The marked-up copy goes out as its own SSE
+        # event straight away — the overlay is drawn on the user's own pixels,
+        # so the levels sit on the real chart rather than a regenerated one.
+        if image and (decoded := _decode_data_uri(image)):
+            from plugins.AiMarketAnalyst.backend.services import chart_annotate
+            from plugins.AiMarketAnalyst.backend.services.vision import (
+                DEFAULT_CHART_PROMPT, read_image,
+            )
+
+            img_bytes, img_mime = decoded
+            try:
+                vision = await read_image(
+                    img_bytes, img_mime, user_msg or DEFAULT_CHART_PROMPT, db,
+                    source="paul-chat", agent_name="paul-vision",
+                )
+            except Exception as ve:  # noqa: BLE001
+                logger.warning(f"[JARVIS] vision read failed: {ve}")
+                vision = None
+
+            if vision:
+                if overlay := chart_annotate.annotate(img_bytes, vision.findings):
+                    import base64 as _b64
+                    overlay_uri = "data:image/png;base64," + _b64.b64encode(overlay).decode()
+                    yield f"data: {json.dumps({'image': overlay_uri})}\n\n"
+                vision_note = (
+                    "I attached an image. A vision model read it as follows:\n\n"
+                    f"{vision.narrative}\n\n"
+                    "Treat that as observed fact about my screen. Answer my "
+                    "question about it, confirming levels against live price where "
+                    "you can. Do not restate the whole description back."
+                )
+            else:
+                vision_note = (
+                    "I attached an image but it could not be read. Tell me that "
+                    "plainly and ask me to resend it."
+                )
+
+        # How hard this turn should work, decided once and used for both the
+        # context gathering and the model call. A fast turn caps how long the
+        # live blocks (news, open-web research, exchange balances) may hold the
+        # answer up — those are network calls, and on a quick question the user
+        # was waiting on them long before the model was even asked.
+        from plugins.AiMarketAnalyst.backend.services.ai_router import resolve_chat_route
+
+        _chat_route = await resolve_chat_route(
+            db, task="paul_chat", text=user_msg, surface="web"
+        )
+
         _first_turn = len([m for m in (messages or []) if m.get("role") == "user"]) <= 1
         system_prompt = await build_jarvis_system_prompt(
-            db, pathname, user_msg, session_key=session_key, first_turn=_first_turn
+            db, pathname, user_msg, session_key=session_key, first_turn=_first_turn,
+            deep=_chat_route.deep,
         )
         if extra_context:
             system_prompt += extra_context
@@ -1107,51 +1293,43 @@ async def stream_jarvis_chat(
 
         full_messages = [{"role": "system", "content": system_prompt}] + messages
 
-        # ── Task-aware provider / model selection ─────────────────────────────
-        # Jarvis picks the best available AI model per task type.
-        # IMPORTANT: _model_override must be a model the selected provider owns —
-        # do NOT use a model name from Provider A when Provider B is the fallback.
-        # We set max_tokens only; model selection is left to the priority router.
-        _model_override: str | None = None
-        _max_tokens: int = 1200
-        try:
+        # The image read rides with the user's turn, not in the system prompt:
+        # that prompt is capped to ~24k chars further down, and a read appended
+        # to the end of it can be truncated away — leaving the model to answer
+        # "I can't see images" about an image it was just told about.
+        if vision_note:
+            full_messages.append({"role": "user", "content": vision_note})
+
+        # ── Speed routing ─────────────────────────────────────────────────────
+        # A fast model answers the turn unless the work is genuinely big or the
+        # user asked for depth. Leaving the model unpinned (what this used to do,
+        # tuning only the token budget) meant every turn ran on whichever model
+        # the first provider happened to default to — here a reasoning model that
+        # thinks for tens of seconds before writing a word, on "what's my
+        # balance" as much as on a full analysis.
+        #
+        # The model is chosen from what this surface's providers actually serve,
+        # so a pinned id can never be one no connected provider has.
+        _route = _chat_route
+        _model_override: str | None = _route.model
+        _max_tokens: int = _route.max_tokens
+        # A question that needs teaching — maths working, a derivation, a
+        # mechanism — is still a fast turn, but a clipped answer is worse than a
+        # slow one, so it keeps the larger budget it always had.
+        if not _route.deep:
             import re as _re_task
             _ml = (user_msg or "").lower()
-            _is_deep = bool(_re_task.search(
-                r'\b(analys[ei]|predict|forecast|all agents|full analysis|'
-                r'strategy|smc|order.?block|market structure|should i|'
-                r'review|assess|evaluate|break.?down|run agents|orchestrat)\b', _ml))
-            _is_quick = bool(_re_task.search(
-                r'\b(price|status|balance|equity|what is|quick|just tell me|how much)\b', _ml))
-            _is_code = bool(_re_task.search(
-                r'\b(code|function|class|debug|how does|explain.*code|implement|build|create)\b', _ml))
-            # A question that needs teaching — maths working, a mechanism, a
-            # derivation. "what is the Krebs cycle" matches _is_quick on
-            # "what is", and a 600-token budget would truncate the answer
-            # mid-explanation, so this has to outrank it.
-            _is_explain = bool(_re_task.search(
+            if _re_task.search(
                 r'\b(explain|why|how (?:do|does|did|can|to)|prove|derive|solve|'
                 r'calculate|compute|walk me through|step by step|difference between|'
-                r'compare|teach|what causes|meaning of)\b', _ml))
-
-            # Adjust token budget only — let each provider use its own default model
-            if _is_deep:
-                _max_tokens = 2400
-            elif _is_explain:
+                r'compare|teach|what causes|meaning of|code|function|class|debug|'
+                r'implement)\b', _ml
+            ):
                 _max_tokens = 2000
-            elif _is_code:
-                _max_tokens = 1800
-            elif _is_quick:
-                _max_tokens = 600
-            else:
-                _max_tokens = 1200
-
-            logger.debug(
-                f"[JARVIS] task={'deep' if _is_deep else 'explain' if _is_explain else 'code' if _is_code else 'quick' if _is_quick else 'std'}"
-                f" → tokens={_max_tokens} (each provider uses its own default model)"
-            )
-        except Exception as _te:
-            logger.debug(f"[JARVIS] task routing skipped: {_te}")
+        logger.debug(
+            f"[JARVIS] route={_route.label} model={_model_override or 'provider default'} "
+            f"tokens={_max_tokens} budget={_route.budget_s}s"
+        )
 
         # ── All-agents orchestration ───────────────────────────────────────────
         # When user explicitly asks for full multi-agent analysis, run the full
@@ -1188,8 +1366,19 @@ async def stream_jarvis_chat(
                         _rsn = (_d.get("reasoning") or "")[:180]
                         _ai = "AI" if _d.get("ai_called") else "memory"
                         _panel += f"- **{_role}** ({_ai}): {_act2} {_conf:.0%} — {_rsn}\n"
+
+                    # One call for the levels and the picture, drawn by the same
+                    # builder Telegram uses, so the two can never disagree.
+                    _overlay, _chart = await _room_plan(_orch_sym, _orch_result)
+                    _panel += _levels_block(_overlay)
                     system_prompt += _panel
                     full_messages[0]["content"] = system_prompt
+
+                    if _chart:
+                        import base64 as _cb64
+                        yield "data: " + json.dumps({
+                            "image": "data:image/png;base64," + _cb64.b64encode(_chart).decode()
+                        }) + "\n\n"
         except Exception as _oe:
             logger.debug(f"[JARVIS] orchestration inject skipped: {_oe}")
 
@@ -1227,14 +1416,16 @@ async def stream_jarvis_chat(
         # named, but a follow-up ("and silver?") can now be answered by fetching
         # rather than by refusing. Providers without tool support transparently
         # fall back to the text-directive protocol inside chat_with_tools.
-        result = await chat_with_tools(
+        result = await chat_turn(
             db,
             full_messages,
-            max_iterations=3,
-            total_budget_s=25.0,
-            json_mode=False,
-            model_override=_model_override,
+            route=_route,
+            # Paul can be given a dedicated profile; unset, this uses any
+            # available provider — or, on a deep turn, the profile reserved for
+            # reasoning, which is where the strong models live.
+            surface_task="paul_chat",
             max_tokens=_max_tokens,
+            json_mode=False,
             source="jarvis_chat",
         )
         if result.get("tools_used"):

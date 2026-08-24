@@ -175,6 +175,9 @@ class SignalStatus(str, enum.Enum):
     TP_HIT = "tp_hit"
     SL_HIT = "sl_hit"
     CLOSED = "closed"
+    # Forex signal that aged out (>3h) without ever being executed — a dead/
+    # missed trade, moved off the Active tab into "Not Traded".
+    EXPIRED = "expired"
 
 
 class TelegramParsedSignal(TelegramBase):
@@ -277,7 +280,54 @@ class TelegramSniperSettings(TelegramBase):
     volume_channel_id = Column(Integer, nullable=True)
     # Trailing stop percentage used after the final TP is crossed (default 1.5 %).
     tp_trail_pct = Column(Float, nullable=False, default=1.5)
+    # Max total telegram-trade margin as % of portfolio equity (default 20 %).
+    # Blocks new sniper orders when (open_margin / equity) would exceed this.
+    max_margin_risk_pct = Column(Float, nullable=False, default=20.0)
+    # ── Forex (MT5) execution ────────────────────────────────────────────
+    # Route forex signals (XAUUSD, EURUSD, …) to a live-linked MT5 account
+    # instead of Bitget (which has no forex). Live forex price = Swissquote.
+    mt5_execute = Column(Boolean, nullable=False, default=False)
+    # Which MT5 account to trade. NULL = first live, api-reachable account.
+    mt5_account_id = Column(Integer, nullable=True, default=None)
+    # Fixed lot size for MT5 forex orders (broker units, e.g. 0.01).
+    mt5_lot_size = Column(Float, nullable=False, default=0.01)
+    # Send a Telegram-bot message on every execution / TP / SL / trailing event.
+    notify_executions = Column(Boolean, nullable=False, default=True)
+    # Confidence (%) at/above which a signal is executed at MARKET immediately
+    # (no sniper limit wait, so high-conviction signals are never missed).
+    # Below this, the optimised sniper limit entry is used instead.
+    immediate_confidence_pct = Column(Float, nullable=False, default=80.0)
+    # Max concurrent PLACED positions in the SAME direction (long/short). Extra
+    # same-direction signals are skipped, keeping only the best by confidence
+    # then profit/pips.
+    max_same_direction = Column(Integer, nullable=False, default=2)
     allowed_channel_ids_json = Column(JSON, nullable=True)  # null = all enabled channels
+    # Execute every signal regardless of confidence / volume / AI gates.
+    # Only position cap and daily cap remain as hard stops.
+    force_telegram_signals = Column(Boolean, nullable=False, default=False)
+    # Demo MT5 account for paper-testing forex signals before going live.
+    mt5_demo_account_id = Column(Integer, nullable=True, default=None)
+    # Route forex signals to the demo account instead of live accounts.
+    mt5_demo_execute = Column(Boolean, nullable=False, default=False)
+    # Aim the position at the channel's FINAL take-profit and let the trailing
+    # stop (locked at TP3) protect the ride, instead of exiting at the nearest
+    # TP. Off = close at the first target above the entry.
+    multi_tp_execute = Column(Boolean, nullable=False, default=True)
+    # Confidence (%) at/above which a signal is treated as high-conviction and
+    # is never dropped by a discretionary gate (reward/risk, volume regime, AI
+    # opinion, same-direction cap). Structural rejections still apply: no live
+    # price, price already past the stop, or every TP already passed.
+    never_skip_confidence_pct = Column(Float, nullable=False, default=90.0)
+    # Hard ceiling on what a single forex trade may lose, as % of account
+    # equity. When the broker's minimum lot would risk more than this the trade
+    # is skipped outright rather than sized up to the floor — the account is
+    # simply too small for that stop distance.
+    mt5_max_risk_pct = Column(Float, nullable=False, default=5.0)
+    # Accounts too small for one broker-minimum lot would sit out every
+    # signal. With this on they still trade, at exactly the floor lot and
+    # limited to a single open app position, so coverage is kept without the
+    # exposure compounding.
+    mt5_small_account_mode = Column(Boolean, nullable=False, default=True)
     updated_at = Column(DateTime, default=now_utc_naive, onupdate=now_utc_naive)
 
 

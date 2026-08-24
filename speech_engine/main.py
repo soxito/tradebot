@@ -9,12 +9,20 @@ any error/timeout with zero frontend changes.
 Run (own venv — see requirements.txt), from inside speech_engine/:
     .venv/bin/uvicorn main:app --host 0.0.0.0 --port 8790
 """
+import asyncio
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, Response, Form
 from loguru import logger
 
 import engine
 
 app = FastAPI(title="Jarvis Local Speech Engine")
+
+# The MLX STT/TTS handlers are shared singletons and not reentrant, so serialise
+# access per handler. Inference still runs off the event loop (asyncio.to_thread),
+# so /health and queued requests stay responsive while one clip is generating.
+_stt_lock = asyncio.Lock()
+_tts_lock = asyncio.Lock()
 
 
 @app.on_event("startup")
@@ -40,7 +48,12 @@ async def stt(file: UploadFile = File(...)):
     if not content:
         raise HTTPException(status_code=400, detail="Empty audio file")
     try:
-        text = engine.transcribe(content, filename=file.filename or "audio.wav")
+        # Parakeet inference is synchronous and CPU/MPS-bound; run it in a worker
+        # thread so the event loop keeps serving /health and concurrent requests.
+        async with _stt_lock:
+            text = await asyncio.to_thread(
+                engine.transcribe, content, filename=file.filename or "audio.wav"
+            )
         return {"text": text}
     except Exception as e:
         logger.error(f"speech_engine STT error: {e}")
@@ -52,7 +65,10 @@ async def tts(text: str = Form(...), voice: str = Form("default")):
     if not engine.is_ready():
         raise HTTPException(status_code=503, detail="speech engine models not loaded")
     try:
-        audio = engine.synthesize(text)
+        # Qwen3-TTS synthesis blocks for the whole clip; offload it to a worker
+        # thread so the sidecar never freezes (health checks + barge-in stay live).
+        async with _tts_lock:
+            audio = await asyncio.to_thread(engine.synthesize, text)
         return Response(content=audio, media_type="audio/wav")
     except Exception as e:
         logger.error(f"speech_engine TTS error: {e}")

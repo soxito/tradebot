@@ -11,6 +11,8 @@ are absent, this degrades to a deterministic summary with zero side effects.
 """
 from __future__ import annotations
 
+import os
+import time
 from typing import Optional, Tuple
 
 from loguru import logger
@@ -238,9 +240,17 @@ async def _run_llm(user_prompt: str) -> Tuple[Optional[str], Optional[str], Opti
     """
     try:
         from app.core.database import AsyncSessionLocal
-        from plugins.AiMarketAnalyst.backend.services.ai_router import db_chat
+        from plugins.AiMarketAnalyst.backend.services.ai_router import (
+            db_chat, resolve_model_for_task,
+        )
     except Exception as exc:
         return None, None, f"AI gateway unavailable: {exc}"
+
+    # Narrating a forecast is long-horizon reasoning, so take the deep-reasoning
+    # chain. The two attempts below use different models from it where possible:
+    # a model that returned nothing usable rarely does better on an immediate
+    # repeat, but its stablemate often does.
+    _chain = resolve_model_for_task("deep_reasoning")
 
     _msgs = [
         {"role": "system", "content": _SYSTEM_PROMPT},
@@ -255,6 +265,12 @@ async def _run_llm(user_prompt: str) -> Tuple[Optional[str], Optional[str], Opti
         preferred_providers=["nvidia", "github"],  # NVIDIA first, GitHub gpt-4o fallback
         bypass_circuits=True,  # always try NVIDIA/GitHub even if circuit was tripped
     )
+    # NVIDIA's Nemotron reasoning model needs ~90s for a full 1500-token analysis,
+    # far past the router's default 40s. Give it a real budget (the frontend
+    # allows 120s) but keep the two attempts inside that window so a genuinely
+    # stuck provider still fails back to the rule-based summary in time.
+    _ATTEMPT_TIMEOUT = float(os.getenv("KRONOS_JARVIS_TIMEOUT_S", "105"))
+    _start = time.monotonic()
 
     def _extract(result: dict) -> Tuple[Optional[str], Optional[str], Optional[str]]:
         """Extract (text, provider, error) from a db_chat result dict."""
@@ -274,7 +290,10 @@ async def _run_llm(user_prompt: str) -> Tuple[Optional[str], Optional[str], Opti
     # ── Attempt 1: NVIDIA only, circuit bypassed (──────────────────────────
     try:
         async with AsyncSessionLocal() as db:
-            result1 = await db_chat(db, _msgs, **_kwargs)
+            result1 = await db_chat(
+                db, _msgs, timeout=_ATTEMPT_TIMEOUT,
+                model_override=_chain[0] if _chain else None, **_kwargs,
+            )
     except Exception as exc:
         logger.warning("[Kronos JARVIS] db_chat exception on attempt 1: {}", exc)
         result1 = {"ok": False, "error": f"AI call failed: {exc}"}
@@ -301,9 +320,24 @@ async def _run_llm(user_prompt: str) -> Tuple[Optional[str], Optional[str], Opti
         )
 
     # ── Attempt 2: retry NVIDIA (circuit already bypassed in _kwargs) ───────
+    # Only retry if there is time left in the frontend's window — a first attempt
+    # that timed out already consumed the budget, so retrying would just blow past
+    # the client and still fail. Bound attempt 2 to whatever remains.
+    _remaining = _ATTEMPT_TIMEOUT - (time.monotonic() - _start)
+    if _remaining < 15.0:
+        logger.info(
+            "[Kronos JARVIS] No budget for a retry ({:.0f}s left) — using fallback.",
+            _remaining,
+        )
+        return None, provider1, first_issue
+
     try:
         async with AsyncSessionLocal() as db:
-            result2 = await db_chat(db, _msgs, **_kwargs)
+            result2 = await db_chat(
+                db, _msgs, timeout=min(_ATTEMPT_TIMEOUT, _remaining),
+                model_override=_chain[1] if len(_chain) > 1 else (_chain[0] if _chain else None),
+                **_kwargs,
+            )
     except Exception as exc:
         logger.warning("[Kronos JARVIS] db_chat exception on attempt 2: {}", exc)
         result2 = {"ok": False, "error": f"retry failed: {exc}"}

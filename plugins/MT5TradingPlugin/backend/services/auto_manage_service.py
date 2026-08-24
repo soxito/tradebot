@@ -220,6 +220,17 @@ async def _process_account(
         ord_rows = await db.execute(select(MT5Order).where(MT5Order.account_id == account.id))
         orders: List[MT5Order] = ord_rows.scalars().all()
 
+    # Protect app-placed positions before anything else: a trade that has run
+    # most of the way to its target must not be allowed back into a loss, and a
+    # trade in clear profit must give back only part of it on a reversal.
+    try:
+        moved = await _apply_protective_stops(account, positions)
+        if moved:
+            summary.setdefault("stops_advanced", 0)
+            summary["stops_advanced"] += moved
+    except Exception as exc:  # noqa: BLE001 — never block the analysis cycle
+        logger.warning(f"[MT5 AutoManage] protective-stop pass failed: {str(exc)[:200]}")
+
     # Symbols = watchlist + any symbols from existing positions/orders
     all_symbols = (
         set(settings["watchlist"])
@@ -235,6 +246,64 @@ async def _process_account(
             msg = f"symbol_{symbol}_acct_{account.id}: {str(exc)[:200]}"
             logger.warning(f"[MT5 AutoManage] {msg}")
             summary["errors"].append(msg)
+
+
+async def _apply_protective_stops(
+    account: MT5Account,
+    positions: List[MT5Position],
+) -> int:
+    """Advance app-placed positions' stops: break-even, then a profit trail.
+
+    Break-even secures a working trade against a loss; the trail then follows a
+    trade in clear profit, banking a rising fraction of the gain so a reversal
+    gives back only part of it. :func:`protective_stop` returns whichever is
+    more protective, forward-only, so one call covers both.
+
+    Only orders this app opened are touched — a position placed by hand in the
+    terminal belongs to the user, and silently moving its stop would override a
+    decision the app was never asked to make. Returns how many were moved.
+    """
+    from app.trading.order_tags import is_app_order
+    from app.trading.trailing import protective_stop
+    from plugins.MT5TradingPlugin.backend.services.mt5_client import mt5_client
+
+    moved = 0
+    for pos in positions:
+        if not is_app_order(pos.comment):
+            continue
+        new_sl = protective_stop(
+            side=pos.side.value if hasattr(pos.side, "value") else str(pos.side),
+            entry=pos.price_open,
+            current_price=pos.price_current or pos.price_open,
+            take_profit=pos.tp,
+            current_sl=pos.sl,
+        )
+        if new_sl is None:
+            continue
+        try:
+            await mt5_client.modify_order(
+                login=account.login, server=account.server,
+                password=account.password_encrypted,
+                ticket=int(pos.mt5_ticket), sl=round(new_sl, 5), tp=pos.tp,
+            )
+            # Whether this is a break-even move or a trail is only cosmetic
+            # in the log; the level itself is already the more protective one.
+            beyond_entry = (
+                new_sl > pos.price_open if str(pos.side).lower() in ("long", "buy")
+                else new_sl < pos.price_open
+            )
+            logger.info(
+                f"[MT5 AutoManage] {pos.symbol} #{pos.mt5_ticket} "
+                f"({pos.comment}) → {'trailing' if beyond_entry else 'break-even'} "
+                f"SL {new_sl:g}"
+            )
+            moved += 1
+        except Exception as exc:  # noqa: BLE001 — one failure must not stop the rest
+            logger.warning(
+                f"[MT5 AutoManage] protective-stop push failed for #{pos.mt5_ticket}: "
+                f"{str(exc)[:160]}"
+            )
+    return moved
 
 
 async def _process_symbol(

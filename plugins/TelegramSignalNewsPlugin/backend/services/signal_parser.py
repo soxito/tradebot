@@ -35,6 +35,7 @@ and compact single-line formats::
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 
 
@@ -111,6 +112,20 @@ _NUM = r"(\d+(?:\.\d+)?)"
 
 # Outcome detectors
 _TP_HIT = re.compile(r"take[-\s]?profit\s*target\s*(\d+).*?profit\s*[:=]?\s*([\d.]+%)", re.IGNORECASE | re.DOTALL)
+# Compact / gold-channel TP-hit phrasings that _TP_HIT (which needs the
+# "take-profit target N" long form) misses, e.g. "FULL TP HIT 4372",
+# "🎯 TP HIT zone 4374", "TP4: Hit done profit", "Hit our target 4450".
+_TP_HIT_SIMPLE = re.compile(
+    r"\bfull\s+tp\s+hit\b"
+    r"|\btp\s*\d*\s*hit\b"
+    r"|\btp\s*\d+\s*:\s*hit\b"
+    r"|\bhit\s+(?:the\s+|our\s+|zone\s+)?(?:full\s+)?(?:tp|target)\b"
+    r"|\btarget\s+(?:hit|reached|achieved|done)\b",
+    re.IGNORECASE,
+)
+# "+140pips ✅", "+ 90pips", "80+pips ✅" — a booked-profit result line.
+_PROFIT_PIPS = re.compile(r"(?:\+\s*\d+\s*pips?|\d+\s*\+\s*pips?)", re.IGNORECASE)
+_RESULT_CHECK = re.compile(r"[✅✔️✔]")
 _SL_HIT = re.compile(r"\bstop\s*loss\b|\bstoploss\b|closed at stoploss", re.IGNORECASE)
 _ALL_ENTRIES = re.compile(r"all\s*entries\s*achieved", re.IGNORECASE)
 _CLOSED = re.compile(r"\bclosed\b|\bcancel(?:led)?\b", re.IGNORECASE)
@@ -135,6 +150,10 @@ def _normalize(text: str) -> str:
     """Strip Telegram markdown so labels and prices sit next to each other."""
     if not text:
         return text
+    # Fold Unicode "fancy" letters/digits (Mathematical Bold, etc.) to ASCII so
+    # channels that post 𝗫𝗠𝖨𝖨𝗦𝗣 or 𝙽𝙼𝙾𝙽 prices are still parsed. NFKC maps the
+    # Mathematical Alphanumeric block to plain A-Z/0-9.
+    text = unicodedata.normalize("NFKC", text)
     text = _MD_LINK.sub(r"\1", text)  # [🔼](tg://emoji?id=…) -> 🔼
     text = _MD_BOLD.sub("", text)      # **TP1 4081** -> TP1 4081
     return text
@@ -238,11 +257,27 @@ def _detect_entry(text: str) -> tuple[float | None, str | None]:
             except ValueError:
                 continue
 
+    # ── Priority 2.5: price stated BEFORE the direction word ──────────────
+    # Gold/forex channels often lead with the pair + entry, then the side:
+    #   "GOLD 4365 BUY TP 4450-4480", "XAUUSD 4365 SELL", "4365 buy now".
+    # The number immediately preceding buy/sell/long/short is the entry. This
+    # must run before Priority 3, whose direction-then-number scan would grab
+    # the TP range that follows the side word.
+    m = re.search(rf"{_NUM}\s+(?:buy|sell|long|short)\b", text, re.IGNORECASE)
+    if m:
+        raw = m.group(1)
+        try:
+            val = float(raw)
+            if val >= 0.00001:
+                return val, raw
+        except ValueError:
+            pass
+
     # ── Priority 3: Entry embedded on the direction line (no "entry" keyword) ──
     # e.g. "LONG : 0.32711 - 0.32809", "GOLD BUY NOW 4051_4054", "SELL NOW 4078".
     # A range is averaged; a single price is used directly.
     m = re.search(
-        rf"(?:long|short|buy|sell)\b[^\d\n]*{_NUM}\s*[-–—_]\s*{_NUM}",
+        rf"(?:long|short|buy|sell)\b[^\d\n]*{_NUM}\s*[-–—_/]\s*{_NUM}",
         text, re.IGNORECASE,
     )
     if m:
@@ -275,9 +310,10 @@ def _detect_stop_loss(text: str) -> tuple[float | None, str | None]:
         return None, m.group(1).replace(" ", "")
 
     # Numeric SL on same or next line. Allow a hyphen in "Stop-Loss", an "@"
-    # separator ("SL @ 4068"), and a stray emoji/symbol before the price.
+    # separator ("SL @ 4068"), underscores ("SL____4380") and a stray emoji
+    # before the price.
     patterns = [
-        rf"(?:stop[\s\-]*loss|sl)\s*[:=@]?\s*\n?\s*[^\d\n]{{0,4}}{_NUM}",
+        rf"(?:stop[\s\-]*loss|sl)\s*[:=@_]?\s*\n?\s*[^\d\n]{{0,8}}{_NUM}",
         rf"stop\s*targets?\s*[:=]?\s*\n?\s*{_NUM}",
     ]
     for pat in patterns:
@@ -307,6 +343,20 @@ def _detect_take_profits(text: str) -> list[float]:
             tps.append(float(m.group(1)))
         except ValueError:
             pass
+
+    # Unindexed repeated labels: "TP 4354", "TP___4368", "📊TP___4366" (gold/forex
+    # channels). `\btp(?![a-z0-9])` matches when TP is NOT followed by a letter
+    # or digit, so it fires on "TP " / "TP_" / "TP:" but never on glued "TP1".
+    # The separator class `[^\d\n]` swallows underscores/emoji before the price,
+    # which must be a decimal or have >=3 integer digits so a bare index or stray
+    # small number can't be mistaken for a level. Runs BEFORE the indexed pattern,
+    # which would otherwise read "TP 4354" as index 43 + price 54.
+    if not tps:
+        for m in re.finditer(r"\btp(?![a-z0-9])\s*[:=@_]?\s*[^\d\n]{0,8}(\d+\.\d+|\d{3,})", text, re.IGNORECASE):
+            try:
+                tps.append(float(m.group(1)))
+            except ValueError:
+                pass
 
     # Labelled: "TP1: 0.105727", "► TP 1: 0.33006", "TP1 🔼4081".
     # The index (1-2 digits) is required so it can't be mistaken for the price
@@ -413,6 +463,21 @@ def parse_outcome(text: str) -> SignalOutcome | None:
     if _TP_HIT.search(text):
         m = _TP_HIT.search(text)
         detail = f"TP{m.group(1)} +{m.group(2)}" if m else None
+        return SignalOutcome(symbol=symbol, kind="tp_hit", detail=detail)
+    # Broad TP-hit: an explicit hit phrase, or a booked-pips line with a ✅.
+    if _TP_HIT_SIMPLE.search(text) or (
+        _PROFIT_PIPS.search(text) and _RESULT_CHECK.search(text)
+    ):
+        tp_no = re.search(r"\btp\s*(\d+)", text, re.IGNORECASE)
+        pips = _PROFIT_PIPS.search(text)
+        if tp_no and pips:
+            detail = f"TP{tp_no.group(1)} {pips.group(0).strip()}"
+        elif pips:
+            detail = pips.group(0).strip()
+        elif tp_no:
+            detail = f"TP{tp_no.group(1)} hit"
+        else:
+            detail = "TP hit"
         return SignalOutcome(symbol=symbol, kind="tp_hit", detail=detail)
     if _SL_HIT.search(text):
         return SignalOutcome(symbol=symbol, kind="sl_hit", detail=None)

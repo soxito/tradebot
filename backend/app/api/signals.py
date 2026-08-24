@@ -530,6 +530,80 @@ async def get_analysis(
     return result
 
 
+@router.get("/zones/{symbol}")
+async def get_zones(
+    symbol: str,
+    timeframe: str = "1h",
+    limit: int = 220,
+):
+    """
+    Chart-overlay payload: fibonacci bands, supply/demand zones, trendline
+    channels and pivot-cluster S/R levels for one symbol — everything the
+    frontend needs to draw the desk's zone read in one request.
+
+    Symbol accepts BTC/USDT, BTCUSDT, XAUUSD (universal resolver serves
+    non-crypto instruments).
+    """
+    from app.services.candles import fetch as fetch_candles
+    from app.signals.technical import (
+        auto_fib_retracement,
+        ohlcv_to_dataframe,
+        support_resistance_mtf,
+    )
+    from app.signals.zones import analyze_zones
+
+    if "/" not in symbol and symbol.upper().endswith("USDT"):
+        symbol = symbol[:-4] + "/USDT"
+
+    ohlcv = await fetch_candles(symbol, timeframe, max(60, min(limit, 500)))
+    if not ohlcv:
+        raise HTTPException(status_code=404, detail=f"No candles for {symbol} {timeframe}")
+
+    df = ohlcv_to_dataframe(ohlcv)
+    zones_data = analyze_zones(df)
+
+    fib_bands: list[dict] = []
+    try:
+        fib = auto_fib_retracement(df, levels=(0.236, 0.382, 0.5, 0.618, 0.786), extend_lines=False)
+        swing = fib.get("swing") or {}
+        for lvl in fib.get("levels", []):
+            fib_bands.append({
+                "ratio": lvl.get("ratio"),
+                "price": lvl.get("price"),
+                "in_golden_zone": bool(
+                    0.382 <= float(lvl.get("ratio") or 0) <= 0.618
+                ),
+            })
+        fib_swing = {
+            "direction": swing.get("direction"),
+            "high": swing.get("end_price") if swing.get("direction") == "up" else swing.get("start_price"),
+            "low": swing.get("start_price") if swing.get("direction") == "up" else swing.get("end_price"),
+        }
+    except Exception:
+        fib_swing = None
+
+    s_r_levels: list[dict] = []
+    try:
+        sr = support_resistance_mtf(df, include_lines=False)
+        s_r_levels = sr.get("levels", [])
+    except Exception:
+        pass
+
+    sd = zones_data.get("supply_demand", {})
+    ch = zones_data.get("channels", {})
+
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "price": sd.get("price"),
+        "fib": {"swing": fib_swing, "bands": fib_bands},
+        "supply_zones": [z for z in sd.get("zones", []) if z["type"] == "supply"],
+        "demand_zones": [z for z in sd.get("zones", []) if z["type"] == "demand"],
+        "channels": ch.get("channels", []),
+        "s_r_levels": s_r_levels,
+    }
+
+
 @router.post("/tradingview/webhook", response_model=SignalResponse)
 async def tradingview_webhook(
     request: Request,

@@ -321,8 +321,19 @@ def _build_ticker(ohlcv: List[List], last_price: float, source: str = "") -> Dic
 
 
 async def fetch_live_price(symbol: str) -> Optional[float]:
-    """Quick single live-price fetch."""
-    sym_upper = symbol.upper()
+    """Quick single live-price fetch.
+
+    Source priority: Swissquote BBO feed (real broker spread, 5-second cache)
+    → CoinGecko PAXG (gold) / Frankfurter (FX majors).
+    """
+    sym_upper = symbol.upper().replace("/", "").replace("-", "")
+
+    # ── Swissquote (primary — real broker price for all FX and metals) ──
+    swissquote_price = await _fetch_swissquote_price(sym_upper)
+    if swissquote_price is not None:
+        return swissquote_price
+
+    # ── Fallback: CoinGecko PAXG (gold only) or Frankfurter (FX) ──
     if sym_upper in _CG_COIN_MAP:
         return await _cg_current_price(_CG_COIN_MAP[sym_upper])
     try:
@@ -330,3 +341,192 @@ async def fetch_live_price(symbol: str) -> Optional[float]:
         return current
     except Exception:
         return None
+
+
+# ── Swissquote BBO feed ───────────────────────────────────────────────────────
+_SQ_BBO_URL = (
+    "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/{base}/{quote}"
+)
+_sq_live_cache: dict[str, tuple] = {}  # symbol → (timestamp, price)
+_SQ_LIVE_TTL = 5  # seconds
+
+
+def _parse_forex_pair(symbol: str) -> Optional[Tuple[str, str]]:
+    """Split EURUSD or XAU/USD into (EUR, USD). Returns None for non-FX."""
+    sym = symbol.upper().replace("/", "").replace("-", "").replace("_", "")
+    # Try 3+3 split first (most FX), then 3+4
+    for split in (3, 4):
+        base, quote = sym[:split], sym[split:]
+        if (
+            len(base) >= 3 and len(quote) >= 3
+            and base.isalpha() and quote.isalpha()
+        ):
+            return base, quote
+    return None
+
+
+async def _fetch_swissquote_price(symbol: str) -> Optional[float]:
+    """Return the Swissquote BBO mid price, or None on any failure."""
+    import time as _time
+
+    cached = _sq_live_cache.get(symbol)
+    if cached and (_time.monotonic() - cached[0]) < _SQ_LIVE_TTL:
+        return cached[1]
+
+    pair = _parse_forex_pair(symbol)
+    if pair is None:
+        return None
+    base, quote = pair
+
+    url = _SQ_BBO_URL.format(base=base, quote=quote)
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as cl:
+            r = await cl.get(url)
+            if r.status_code != 200:
+                return None
+            data = r.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[ForexProvider] Swissquote fetch {symbol} failed: {exc}")
+        return None
+
+    if not isinstance(data, list):
+        return None
+
+    priority = {"elite": 0, "prime": 1, "premium": 2, "standard": 3}
+    best_bid = best_ask = None
+    best_rank = 99
+    for platform in data:
+        for sp in (platform.get("spreadProfilePrices") or []):
+            bid, ask = sp.get("bid"), sp.get("ask")
+            if not bid or not ask:
+                continue
+            rank = priority.get(str(sp.get("spreadProfile", "")).lower(), 5)
+            if rank < best_rank:
+                best_rank, best_bid, best_ask = rank, float(bid), float(ask)
+
+    if best_bid is None or best_ask is None:
+        return None
+
+    import time as _time2
+    mid = round((best_bid + best_ask) / 2.0, 8)
+    _sq_live_cache[symbol] = (_time2.monotonic(), mid)
+    logger.debug(f"[ForexProvider] Swissquote {symbol}: {mid}")
+    return mid
+
+
+async def swissquote_price(symbol: str) -> Optional[float]:
+    """Public accessor for the Swissquote BBO mid of *symbol* (None if unquoted).
+
+    Swissquote is the broker whose prices the user actually trades, so it is the
+    reference every FX / metals chart in the app should agree with. Outside
+    market hours the feed keeps serving the last traded BBO — i.e. Friday's
+    close — which is exactly what a weekend chart should end on.
+    """
+    return await _fetch_swissquote_price(symbol.upper().replace("/", "").replace("-", ""))
+
+
+#: Widest basis we will silently correct. A real spot-vs-future basis is ~1-2%
+#: (gold) and ~0 (FX); anything beyond this is a symbol-mapping bug — a series
+#: for a *different* instrument — and rescaling it would hide that behind
+#: plausible-looking candles instead of surfacing it.
+_SQ_MAX_BASIS = 0.10
+
+
+async def swissquote_ratio(symbol: str, feed_last_close: float) -> Optional[float]:
+    """Factor that puts a feed's series on Swissquote's price scale, or None.
+
+    Yahoo has no ticker for spot metals, so ``yahoo_provider`` charts gold and
+    silver off the front-month COMEX future (``GC=F`` / ``SI=F``). The future
+    carries a cost-of-carry premium — ~$61/oz, 1.4%, when this was written — so
+    a "gold" chart ended Friday ~$61 above where XAU/USD actually closed on the
+    broker, and every level derived from it (entry, stop, target) was off by that
+    much. Spot FX pairs come off Yahoo's own spot series and need only a pip of
+    correction, but they take the same route so that every chart, forecast and
+    order ticket in the app quotes the one broker the user actually trades.
+
+    The correction is a *ratio*, not a constant offset: the basis is a percentage
+    of price, and scaling leaves every bar's return — the only thing the forecast
+    model reads — exactly unchanged.
+
+    None means "leave the series alone": Swissquote does not quote the symbol,
+    the feed's close is unusable, the basis is already nil, or it is so wide that
+    the two series cannot be the same instrument.
+    """
+    if not feed_last_close or feed_last_close <= 0:
+        return None
+
+    sq_mid = await swissquote_price(symbol)
+    if sq_mid is None or sq_mid <= 0:
+        return None
+
+    ratio = sq_mid / feed_last_close
+    if abs(ratio - 1.0) > _SQ_MAX_BASIS:
+        logger.warning(
+            f"[ForexProvider] Swissquote anchor skipped for {symbol}: "
+            f"feed close {feed_last_close} vs Swissquote {sq_mid} "
+            f"({(ratio - 1.0) * 100:+.2f}%) — likely a different instrument"
+        )
+        return None
+    if abs(ratio - 1.0) < 1e-9:
+        return None
+
+    logger.info(
+        f"[ForexProvider] {symbol} → Swissquote {sq_mid} "
+        f"({(ratio - 1.0) * 100:+.3f}% from feed close {feed_last_close})"
+    )
+    return ratio
+
+
+async def anchor_ohlcv_to_swissquote(symbol: str, rows: List[List]) -> List[List]:
+    """Rescale ccxt-style rows — ``[ts, o, h, l, c, v]`` — onto Swissquote's
+    price scale, so the last close *is* the broker's quote. See
+    ``swissquote_ratio``. Volume and timestamps are never touched, and any
+    reason to doubt the correction returns *rows* exactly as fetched.
+    """
+    if not rows:
+        return rows
+    try:
+        last_close = float(rows[-1][4])
+    except (IndexError, TypeError, ValueError):
+        return rows
+
+    ratio = await swissquote_ratio(symbol, last_close)
+    if ratio is None:
+        return rows
+
+    anchored: List[List] = []
+    for r in rows:
+        try:
+            row = list(r)
+            for i in (1, 2, 3, 4):  # open, high, low, close — volume untouched
+                row[i] = float(row[i]) * ratio
+            anchored.append(row)
+        except (IndexError, TypeError, ValueError):
+            anchored.append(r)
+    return anchored
+
+
+async def anchor_bars_to_swissquote(symbol: str, bars: List[Dict]) -> List[Dict]:
+    """``anchor_ohlcv_to_swissquote`` for the dict bars ``yahoo_provider`` emits
+    (``{"time", "open", "high", "low", "close", "volume"}``)."""
+    if not bars:
+        return bars
+    try:
+        last_close = float(bars[-1]["close"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return bars
+
+    ratio = await swissquote_ratio(symbol, last_close)
+    if ratio is None:
+        return bars
+
+    anchored: List[Dict] = []
+    for b in bars:
+        try:
+            bar = dict(b)
+            for k in ("open", "high", "low", "close"):
+                bar[k] = float(bar[k]) * ratio
+            anchored.append(bar)
+        except (KeyError, TypeError, ValueError):
+            anchored.append(b)
+    return anchored

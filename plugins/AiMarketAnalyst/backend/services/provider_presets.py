@@ -305,6 +305,58 @@ MODEL_CATALOG: dict[str, dict[str, Any]] = {
         "notes": "Best free Gemini reasoning; lower quota (20/day) — use as quality fallback.",
     },
     # ── NVIDIA NIM (build.nvidia.com) ────────────────────
+    # The four below are the task-routed models (ai_router.TASK_MODEL_CHAINS).
+    # Every figure here was checked against a live account on 2026-08-15 rather
+    # than copied off the model card.
+    "nvidia/nemotron-3.5-lightning-30b-a3b": {
+        "label": "Nemotron 3.5 Lightning 30B (NVIDIA)",
+        "context": 1000000, "params": "30B-A3B MoE", "speed": 5,
+        "strengths": ["Fastest agentic", "Tool use", "1M context", "Long-running agents"],
+        "best_for": "Default for everything interactive — bot replies, tool calls, "
+                    "position checks. Fastest 30B MoE with switchable thinking.",
+        "vision": False, "reasoning": True, "json_mode": True, "cost": "free",
+        "notes": "Preferred NVIDIA default: answers in seconds where Ultra 550B "
+                 "takes minutes, at the accuracy these tasks need. Emits "
+                 "reasoning_content first, so give it >=2048 max_tokens.",
+    },
+    "z-ai/glm-5.2": {
+        "label": "GLM-5.2 (NVIDIA)",
+        "context": 1000000, "params": "753B", "speed": 2,
+        "strengths": ["Long-horizon reasoning", "Agentic workflows", "Coding"],
+        "best_for": "Deep market analysis, strategy synthesis and forecast narration.",
+        "vision": False, "reasoning": True, "json_mode": True, "cost": "free",
+        "notes": "Flagship reasoning model. Slow — allow ~120s — so reserve it "
+                 "for analysis the user is willing to wait for.",
+    },
+    "thinkingmachines/inkling": {
+        "label": "Inkling 952B (Thinking Machines)",
+        "context": 128000, "params": "952B MoE (256 experts)", "speed": 1,
+        "strengths": ["Vision", "Deepest chart reading", "Tool use", "Reasoning"],
+        "best_for": "Primary chart/screenshot reader — reads instrument, timeframe "
+                    "and structure off an image and reports levels honestly.",
+        "vision": True, "reasoning": True, "json_mode": True, "cost": "free",
+        "notes": "Mamba-hybrid MoE. Regularly exceeds 60s on a chart, so it runs "
+                 "on a 120s deadline; a short one times out and trips the breaker.",
+    },
+    "meta/muse-glimmer-30b": {
+        "label": "Muse Glimmer 30B (Meta)",
+        "context": 131000, "params": "30B", "speed": 4,
+        "strengths": ["Vision", "Chart reading", "Reasoning", "Tool use"],
+        "best_for": "Faster second opinion on images when Inkling is busy or slow.",
+        "vision": True, "reasoning": True, "json_mode": True, "cost": "free",
+        "notes": "Multimodal reasoning model on vLLM with native tool-calling. "
+                 "Read a test chart's instrument and timeframe correctly.",
+    },
+    "nvidia/nemotron-3-ultra-550b-a55b": {
+        "label": "Nemotron 3 Ultra 550B (NVIDIA)",
+        "context": 128000, "params": "550B-A55B MoE", "speed": 1,
+        "strengths": ["Largest free model", "Deep reasoning"],
+        "best_for": "One-off deep analysis where latency genuinely does not matter.",
+        "vision": False, "reasoning": True, "json_mode": True, "cost": "free",
+        "notes": "Too slow to be a default: it cannot answer inside the standard "
+                 "40s deadline, which is why every call used to time out and take "
+                 "the whole provider down with it. Prefer Nemotron 3.5 Lightning.",
+    },
     "nvidia/nemotron-3-super-120b-a12b": {
         "label": "Nemotron 3 Super 120B (NVIDIA)",
         "context": 128000, "params": "120B MoE", "speed": 3,
@@ -328,6 +380,25 @@ MODEL_CATALOG: dict[str, dict[str, Any]] = {
         "best_for": "Fast high-accuracy reasoning free on NVIDIA NIM.",
         "vision": False, "reasoning": True, "json_mode": True, "cost": "free",
         "notes": "Latest DeepSeek generation on NVIDIA's free endpoint.",
+    },
+    "nvidia/nemotron-nano-12b-v2-vl": {
+        "label": "Nemotron Nano 12B VL (NVIDIA)",
+        "context": 128000, "params": "12B", "speed": 4,
+        "strengths": ["Vision", "Chart reading", "Fast"],
+        "best_for": "Reading chart screenshots and other images sent to the bot.",
+        "vision": True, "reasoning": False, "json_mode": True, "cost": "free",
+        "notes": "Default for Telegram image analysis. Verified against a live "
+                 "account: read instrument, timeframe and trend off a candlestick "
+                 "chart correctly.",
+    },
+    "meta/llama-3.2-11b-vision-instruct": {
+        "label": "Llama 3.2 11B Vision (NVIDIA)",
+        "context": 128000, "params": "11B", "speed": 4,
+        "strengths": ["Vision", "Chart reading"],
+        "best_for": "Vision fallback when the Nemotron VL function is unavailable.",
+        "vision": True, "reasoning": False, "json_mode": False, "cost": "free",
+        "notes": "Verified serving. The 90B sibling is deployed but too slow for "
+                 "a chat round trip (>90s on a 900x520 chart).",
     },
     # ── SambaNova Cloud (trial credits, record speed) ────
     "Meta-Llama-3.3-70B-Instruct": {
@@ -580,8 +651,21 @@ PROVIDER_PRESETS: list[dict[str, Any]] = [
         # (llama-3.1-nemotron-ultra-253b-v1, -70b-instruct, -51b-instruct,
         # nemotron-4-340b-instruct) are removed — a catalog listing is not
         # evidence that a model will serve.
-        "default_model": "nvidia/nemotron-3-super-120b-a12b",
+        # Lightning leads: it is the newest generation and answers in seconds,
+        # where Ultra 550B cannot finish inside a normal request deadline at all.
+        # A default nobody can wait for is what made this provider look broken.
+        "default_model": "nvidia/nemotron-3.5-lightning-30b-a3b",
         "models": [
+            # Task-routed models (see ai_router.TASK_MODEL_CHAINS). All four
+            # verified serving against a live account on 2026-08-15.
+            # Text-only — do not send image blocks to these two.
+            "nvidia/nemotron-3.5-lightning-30b-a3b",
+            "z-ai/glm-5.2",
+            # Vision-capable (text+image in, text out), verified with a chart
+            # image. Both emit `reasoning_content` before `content`, so they
+            # need max_tokens >= 2048 or `content` comes back empty.
+            "thinkingmachines/inkling",
+            "meta/muse-glimmer-30b",
             "nvidia/nemotron-3-super-120b-a12b",
             "nvidia/nemotron-3-ultra-550b-a55b",
             "deepseek-ai/deepseek-v4-flash",
@@ -591,6 +675,12 @@ PROVIDER_PRESETS: list[dict[str, Any]] = [
             "nvidia/nemotron-3-nano-30b-a3b",
             "nvidia/nvidia-nemotron-nano-9b-v2",
             "nvidia/nemotron-mini-4b-instruct",
+            # Vision — verified serving with an image payload. Of the vision ids
+            # NVIDIA lists, only these two and llama-3.1-nemotron-nano-vl-8b-v1
+            # have a function deployed; gemma-3, phi-3-vision and neva-22b all
+            # 404, and llama-3.2-90b-vision times out.
+            "nvidia/nemotron-nano-12b-v2-vl",
+            "meta/llama-3.2-11b-vision-instruct",
         ],
         "free_tier": True,
         "daily_limit": None,

@@ -4,6 +4,7 @@ AI Market Analyst Plugin — API Router
 All routes prefixed at /plugins/ai-analyst by the plugin loader.
 """
 from typing import Any, List, Optional
+import time
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select, desc, func
@@ -53,6 +54,152 @@ async def get_db():
 
 # ── Multi-provider AI accounts ─────────────────────────────
 
+def mask_api_key(key: Optional[str]) -> Optional[str]:
+    """First five and last four characters, so a key is recognisable but not usable.
+
+    Short keys are masked entirely rather than partially: revealing nine
+    characters of a twelve-character secret gives away most of it, and no real
+    provider issues keys that short anyway.
+    """
+    if not key:
+        return None
+    key = key.strip()
+    if len(key) < 16:
+        return "•" * 8
+    return f"{key[:5]}…{key[-4:]}"
+
+
+async def find_duplicate_key(
+    db: AsyncSession, api_key: str, exclude_id: Optional[int] = None
+) -> Optional[AILLMProvider]:
+    """The provider already holding this key, if any.
+
+    The same key configured twice does not buy extra capacity — it is one
+    upstream quota being drawn down from two rows, so the router's load
+    balancing spreads calls across what it believes are two independent keys and
+    hits the rate limit twice as fast.
+    """
+    needle = (api_key or "").strip()
+    if not needle:
+        return None
+
+    rows = (await db.execute(select(AILLMProvider))).scalars().all()
+    for row in rows:
+        if exclude_id is not None and row.id == exclude_id:
+            continue
+        if (row.api_key or "").strip() == needle:
+            return row
+    return None
+
+
+def _duplicate_key_error(existing: AILLMProvider) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail=(
+            f"That key is already connected as “{existing.label}” "
+            f"(id {existing.id}). Using one key twice draws down a single quota "
+            f"from two rows and rate-limits twice as fast — add a different key, "
+            f"or edit the existing one."
+        ),
+    )
+
+
+async def _resync_shared_pool_models(db: AsyncSession) -> None:
+    """Give every model exactly one home.
+
+    A model reachable from two profiles is a back door: a call naming it lands
+    on whichever profile the router happens to pick, spending a quota the
+    dedication was meant to reserve. So models are claimed in priority order and
+    never re-offered:
+
+    1. Tasks with a model chain claim their chain — the strongest statement of
+       intent, and the models are named explicitly.
+    2. Tasks without one (the chat surfaces) claim what is left of their own
+       provider's catalogue. They pin no models by design, so they must yield to
+       the chains rather than swallow them.
+    3. The shared pool gets the remainder.
+
+    A profile stripped to nothing keeps its default model: a row offering no
+    models cannot serve anything and reads as broken rather than narrowed.
+    """
+    rows = (await db.execute(select(AILLMProvider))).scalars().all()
+    claimed: set[str] = set()
+
+    def catalogue_of(p: AILLMProvider) -> list[str]:
+        return _provider_models(get_preset(p.provider_key), p.default_model) or []
+
+    def settle(p: AILLMProvider, kept: list[str]) -> None:
+        p.models_json = kept or ([p.default_model] if p.default_model else [])
+        claimed.update(p.models_json or [])
+        if p.default_model and p.default_model not in (p.models_json or []):
+            p.default_model = (p.models_json or [None])[0]
+
+    dedicated = [p for p in rows if p.assigned_task]
+    # Chain-holders first, so a surface task on the same vendor cannot absorb
+    # models another task depends on.
+    chained = [
+        p for p in dedicated
+        if ai_router.resolve_model_for_task(p.assigned_task or "")
+    ]
+    for p in chained:
+        settle(p, ai_router.models_for_dedicated_profile(p.assigned_task, catalogue_of(p)))
+
+    for p in dedicated:
+        if p in chained:
+            continue
+        settle(p, [m for m in catalogue_of(p) if m not in claimed])
+
+    for p in rows:
+        if p.assigned_task:
+            continue
+        p.models_json = [m for m in catalogue_of(p) if m not in claimed] or (
+            [p.default_model] if p.default_model else []
+        )
+        if p.default_model and p.default_model not in (p.models_json or []):
+            p.default_model = (p.models_json or [None])[0]
+
+
+async def _validated_task_assignment(
+    db: AsyncSession,
+    raw: str | None,
+    *,
+    exclude_id: int | None = None,
+) -> str | None:
+    """Normalise and check a requested task dedication.
+
+    Refuses a task that another profile already holds. The column is unique, so
+    the database would refuse it anyway — but as an IntegrityError raised at
+    commit, which surfaces as a 500 and rolls back every other edit in the same
+    request. Checking here returns a 409 that names the profile already holding
+    it, which is the thing the user needs to know to resolve it.
+    """
+    task = (raw or "").strip()
+    if not task:
+        return None
+
+    known = set(ai_router.TASK_MODEL_CHAINS)
+    if task not in known:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown task {task!r}. Known tasks: {', '.join(sorted(known))}.",
+        )
+
+    stmt = select(AILLMProvider).where(AILLMProvider.assigned_task == task)
+    if exclude_id is not None:
+        stmt = stmt.where(AILLMProvider.id != exclude_id)
+    clash = (await db.execute(stmt)).scalars().first()
+    if clash is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"“{clash.label}” (id {clash.id}) is already dedicated to "
+                f"{task}. A task runs on exactly one profile — free that one "
+                f"first, or pick a different task."
+            ),
+        )
+    return task
+
+
 def _provider_to_response(p: AILLMProvider) -> AIProviderResponse:
     # Tolerate a double-encoded model list. `models_json` is a JSON column and
     # should always be a list, but anything that ever wrote json.dumps(...) into
@@ -60,6 +207,18 @@ def _provider_to_response(p: AILLMProvider) -> AIProviderResponse:
     # validation and 500 the entire providers page, hiding every healthy
     # provider along with it.
     models = ai_router.normalise_model_list(p.models_json)
+
+    # `models_json` is a snapshot taken when the row was created, so a model
+    # added to a preset later never reached the dropdown for providers people
+    # already had. For fixed-endpoint presets the catalog in code is the truth —
+    # serve that, and keep the stored list only for custom endpoints the user
+    # curates themselves.
+    preset = get_preset(p.provider_key)
+    if preset and not preset.get("editable_endpoint"):
+        catalog = list(preset["models"])
+        # Anything the user added by hand stays available.
+        models = catalog + [m for m in models if m not in catalog]
+
     model_info = {m: info for m in models if (info := get_model_info(m))}
     return AIProviderResponse(
         id=p.id,
@@ -67,6 +226,7 @@ def _provider_to_response(p: AILLMProvider) -> AIProviderResponse:
         label=p.label,
         type=p.type,
         api_key_set=bool(p.api_key),
+        api_key_preview=mask_api_key(p.api_key),
         base_url=p.base_url,
         default_model=p.default_model,
         models=models,
@@ -117,8 +277,164 @@ async def list_providers(db: AsyncSession = Depends(get_db)):
     return [_provider_to_response(p) for p in res.scalars().all()]
 
 
+class TaskAssignmentRequest(BaseModel):
+    #: null releases the task back to the shared provider pool.
+    provider_id: Optional[int] = None
+
+
+@router.get("/ai/task-assignments")
+async def list_task_assignments(db: AsyncSession = Depends(get_db)):
+    """Which profile serves which task, for the Recommended Setup panels.
+
+    Returns every known task, including the ones nobody is dedicated to, so the
+    UI can render "shared pool" as a state of its own.
+    """
+    tasks = list((await ai_router.task_assignments(db)).values())
+    unmet = [t for t in tasks if t["needs_key"]]
+    # Count profiles the user could still dedicate without taking one off a job
+    # it already has, so the UI can say how many more keys are actually needed.
+    free = (await db.execute(
+        select(AILLMProvider)
+        .where(AILLMProvider.enabled.is_(True))
+        .where(AILLMProvider.assigned_task.is_(None))
+    )).scalars().all()
+    return {
+        "tasks": tasks,
+        "required_unmet": [t["task"] for t in unmet],
+        "free_profiles": len(free),
+        # Every required slot needs its own profile; the shared pool must keep at
+        # least one, or untasked calls have nowhere to go.
+        "keys_needed": max(0, len(unmet) - max(0, len(free) - 1)),
+        "signup_urls": ai_router.KEY_SIGNUP_URLS,
+    }
+
+
+@router.post("/ai/task-assignments/{task}/test")
+async def test_task_assignment(task: str, db: AsyncSession = Depends(get_db)):
+    """Send one real call down whatever this task would actually use.
+
+    Deliberately not a provider ping: it resolves the profile the same way the
+    task does at runtime — dedicated if set, borrowed from the shared pool if
+    not — so a pass means *this task* works, not merely that some key somewhere
+    answers. The reply says which profile served it and whether that profile was
+    the task's own or a borrowed one.
+    """
+    if task not in ai_router.TASK_MODEL_CHAINS:
+        raise HTTPException(status_code=404, detail=f"Unknown task {task!r}")
+
+    dedicated = await ai_router.dedicated_profile_for(db, task)
+    started = time.perf_counter()
+    try:
+        res = await ai_router.chat_for_task(
+            db,
+            [{"role": "user", "content": "Reply with exactly: READY"}],
+            task=task,
+            max_tokens=2048,   # reasoning models spend budget before answering
+            temperature=0,
+            bypass_openmanus=True,
+            agent_name=f"test-{task}",
+            source="settings-test",
+        )
+    except Exception as exc:  # noqa: BLE001 — a failed test is a result, not a 500
+        return {
+            "task": task, "ok": False, "error": str(exc)[:300],
+            "dedicated": dedicated is not None,
+            "latency_ms": round((time.perf_counter() - started) * 1000),
+        }
+
+    content = (res.get("content") or "").strip()
+    return {
+        "task": task,
+        "ok": bool(res.get("ok") and content),
+        "provider": res.get("provider"),
+        "model": res.get("model"),
+        "reply": content[:120] or None,
+        "error": res.get("error"),
+        "latency_ms": round((time.perf_counter() - started) * 1000),
+        "dedicated": dedicated is not None,
+        # True when the task has no profile of its own and ran on a shared key.
+        "borrowed": dedicated is None,
+    }
+
+
+@router.put("/ai/task-assignments/{task}")
+async def assign_task(
+    task: str,
+    payload: TaskAssignmentRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Dedicate one profile to ``task``, or release it with provider_id: null."""
+    if task not in ai_router.TASK_MODEL_CHAINS:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown task {task!r}. Known: {', '.join(sorted(ai_router.TASK_MODEL_CHAINS))}.",
+        )
+
+    # Whoever holds it now loses it — assigning is a move, not a copy, which is
+    # what keeps one task on exactly one profile without the caller having to
+    # clear the old one first.
+    current = (
+        await db.execute(select(AILLMProvider).where(AILLMProvider.assigned_task == task))
+    ).scalars().all()
+
+    if payload.provider_id is None:
+        for p in current:
+            p.assigned_task = None
+            # Hand the full catalogue back — off duty it rejoins the shared pool
+            # and should be able to serve anything again.
+            p.models_json = _provider_models(get_preset(p.provider_key), p.default_model)
+        await _resync_shared_pool_models(db)
+        await db.commit()
+        return {"task": task, "provider_id": None, "dedicated": False}
+
+    target = await db.get(AILLMProvider, payload.provider_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="Provider not found")
+    if target.assigned_task and target.assigned_task != task:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"“{target.label}” is already dedicated to {target.assigned_task}. "
+                f"One profile serves one task — release it first, or pick "
+                f"another profile."
+            ),
+        )
+
+    for p in current:
+        if p.id != target.id:
+            p.assigned_task = None
+            p.models_json = _provider_models(get_preset(p.provider_key), p.default_model)
+
+    target.assigned_task = task
+    # Narrow the profile to its task's chain. The chains are disjoint (asserted
+    # at import), so this is what guarantees two dedicated profiles can never
+    # offer the same model — rather than leaving every profile holding the full
+    # catalogue and trusting the router not to cross over.
+    catalogue = _provider_models(get_preset(target.provider_key), target.default_model) or []
+    chain = ai_router.models_for_dedicated_profile(task, catalogue)
+    if chain:
+        target.models_json = chain
+        if target.default_model not in chain:
+            target.default_model = chain[0]
+    await _resync_shared_pool_models(db)
+    await db.commit()
+    await db.refresh(target)
+    return {
+        "task": task,
+        "provider_id": target.id,
+        "provider_label": target.label,
+        "models": list(target.models_json or []),
+        "default_model": target.default_model,
+        "dedicated": True,
+    }
+
+
 @router.post("/ai/providers", response_model=AIProviderResponse)
 async def add_provider(payload: AIProviderCreate, db: AsyncSession = Depends(get_db)):
+    existing = await find_duplicate_key(db, payload.api_key)
+    if existing is not None:
+        raise _duplicate_key_error(existing)
+
     preset = get_preset(payload.provider_key)
     base_url = _normalize_optional_text(payload.base_url) or (preset["base_url"] if preset else None)
     default_model = _normalize_optional_text(payload.default_model) or (preset["default_model"] if preset else None)
@@ -162,6 +478,11 @@ async def update_provider(provider_id: int, payload: AIProviderUpdate, db: Async
     preset = get_preset(provider.provider_key)
     data = payload.model_dump(exclude_unset=True)
     if "api_key" in data and data["api_key"]:
+        # Same guard on edit: pasting a key another row already holds is the
+        # easy way to create the duplicate the create path refuses.
+        clash = await find_duplicate_key(db, data["api_key"], exclude_id=provider.id)
+        if clash is not None:
+            raise _duplicate_key_error(clash)
         provider.api_key = data["api_key"].strip()
     for attr in ("label", "enabled", "priority", "daily_limit", "monthly_limit"):
         if attr in data and data[attr] is not None:
@@ -170,7 +491,25 @@ async def update_provider(provider_id: int, payload: AIProviderUpdate, db: Async
         provider.base_url = _normalize_optional_text(data["base_url"])
     if "default_model" in data and data["default_model"] is not None:
         provider.default_model = _normalize_optional_text(data["default_model"])
-        provider.models_json = _provider_models(preset, provider.default_model)
+        catalogue = _provider_models(preset, provider.default_model)
+        # A dedicated profile must not be re-expanded to the vendor's whole
+        # catalogue here. Setting a model is a routine edit — and it was silently
+        # undoing the narrowing every time, handing the profile back every model
+        # including ones another task owns, which is how everything drifted back
+        # onto one NVIDIA profile.
+        if provider.assigned_task:
+            provider.models_json = ai_router.models_for_dedicated_profile(
+                provider.assigned_task, catalogue or []
+            ) or catalogue
+        else:
+            provider.models_json = catalogue
+    if "assigned_task" in data:
+        provider.assigned_task = await _validated_task_assignment(
+            db, data["assigned_task"], exclude_id=provider.id
+        )
+    # Keep the shared pool clear of dedicated models after any edit that could
+    # have widened a catalogue again.
+    await _resync_shared_pool_models(db)
     await db.commit()
     await db.refresh(provider)
     return _provider_to_response(provider)

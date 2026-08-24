@@ -49,7 +49,11 @@ import {
   Globe,
   FlaskConical,
   Smartphone,
+  Activity,
   ChevronDown,
+  Users,
+  Plug,
+  Repeat,
 } from 'lucide-react';
 
 interface NavItem {
@@ -75,7 +79,13 @@ const navItems: NavItem[] = [
   { href: '/smart-money-concepts', label: 'Smart Money Concepts', icon: CandlestickChart },
   { href: '/kronos-forecast', label: 'Kronos Forecast', icon: Telescope },
   { href: '/delistings', label: 'Delistings', icon: AlertTriangle },
+  { href: '/trading-room', label: 'Trading Room', icon: Users, children: [
+    { href: '/trading-room-settings', label: 'Room Settings', icon: Settings },
+  ],
+  },
+  { href: '/bitcoin-cycle', label: 'Bitcoin Cycle', icon: Repeat },
   { href: '/agents', label: 'AI Agents', icon: Bot },
+  { href: '/ai-providers', label: 'AI Providers', icon: Plug },
   { href: '/custom-agents', label: 'Custom Agents', icon: Cpu },
   { href: '/agent-paul', label: 'Agent Paul', icon: Workflow },
   { href: '/intelligence', label: 'Intelligence', icon: Network },
@@ -94,6 +104,7 @@ const navItems: NavItem[] = [
   { href: '/vibe-trading', label: 'Vibe Trading', icon: FlaskConical },
   { href: '/openhuman-hub', label: 'OpenHuman', icon: Atom },
   { href: '/ngrok', label: 'Ngrok', icon: Globe },
+  { href: '/system-monitor', label: 'System Monitor', icon: Activity },
   {
     href: '/settings',
     label: 'Settings',
@@ -103,6 +114,9 @@ const navItems: NavItem[] = [
     ],
   },
 ];
+
+/** Pages with their own agent visuals — the floating robot stays away. */
+const ROBOT_FREE_ROUTES = new Set(['/trading-room', '/trading-room-settings']);
 
 export default function Layout({ children }: { children: React.ReactNode }) {
   const router = useRouter();
@@ -259,7 +273,9 @@ export default function Layout({ children }: { children: React.ReactNode }) {
 
       {/* PAUL JARVIS — global floating assistant (available on every page) */}
       <ErrorBoundary fallback={<div className="fixed bottom-4 left-1/2 -translate-x-1/2 text-red-400 text-xs font-mono">JARVIS unavailable</div>}>
-        <PaulChat />
+        {/* The roaming robot is suppressed on pages that render their own agent
+            visuals — it would otherwise walk across the trading-room table. */}
+        <PaulChat hideRobot={ROBOT_FREE_ROUTES.has(router.pathname)} />
       </ErrorBoundary>
 
       {/* Browser extension install prompt (auto-hides when extension connects) */}

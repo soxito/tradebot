@@ -102,6 +102,13 @@ class MT5PositionResponse(BaseModel):
     rr_ratio: Optional[float] = None
     risk_pips: Optional[float] = None
     reward_pips: Optional[float] = None
+    # Where the order came from, derived from the MT5 comment. "app" when this
+    # app placed it (with `source` naming which part), "manual" when it was
+    # placed by hand in the terminal.
+    origin: str = "manual"
+    source: str = "manual"
+    source_ref: Optional[str] = None
+    origin_label: str = "Manual order"
 
 
 # ── Deal Schemas ───────────────────────────────────────────
@@ -410,6 +417,9 @@ class MT5SmcAnalyzeResponse(BaseModel):
     momentum: Optional[str] = None
     equilibrium: Optional[float] = None
     range: Optional[Dict[str, float]] = None
+    # Auto fib retracement of the latest ZigZag swing (levels + golden zone),
+    # so the chart can draw the same levels the fib confluence factor scored.
+    fib: Optional[Dict[str, Any]] = None
     structure_events: List[Dict[str, Any]] = []
     liquidity: Dict[str, List[float]] = {}
     zones: List[MT5SmcZone] = []

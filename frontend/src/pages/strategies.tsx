@@ -34,7 +34,7 @@ import {
 interface IndicatorConfig {
   name: string
   enabled: boolean
-  params: Record<string, number>
+  params: Record<string, any>
   weight: number
 }
 
@@ -71,7 +71,24 @@ interface PineScriptItem {
 
 const TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d']
 
-const AVAILABLE_INDICATORS: { name: string; label: string; defaultParams: Record<string, number> }[] = [
+// Fib ratios + defaults mirror the backend's DEFAULT_FIB_LEVELS / _FIB_DEFAULT_COLORS
+// (backend/app/signals/technical.py) so the UI defaults match what's computed server-side.
+const FIB_RATIOS = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1, 1.272, 1.618, 2.618]
+const FIB_DEFAULT_COLORS: Record<number, string> = {
+  0: '#787b86', 0.236: '#f44336', 0.382: '#81c784', 0.5: '#4caf50', 0.618: '#009688',
+  0.786: '#64b5f6', 1: '#787b86', 1.272: '#81c784', 1.618: '#2962ff', 2.618: '#f44336',
+}
+const FIB_DEFAULT_ENABLED = new Set([0, 0.236, 0.382, 0.5, 0.618, 0.786, 1])
+
+function defaultFibLevels(): Record<string, { enabled: boolean; color: string }> {
+  const levels: Record<string, { enabled: boolean; color: string }> = {}
+  FIB_RATIOS.forEach(r => {
+    levels[String(r)] = { enabled: FIB_DEFAULT_ENABLED.has(r), color: FIB_DEFAULT_COLORS[r] }
+  })
+  return levels
+}
+
+const AVAILABLE_INDICATORS: { name: string; label: string; defaultParams: Record<string, any> }[] = [
   { name: 'rsi', label: 'RSI', defaultParams: { period: 14, overbought: 70, oversold: 30 } },
   { name: 'macd', label: 'MACD', defaultParams: { fast: 12, slow: 26, signal: 9 } },
   { name: 'bollinger', label: 'Bollinger Bands', defaultParams: { period: 20, mult: 2 } },
@@ -79,6 +96,7 @@ const AVAILABLE_INDICATORS: { name: string; label: string; defaultParams: Record
   { name: 'stoch_rsi', label: 'Stochastic RSI', defaultParams: { period: 14, overbought: 80, oversold: 20 } },
   { name: 'adx', label: 'ADX', defaultParams: { period: 14, threshold: 25 } },
   { name: 'volume', label: 'Volume Surge', defaultParams: { period: 20, mult: 1.5 } },
+  { name: 'fib_retracement', label: 'Auto Fib Retracement', defaultParams: { deviation_pct: 5, depth: 10, levels: defaultFibLevels() } },
 ]
 
 const DEFAULT_PAIRS = [
@@ -830,6 +848,14 @@ function StrategyForm({
     update('indicators', inds)
   }
 
+  const updateIndicatorLevelParam = (idx: number, ratio: number, field: 'enabled' | 'color', val: boolean | string) => {
+    const inds = [...form.indicators]
+    const levels = { ...(inds[idx].params.levels || defaultFibLevels()) }
+    levels[String(ratio)] = { ...levels[String(ratio)], [field]: val }
+    inds[idx] = { ...inds[idx], params: { ...inds[idx].params, levels } }
+    update('indicators', inds)
+  }
+
   const addPair = () => {
     const p = pairInput.trim().toUpperCase()
     if (p && !form.pairs.includes(p)) {
@@ -1010,18 +1036,44 @@ function StrategyForm({
                 </div>
                 {ind.enabled && (
                   <div className="flex flex-wrap gap-3">
-                    {Object.entries(ind.params).map(([key, val]) => (
-                      <div key={key} className="flex items-center gap-1.5">
-                        <label className="text-[10px] text-gray-500">{key}</label>
-                        <input
-                          type="number"
-                          step={key.includes('mult') ? 0.1 : 1}
-                          className="w-16 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-white outline-none"
-                          value={val}
-                          onChange={e => updateIndicatorParam(idx, key, parseFloat(e.target.value) || 0)}
-                        />
-                      </div>
-                    ))}
+                    {Object.entries(ind.params)
+                      .filter(([, val]) => typeof val === 'number')
+                      .map(([key, val]) => (
+                        <div key={key} className="flex items-center gap-1.5">
+                          <label className="text-[10px] text-gray-500">{key}</label>
+                          <input
+                            type="number"
+                            step={key.includes('mult') ? 0.1 : 1}
+                            className="w-16 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-white outline-none"
+                            value={val as number}
+                            onChange={e => updateIndicatorParam(idx, key, parseFloat(e.target.value) || 0)}
+                          />
+                        </div>
+                      ))}
+                  </div>
+                )}
+                {ind.enabled && ind.name === 'fib_retracement' && (
+                  <div className="mt-3 grid grid-cols-2 sm:grid-cols-3 gap-x-4 gap-y-1.5 border-t border-gray-700/50 pt-3">
+                    {FIB_RATIOS.map(ratio => {
+                      const lvl = ind.params.levels?.[String(ratio)] || { enabled: FIB_DEFAULT_ENABLED.has(ratio), color: FIB_DEFAULT_COLORS[ratio] }
+                      return (
+                        <div key={ratio} className="flex items-center gap-1.5">
+                          <input
+                            type="checkbox"
+                            checked={lvl.enabled}
+                            onChange={e => updateIndicatorLevelParam(idx, ratio, 'enabled', e.target.checked)}
+                            className="accent-purple-500"
+                          />
+                          <input
+                            type="color"
+                            value={lvl.color}
+                            onChange={e => updateIndicatorLevelParam(idx, ratio, 'color', e.target.value)}
+                            className="w-5 h-5 rounded border border-gray-700 bg-transparent cursor-pointer"
+                          />
+                          <span className="text-[10px] text-gray-400">{(ratio * 100).toFixed(1)}%</span>
+                        </div>
+                      )
+                    })}
                   </div>
                 )}
               </div>

@@ -105,12 +105,26 @@ def pivot_highs(series: pd.Series, left: int = 5, right: int = 5) -> pd.Series:
     Detect pivot highs (swing highs). A bar is a pivot high if it's the highest
     of `left` bars before and `right` bars after. Returns NaN where no pivot.
     Mirrors TradingView's ta.pivothigh(source, leftbars, rightbars).
+
+    Vectorised: rolling window max + uniqueness check instead of a per-bar
+    Python loop with .iloc slicing (the old version dominated profile time).
     """
+    values = series.to_numpy(dtype=float)
+    n = len(values)
     result = pd.Series(np.nan, index=series.index)
-    for i in range(left, len(series) - right):
-        window = series.iloc[i - left: i + right + 1]
-        if series.iloc[i] == window.max() and (window == series.iloc[i]).sum() == 1:
-            result.iloc[i] = series.iloc[i]
+    if n <= left + right:
+        return result
+    win = left + right + 1
+    # Rolling max over the full window centred on each candidate bar.
+    s = pd.Series(values, index=series.index)
+    roll_max = s.rolling(win, center=True).max()
+    candidates = np.nonzero((values == roll_max.to_numpy()) & ~np.isnan(roll_max.to_numpy()))[0]
+    for i in candidates:
+        if i < left or i >= n - right:
+            continue
+        w = values[i - left: i + right + 1]
+        if (w == values[i]).sum() == 1:
+            result.iloc[i] = values[i]
     return result
 
 
@@ -120,12 +134,126 @@ def pivot_lows(series: pd.Series, left: int = 5, right: int = 5) -> pd.Series:
     of `left` bars before and `right` bars after. Returns NaN where no pivot.
     Mirrors TradingView's ta.pivotlow(source, leftbars, rightbars).
     """
+    values = series.to_numpy(dtype=float)
+    n = len(values)
     result = pd.Series(np.nan, index=series.index)
-    for i in range(left, len(series) - right):
-        window = series.iloc[i - left: i + right + 1]
-        if series.iloc[i] == window.min() and (window == series.iloc[i]).sum() == 1:
-            result.iloc[i] = series.iloc[i]
+    if n <= left + right:
+        return result
+    win = left + right + 1
+    s = pd.Series(values, index=series.index)
+    roll_min = s.rolling(win, center=True).min()
+    candidates = np.nonzero((values == roll_min.to_numpy()) & ~np.isnan(roll_min.to_numpy()))[0]
+    for i in candidates:
+        if i < left or i >= n - right:
+            continue
+        w = values[i - left: i + right + 1]
+        if (w == values[i]).sum() == 1:
+            result.iloc[i] = values[i]
     return result
+
+
+def ichimoku(
+    df: pd.DataFrame,
+    conversion: int = 9,
+    base: int = 26,
+    span_b: int = 52,
+) -> Dict[str, Any]:
+    """
+    Ichimoku Kinko Hyo. Returns the four lines plus where the current close sits
+    relative to the cloud.
+
+    The spans are NOT shifted forward here: the standard 26-bar displacement
+    projects the cloud into the future, but the question asked of it — is the
+    cloud above or below price right now — is about the cloud drawn at the
+    current bar, which is the unshifted value.
+
+    Returns tenkan/kijun/senkou_a/senkou_b series plus:
+      - cloud_top / cloud_bottom: latest values (None when history is short)
+      - position: "above" | "below" | "inside" | None
+    """
+    high, low, close = df["high"], df["low"], df["close"]
+
+    def midpoint(period: int) -> pd.Series:
+        return (high.rolling(period, min_periods=period).max()
+                + low.rolling(period, min_periods=period).min()) / 2
+
+    tenkan = midpoint(conversion)
+    kijun = midpoint(base)
+    senkou_a = (tenkan + kijun) / 2
+    senkou_b = midpoint(span_b)
+
+    out: Dict[str, Any] = {
+        "tenkan": tenkan, "kijun": kijun,
+        "senkou_a": senkou_a, "senkou_b": senkou_b,
+        "cloud_top": None, "cloud_bottom": None, "position": None,
+    }
+    if len(df) < span_b:
+        return out
+
+    a, b = senkou_a.iloc[-1], senkou_b.iloc[-1]
+    if pd.isna(a) or pd.isna(b):
+        return out
+
+    top, bottom = float(max(a, b)), float(min(a, b))
+    price = float(close.iloc[-1])
+    out["cloud_top"], out["cloud_bottom"] = round(top, 6), round(bottom, 6)
+    out["position"] = "above" if price > top else "below" if price < bottom else "inside"
+    return out
+
+
+def detect_triangle(
+    df: pd.DataFrame,
+    pivot_left: int = 5,
+    pivot_right: int = 5,
+    flat_tolerance_pct: float = 0.6,
+    min_pivots: int = 3,
+) -> Optional[Dict[str, Any]]:
+    """
+    Ascending / descending triangle, read off confirmed pivots.
+
+    Deliberately narrow: it only claims a triangle when one side is genuinely
+    flat (every pivot within `flat_tolerance_pct` of their mean) and the other
+    is monotonically converging toward it. Anything else returns None — an
+    unnamed pattern is far better than a named one that isn't there, since the
+    name is what a reader will trade against.
+
+    Returns {kind, level, broken, ...} where `level` is the flat boundary and
+    `broken` says whether the latest close has closed through it.
+    """
+    if len(df) < (pivot_left + pivot_right + 10):
+        return None
+
+    ph = pivot_highs(df["high"], pivot_left, pivot_right).dropna()
+    pl = pivot_lows(df["low"], pivot_left, pivot_right).dropna()
+    if len(ph) < min_pivots or len(pl) < min_pivots:
+        return None
+
+    highs = [float(v) for v in ph.iloc[-min_pivots:]]
+    lows = [float(v) for v in pl.iloc[-min_pivots:]]
+    close = float(df["close"].iloc[-1])
+
+    def is_flat(values: List[float]) -> bool:
+        mean = sum(values) / len(values)
+        if mean == 0:
+            return False
+        return all(abs(v - mean) / abs(mean) * 100 <= flat_tolerance_pct for v in values)
+
+    rising = all(b > a for a, b in zip(lows, lows[1:]))
+    falling = all(b < a for a, b in zip(highs, highs[1:]))
+
+    if is_flat(highs) and rising:
+        level = sum(highs) / len(highs)
+        return {
+            "kind": "ascending", "level": round(level, 6),
+            "broken": close > level, "direction": "up" if close > level else None,
+        }
+    if is_flat(lows) and falling:
+        level = sum(lows) / len(lows)
+        return {
+            "kind": "descending", "level": round(level, 6),
+            "broken": close < level, "direction": "down" if close < level else None,
+        }
+    return None
 
 
 def support_resistance_mtf(
@@ -135,6 +263,7 @@ def support_resistance_mtf(
     zone_merge_pct: float = 0.5,
     max_levels: int = 8,
     min_touches: int = 2,
+    include_lines: bool = False,
 ) -> Dict[str, Any]:
     """
     Support and Resistance Signals MTF — replicates the TradingView indicator logic.
@@ -146,11 +275,16 @@ def support_resistance_mtf(
     4. Generate signals: BUY when price bounces off support, SELL at resistance.
     5. Return level lines + signal markers for chart overlay.
 
+    Args:
+      include_lines: build per-bar chart-line series. Only chart-overlay
+        consumers need these (~max_levels × len(df) dicts); scoring callers
+        leave it off so the hot pipeline never pays that cost.
+
     Returns:
       - levels: list of {price, type, strength, touches, first_time, last_time}
       - signals: list of {time, type, price, level_price}
-      - support_lines: series data for chart
-      - resistance_lines: series data for chart
+      - support_lines: series data for chart (empty unless include_lines)
+      - resistance_lines: series data for chart (empty unless include_lines)
     """
     highs = df["high"]
     lows = df["low"]
@@ -240,29 +374,33 @@ def support_resistance_mtf(
     support_lines = []
     resistance_lines = []
 
-    for level in levels:
-        price = level["price"]
-        start_time = level["first_time"]
-        end_time = int(timestamps.iloc[-1].timestamp())
+    if include_lines:
+        # One numpy pass for all timestamps instead of a .iloc call per bar.
+        ts_array = pd.to_datetime(timestamps).astype("int64").to_numpy() // 10**9
+        end_time = int(ts_array[-1])
 
-        line_data = []
-        for i in range(len(df)):
-            ts = int(timestamps.iloc[i].timestamp())
-            if ts >= start_time:
-                line_data.append({"time": ts, "value": price})
+        for level in levels:
+            price = level["price"]
+            start_time = level["first_time"]
 
-        if level["type"] == "support":
-            support_lines.append({
-                "price": price,
-                "strength": level["strength"],
-                "data": line_data,
-            })
-        else:
-            resistance_lines.append({
-                "price": price,
-                "strength": level["strength"],
-                "data": line_data,
-            })
+            mask = ts_array >= start_time
+            line_data = [
+                {"time": int(t), "value": price}
+                for t in ts_array[mask]
+            ]
+
+            if level["type"] == "support":
+                support_lines.append({
+                    "price": price,
+                    "strength": level["strength"],
+                    "data": line_data,
+                })
+            else:
+                resistance_lines.append({
+                    "price": price,
+                    "strength": level["strength"],
+                    "data": line_data,
+                })
 
     # Generate signals: price approaching or bouncing from S/R levels
     atr_val = atr(df, 14).iloc[-1] if len(df) >= 15 else (highs.iloc[-1] - lows.iloc[-1])
@@ -319,6 +457,283 @@ def support_resistance_mtf(
         "support_lines": support_lines,
         "resistance_lines": resistance_lines,
     }
+
+
+DEFAULT_FIB_LEVELS = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1, 1.272, 1.618, 2.618]
+
+_FIB_DEFAULT_COLORS = {
+    0: "#787b86",
+    0.236: "#f44336",
+    0.382: "#81c784",
+    0.5: "#4caf50",
+    0.618: "#009688",
+    0.786: "#64b5f6",
+    1: "#787b86",
+    1.272: "#81c784",
+    1.618: "#2962ff",
+    2.618: "#f44336",
+}
+
+
+def zigzag_deviation_pct(df: pd.DataFrame, threshold_multiplier: float = 3.0) -> float:
+    """Swing threshold scaled to the instrument's own volatility, as a percent.
+
+    Mirrors the Pine `devThreshold := ta.atr(10) / close * 100 * multiplier`. A
+    fixed percentage cannot serve every market: 5% is a routine crypto swing but
+    more than gold moves in a week, so a fixed default finds no pivots at all on
+    FX and metals — the instruments this bot mostly charts.
+    """
+    a = atr(df, period=10)
+    close = df["close"]
+    pct = (a / close * 100.0 * threshold_multiplier).dropna()
+    if pct.empty:
+        return 5.0
+    return max(float(pct.iloc[-1]), 0.01)
+
+
+def zigzag_pivots(
+    df: pd.DataFrame,
+    deviation_pct: Optional[float] = None,
+    depth: int = 10,
+    threshold_multiplier: float = 3.0,
+) -> Dict[str, Any]:
+    """
+    TradingView-style ZigZag pivot detection. Tracks the running price extreme in
+    the current direction and confirms/flips a pivot only when price retraces
+    `deviation_pct`% from that extreme, with at least `depth` bars between confirmed
+    pivots. Distinct from pivot_highs/pivot_lows (symmetric left/right lookback) —
+    mirrors the deviation/depth semantics of TradingView's zigzag(deviation, depth).
+
+    `deviation_pct` defaults to an ATR-derived threshold (see zigzag_deviation_pct)
+    so the same call works on crypto, FX and metals; pass a number to pin it.
+
+    Returns:
+      - pivots: chronological list of {idx, time, price, type: "high"|"low"}
+      - last_swing: {start_idx, start_price, end_idx, end_price, direction} | None
+        (the most recent confirmed pivot through to the current running extreme)
+    """
+    highs = df["high"].values
+    lows = df["low"].values
+    timestamps = df["timestamp"]
+    n = len(df)
+    if n < 2:
+        return {"pivots": [], "last_swing": None}
+
+    if deviation_pct is None:
+        deviation_pct = zigzag_deviation_pct(df, threshold_multiplier)
+
+    pivots: List[Dict[str, Any]] = []
+
+    # Phase 1: determine the initial direction by tracking both running extremes
+    # from bar 0 until price deviates deviation_pct% from one of them.
+    run_high, run_high_idx = highs[0], 0
+    run_low, run_low_idx = lows[0], 0
+    direction = 0
+    ext_idx, ext_price = 0, highs[0]
+    start_idx = n
+
+    for i in range(1, n):
+        if highs[i] > run_high:
+            run_high, run_high_idx = highs[i], i
+        if lows[i] < run_low:
+            run_low, run_low_idx = lows[i], i
+
+        up_dev = (run_high - run_low) / run_low * 100 if run_low > 0 else 0
+        if run_high_idx > run_low_idx and up_dev >= deviation_pct:
+            direction = 1
+            pivots.append({
+                "idx": run_low_idx,
+                "time": int(timestamps.iloc[run_low_idx].timestamp()),
+                "price": run_low, "type": "low",
+            })
+            ext_idx, ext_price = run_high_idx, run_high
+            start_idx = i + 1
+            break
+
+        down_dev = (run_high - run_low) / run_high * 100 if run_high > 0 else 0
+        if run_low_idx > run_high_idx and down_dev >= deviation_pct:
+            direction = -1
+            pivots.append({
+                "idx": run_high_idx,
+                "time": int(timestamps.iloc[run_high_idx].timestamp()),
+                "price": run_high, "type": "high",
+            })
+            ext_idx, ext_price = run_low_idx, run_low
+            start_idx = i + 1
+            break
+
+    if direction == 0:
+        return {"pivots": [], "last_swing": None}
+
+    # Phase 2: extend the current leg, flipping direction on deviation once the
+    # reversal is seen at least `depth` bars past the previous confirmed pivot.
+    #
+    # The depth guard counts from the current bar, not from the extreme. Counting
+    # from the extreme deadlocks: once price reverses, the extreme stops moving,
+    # so a reversal rejected as too-early can never age into acceptance and the
+    # tracker freezes on a stale swing for the rest of the series.
+    for i in range(start_idx, n):
+        if direction == 1:
+            if highs[i] > ext_price:
+                ext_price, ext_idx = highs[i], i
+            reversed_ = ext_price > 0 and lows[i] <= ext_price * (1 - deviation_pct / 100)
+            if reversed_ and (i - pivots[-1]["idx"]) >= depth:
+                pivots.append({
+                    "idx": ext_idx, "time": int(timestamps.iloc[ext_idx].timestamp()),
+                    "price": ext_price, "type": "high",
+                })
+                direction = -1
+                ext_price, ext_idx = lows[i], i
+        else:
+            if lows[i] < ext_price:
+                ext_price, ext_idx = lows[i], i
+            reversed_ = ext_price > 0 and highs[i] >= ext_price * (1 + deviation_pct / 100)
+            if reversed_ and (i - pivots[-1]["idx"]) >= depth:
+                pivots.append({
+                    "idx": ext_idx, "time": int(timestamps.iloc[ext_idx].timestamp()),
+                    "price": ext_price, "type": "low",
+                })
+                direction = 1
+                ext_price, ext_idx = highs[i], i
+
+    last_pivot = pivots[-1]
+    last_swing = {
+        "start_idx": last_pivot["idx"],
+        "start_price": last_pivot["price"],
+        "end_idx": ext_idx,
+        "end_price": ext_price,
+        "direction": "up" if direction == 1 else "down",
+    }
+    return {"pivots": pivots, "last_swing": last_swing}
+
+
+def auto_fib_retracement(
+    df: pd.DataFrame,
+    deviation_pct: Optional[float] = None,
+    depth: int = 10,
+    levels: Optional[Any] = None,
+    extend_lines: bool = True,
+) -> Dict[str, Any]:
+    """
+    Auto Fibonacci Retracement — detects the latest ZigZag swing (see zigzag_pivots)
+    and computes fib retracement/extension levels off it. Mirrors the TradingView
+    "Auto Fib Retracement" Pine Script: deviation/depth-based swing detection,
+    per-level enable/color, lines extendable to the current bar.
+
+    `levels` may be omitted (uses DEFAULT_FIB_LEVELS, all enabled), a list of
+    floats, a list of {"ratio", "enabled", "color"} dicts, or a {ratio: {enabled,
+    color}} mapping (as stored by the frontend's per-level toggle UI).
+
+    Returns overlay-series-compatible data modeled on support_resistance_mtf():
+      - swing: {start_time, start_price, end_time, end_price, direction}
+      - levels: [{ratio, price, enabled, color, label}, ...]
+      - golden_zone: {low, high} (the 0.5-0.618 zone, for confluence scoring)
+      - lines: [{ratio, price, color, data}, ...] (enabled levels only)
+    """
+    zz = zigzag_pivots(df, deviation_pct=deviation_pct, depth=depth)
+    swing = zz.get("last_swing")
+    if not swing:
+        return {"swing": None, "levels": [], "golden_zone": None, "lines": []}
+
+    normalized: List[Dict[str, Any]] = []
+    if isinstance(levels, dict):
+        for ratio_key, cfg in levels.items():
+            cfg = cfg or {}
+            normalized.append({
+                "ratio": float(ratio_key),
+                "enabled": cfg.get("enabled", True),
+                "color": cfg.get("color"),
+            })
+    elif levels:
+        for item in levels:
+            if isinstance(item, dict):
+                normalized.append({
+                    "ratio": float(item["ratio"]),
+                    "enabled": item.get("enabled", True),
+                    "color": item.get("color"),
+                })
+            else:
+                normalized.append({"ratio": float(item), "enabled": True, "color": None})
+    else:
+        normalized = [{"ratio": r, "enabled": True, "color": None} for r in DEFAULT_FIB_LEVELS]
+
+    start_price = swing["start_price"]
+    end_price = swing["end_price"]
+    height = end_price - start_price
+    direction = swing["direction"]
+
+    timestamps = df["timestamp"]
+    start_time = int(timestamps.iloc[swing["start_idx"]].timestamp())
+    swing_end_time = int(timestamps.iloc[swing["end_idx"]].timestamp())
+    last_bar_idx = len(df) - 1
+
+    out_levels = []
+    lines = []
+    for lv in normalized:
+        ratio = lv["ratio"]
+        price = end_price - height * ratio
+        color = lv.get("color") or _FIB_DEFAULT_COLORS.get(ratio, "#9598a1")
+        out_levels.append({
+            "ratio": ratio,
+            "price": round(price, 6),
+            "enabled": lv["enabled"],
+            "color": color,
+            "label": f"{ratio * 100:.1f}%",
+        })
+        if lv["enabled"]:
+            end_idx = last_bar_idx if extend_lines else swing["end_idx"]
+            line_data = [
+                {"time": int(timestamps.iloc[i].timestamp()), "value": round(price, 6)}
+                for i in range(swing["end_idx"], end_idx + 1)
+            ]
+            lines.append({"ratio": ratio, "price": round(price, 6), "color": color, "data": line_data})
+
+    golden_a = end_price - height * 0.5
+    golden_b = end_price - height * 0.618
+    golden_zone = {"low": round(min(golden_a, golden_b), 6), "high": round(max(golden_a, golden_b), 6)}
+
+    return {
+        "swing": {
+            "start_time": start_time,
+            "start_price": round(start_price, 6),
+            "end_time": swing_end_time,
+            "end_price": round(end_price, 6),
+            "direction": direction,
+        },
+        "levels": out_levels,
+        "golden_zone": golden_zone,
+        "lines": lines,
+    }
+
+
+def fib_confluence_score(
+    price: float,
+    fib_result: Optional[Dict[str, Any]],
+    direction: Optional[str] = None,
+) -> Optional[float]:
+    """
+    Score 0..1 for how strongly `price` sits inside the fib golden zone
+    (0.5-0.618 retracement band): full credit at the zone midpoint, decaying
+    linearly to 0 at the zone edges, 0 outside the zone. Returns None when no
+    confirmed swing/golden zone is available (caller should treat as inapplicable
+    rather than a neutral 0, so weighting schemes can redistribute correctly).
+    """
+    if not fib_result:
+        return None
+    zone = fib_result.get("golden_zone")
+    if not zone:
+        return None
+    low, high = zone.get("low"), zone.get("high")
+    if low is None or high is None or high <= low:
+        return None
+    if price < low or price > high:
+        return 0.0
+    mid = (low + high) / 2.0
+    half_width = (high - low) / 2.0
+    if half_width <= 0:
+        return 1.0
+    dist = abs(price - mid) / half_width
+    return round(max(0.0, 1.0 - dist), 4)
 
 
 def adx(df: pd.DataFrame, period: int = 14) -> Dict[str, pd.Series]:
@@ -735,6 +1150,24 @@ def analyze(ohlcv: List[List], timeframe: str = "1h") -> Dict[str, Any]:
     else:
         evaluators["volume"] = 0.0
 
+    # --- 13. Zone reaction (supply/demand + channel structure) ---
+    # Where price sits relative to the bases it left behind and the rails it
+    # has been riding. Fresh demand under price is the strongest long context
+    # there is; a fresh supply overhead mirrors it for shorts.
+    try:
+        from app.signals.zones import analyze_zones, zone_reaction_score
+
+        zones_data = analyze_zones(df)
+        z_score, z_reasons = zone_reaction_score(
+            current_price, zones_data.get("supply_demand", {}),
+            (zones_data.get("channels") or {}).get("active_channel"),
+        )
+        evaluators["zone_reaction"] = z_score
+        reasons.extend(z_reasons)
+    except Exception as exc:  # noqa: BLE001 — an enrichment must never break scoring
+        logger.debug(f"zone_reaction evaluator skipped: {exc}")
+        evaluators["zone_reaction"] = 0.0
+
     # ── Weighted combination (direct convention: positive=buy) ───
     # Divergence signals get highest weights (most predictive for reversals).
     # Trend structure provides directional foundation.
@@ -751,6 +1184,7 @@ def analyze(ohlcv: List[List], timeframe: str = "1h") -> Dict[str, Any]:
         "volume": 0.05,
         "adx": 0.07,
         "stoch_rsi": 0.05,
+        "zone_reaction": 0.08,
     }
 
     weighted_sum = 0.0
@@ -848,6 +1282,28 @@ def analyze(ohlcv: List[List], timeframe: str = "1h") -> Dict[str, Any]:
     if has_ema200:
         indicators["ema200"] = safe(latest["ema200"])
 
+    # Auto Fib Retracement — reported alongside the indicators so every consumer
+    # of analyze() (agents, Jarvis, research) sees the golden zone without
+    # recomputing it. Reported only, never folded into `score`: the pipeline
+    # already applies fib confluence as its own conditional weight, and doubling
+    # it here would count the same evidence twice.
+    fib: Optional[Dict[str, Any]] = None
+    try:
+        fib_result = auto_fib_retracement(df, levels=(0.5, 0.618), extend_lines=False)
+        swing = fib_result.get("swing")
+        if swing:
+            conf = fib_confluence_score(current_price, fib_result, swing["direction"])
+            zone = fib_result.get("golden_zone")
+            fib = {
+                "direction": swing["direction"],
+                "swing": swing,
+                "golden_zone": zone,
+                "confidence": round(conf, 4) if conf is not None else None,
+                "in_golden_zone": bool(zone and zone["low"] <= current_price <= zone["high"]),
+            }
+    except Exception as e:  # noqa: BLE001 - one indicator must not fail the analysis
+        logger.warning(f"Auto fib retracement failed on {timeframe}: {e}")
+
     return {
         "action": action,
         "score": round(score, 4),
@@ -856,6 +1312,7 @@ def analyze(ohlcv: List[List], timeframe: str = "1h") -> Dict[str, Any]:
         "reasons": reasons,
         "indicators": indicators,
         "evaluators": {k: round(v, 4) for k, v in evaluators.items()},
+        "fib": fib,
         "timeframe": timeframe,
         "candles_analyzed": len(df),
     }

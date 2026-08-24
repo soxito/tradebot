@@ -35,7 +35,7 @@ interface TelegramSignalMessage {
   created_at: string
 }
 
-type SignalStatus = 'active' | 'filled' | 'tp_hit' | 'sl_hit' | 'closed'
+type SignalStatus = 'active' | 'filled' | 'tp_hit' | 'sl_hit' | 'closed' | 'expired'
 
 interface ParsedSignal {
   id: number
@@ -90,8 +90,27 @@ interface SniperSettings {
   execute_immediately: boolean
   skipped_reanalyze_minutes: number
   tp_trail_pct: number
+  mt5_execute: boolean
+  mt5_account_id: number | null
+  mt5_lot_size: number
+  mt5_demo_execute: boolean
+  mt5_demo_account_id: number | null
+  multi_tp_execute: boolean
+  never_skip_confidence_pct: number
+  mt5_max_risk_pct: number
+  mt5_small_account_mode: boolean
   volume_channel_id: number | null
   allowed_channel_ids: number[] | null
+}
+
+interface Mt5AccountOption {
+  id: number
+  name: string
+  account_type: string
+  currency: string | null
+  equity: number | null
+  balance: number | null
+  api_reachable?: boolean
 }
 
 type SniperTradeStatus = 'pending' | 'placed' | 'skipped' | 'missed' | 'failed'
@@ -270,6 +289,7 @@ export default function TelegramSignalsPage() {
   // Sniper tab state
   const [sniperSettings, setSniperSettings] = useState<SniperSettings | null>(null)
   const [sniperTrades, setSniperTrades] = useState<SniperTrade[]>([])
+  const [mt5Accounts, setMt5Accounts] = useState<Mt5AccountOption[]>([])
   const [savingSniper, setSavingSniper] = useState(false)
   const [runningSniper, setRunningSniper] = useState(false)
 
@@ -432,6 +452,13 @@ export default function TelegramSignalsPage() {
       setSniperTrades(Array.isArray(tradesRes.data) ? tradesRes.data : [])
     } catch {
       // best-effort
+    }
+    try {
+      // Populates the MT5 demo/live account pickers for forex execution.
+      const acctRes = await apiClient.mt5.getAccounts()
+      setMt5Accounts(Array.isArray(acctRes.data) ? (acctRes.data as Mt5AccountOption[]) : [])
+    } catch {
+      // MT5 plugin may not be installed — the pickers just stay empty.
     }
   }, [])
 
@@ -917,6 +944,7 @@ export default function TelegramSignalsPage() {
           <SniperView
             settings={sniperSettings}
             trades={sniperTrades}
+            mt5Accounts={mt5Accounts}
             saving={savingSniper}
             running={runningSniper}
             onSave={saveSniper}
@@ -1078,6 +1106,7 @@ const STATUS_STYLES: Record<string, string> = {
   tp_hit: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40',
   sl_hit: 'bg-red-500/20 text-red-300 border-red-500/40',
   closed: 'bg-gray-600/30 text-gray-300 border-gray-600/50',
+  expired: 'bg-amber-600/20 text-amber-300 border-amber-600/40',
 }
 
 const STATUS_OPTIONS: Array<{ value: SignalStatus | ''; label: string }> = [
@@ -1086,6 +1115,12 @@ const STATUS_OPTIONS: Array<{ value: SignalStatus | ''; label: string }> = [
   { value: 'tp_hit', label: 'TP Hit' },
   { value: 'sl_hit', label: 'SL Hit' },
   { value: 'closed', label: 'Closed' },
+]
+
+// Forex-only filters add "Not Traded" (expired) — dead signals aged out >3h.
+const FOREX_STATUS_OPTIONS: Array<{ value: SignalStatus | ''; label: string }> = [
+  ...STATUS_OPTIONS,
+  { value: 'expired', label: 'Not Traded' },
 ]
 
 function ActiveSignalsView(props: {
@@ -1370,12 +1405,13 @@ const SNIPER_STATUS_STYLES: Record<string, string> = {
 function SniperView(props: {
   settings: SniperSettings | null
   trades: SniperTrade[]
+  mt5Accounts: Mt5AccountOption[]
   saving: boolean
   running: boolean
   onSave: (patch: Partial<SniperSettings>) => void
   onRunNow: () => void
 }) {
-  const { settings, trades, saving, running, onSave, onRunNow } = props
+  const { settings, trades, mt5Accounts, saving, running, onSave, onRunNow } = props
 
   if (!settings) {
     return <div className="text-sm text-gray-400">Loading sniper settings…</div>
@@ -1450,6 +1486,7 @@ function SniperView(props: {
           {numberField('Min reward/risk', 'min_risk_reward', 0.1)}
           {numberField('Pending TTL', 'pending_ttl_minutes', 5, 'min')}
           {numberField('Re-check skipped', 'skipped_reanalyze_minutes', 5, 'min')}
+          {numberField('Never skip above', 'never_skip_confidence_pct', 1, '%')}
           <div>
             <label className="block text-xs text-gray-400 mb-1">Margin mode</label>
             <select
@@ -1505,6 +1542,125 @@ function SniperView(props: {
             </span>
             Execute immediately (market)
           </button>
+        </div>
+
+        {/* Forex (MT5) execution — XAUUSD/EURUSD/… never touch Bitget */}
+        <div className="mt-4 pt-3 border-t border-gray-700">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-semibold text-white">Forex Execution (MT5)</h3>
+              <p className="text-[11px] text-gray-400 mt-0.5 max-w-2xl">
+                Forex signals (XAUUSD, EURUSD, …) can&apos;t trade on Bitget — they route to MT5.
+                With both switches off they only ever reach{' '}
+                <strong className="text-gray-200">PENDING</strong> and are never placed.
+              </p>
+            </div>
+          </div>
+
+          <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3">
+            {/* Demo */}
+            <div className={`rounded-lg border p-3 ${settings.mt5_demo_execute ? 'border-emerald-600/50 bg-emerald-900/10' : 'border-gray-700 bg-gray-900/30'}`}>
+              <button
+                onClick={() => onSave({ mt5_demo_execute: !settings.mt5_demo_execute })}
+                disabled={saving}
+                className="flex items-center gap-2 text-xs text-gray-200"
+                title="Auto-place forex signals on the selected MT5 demo account"
+              >
+                <span className={`relative inline-flex h-4 w-7 items-center rounded-full transition ${settings.mt5_demo_execute ? 'bg-emerald-600' : 'bg-gray-600'}`}>
+                  <span className={`inline-block h-3 w-3 transform rounded-full bg-white transition ${settings.mt5_demo_execute ? 'translate-x-3.5' : 'translate-x-0.5'}`} />
+                </span>
+                Execute on MT5 <strong>Demo</strong>
+              </button>
+              <select
+                value={settings.mt5_demo_account_id ?? ''}
+                onChange={(e) =>
+                  onSave({ mt5_demo_account_id: e.target.value ? Number(e.target.value) : null })
+                }
+                className="mt-2 w-full rounded bg-gray-900 border border-gray-700 px-2.5 py-1.5 text-sm text-white"
+              >
+                <option value="">— select demo account —</option>
+                {mt5Accounts
+                  .filter((a) => a.account_type?.toUpperCase() === 'DEMO')
+                  .map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.name} · {a.currency ?? ''} {Math.round(a.equity ?? a.balance ?? 0).toLocaleString()}
+                    </option>
+                  ))}
+              </select>
+              {settings.mt5_demo_execute && !settings.mt5_demo_account_id && (
+                <p className="mt-1.5 text-[11px] text-amber-400">
+                  Pick a demo account — without one nothing is placed.
+                </p>
+              )}
+            </div>
+
+            {/* Live */}
+            <div className={`rounded-lg border p-3 ${settings.mt5_execute ? 'border-red-600/50 bg-red-900/10' : 'border-gray-700 bg-gray-900/30'}`}>
+              <button
+                onClick={() => onSave({ mt5_execute: !settings.mt5_execute })}
+                disabled={saving}
+                className="flex items-center gap-2 text-xs text-gray-200"
+                title="Auto-place forex signals on live MT5 account(s) — uses real funds"
+              >
+                <span className={`relative inline-flex h-4 w-7 items-center rounded-full transition ${settings.mt5_execute ? 'bg-red-600' : 'bg-gray-600'}`}>
+                  <span className={`inline-block h-3 w-3 transform rounded-full bg-white transition ${settings.mt5_execute ? 'translate-x-3.5' : 'translate-x-0.5'}`} />
+                </span>
+                Execute on MT5 <strong>Live</strong> <span className="text-red-400">(real money)</span>
+              </button>
+              <select
+                value={settings.mt5_account_id ?? ''}
+                onChange={(e) =>
+                  onSave({ mt5_account_id: e.target.value ? Number(e.target.value) : null })
+                }
+                className="mt-2 w-full rounded bg-gray-900 border border-gray-700 px-2.5 py-1.5 text-sm text-white"
+              >
+                <option value="">All live accounts (fan out)</option>
+                {mt5Accounts
+                  .filter((a) => a.account_type?.toUpperCase() === 'LIVE')
+                  .map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.name} · {a.currency ?? ''} {Math.round(a.equity ?? a.balance ?? 0).toLocaleString()}
+                    </option>
+                  ))}
+              </select>
+              {settings.mt5_demo_execute && settings.mt5_execute && (
+                <p className="mt-1.5 text-[11px] text-amber-400">
+                  Demo takes priority — live orders are skipped while demo is on.
+                </p>
+              )}
+            </div>
+          </div>
+
+          <div className="mt-3 flex flex-wrap items-center gap-4">
+            <div className="w-32">{numberField('Min lot size', 'mt5_lot_size', 0.01)}</div>
+            <div className="w-32">{numberField('Max risk / trade', 'mt5_max_risk_pct', 0.5, '%')}</div>
+            <button
+              onClick={() => onSave({ multi_tp_execute: !settings.multi_tp_execute })}
+              className="flex items-center gap-2 text-xs text-gray-300"
+              title="Aim the position at the channel's LAST take-profit and let the stop (locked at TP3) protect the ride. Off = exit at the nearest TP."
+            >
+              <span className={`relative inline-flex h-4 w-7 items-center rounded-full transition ${settings.multi_tp_execute ? 'bg-cyan-600' : 'bg-gray-600'}`}>
+                <span className={`inline-block h-3 w-3 transform rounded-full bg-white transition ${settings.multi_tp_execute ? 'translate-x-3.5' : 'translate-x-0.5'}`} />
+              </span>
+              Run to final TP (stop locks at TP3)
+            </button>
+            <button
+              onClick={() => onSave({ mt5_small_account_mode: !settings.mt5_small_account_mode })}
+              className="flex items-center gap-2 text-xs text-gray-300"
+              title="Accounts too small for one broker-minimum lot still trade — at exactly the floor lot, and limited to one open position at a time."
+            >
+              <span className={`relative inline-flex h-4 w-7 items-center rounded-full transition ${settings.mt5_small_account_mode ? 'bg-cyan-600' : 'bg-gray-600'}`}>
+                <span className={`inline-block h-3 w-3 transform rounded-full bg-white transition ${settings.mt5_small_account_mode ? 'translate-x-3.5' : 'translate-x-0.5'}`} />
+              </span>
+              Small accounts trade at 0.01 (1 open)
+            </button>
+            {mt5Accounts.length === 0 && (
+              <span className="text-[11px] text-amber-400">
+                No MT5 accounts found — link one on the{' '}
+                <a href="/mt5" className="underline">MT5</a> page first.
+              </span>
+            )}
+          </div>
         </div>
 
         <div className="mt-4 flex items-center gap-3">
@@ -2655,19 +2811,120 @@ function ConnectAIView(props: {
     modelId: string
     status: 'pending' | 'setting' | 'testing' | 'ok' | 'error' | 'missing'
     error?: string
+    //: Which profile this task actually claimed. Recorded at apply time so the
+    //: save step writes back to that exact profile instead of re-resolving and
+    //: landing on the first one of the preset again.
+    providerId?: number
+    providerLabel?: string
   }
-  const RECOMMENDED_MODELS: Omit<RecommendedResult, 'status'>[] = [
-    { task: 'Market Analysis',  provider: 'NVIDIA NIM',           model: 'Nemotron 3 Ultra 550B (deepest free)', presetKey: 'nvidia',        modelId: 'nvidia/nemotron-3-ultra-550b-a55b' },
-    { task: 'News Context',     provider: 'NVIDIA NIM',           model: 'Nemotron 3 Ultra 550B (deepest free)', presetKey: 'nvidia',        modelId: 'nvidia/nemotron-3-ultra-550b-a55b' },
-    { task: 'Volume Analysis',  provider: 'Cerebras',             model: 'GPT-OSS 120B (wafer speed)',           presetKey: 'cerebras',      modelId: 'gpt-oss-120b' },
-    { task: 'Final Synthesis',  provider: 'NVIDIA NIM',           model: 'Nemotron 3 Ultra 550B (deepest free)', presetKey: 'nvidia',        modelId: 'nvidia/nemotron-3-ultra-550b-a55b' },
-    { task: 'News → Positions', provider: 'NVIDIA NIM',           model: 'Nemotron 3 Ultra 550B (deepest free)', presetKey: 'nvidia',        modelId: 'nvidia/nemotron-3-ultra-550b-a55b' },
+  // Matched to what each task actually needs. Ultra 550B used to be the answer
+  // to everything and was the reason this provider looked broken: it cannot
+  // finish inside a normal request deadline, so every call timed out. Lightning
+  // answers the fast tasks in seconds; GLM-5.2 takes the two that are worth
+  // waiting on. Keep in step with ai_router.TASK_MODEL_CHAINS.
+  // Each task lists acceptable models in preference order, ACROSS vendors —
+  // not a single NVIDIA id. Apply-All walks this list and takes the first model
+  // an unclaimed, healthy provider actually offers, so work lands wherever
+  // there is capacity instead of stacking on NVIDIA until it rate-limits.
+  //
+  // The old shape named one NVIDIA model per task. Once the NVIDIA profiles
+  // were claimed the rest fell to Mistral — and then tried to set an NVIDIA
+  // model id on it, which Mistral cannot serve. Matching provider *by model*
+  // rather than by preset is what makes the spread safe.
+  const RECOMMENDED_MODELS: (Omit<RecommendedResult, 'status'> & { candidates: string[] })[] = [
+    {
+      task: 'Market Analysis', provider: 'auto', model: 'Deep reasoning', presetKey: 'nvidia',
+      modelId: 'z-ai/glm-5.2',
+      candidates: ['z-ai/glm-5.2', 'nvidia/nemotron-3-super-120b-a12b', 'Meta-Llama-3.3-70B-Instruct', 'mistral-small-latest'],
+    },
+    {
+      task: 'News Context', provider: 'auto', model: 'Fast synthesis', presetKey: 'nvidia',
+      modelId: 'nvidia/nemotron-3.5-lightning-30b-a3b',
+      candidates: ['nvidia/nemotron-3.5-lightning-30b-a3b', 'mistral-small-latest', 'ministral-8b-latest', 'open-mistral-nemo'],
+    },
+    {
+      task: 'Volume Analysis', provider: 'auto', model: 'Fast analysis', presetKey: 'nvidia',
+      modelId: 'nvidia/nemotron-3.5-lightning-30b-a3b',
+      candidates: ['ministral-8b-latest', 'nvidia/nemotron-3.5-lightning-30b-a3b', 'open-mistral-nemo', 'mistral-small-latest'],
+    },
+    {
+      task: 'Final Synthesis', provider: 'auto', model: 'Deep reasoning', presetKey: 'nvidia',
+      modelId: 'nvidia/nemotron-3-super-120b-a12b',
+      candidates: ['nvidia/nemotron-3-super-120b-a12b', 'z-ai/glm-5.2', 'Meta-Llama-3.3-70B-Instruct', 'mistral-small-latest'],
+    },
+    {
+      task: 'News → Positions', provider: 'auto', model: 'Fast mapping', presetKey: 'nvidia',
+      modelId: 'open-mistral-nemo',
+      candidates: ['open-mistral-nemo', 'mistral-small-latest', 'nvidia/nemotron-3.5-lightning-30b-a3b', 'ministral-8b-latest'],
+    },
+    {
+      // Vision has no non-NVIDIA option: no other connected vendor ships a
+      // vision model, so this list is short by capability, not by preference.
+      task: 'Chart / Image', provider: 'auto', model: 'Vision', presetKey: 'nvidia',
+      modelId: 'meta/llama-3.2-11b-vision-instruct',
+      candidates: ['meta/llama-3.2-11b-vision-instruct', 'nvidia/nemotron-nano-12b-v2-vl', 'meta/muse-glimmer-30b'],
+    },
   ]
+
+  // ── Dedicated provider profiles ─────────────────────────────────────────
+  // Which backend task each card drives, so the panel can show the profile
+  // actually serving it. Several cards legitimately share one task — they are
+  // different framings of the same routing category, so they show the same
+  // profile, which is the truth rather than a bug.
+  const TASK_KEYS: Record<string, string> = {
+    'Market Analysis': 'deep_reasoning',
+    'News Context': 'fast_agentic',
+    'Volume Analysis': 'fast_agentic',
+    'Final Synthesis': 'deep_reasoning',
+    'News → Positions': 'fast_agentic',
+    'Chart / Image': 'vision_analysis',
+  }
+  const [assignments, setAssignments] = useState<Record<string, any>>({})
+  const [assigningTask, setAssigningTask] = useState<string | null>(null)
+
+  const loadAssignments = useCallback(async () => {
+    try {
+      const res = await apiClient.aiAnalyst.getTaskAssignments()
+      const byTask: Record<string, any> = {}
+      for (const t of res.data?.tasks || []) byTask[t.task] = t
+      setAssignments(byTask)
+    } catch {
+      // The panel still renders without it — assignment is an enhancement to
+      // the guide, not a precondition for reading it.
+      setAssignments({})
+    }
+  }, [])
+
+  useEffect(() => { loadAssignments() }, [loadAssignments])
+
+  const assignProfile = useCallback(async (taskKey: string, providerId: number | null) => {
+    setAssigningTask(taskKey)
+    try {
+      await apiClient.aiAnalyst.assignTaskProfile(taskKey, providerId)
+      await loadAssignments()
+      onReload()
+      onMessage(providerId
+        ? 'Profile dedicated — only this task will use it.'
+        : 'Profile released back to the shared pool.')
+    } catch (e: any) {
+      onError(e?.response?.data?.detail || 'Could not change the assignment')
+    } finally {
+      setAssigningTask(null)
+    }
+  }, [loadAssignments, onReload, onMessage, onError])
   const [showRecommendedModal, setShowRecommendedModal] = useState(false)
   const [recommendedResults, setRecommendedResults] = useState<RecommendedResult[]>([])
   const [recommendedRunning, setRecommendedRunning] = useState(false)
   const [recommendedDone, setRecommendedDone] = useState(false)
   const [recommendedSaving, setRecommendedSaving] = useState(false)
+
+  /** Reject after `ms` so one slow provider cannot stall the whole run. */
+  function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
+    return Promise.race([
+      p,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error(message)), ms)),
+    ])
+  }
 
   const applyAllRecommended = async () => {
     const initial: RecommendedResult[] = RECOMMENDED_MODELS.map(r => ({ ...r, status: 'pending' }))
@@ -2678,29 +2935,103 @@ function ConnectAIView(props: {
     setRecommendedSaving(false)
 
     const updated = [...initial]
+
+    // Plan every task up front: one profile each, never the same twice, and
+    // always a model that profile can actually serve.
+    //
+    // This used to be `providers.find(p => p.provider_key === presetKey)`, which
+    // returns the *first* NVIDIA profile for every row — so all six tasks wrote
+    // to one profile, each overwriting the last, then tested it six times over.
+    // Matching by model instead of by preset is what lets a task land on
+    // Mistral without being handed an NVIDIA model id it cannot run.
+    const offers = (p: AIProvider, modelId: string) =>
+      (p.models ?? []).includes(modelId) || p.default_model === modelId
+
+    const claimed = new Set<number>()
+    const plan = new Map<string, { provider: AIProvider; modelId: string }>()
+
+    // Most-constrained task first. Vision has the fewest possible homes, and in
+    // list order it comes last — so with a naive pass it would arrive to find
+    // every vision-capable profile already taken and be marked unavailable
+    // while a text task sat on the only profile that could have run it.
+    const byScarcity = [...RECOMMENDED_MODELS].sort((a, b) => {
+      const homes = (r: typeof a) =>
+        providers.filter(p => p.enabled && r.candidates.some(m => offers(p, m))).length
+      return homes(a) - homes(b)
+    })
+
+    for (const rec of byScarcity) {
+      let pick: { provider: AIProvider; modelId: string } | undefined
+      // Preference order is per-model, not per-provider: take the best model
+      // that some free, healthy profile offers before settling for a worse one.
+      for (const modelId of rec.candidates) {
+        const p = providers.find(
+          x => x.enabled && x.status !== 'error' && !claimed.has(x.id) && offers(x, modelId),
+        )
+        if (p) { pick = { provider: p, modelId }; break }
+      }
+      // Nothing free and healthy — allow an erroring profile (a test may well
+      // clear it), then allow reuse. Reuse is the last resort, not the default.
+      if (!pick) {
+        for (const modelId of rec.candidates) {
+          const p = providers.find(x => x.enabled && !claimed.has(x.id) && offers(x, modelId))
+          if (p) { pick = { provider: p, modelId }; break }
+        }
+      }
+      if (!pick) {
+        for (const modelId of rec.candidates) {
+          const p = providers.find(x => x.enabled && offers(x, modelId))
+          if (p) { pick = { provider: p, modelId }; break }
+        }
+      }
+      if (pick) {
+        claimed.add(pick.provider.id)
+        plan.set(rec.task, pick)
+      }
+    }
+
     for (let i = 0; i < RECOMMENDED_MODELS.length; i++) {
       const rec = RECOMMENDED_MODELS[i]
-      const found = providers.find(p => p.provider_key === rec.presetKey && p.enabled)
-      if (!found) {
-        updated[i] = { ...updated[i], status: 'missing', error: 'Provider not added — get free API key first' }
+      const chosen = plan.get(rec.task)
+      if (!chosen) {
+        updated[i] = {
+          ...updated[i], status: 'missing',
+          error: `No connected provider offers a model for this task (${rec.candidates[0]}…)`,
+        }
         setRecommendedResults([...updated])
         continue
       }
+      const found = chosen.provider
+      // The model the chosen profile can actually run, which may not be the
+      // list's first choice. Kept local — writing it back onto RECOMMENDED_MODELS
+      // would leak this run's picks into the next one.
+      const modelId = chosen.modelId
       // Step 1: set the recommended model
-      updated[i] = { ...updated[i], status: 'setting' }
+      updated[i] = {
+        ...updated[i], status: 'setting', modelId,
+        providerId: found.id, providerLabel: found.label,
+      }
       setRecommendedResults([...updated])
       try {
-        await apiClient.aiAnalyst.updateProvider(found.id, { default_model: rec.modelId })
+        await apiClient.aiAnalyst.updateProvider(found.id, { default_model: modelId })
       } catch (e: unknown) {
         updated[i] = { ...updated[i], status: 'error', error: `Set model failed: ${toErrorMessage(e)}` }
         setRecommendedResults([...updated])
         continue
       }
-      // Step 2: test the provider with the new model
+      // Step 2: test the provider with the new model.
+      //
+      // Bounded: some of these models legitimately take over two minutes, and a
+      // dialog with no ceiling on six of them in a row is indistinguishable
+      // from a hang. A slow model is reported as slow, not left spinning.
       updated[i] = { ...updated[i], status: 'testing' }
       setRecommendedResults([...updated])
       try {
-        const res = await apiClient.aiAnalyst.testProvider(found.id)
+        const res = await withTimeout(
+          apiClient.aiAnalyst.testProvider(found.id),
+          45000,
+          'Timed out after 45s — the model answers too slowly for this task',
+        )
         const r = res.data as { status?: string; ok?: boolean; error?: string; last_error?: string }
         const ok = r.status === 'ok' || r.ok === true
         updated[i] = ok
@@ -2722,9 +3053,11 @@ function ConnectAIView(props: {
       // Re-apply only the successful ones (model already set; this call persists status)
       for (const rec of recommendedResults) {
         if (rec.status !== 'ok') continue
-        const found = providers.find(p => p.provider_key === rec.presetKey && p.enabled)
-        if (found) {
-          await apiClient.aiAnalyst.updateProvider(found.id, { default_model: rec.modelId, status: 'ok' })
+        // The profile this task actually claimed during apply. Re-resolving by
+        // preset here would write every task back onto the first matching
+        // profile and undo the distribution that just succeeded.
+        if (rec.providerId) {
+          await apiClient.aiAnalyst.updateProvider(rec.providerId, { default_model: rec.modelId, status: 'ok' })
         }
       }
       await onReload()
@@ -2939,7 +3272,11 @@ function ConnectAIView(props: {
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center justify-between gap-2">
                         <span className="text-xs font-semibold text-gray-300">{r.task}</span>
-                        <span className="text-[10px] text-gray-500">{r.provider}</span>
+                        {/* The profile this task claimed — shown so a repeat
+                            assignment is visible rather than assumed. */}
+                        <span className="text-[10px] text-gray-500">
+                          {r.providerLabel ? `${r.providerLabel} (id ${r.providerId})` : r.provider}
+                        </span>
                       </div>
                       <div className={`text-xs mt-0.5 ${textColor} break-words`}>{label}</div>
                     </div>
@@ -2998,8 +3335,8 @@ function ConnectAIView(props: {
             {
               task: 'Market Analysis',
               provider: 'NVIDIA NIM',
-              model: 'Nemotron 3 Ultra 550B (deepest free)',
-              why: 'NVIDIA’s deepest free model, no per-minute cap — deep SMC analysis, bias reads and market structure',
+              model: 'GLM-5.2 (deep reasoning)',
+              why: '753B flagship built for long-horizon reasoning, 1M context — deep SMC analysis, bias reads and market structure. Slow by design; worth the wait on real analysis.',
               signupUrl: 'https://build.nvidia.com',
               presetKey: 'nvidia',
               color: 'green',
@@ -3007,26 +3344,26 @@ function ConnectAIView(props: {
             {
               task: 'News Context',
               provider: 'NVIDIA NIM',
-              model: 'Nemotron 3 Ultra 550B (deepest free)',
-              why: 'NVIDIA’s deepest free model, 128K context, no per-minute cap — news synthesis and market sentiment. Falls back to Cohere Command A (256K) then Gemini (1M).',
+              model: 'Nemotron 3.5 Lightning (fast, 1M ctx)',
+              why: 'Fastest 30B MoE with a 1M window — news synthesis at speed, so a headline sweep does not hold up the desk. Falls back to Cohere Command A then Gemini.',
               signupUrl: 'https://build.nvidia.com',
               presetKey: 'nvidia',
               color: 'sky',
             },
             {
               task: 'Volume Analysis',
-              provider: 'Cerebras',
-              model: 'GPT-OSS 120B (wafer speed)',
-              why: 'World’s fastest inference — wafer-speed quantitative buy/sell pressure analysis, no 12/day cap',
-              signupUrl: 'https://cloud.cerebras.ai/',
-              presetKey: 'cerebras',
+              provider: 'NVIDIA NIM',
+              model: 'Nemotron 3.5 Lightning (fast, 1M ctx)',
+              why: 'Fastest NVIDIA MoE with a 1M context window — buy/sell pressure analysis at low latency with a generous free tier. Falls back to Groq then Cerebras if NVIDIA is unavailable.',
+              signupUrl: 'https://build.nvidia.com',
+              presetKey: 'nvidia',
               color: 'purple',
             },
             {
               task: 'Final Synthesis',
               provider: 'NVIDIA NIM',
-              model: 'Nemotron 3 Ultra 550B',
-              why: 'NVIDIA’s deepest free model — deepest reasoning for decisive JARVIS narratives',
+              model: 'GLM-5.2 (deep reasoning)',
+              why: 'Long-horizon reasoning for decisive JARVIS narratives — the call that pulls every agent’s read into one verdict',
               signupUrl: 'https://build.nvidia.com',
               presetKey: 'nvidia',
               color: 'orange',
@@ -3034,11 +3371,20 @@ function ConnectAIView(props: {
             {
               task: 'News → Positions',
               provider: 'NVIDIA NIM',
-              model: 'Nemotron 3 Ultra 550B (deepest free)',
-              why: 'NVIDIA’s deepest free model maps headlines onto open positions. Its 128K window covers a normal book; a very large one falls through to Gemini 2.5 Flash (1M).',
+              model: 'Nemotron 3.5 Lightning (fast, 1M ctx)',
+              why: 'Maps headlines onto open positions. Its own 1M window covers any book, and it runs fast enough to re-check the whole book as news lands.',
               signupUrl: 'https://build.nvidia.com',
               presetKey: 'nvidia',
               color: 'blue',
+            },
+            {
+              task: 'Chart / Image',
+              provider: 'NVIDIA NIM',
+              model: 'Inkling 952B (vision)',
+              why: 'Reads chart screenshots sent to the bot or Paul — instrument, timeframe, structure and levels. Muse Glimmer 30B is the quicker second opinion behind it.',
+              signupUrl: 'https://build.nvidia.com',
+              presetKey: 'nvidia',
+              color: 'violet',
             },
           ].map((item) => {
             const colorMap: Record<string, { border: string; badge: string; text: string }> = {
@@ -3047,6 +3393,7 @@ function ConnectAIView(props: {
               purple: { border: 'border-purple-500/30', badge: 'bg-purple-500/10 text-purple-300',text: 'text-purple-300' },
               orange: { border: 'border-orange-500/30', badge: 'bg-orange-500/10 text-orange-300',text: 'text-orange-300' },
               blue:   { border: 'border-blue-500/30',   badge: 'bg-blue-500/10 text-blue-300',   text: 'text-blue-300' },
+              violet: { border: 'border-violet-500/30', badge: 'bg-violet-500/10 text-violet-300', text: 'text-violet-300' },
             }
             const c = colorMap[item.color] || colorMap.blue
             const alreadyAdded = providers.some(p => p.provider_key === item.presetKey && p.enabled)
@@ -3061,6 +3408,58 @@ function ConnectAIView(props: {
                 <div className={`font-semibold text-sm ${c.text}`}>{item.provider}</div>
                 <div className="font-mono text-xs text-gray-300">{item.model}</div>
                 <div className="text-xs text-gray-500 leading-relaxed">{item.why}</div>
+
+                {/* Dedicated profile — which of your provider rows serves this
+                    task, and nothing else. */}
+                {(() => {
+                  const taskKey = TASK_KEYS[item.task]
+                  if (!taskKey) return null
+                  const a = assignments[taskKey]
+                  const takenElsewhere = new Set(
+                    Object.entries(assignments)
+                      .filter(([k, v]: [string, any]) => k !== taskKey && v?.provider_id)
+                      .map(([, v]: [string, any]) => v.provider_id)
+                  )
+                  return (
+                    <div className="border-t border-gray-700/60 pt-2 mt-1">
+                      <div className="flex items-center justify-between mb-1">
+                        <span className="text-[10px] uppercase tracking-wide text-gray-500">
+                          Dedicated profile
+                        </span>
+                        <span className={`text-[10px] font-semibold ${a?.dedicated ? 'text-emerald-400' : 'text-gray-500'}`}>
+                          {a?.dedicated ? '🔒 exclusive' : 'shared pool'}
+                        </span>
+                      </div>
+                      <select
+                        value={a?.provider_id ?? ''}
+                        disabled={assigningTask === taskKey}
+                        onChange={(e) => assignProfile(taskKey, e.target.value ? Number(e.target.value) : null)}
+                        className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200 disabled:opacity-50"
+                        title="A profile dedicated here is used by this task only, and is held out of every other call"
+                      >
+                        <option value="">Shared pool (no dedicated profile)</option>
+                        {providers.map((p) => (
+                          <option
+                            key={p.id}
+                            value={p.id}
+                            // Already dedicated to a different task — offering it
+                            // here would just produce a 409 on save.
+                            disabled={takenElsewhere.has(p.id)}
+                          >
+                            {p.label}
+                            {takenElsewhere.has(p.id) ? ' — taken' : ''}
+                          </option>
+                        ))}
+                      </select>
+                      <div className="text-[10px] text-gray-500 mt-1 leading-snug">
+                        {a?.models?.length
+                          ? <>Runs <span className="font-mono text-gray-400">{a.models[0]}</span>{a.models.length > 1 ? ` +${a.models.length - 1} fallback` : ''}</>
+                          : 'No model chain configured'}
+                      </div>
+                    </div>
+                  )
+                })()}
+
                 <div className="mt-auto flex gap-2">
                   <a
                     href={item.signupUrl}
@@ -3593,7 +3992,7 @@ function ForexSignalsView(props: {
       <div className="bg-gray-800/30 border border-amber-700/30 rounded-lg p-4 flex flex-wrap items-center gap-3">
         <span className="text-xs text-amber-400 font-semibold uppercase tracking-wider">Forex</span>
         <div className="flex items-center gap-1 flex-wrap">
-          {STATUS_OPTIONS.map((opt) => (
+          {FOREX_STATUS_OPTIONS.map((opt) => (
             <button
               key={opt.value || 'all'}
               onClick={() => onStatusFilter(opt.value)}

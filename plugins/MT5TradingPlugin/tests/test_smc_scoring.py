@@ -288,7 +288,7 @@ def test_every_signal_carries_a_numeric_factor_breakdown():
     for f in bd["factors"]:
         assert set(f) == {"name", "family", "raw_value", "normalized", "weight",
                           "contribution"}
-        assert f["family"] in ("volume", "structure", "movement", "risk", "macro")
+        assert f["family"] in set(smc_scoring.FACTOR_FAMILY.values())
         assert -1.0 <= f["normalized"] <= 1.0
         assert f["contribution"] == pytest.approx(f["normalized"] * f["weight"], abs=1e-3)
 

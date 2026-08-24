@@ -58,9 +58,12 @@ def test_no_chain_routes_through_a_retired_provider(task):
 
 
 def test_news_position_can_still_reach_a_million_token_window():
-    """Nemotron is 128K. Mapping every headline onto every open position can
-    exceed that on a big book, and a context overflow is just another provider
-    error — so a 1M-context model has to sit behind it to catch the fall."""
+    """The primary now carries 1M itself, but the fallbacks must too.
+
+    Mapping every headline onto every open position can outgrow a 128K window on
+    a big book, and a context overflow is just another provider error — so the
+    chain still has to land somewhere that can hold the prompt.
+    """
     chain = _JARVIS_TASK_MODELS["news_position"]
     assert chain[0][0] == "nvidia"
     assert any(provider == "gemini" for provider, _ in chain[1:]), (
@@ -72,25 +75,40 @@ def test_every_task_has_a_label_for_the_ui():
     assert set(_JARVIS_TASK_MODELS) == set(_JARVIS_TASK_LABELS)
 
 
-# ── The primary is NVIDIA's deepest model ────────────────────────────────────
+# ── The primary must be a model that can actually answer ─────────────────────
 
+#: Ultra 550B cannot finish inside a normal request deadline. Leading a chain
+#: with it meant every call timed out and tripped the provider breaker, taking
+#: the rest of NVIDIA's catalog down with it — the biggest model is not the best
+#: one if nothing ever waits long enough to read its answer.
 ULTRA = "nvidia/nemotron-3-ultra-550b-a55b"
+
+#: What each task leads on now, chosen by the shape of the work. Mirrors
+#: ai_router.TASK_MODEL_CHAINS.
+EXPECTED_PRIMARY = {
+    "market_analysis": "z-ai/glm-5.2",
+    "synthesis": "z-ai/glm-5.2",
+    "news_context": "nvidia/nemotron-3.5-lightning-30b-a3b",
+    "news_position": "nvidia/nemotron-3.5-lightning-30b-a3b",
+}
+
+
+@pytest.mark.parametrize("task", sorted(_JARVIS_TASK_MODELS))
+def test_no_chain_leads_on_a_model_that_cannot_meet_the_deadline(task):
+    assert _JARVIS_TASK_MODELS[task][0][1] != ULTRA, (
+        f"{_JARVIS_TASK_LABELS[task]} leads on Ultra 550B, which times out on every call"
+    )
 
 
 @pytest.mark.parametrize("task", NEMOTRON_PRIMARY_TASKS)
-def test_the_deepest_nemotron_leads_with_the_120b_right_behind_it(task):
-    """Ultra 550B first, Super 120B second.
-
-    A 550B is likelier to be at capacity (HTTP 529), and the 120B is the same
-    family — verified to return parseable JSON — so it is the cheapest possible
-    fall.
-    """
+def test_each_task_leads_on_the_model_suited_to_it(task):
+    """Deep reasoning where someone will wait; fast where context or latency rules."""
     chain = _JARVIS_TASK_MODELS[task]
-    assert chain[0] == ("nvidia", ULTRA), (
-        f"{_JARVIS_TASK_LABELS[task]} should lead on Nemotron Ultra, got {chain[0]}"
+    assert chain[0] == ("nvidia", EXPECTED_PRIMARY[task]), (
+        f"{_JARVIS_TASK_LABELS[task]} should lead on {EXPECTED_PRIMARY[task]}, got {chain[0]}"
     )
     assert chain[1] == ("nvidia", NEMOTRON), (
-        f"{_JARVIS_TASK_LABELS[task]} has no Nemotron Super behind the 550B"
+        f"{_JARVIS_TASK_LABELS[task]} has no same-provider Nemotron Super behind the primary"
     )
 
 

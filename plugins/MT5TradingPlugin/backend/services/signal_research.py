@@ -256,6 +256,51 @@ def _movement_block(symbol: str, series: Dict[str, List[List[float]]],
     return "\n".join(lines)
 
 
+def _fib_block(symbol: str, series: Dict[str, List[List[float]]]) -> str:
+    """Where price sits in the latest swing's fib retracement, per timeframe.
+
+    A signal that enters inside the 0.5–0.618 golden zone in the direction of the
+    swing is a materially different proposition from one chasing an extension,
+    and the model cannot infer that from the movement block's flat range figures.
+    """
+    from app.signals.technical import (
+        auto_fib_retracement,
+        fib_confluence_score,
+        ohlcv_to_dataframe,
+    )
+
+    lines = [f"# Auto fib retracement — {symbol}"]
+    for tf, ohlcv in series.items():
+        if len(ohlcv) < 20:
+            lines.append(f"- {tf}: no usable history")
+            continue
+        try:
+            df = ohlcv_to_dataframe(ohlcv)
+            fib = auto_fib_retracement(df, levels=(0.5, 0.618), extend_lines=False)
+            swing = fib.get("swing")
+            if not swing:
+                lines.append(f"- {tf}: no confirmed swing")
+                continue
+            close = float(df["close"].iloc[-1])
+            zone = fib.get("golden_zone") or {}
+            conf = fib_confluence_score(close, fib, swing["direction"])
+            inside = bool(zone and zone.get("low") <= close <= zone.get("high"))
+            bias = "bullish" if swing["direction"] == "up" else "bearish"
+            where = (
+                f"in the golden zone (strength {conf:.2f})" if inside and conf is not None
+                else "outside the golden zone"
+            )
+            lines.append(
+                f"- {tf}: {bias} swing {swing['start_price']:.6g}→{swing['end_price']:.6g} | "
+                f"close {close:.6g} {where} "
+                f"(0.5–0.618 = {zone.get('low', 0):.6g}–{zone.get('high', 0):.6g})"
+            )
+        except Exception as exc:  # noqa: BLE001 - research must never fail on one timeframe
+            logger.debug(f"[signal-research] fib {symbol}/{tf}: {exc}")
+            lines.append(f"- {tf}: unavailable")
+    return "\n".join(lines)
+
+
 # ── Signal collection ────────────────────────────────────────────────────────
 
 def _norm(symbol: str) -> str:
@@ -1028,6 +1073,38 @@ def _clean_entries(raw: Any, fallback_confidence: float) -> List[Dict[str, Any]]
     return out
 
 
+class _TwoEntryGate:
+    """Validator that holds out for two costed entries.
+
+    The prompt asks for exactly two — a fill now and the deeper alternate — but
+    models routinely return one, or none on a ``stand_aside``, and a card that
+    says "no tradeable entry" tells the desk nothing it can act on. Rejecting
+    makes ``analyze_with_cascade`` move to the next provider, which is the same
+    path a transport error takes, so a stingy model costs a retry instead of the
+    answer.
+
+    What it will not do is invent the missing entry. An entry, a stop and a
+    target are numbers someone sizes real risk against; a fabricated second leg
+    is worse than an honest single. So the best partial answer seen along the
+    way is kept, and :func:`_predict` falls back to it when no provider produces
+    two — one more pass would cost another full cascade for the same words.
+    """
+
+    def __init__(self) -> None:
+        self.fallback: Optional[Dict[str, Any]] = None
+
+    def __call__(self, content: Any) -> Optional[Dict[str, Any]]:
+        pred = validate_prediction(content)
+        if pred is None:
+            return None
+        if len(pred.get("entries") or []) >= 2:
+            return pred
+        best = len(self.fallback.get("entries") or []) if self.fallback else -1
+        if len(pred.get("entries") or []) > best:
+            self.fallback = pred
+        return None
+
+
 async def _provider_exclusions(db) -> Tuple[List[str], str]:
     """Labels to keep out of the cascade, and the policy that decided them.
 
@@ -1059,6 +1136,15 @@ async def _provider_exclusions(db) -> Tuple[List[str], str]:
         await asyncio.sleep(min(5.0, remaining))
 
 
+def _has_answer(result: Dict[str, Any]) -> bool:
+    """A cascade result the caller can actually persist.
+
+    ``ok`` alone is not enough: a pass can report success with no content, and
+    the job would be marked done with nothing to store.
+    """
+    return bool(result.get("ok") and result.get("content"))
+
+
 async def _predict(db, job: SignalResearchJob, context: str) -> Dict[str, Any]:
     from plugins.AiMarketAnalyst.backend.services import analysis_router
 
@@ -1071,11 +1157,15 @@ async def _predict(db, job: SignalResearchJob, context: str) -> Dict[str, Any]:
         f"Reconcile every signal above into one view of {job.symbol}, then give "
         f"exactly two entry plans."
     )
+    # One gate across both passes, so a single-entry answer from an idle
+    # provider is still available if the all-providers pass fares no better.
+    gate = _TwoEntryGate()
+
     result = await analysis_router.analyze_with_cascade(
         db,
         [{"role": "system", "content": _SYSTEM_PROMPT},
          {"role": "user", "content": user}],
-        validator=validate_prediction,
+        validator=gate,
         temperature=0.2,
         max_tokens=800,
         json_mode=True,
@@ -1086,6 +1176,24 @@ async def _predict(db, job: SignalResearchJob, context: str) -> Dict[str, Any]:
         agent_role="market_analyst",
         source="signal_research",
     )
+
+    # A rejected-for-one-entry pass is not a dead cascade: the providers
+    # answered, they just would not cost a second leg. Escalating to every
+    # provider would spend a whole second cascade to be told the same thing —
+    # `stand_aside` verdicts legitimately carry no entries at all — so take the
+    # best read now and let the card say how thin it is.
+    if not _has_answer(result) and gate.fallback is not None:
+        logger.info(
+            f"[signal-research] {job.symbol}: no provider costed two entries; "
+            f"keeping the best {len(gate.fallback.get('entries') or [])}-entry read"
+        )
+        return {
+            "ok": True,
+            "content": gate.fallback,
+            "provider_used": result.get("provider_used"),
+            "policy": f"{policy} → partial-entries",
+            "errors": list(result.get("errors") or []),
+        }
 
     # Idle-first is a courtesy to live analysis, not a reason to give up. If
     # every idle provider was dead or misconfigured, the ones we politely held
@@ -1100,7 +1208,7 @@ async def _predict(db, job: SignalResearchJob, context: str) -> Dict[str, Any]:
             db,
             [{"role": "system", "content": _SYSTEM_PROMPT},
              {"role": "user", "content": user}],
-            validator=validate_prediction,
+            validator=gate,
             temperature=0.2,
             max_tokens=800,
             json_mode=True,
@@ -1110,7 +1218,9 @@ async def _predict(db, job: SignalResearchJob, context: str) -> Dict[str, Any]:
             agent_role="market_analyst",
             source="signal_research",
         )
-        if retry.get("ok"):
+        # `ok` without content is not an answer — the caller would mark the job
+        # done with nothing to persist.
+        if _has_answer(retry):
             retry["policy"] = f"{policy} → all-providers"
             return retry
         # Keep both passes' errors: which providers were skipped and why is the
@@ -1118,6 +1228,16 @@ async def _predict(db, job: SignalResearchJob, context: str) -> Dict[str, Any]:
         retry["errors"] = list(result.get("errors") or []) + list(retry.get("errors") or [])
         result = retry
         policy = f"{policy} → all-providers"
+
+    # The all-providers pass may itself have turned up a partial read.
+    if not _has_answer(result) and gate.fallback is not None:
+        return {
+            "ok": True,
+            "content": gate.fallback,
+            "provider_used": result.get("provider_used"),
+            "policy": f"{policy} → partial-entries",
+            "errors": list(result.get("errors") or []),
+        }
 
     result["policy"] = policy
     return result
@@ -1215,16 +1335,26 @@ async def _persist_prediction(db, job: SignalResearchJob, pred: Dict[str, Any],
 
     levels = pred.get("key_levels") or {}
     entries = list(pred.get("entries") or [])
+    # Entry, stop and target on every line, spelled out. This is the part of the
+    # card a person acts on, so it never abbreviates to "see rationale".
     entry_lines = "\n".join(
-        f"- {e['label']}: {e['side'].upper()} @ {e['entry']:.6g} "
-        f"stop {e['stop_loss']:.6g} target {e['take_profit']:.6g} "
-        f"({e['rr']}R, conf {e['confidence'] * 100:.0f}%)"
-        + (f" — {e['trigger']}" if e.get("trigger") else "")
+        f"- {e['label']}: {e['side'].upper()} entry {e['entry']:.6g} | "
+        f"SL {e['stop_loss']:.6g} | TP {e['take_profit']:.6g} | "
+        f"{e['rr']}R | conf {e['confidence'] * 100:.0f}%"
+        + (f"\n  trigger: {e['trigger']}" if e.get("trigger") else "")
+        + (f"\n  why: {e['rationale']}" if e.get("rationale") else "")
         for e in entries
-    ) or "- no tradeable entry"
+    ) or "- no tradeable entry: no provider returned a plan whose stop sat on the risk side of its entry"
+    if len(entries) == 1:
+        entry_lines += (
+            "\n- secondary: none — no provider costed a second plan for this batch"
+        )
+    # Entries lead. The card shows the first lines of this text before it is
+    # opened, and the plan is what a person needs at a glance — the reasoning is
+    # what they read after deciding it is worth reading.
     body = (
-        f"{pred['rationale']}\n\n"
         f"Entries:\n{entry_lines}\n\n"
+        f"{pred['rationale']}\n\n"
         f"horizon {pred['horizon_hours']}h | "
         f"support {levels.get('support')} | resistance {levels.get('resistance')} | "
         f"invalidation {levels.get('invalidation')}\n"
@@ -1386,6 +1516,7 @@ async def research_signal(db, job: SignalResearchJob) -> Dict[str, Any]:
         series[tf] = await _candles(job.symbol, tf, limit=200)
     bars = sum(len(v) for v in series.values())
     context.append(_movement_block(job.symbol, series, job))
+    context.append(_fib_block(job.symbol, series))
     await _end_step(db, job, t, "done" if bars else "empty", f"{bars} bars across {len(TIMEFRAMES)} timeframes")
 
     # 3 ── what we already know about the pair

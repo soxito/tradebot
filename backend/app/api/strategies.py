@@ -22,6 +22,7 @@ from app.signals.technical import (
     ohlcv_to_dataframe, sma, ema, rsi, macd, bollinger_bands,
     buy_sell_volume, adx, stochastic_rsi, atr,
     support_resistance_mtf, pivot_highs, pivot_lows,
+    auto_fib_retracement, zigzag_pivots, fib_confluence_score,
 )
 import numpy as np
 import pandas as pd
@@ -479,6 +480,23 @@ def _parse_pinescript_to_indicators(code: str) -> List[dict]:
         indicators.append({
             "name": "support_resistance", "enabled": True, "weight": 1.2,
             "params": {"pivot_left": left, "pivot_right": right, "max_levels": 8},
+        })
+
+    # Auto Fib Retracement: zigzag(deviation, depth) or fib retracement keywords
+    has_zigzag = bool(re.search(r'zigzag|zig_zag', code, re.IGNORECASE))
+    has_fib = bool(re.search(r'fib(?:onacci)?[\s._]?retrac|fib[\s._]?level|golden[\s._]?zone', code, re.IGNORECASE))
+    if has_zigzag or has_fib:
+        deviation = 5.0
+        depth = 10
+        dev_m = re.search(r'deviation["\']?\s*[:=,]\s*([\d.]+)', code, re.IGNORECASE)
+        if dev_m:
+            deviation = float(dev_m.group(1))
+        depth_m = re.search(r'depth["\']?\s*[:=,]\s*(\d+)', code, re.IGNORECASE)
+        if depth_m:
+            depth = int(depth_m.group(1))
+        indicators.append({
+            "name": "fib_retracement", "enabled": True, "weight": 1.0,
+            "params": {"deviation_pct": deviation, "depth": depth, "extend_lines": True},
         })
 
     # Volume: ta.sma(volume, N) or any volume reference
@@ -1162,7 +1180,7 @@ async def evaluate_pinescript(
                 pl = params.get("pivot_left", 5)
                 pr = params.get("pivot_right", 5)
                 max_lvl = params.get("max_levels", 8)
-                sr = support_resistance_mtf(df, pivot_left=pl, pivot_right=pr, max_levels=max_lvl)
+                sr = support_resistance_mtf(df, pivot_left=pl, pivot_right=pr, max_levels=max_lvl, include_lines=True)
                 indicator_values["sr_levels"] = len(sr["levels"])
                 indicator_values["sr_support_count"] = sum(1 for l in sr["levels"] if l["type"] == "support")
                 indicator_values["sr_resistance_count"] = sum(1 for l in sr["levels"] if l["type"] == "resistance")
@@ -1237,6 +1255,43 @@ async def evaluate_pinescript(
                         score_parts.append(-0.3 * w)
                     else:
                         score_parts.append(0.0)
+                weight_total += w
+
+            elif iname == "fib_retracement":
+                dev = params.get("deviation_pct", 5.0)
+                fib_depth = params.get("depth", 10)
+                level_cfg = params.get("levels")
+                extend = params.get("extend_lines", True)
+                fib = auto_fib_retracement(df, deviation_pct=dev, depth=fib_depth, levels=level_cfg, extend_lines=extend)
+                swing = fib.get("swing")
+                indicator_values["fib_swing_direction"] = swing["direction"] if swing else None
+                indicator_values["fib_golden_low"] = fib.get("golden_zone", {}).get("low") if fib.get("golden_zone") else None
+                indicator_values["fib_golden_high"] = fib.get("golden_zone", {}).get("high") if fib.get("golden_zone") else None
+                if fib.get("lines"):
+                    primary = fib["lines"][0]
+                    overlay_series.append({
+                        "name": "Auto Fib Retracement",
+                        "type": "line", "pane": "main",
+                        "color": primary["color"],
+                        "lineWidth": 1,
+                        "lineStyle": 2,
+                        "data": primary["data"],
+                        "extra_lines": [
+                            {
+                                "name": f"Fib {ln['ratio'] * 100:.1f}%",
+                                "color": ln["color"],
+                                "data": ln["data"],
+                            }
+                            for ln in fib["lines"][1:]
+                        ],
+                    })
+                cp = float(df["close"].iloc[-1])
+                fib_conf = fib_confluence_score(cp, fib, swing["direction"] if swing else None)
+                if fib_conf and swing:
+                    direction_sign = 1 if swing["direction"] == "up" else -1
+                    score_parts.append(direction_sign * fib_conf * w)
+                else:
+                    score_parts.append(0.0)
                 weight_total += w
 
         except Exception as e:
@@ -1664,7 +1719,7 @@ async def evaluate_strategy(
                 pl = params.get("pivot_left", 5)
                 pr = params.get("pivot_right", 5)
                 max_lvl = params.get("max_levels", 8)
-                sr = support_resistance_mtf(df, pivot_left=pl, pivot_right=pr, max_levels=max_lvl)
+                sr = support_resistance_mtf(df, pivot_left=pl, pivot_right=pr, max_levels=max_lvl, include_lines=True)
                 indicator_values["sr_levels"] = len(sr["levels"])
                 indicator_values["sr_support_count"] = sum(1 for l in sr["levels"] if l["type"] == "support")
                 indicator_values["sr_resistance_count"] = sum(1 for l in sr["levels"] if l["type"] == "resistance")
@@ -1730,6 +1785,43 @@ async def evaluate_strategy(
                         score_parts.append(-0.3 * w)
                     else:
                         score_parts.append(0.0)
+                weight_total += w
+
+            elif iname == "fib_retracement":
+                dev = params.get("deviation_pct", 5.0)
+                fib_depth = params.get("depth", 10)
+                level_cfg = params.get("levels")
+                extend = params.get("extend_lines", True)
+                fib = auto_fib_retracement(df, deviation_pct=dev, depth=fib_depth, levels=level_cfg, extend_lines=extend)
+                swing = fib.get("swing")
+                indicator_values["fib_swing_direction"] = swing["direction"] if swing else None
+                indicator_values["fib_golden_low"] = fib.get("golden_zone", {}).get("low") if fib.get("golden_zone") else None
+                indicator_values["fib_golden_high"] = fib.get("golden_zone", {}).get("high") if fib.get("golden_zone") else None
+                if fib.get("lines"):
+                    primary = fib["lines"][0]
+                    overlay_series.append({
+                        "name": "Auto Fib Retracement",
+                        "type": "line", "pane": "main",
+                        "color": primary["color"],
+                        "lineWidth": 1,
+                        "lineStyle": 2,
+                        "data": primary["data"],
+                        "extra_lines": [
+                            {
+                                "name": f"Fib {ln['ratio'] * 100:.1f}%",
+                                "color": ln["color"],
+                                "data": ln["data"],
+                            }
+                            for ln in fib["lines"][1:]
+                        ],
+                    })
+                cp = float(df["close"].iloc[-1])
+                fib_conf = fib_confluence_score(cp, fib, swing["direction"] if swing else None)
+                if fib_conf and swing:
+                    direction_sign = 1 if swing["direction"] == "up" else -1
+                    score_parts.append(direction_sign * fib_conf * w)
+                else:
+                    score_parts.append(0.0)
                 weight_total += w
 
         except Exception as e:
@@ -1949,6 +2041,27 @@ def _build_pinescript(
             indicator_blocks.append(f'srScore = close > lastSupport and close < lastResistance ? (close - lastSupport) / (lastResistance - lastSupport) : close <= lastSupport ? 1.0 : -1.0')
             indicator_blocks.append(f'srScore := (0.5 - srScore) * 2.0')
             score_parts.append(f'srScore * {w}')
+
+        elif iname == "fib_retracement":
+            dev = params.get("deviation_pct", 5.0)
+            fib_depth = params.get("depth", 10)
+            indicator_blocks.append(f'// Auto Fib Retracement (ZigZag deviation={dev}%, depth={fib_depth})')
+            indicator_blocks.append(f'fibPH = ta.pivothigh(high, {fib_depth}, {fib_depth})')
+            indicator_blocks.append(f'fibPL = ta.pivotlow(low, {fib_depth}, {fib_depth})')
+            indicator_blocks.append(f'var float fibSwingHigh = na')
+            indicator_blocks.append(f'var float fibSwingLow = na')
+            indicator_blocks.append(f'if not na(fibPH)')
+            indicator_blocks.append(f'    fibSwingHigh := fibPH')
+            indicator_blocks.append(f'if not na(fibPL)')
+            indicator_blocks.append(f'    fibSwingLow := fibPL')
+            indicator_blocks.append(f'fibHeight = fibSwingHigh - fibSwingLow')
+            indicator_blocks.append(f'fibGoldenLow = fibSwingHigh - fibHeight * 0.618')
+            indicator_blocks.append(f'fibGoldenHigh = fibSwingHigh - fibHeight * 0.5')
+            indicator_blocks.append(f'plot(fibGoldenLow, "Fib 61.8%", color=color.new(color.teal, 30))')
+            indicator_blocks.append(f'plot(fibGoldenHigh, "Fib 50%", color=color.new(color.green, 30))')
+            indicator_blocks.append(f'fibInZone = close >= fibGoldenLow and close <= fibGoldenHigh')
+            indicator_blocks.append(f'fibScore = fibInZone ? (close > open ? 1.0 : -1.0) : 0.0')
+            score_parts.append(f'fibScore * {w}')
 
     lines.extend(indicator_blocks)
     lines.append('')

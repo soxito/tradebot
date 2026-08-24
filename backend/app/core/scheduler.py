@@ -7,6 +7,7 @@ Dedicated auto-trade loops (separate from the scheduler) that persist
 across frontend page reloads and can be started / stopped via API.
 """
 import asyncio
+import json
 from datetime import datetime
 from loguru import logger
 
@@ -1437,3 +1438,238 @@ def get_vault_sync_status() -> dict:
     except Exception:  # noqa: BLE001
         return {"running": False, "available": False}
     return _status()
+
+
+# ── Bitcoin cycle detector ────────────────────────────────────────────────────
+# Watches the 1064-day calendar for a phase turn. The calendar itself is
+# deterministic — the loop's job is to notice the day the phase flips and tell
+# every surface at once: an SSE event for the room, a SYSTEM signal tagged
+# kind=cycle_transition for the feed, and an alert for the desk.
+
+_cycle_task: asyncio.Task | None = None
+_cycle_running = False
+#: The last phase the detector announced, so a transition fires exactly once.
+_cycle_last_phase: str | None = None
+
+
+async def run_cycle_detector() -> dict | None:
+    """Resolve the snapshot once; announce a transition when the phase changed.
+
+    Returns the transition payload, or None when there was nothing to say.
+    """
+    global _cycle_last_phase
+
+    from app.core.events import Topics, event_bus
+    from app.services import market_cycle
+
+    snap = await market_cycle.resolve_cycle_snapshot()
+    if snap is None or not snap.ok:
+        return None
+
+    payload = {
+        "phase": snap.phase,
+        "previous_phase": _cycle_last_phase,
+        "anchor": snap.anchor,
+        "day_of_cycle": snap.day_of_cycle,
+        "projected_top": snap.projected_top,
+        "projected_bottom": snap.projected_bottom,
+        "days_to_top": snap.days_to_top,
+        "days_to_bottom": snap.days_to_bottom,
+        "late_phase": snap.late_phase,
+        "at": now_sast().isoformat(),
+    }
+
+    if _cycle_last_phase is not None and _cycle_last_phase != snap.phase:
+        payload["transition"] = f"{_cycle_last_phase}->{snap.phase}"
+        try:
+            await event_bus.publish(Topics.CYCLE_TRANSITION, payload)
+        except Exception as exc:  # noqa: BLE001 — telemetry must not break the tick
+            logger.warning(f"[cycle] SSE publish failed: {exc}")
+
+        await _emit_cycle_signal(payload)
+        await _notify_cycle_transition(payload)
+
+    _cycle_last_phase = snap.phase
+    return payload
+
+
+async def _emit_cycle_signal(payload: dict) -> None:
+    """Store the turn as a SYSTEM signal so the feed and journal record it."""
+    try:
+        from app.models.database import SignalSource
+        from app.models.schemas import SignalCreate
+        from app.signals.service import SignalService
+
+        transition = payload.get("transition") or ""
+        async with AsyncSessionLocal() as db:
+            signal = await SignalService.create_signal(
+                db,
+                SignalCreate(
+                    source=SignalSource.SYSTEM,
+                    symbol="BTCUSD",
+                    action="hold",
+                    price=0.0,
+                    timeframe="1d",
+                    strength=0.6,
+                    confidence=0.6,
+                    raw_data=json.dumps({"kind": "cycle_transition", **payload}),
+                    indicators=json.dumps({
+                        "cycle_phase": payload.get("phase"),
+                        "day_of_cycle": payload.get("day_of_cycle"),
+                        "projected_top": payload.get("projected_top"),
+                        "projected_bottom": payload.get("projected_bottom"),
+                    }),
+                ),
+            )
+        logger.warning(f"🔄 [CYCLE] transition {transition} recorded as signal id={getattr(signal, 'id', '?')}")
+    except Exception as exc:  # noqa: BLE001 — a failed record must not fail the tick
+        logger.warning(f"[cycle] signal record failed: {exc}")
+
+
+async def _notify_cycle_transition(payload: dict) -> None:
+    """Tell the desk the season changed."""
+    try:
+        phase = str(payload.get("phase") or "").upper()
+        await AlertService.notify(
+            title=f"Bitcoin cycle: {phase} phase",
+            message=(
+                f"Cycle turned {payload.get('transition')} — day {payload.get('day_of_cycle')} "
+                f"since the {payload.get('anchor')} bottom. Projected top "
+                f"{payload.get('projected_top')} ({payload.get('days_to_top')}d), "
+                f"projected bottom {payload.get('projected_bottom')} "
+                f"({payload.get('days_to_bottom')}d)."
+            ),
+            level="WARNING",
+            details={"kind": "cycle_transition", "phase": phase},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[cycle] alert skipped: {exc}")
+
+
+async def _cycle_loop(interval: int):
+    global _cycle_running
+    while _cycle_running:
+        try:
+            await run_cycle_detector()
+            record_scheduler_cycle("cycle_detect", "ok")
+        except Exception as exc:  # noqa: BLE001 — the loop outlives any single failure
+            logger.error(f"Cycle detector error: {exc}")
+            record_scheduler_cycle("cycle_detect", "error")
+        await asyncio.sleep(max(300, interval))
+
+
+def start_cycle_detector_loop(interval: int | None = None) -> bool:
+    """Start watching the Bitcoin calendar. Idempotent."""
+    global _cycle_task, _cycle_running
+    if _cycle_task is not None and not _cycle_task.done():
+        return True
+    interval = interval or getattr(settings, "CYCLE_RECHECK_INTERVAL_SECONDS", 3600)
+    _cycle_running = True
+    _cycle_task = asyncio.create_task(_cycle_loop(int(interval)))
+    logger.info(f"📅 Cycle detector started — checking every {interval}s")
+    return True
+
+
+def stop_cycle_detector_loop() -> bool:
+    """Stop the cycle detector."""
+    global _cycle_task, _cycle_running
+    _cycle_running = False
+    if _cycle_task:
+        _cycle_task.cancel()
+        _cycle_task = None
+    return True
+
+
+def get_cycle_detector_status() -> dict:
+    """Detector state for the system monitor."""
+    return {
+        "running": _cycle_running,
+        "interval_seconds": getattr(settings, "CYCLE_RECHECK_INTERVAL_SECONDS", 3600),
+        "last_phase": _cycle_last_phase,
+    }
+
+
+# ── Whale watch loop ─────────────────────────────────────────────────────────
+# Reads the curated whale registry every minute; when a transfer above the
+# move threshold is new since the last tick, it lands on the wire as
+# whale.move so the room and the page light up in near real time.
+
+_whale_task: asyncio.Task | None = None
+_whale_running = False
+_whale_seen_txids: set[str] = set()
+
+
+async def run_whale_watch() -> dict | None:
+    """Resolve the whale snapshot once; announce new threshold transfers."""
+    from app.core.events import Topics, event_bus
+    from app.services import whale_watch
+
+    snap = await whale_watch.resolve_whale_snapshot()
+    if snap is None:
+        return None
+
+    announced: list[dict] = []
+    for move in snap.moves:
+        txid = str(move.get("txid") or "")
+        if not txid or txid in _whale_seen_txids:
+            continue
+        _whale_seen_txids.add(txid)
+        if len(_whale_seen_txids) > 2000:
+            # Keep the newest memory bounded — drop half rather than all so a
+            # burst of transfers can't re-announce everything at once.
+            _whale_seen_txids.clear()
+            _whale_seen_txids.update(str(m.get("txid")) for m in snap.moves[:100])
+        announced.append(move)
+        try:
+            await event_bus.publish(Topics.WHALE_MOVE, {
+                **move,
+                "score": snap.score,
+                "at": now_sast().isoformat(),
+            })
+        except Exception as exc:  # noqa: BLE001 — telemetry must not break the tick
+            logger.warning(f"[whale] SSE publish failed: {exc}")
+
+    return {"score": snap.score, "net_flow_7d_btc": snap.net_flow_7d_btc,
+            "announced": len(announced)}
+
+
+async def _whale_loop(interval: int):
+    global _whale_running
+    while _whale_running:
+        try:
+            await run_whale_watch()
+        except Exception as exc:  # noqa: BLE001 — the loop outlives any failure
+            logger.error(f"Whale watch error: {exc}")
+        await asyncio.sleep(max(30, interval))
+
+
+def start_whale_watch_loop(interval: int | None = None) -> bool:
+    """Start reading the whale registry. Idempotent. Default cadence: 60s."""
+    global _whale_task, _whale_running
+    if _whale_task is not None and not _whale_task.done():
+        return True
+    interval = interval or 60
+    _whale_running = True
+    _whale_task = asyncio.create_task(_whale_loop(int(interval)))
+    logger.info(f"🐋 Whale watch started — checking every {interval}s")
+    return True
+
+
+def stop_whale_watch_loop() -> bool:
+    global _whale_task, _whale_running
+    _whale_running = False
+    if _whale_task:
+        _whale_task.cancel()
+        _whale_task = None
+    return True
+
+
+def get_whale_watch_status() -> dict:
+    from app.services.whale_watch import BALANCE_TTL_S
+
+    return {
+        "running": _whale_running,
+        "interval_seconds": 60,
+        "cache_ttl_s": BALANCE_TTL_S,
+        "tracked_transfers": len(_whale_seen_txids),
+    }

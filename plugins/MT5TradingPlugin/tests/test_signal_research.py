@@ -341,6 +341,71 @@ async def test_a_batch_is_researched_into_two_entries(monkeypatch, db):
     assert "3 signal(s)" in step["detail"]
 
 
+def test_the_gate_holds_out_for_two_entries():
+    """One entry sends the cascade to the next provider, like a dead request."""
+    gate = signal_research._TwoEntryGate()
+    two = {
+        **_GOOD_PREDICTION,
+        "entries": [
+            {"label": "primary", "side": "buy", "entry": 100.0, "stop_loss": 96.0,
+             "take_profit": 112.0},
+            {"label": "secondary", "side": "buy", "entry": 97.0, "stop_loss": 94.0,
+             "take_profit": 109.0},
+        ],
+    }
+    one = {
+        **_GOOD_PREDICTION,
+        "entries": [
+            {"label": "primary", "side": "buy", "entry": 100.0, "stop_loss": 96.0,
+             "take_profit": 112.0},
+        ],
+    }
+
+    assert gate(one) is None, "a single entry is rejected, not accepted"
+    assert len(gate.fallback["entries"]) == 1, "but it is remembered"
+    assert gate(two) is not None, "two entries pass"
+
+
+def test_the_gate_keeps_the_fullest_partial_it_saw():
+    """Two providers, two thin answers — keep the one carrying more."""
+    gate = signal_research._TwoEntryGate()
+    gate({**_GOOD_PREDICTION, "entries": []})
+    gate({
+        **_GOOD_PREDICTION,
+        "entries": [{"label": "primary", "side": "buy", "entry": 100.0,
+                     "stop_loss": 96.0, "take_profit": 112.0}],
+    })
+    gate({**_GOOD_PREDICTION, "entries": []})
+
+    assert len(gate.fallback["entries"]) == 1
+
+
+def test_a_malformed_response_is_not_remembered_as_a_partial():
+    gate = signal_research._TwoEntryGate()
+    assert gate({"verdict": "not-a-verdict"}) is None
+    assert gate.fallback is None
+
+
+@pytest.mark.asyncio
+async def test_a_one_entry_answer_still_reaches_the_page(monkeypatch, db):
+    """A thin read beats no read — and it must not cost a second cascade."""
+    calls: list[list[str]] = []
+    _install_cascade(monkeypatch, _cascade_stub({
+        **_GOOD_PREDICTION,
+        "entries": [
+            {"label": "primary", "side": "buy", "entry": 100.0, "stop_loss": 96.0,
+             "take_profit": 112.0, "confidence": 0.6},
+        ],
+    }, record=calls))
+
+    job = await _job(db)
+    await signal_research.research_signal(db, job)
+
+    assert job.status == "done"
+    assert [e["label"] for e in job.entries] == ["primary"]
+    assert len(calls) == 1, "a stingy model must not trigger a second cascade"
+
+
 def test_an_entry_whose_stop_is_on_the_wrong_side_is_dropped():
     """It would be executed. Dropping beats guessing at someone's risk."""
     v = signal_research.validate_prediction

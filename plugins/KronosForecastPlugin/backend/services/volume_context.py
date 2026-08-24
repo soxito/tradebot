@@ -143,7 +143,18 @@ def _has_weekly_break(symbol: str) -> bool:
     try:
         from app.services import market_data  # type: ignore
 
-        return market_data.classify(symbol) != market_data.CRYPTO
+        if market_data.classify(symbol) != market_data.CRYPTO:
+            return True
+        # classify() labels anything quoted in USDT/USDC as crypto, but a gold or
+        # silver pair keeps its weekend break whatever the quote — XAU/USDT is
+        # gold, not a coin. Detect precious-metal bases directly so they are not
+        # held to the 24/7 volume rule.
+        s = market_data.normalize_symbol(symbol) or ""
+        for q in ("USDT", "USDC", "USD"):
+            if s.endswith(q) and len(s) > len(q):
+                s = s[: -len(q)]
+                break
+        return s in {"XAU", "XAG", "XPT", "XPD"}
     except Exception:  # noqa: BLE001 — unknown instrument: assume 24/7, stay strict
         return False
 
@@ -353,6 +364,14 @@ def classify_divergence(
 # ── the public builders ──────────────────────────────────────────────────────
 
 def _unavailable(symbol: str, source: str, detail: str, status: str = "UNAVAILABLE") -> VolumeContext:
+    # FX, metals and indices print no reliable volume (spot FX prints none at
+    # all) and close every weekend, so volume is never a hard gate for them:
+    # report NOT_APPLICABLE and let the caller forecast on price/structure.
+    if status != "OK" and _has_weekly_break(symbol):
+        return VolumeContext(
+            status="NOT_APPLICABLE", symbol=symbol, source=source,
+            detail=f"{detail} Volume not required for this market — forecasting on price/structure.",
+        )
     return VolumeContext(status=status, symbol=symbol, source=source, detail=detail)
 
 
@@ -434,13 +453,21 @@ def build_volume_context(
                 f" {closed_seconds}s of that was the weekend close, leaving "
                 f"{trading_age}s of trading time unaccounted for."
             )
+        # A weekend-closing instrument (gold, FX, indices) that is *currently*
+        # shut is not a broken feed — downgrade to NOT_APPLICABLE and forecast on
+        # price/structure. A genuine weekday outage (or 24/7 crypto) still blocks.
+        weekly = _has_weekly_break(symbol) and _in_weekly_break(int(now))
         return VolumeContext(
-            status="STALE", symbol=symbol, source=source, volume_unit=volume_unit,
+            status="NOT_APPLICABLE" if weekly else "STALE",
+            symbol=symbol, source=source, volume_unit=volume_unit,
             volume_24h=volume_24h, volume_1h=volume_1h,
             hourly_mean_24h=volume_24h / REQUIRED_HOURS,
             hours_covered=len(trailing),
             last_bar_time=last.start, age_seconds=age_seconds,
-            detail=detail,
+            detail=detail + (
+                " Volume not required for this market — forecasting on price/structure."
+                if weekly else ""
+            ),
         )
 
     hourly_mean_24h = volume_24h / REQUIRED_HOURS
@@ -562,6 +589,8 @@ def volume_multiplier(direction: str, ctx: VolumeContext) -> float:
     reason it holds that value. Deterministic: the same context always yields
     the same multiplier.
     """
+    if ctx.status == "NOT_APPLICABLE":
+        return 1.0
     if ctx.status != "OK":
         return 0.0
     if is_reversal_risk(direction, ctx):
@@ -615,28 +644,32 @@ def score_confidence(
     dispersion: float,
     ctx: VolumeContext,
     macro: Optional[Any] = None,
+    cycle: Optional[Any] = None,
 ) -> float:
     """Final confidence.
 
         confidence = clamp( base_model_confidence(agreement, dispersion)
                             × volume_multiplier(direction, context)
-                            × macro_multiplier(direction, macro),
+                            × macro_multiplier(direction, macro)
+                            × cycle_multiplier(direction, cycle),
                             0, MAX_CONFIDENCE )
 
     With a non-OK context the volume multiplier is 0 — a forecast without
     resolved volume has no confidence at all, which is what forces the NO_TRADE
-    branch. The macro multiplier defaults to 1.0, so every existing caller is
-    unaffected. The upper clamp is MAX_CONFIDENCE, not 1.0: neither volume nor
-    the dollar can turn a sampled forecast into a certainty.
+    branch. The macro and cycle multipliers default to 1.0, so every existing
+    caller is unaffected. The upper clamp is MAX_CONFIDENCE, not 1.0: neither
+    volume, the dollar, nor the calendar can turn a sampled forecast into a
+    certainty.
     """
     return max(0.0, min(MAX_CONFIDENCE, base_model_confidence(agreement, dispersion)
                         * volume_multiplier(direction, ctx)
-                        * macro_multiplier(direction, macro)))
+                        * macro_multiplier(direction, macro)
+                        * cycle_multiplier(direction, cycle)))
 
 
 def decide(confidence: float, ctx: VolumeContext) -> str:
     """Map a scored forecast onto OK / LOW_CONFIDENCE / NO_TRADE."""
-    if ctx.status != "OK":
+    if ctx.status not in ("OK", "NOT_APPLICABLE"):
         return "NO_TRADE"
     if confidence < MIN_TRADEABLE_CONFIDENCE:
         return "LOW_CONFIDENCE"
@@ -668,6 +701,8 @@ UNIT_LABEL: Dict[str, str] = {
 def volume_evidence_lines(ctx: VolumeContext) -> List[str]:
     """Plain-language volume evidence, safe to show for any status."""
     unit = UNIT_LABEL.get(ctx.volume_unit, "volume")
+    if ctx.status == "NOT_APPLICABLE":
+        return [f"Volume not required for this market — {ctx.detail}".rstrip()]
     if ctx.status != "OK":
         return [f"Volume {ctx.status.lower()}: {ctx.detail}"]
     lines = [
@@ -686,6 +721,37 @@ def volume_evidence_lines(ctx: VolumeContext) -> List[str]:
     return lines
 
 
+#: Cycle confidence multipliers — conservative, mirroring the macro pattern.
+#: Late bull / bear seasons argue longs down; early bull argues them up.
+CYCLE_LATE_BULL_LONG_WEIGHT = 0.85
+CYCLE_BEAR_LONG_WEIGHT = 0.85
+CYCLE_EARLY_BULL_LONG_WEIGHT = 1.05
+
+
+def cycle_multiplier(direction: str, cycle: Optional[Any]) -> float:
+    """The 1064-day calendar's weight on this direction.
+
+    Longs get discounted inside the projected-bear phase and the late-bull
+    caution window, and nudged up in early/mid bull. Shorts read the same
+    table mirrored. A cycle that did not resolve is a no-op — never a gate.
+    """
+    if cycle is None or not getattr(cycle, "applicable", False):
+        return 1.0
+    phase = getattr(cycle, "phase", "bear")
+    day = int(getattr(cycle, "day_of_cycle", 0) or 0)
+    late = bool(getattr(cycle, "late_phase", False))
+    long_side = str(direction).lower() in {"up", "long", "buy"}
+
+    if phase == "bull":
+        if late:
+            return CYCLE_LATE_BULL_LONG_WEIGHT if long_side else 1.0
+        return CYCLE_EARLY_BULL_LONG_WEIGHT if long_side else 1.0
+    # Bear season: day > bull_days means past the projected top.
+    if long_side:
+        return CYCLE_BEAR_LONG_WEIGHT
+    return 1.05 if day > 0 else 1.0
+
+
 def direction_rationale(
     direction: str,
     ctx: VolumeContext,
@@ -695,6 +761,7 @@ def direction_rationale(
     confidence: float,
     decision: str,
     macro: Optional[Any] = None,
+    cycle: Optional[Any] = None,
 ) -> List[str]:
     """Why this direction was chosen, and what volume and macro did to it.
 
@@ -702,6 +769,14 @@ def direction_rationale(
     also propagate for free into every sniper entry's ``reasons``, which is how
     the macro read reaches the user without a second assembly site.
     """
+    if ctx.status == "NOT_APPLICABLE":
+        base = base_model_confidence(agreement, dispersion)
+        return [
+            f"Model paths: {agreement * 100:.0f}% agree on '{direction}', dispersion "
+            f"{dispersion * 100:.2f}% of price → base confidence {base:.2f}.",
+            f"Volume not required for this market — {ctx.detail}".rstrip(),
+            f"Confidence is the price-model read, unadjusted by volume → {confidence:.2f} → {decision}.",
+        ]
     if ctx.status != "OK":
         return [
             f"NO_TRADE — volume context could not be established ({ctx.status}).",
@@ -740,9 +815,17 @@ def direction_rationale(
         why = getattr(macro, "reason", "") if macro is not None else "not consulted"
         lines.append(f"Macro context did not apply ({why}) — confidence unchanged by it.")
 
+    cycle_mult = cycle_multiplier(direction, cycle)
+    if cycle is not None and getattr(cycle, "applicable", False):
+        for line in getattr(cycle, "lines", []) or []:
+            lines.append(line)
+        lines.append(f"Cycle adjustment: ×{cycle_mult:.2f}.")
+    else:
+        lines.append("BTC cycle did not apply — confidence unchanged by it.")
+
     lines.append(
         f"Final confidence {base:.2f} × {mult:.2f} (volume) × {macro_mult:.2f} "
-        f"(macro) = {confidence:.2f} → {decision}."
+        f"(macro) × {cycle_mult:.2f} (cycle) = {confidence:.2f} → {decision}."
     )
     if decision == "LOW_CONFIDENCE":
         lines.append(

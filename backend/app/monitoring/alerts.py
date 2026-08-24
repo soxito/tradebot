@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import smtplib
 from email.message import EmailMessage
 from typing import Any
@@ -41,6 +42,11 @@ class AlertService:
 
     @staticmethod
     async def send_telegram(text: str) -> bool:
+        # The other path to the user's phone. Same rule as the bot service: a
+        # test run must not be able to produce a message about a trade.
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            logger.debug("Telegram alert suppressed under test")
+            return False
         if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
             return False
 

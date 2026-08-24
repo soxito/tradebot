@@ -295,3 +295,28 @@ async def test_price_block_keeps_mentioned_symbol_ahead_of_filler(monkeypatch):
 
     block = await md.price_block(["XAUUSD"], include_top_crypto=True, max_lines=5)
     assert "XAUUSD" in block
+
+
+# ── One token → one instrument ───────────────────────────────────────────────
+
+@pytest.mark.parametrize(("token", "expected"), [
+    ("CADJPY", "CADJPY"), ("cadjpy", "CADJPY"), ("GBPJPY", "GBPJPY"),
+    ("XAU/USD", "XAUUSD"), ("US30", "US30"), ("nas100", "NAS100"),
+    ("gold", "XAUUSD"), ("oil", "USOIL"), ("BTC", "BTCUSDT"),
+    ("ETH/USDT", "ETHUSDT"),
+    ("why", None), ("the", None), ("analyse", None), ("about", None),
+    ("USD", None), ("1h", None), ("", None),
+])
+def test_symbol_from_token_reads_one_token(token, expected):
+    assert md.symbol_from_token(token) == expected
+
+
+@pytest.mark.parametrize(("token", "expected"), [
+    # Unmistakable spellings survive inside a sentence.
+    ("CADJPY", "CADJPY"), ("XAUUSD", "XAUUSD"), ("US30", "US30"),
+    ("BTCUSDT", "BTCUSDT"),
+    # Plain-English names are words first when they are not typed alone.
+    ("gold", None), ("oil", None), ("silver", None), ("dow", None),
+])
+def test_strict_mode_only_accepts_an_unmistakable_spelling(token, expected):
+    assert md.symbol_from_token(token, strict=True) == expected

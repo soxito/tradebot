@@ -35,6 +35,7 @@ Blockers (no trade generated)
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -42,6 +43,7 @@ import pandas as pd
 from loguru import logger
 
 from app.exchanges.manager import exchange_manager, SupportedExchange
+from app.signals.candle_source import get_ohlcv as cached_get_ohlcv
 
 
 def _to_py(obj):
@@ -524,22 +526,26 @@ async def analyze_mtpc(
         }
 
     # ── 1. Fetch OHLCV + run TA for all three timeframes ──────────────────
+    # Concurrent via the shared candle cache — the pipeline usually fetched
+    # these same series moments earlier.
     tf_ohlcv: Dict[str, List]       = {}
     tf_ta:    Dict[str, Dict]       = {}
     errors:   List[str]             = []
 
-    for tf, limit in TF_LIMITS.items():
+    async def _one_tf(tf: str, limit: int) -> None:
         try:
-            ohlcv = await connector.get_ohlcv(symbol=symbol, timeframe=tf, limit=limit)
+            ohlcv = await cached_get_ohlcv(symbol=symbol, timeframe=tf, limit=limit, exchange=exch)
             ta    = technical_analyze(ohlcv, tf)
             if "error" in ta:
                 errors.append(f"{tf}: {ta['error']}")
-                continue
+                return
             tf_ohlcv[tf] = ohlcv
             tf_ta[tf]    = ta
         except Exception as exc:
             errors.append(f"{tf}: {exc}")
             logger.debug(f"[MTPC] {symbol} {tf} error: {exc}")
+
+    await asyncio.gather(*(_one_tf(tf, limit) for tf, limit in TF_LIMITS.items()))
 
     if TREND_TF not in tf_ta or SETUP_TF not in tf_ta:
         return {

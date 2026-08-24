@@ -4,6 +4,7 @@ import dynamic from 'next/dynamic'
 import WalletBalance from '@/components/WalletBalance'
 import SignalFeed from '@/components/SignalFeed'
 import TradeHistory from '@/components/TradeHistory'
+import CycleBadge from '@/components/CycleBadge'
 import { useTradeStore } from '@/store/useTradeStore'
 import { apiClient } from '@/services/api'
 import { SMART_MONEY_CONCEPTS_STUDY_ID } from '@/utils/tradingviewStudies'
@@ -58,11 +59,16 @@ export default function Dashboard() {
 
       <div className="space-y-6 max-w-7xl mx-auto">
         {/* Header */}
-        <div>
-          <h1 className="text-3xl font-bold text-white">Dashboard</h1>
-          <p className="text-sm text-gray-400 mt-1">
-            Overview of your trading activity
-          </p>
+        <div className="flex flex-wrap items-center gap-3">
+          <div>
+            <h1 className="text-3xl font-bold text-white">Dashboard</h1>
+            <p className="text-sm text-gray-400 mt-1">
+              Overview of your trading activity
+            </p>
+          </div>
+          <div className="ml-auto">
+            <CycleBadge />
+          </div>
         </div>
 
         {/* Status Cards */}

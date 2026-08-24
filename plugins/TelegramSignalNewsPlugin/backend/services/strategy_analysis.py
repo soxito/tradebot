@@ -42,7 +42,15 @@ async def _fetch_ohlcv(symbol: str, timeframe: str = "15m", limit: int = 200) ->
     back to Binance/OKX/Bybit. The Bitget connector auto-converts to futures
     format (CRV/USDT:USDT), which fails for spot-only pairs — so we bypass the
     helper and call ``exchange.fetch_ohlcv`` directly with the spot symbol.
+
+    The bar count never drops below 200 (~50h at 15m) and scales up with
+    AGENT_ANALYSIS_CANDLES so deeper reads pull more closed candles.
     """
+    try:
+        from app.core.config import settings  # type: ignore
+        limit = max(limit, int(getattr(settings, "AGENT_ANALYSIS_CANDLES", 120) or 120))
+    except Exception:
+        pass
     try:
         from app.exchanges.manager import exchange_manager, SupportedExchange
     except Exception:

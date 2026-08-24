@@ -259,3 +259,112 @@ async def test_provider_error_is_returned_not_retried_forever(monkeypatch):
     monkeypatch.setattr(ai_router, "db_chat", _fail)
     out = await ai_router.chat_with_tools(_FakeDB(), [{"role": "user", "content": "hi"}])
     assert out["ok"] is False and out["error"] == "no providers"
+
+
+# ── Inline (text-emitted) tool calls: Nemotron / Qwen / Hermes ───────────────
+
+def test_parse_inline_tool_calls_reads_the_chatml_keyvalue_shape():
+    """The exact markup a user saw leak instead of an analysis must parse."""
+    from plugins.AiMarketAnalyst.backend.services import ai_tools
+
+    raw = (
+        "<tool_call>analyze_symbol"
+        "<arg_key>symbol</arg_key><arg_value>GBPUSD</arg_value>"
+        "<arg_key>timeframe</arg_key><arg_value>1h</arg_value></tool_call>"
+    )
+    assert ai_tools.parse_inline_tool_calls(raw) == [
+        {"name": "analyze_symbol", "arguments": {"symbol": "GBPUSD", "timeframe": "1h"}}
+    ]
+
+
+def test_parse_inline_tool_calls_reads_the_json_shape_and_coerces_types():
+    from plugins.AiMarketAnalyst.backend.services import ai_tools
+
+    js = '<tool_call>{"name": "analyze_symbol", "arguments": {"symbol": "GBPUSD"}}</tool_call>'
+    assert ai_tools.parse_inline_tool_calls(js) == [
+        {"name": "analyze_symbol", "arguments": {"symbol": "GBPUSD"}}
+    ]
+    # A truncated call (no closing tag) with an array value keeps the list type.
+    trunc = '<tool_call>price_lookup<arg_key>symbols</arg_key><arg_value>["XAUUSD", "GBPUSD"]</arg_value>'
+    assert ai_tools.parse_inline_tool_calls(trunc) == [
+        {"name": "price_lookup", "arguments": {"symbols": ["XAUUSD", "GBPUSD"]}}
+    ]
+
+
+def test_unknown_inline_tool_is_ignored():
+    from plugins.AiMarketAnalyst.backend.services import ai_tools
+
+    assert ai_tools.parse_inline_tool_calls(
+        "<tool_call>drop_table<arg_key>x</arg_key><arg_value>1</arg_value></tool_call>"
+    ) == []
+
+
+def test_strip_inline_tool_calls_cleans_leaked_markup():
+    from plugins.AiMarketAnalyst.backend.services import ai_tools
+
+    leaked = "Here is my read, Sir. <tool_call>analyze_symbol<arg_key>symbol</arg_key><arg_value>GBPUSD</arg_value></tool_call>"
+    assert ai_tools.strip_inline_tool_calls(leaked) == "Here is my read, Sir."
+    assert ai_tools.strip_inline_tool_calls("Plain answer.") == "Plain answer."
+
+
+@pytest.mark.asyncio
+async def test_loop_runs_a_text_emitted_tool_call_instead_of_leaking_it(monkeypatch):
+    """A provider that advertises tools but emits the call as text content.
+
+    This reproduces the reported bug: NVIDIA/Nemotron returns
+    ``<tool_call>analyze_symbol…</tool_call>`` in ``content`` with an empty
+    native ``tool_calls`` list. The loop must execute it and answer, never
+    hand the raw markup back.
+    """
+    turns = []
+    raw_call = (
+        "<tool_call>analyze_symbol"
+        "<arg_key>symbol</arg_key><arg_value>GBPUSD</arg_value>"
+        "<arg_key>timeframe</arg_key><arg_value>1h</arg_value></tool_call>"
+    )
+
+    async def _fake_db_chat(db, messages, **kw):
+        turns.append(list(messages))
+        if len(turns) == 1:
+            return {"ok": True, "content": raw_call, "tools_supported": True,
+                    "message": {"role": "assistant", "content": raw_call},
+                    "tool_calls": []}
+        return {"ok": True, "content": "GBPUSD is grinding up, Sir.",
+                "tools_supported": True,
+                "message": {"role": "assistant", "content": "GBPUSD is grinding up, Sir."},
+                "tool_calls": []}
+
+    captured = {}
+
+    async def _fake_exec(name, args):
+        captured["call"] = (name, args)
+        return "GBPUSD 4h: bullish, RSI 58"
+
+    monkeypatch.setattr(ai_router, "db_chat", _fake_db_chat)
+    from plugins.AiMarketAnalyst.backend.services import ai_tools
+    monkeypatch.setattr(ai_tools, "execute_tool", _fake_exec)
+
+    out = await ai_router.chat_with_tools(
+        _FakeDB(), [{"role": "user", "content": "take on GBPUSD?"}]
+    )
+
+    assert captured["call"] == ("analyze_symbol", {"symbol": "GBPUSD", "timeframe": "1h"})
+    assert out["ok"] and out["content"] == "GBPUSD is grinding up, Sir."
+    assert "<tool_call>" not in out["content"]
+    assert out["tools_used"] == ["analyze_symbol"]
+
+
+@pytest.mark.asyncio
+async def test_unparsed_inline_markup_is_stripped_before_returning(monkeypatch):
+    """An unknown/malformed inline call the loop cannot run must not leak."""
+    async def _fake_db_chat(db, messages, **kw):
+        return {"ok": True,
+                "content": "Done, Sir. <tool_call>mystery_tool<arg_key>x</arg_key><arg_value>1</arg_value></tool_call>",
+                "tools_supported": True,
+                "message": {"role": "assistant", "content": "..."},
+                "tool_calls": []}
+
+    monkeypatch.setattr(ai_router, "db_chat", _fake_db_chat)
+    out = await ai_router.chat_with_tools(_FakeDB(), [{"role": "user", "content": "hi"}])
+    assert out["content"] == "Done, Sir."
+    assert "<tool_call>" not in out["content"]

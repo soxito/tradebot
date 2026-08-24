@@ -103,10 +103,69 @@ def is_forex_pair(symbol: str) -> bool:
     return _parse_pair(symbol) is not None
 
 
+# ── Swissquote live feed (primary source) ───────────────────────────────────
+# Public, no-key BBO feed used by the Swissquote trading platform. Returns real
+# broker bid/ask per liquidity profile, so it is the true tradeable forex price
+# (the currency-api CDN below is only a once-a-day fallback reference rate).
+_SWISSQUOTE_URL = (
+    "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/{base}/{quote}"
+)
+_sq_cache: dict[str, tuple[datetime, float]] = {}
+_SQ_TTL = timedelta(seconds=5)
+
+
+async def _fetch_swissquote(base: str, quote: str) -> float | None:
+    """Return the Swissquote mid price for base/quote, or None."""
+    key = f"{base}{quote}"
+    now = now_utc_naive()
+    cached = _sq_cache.get(key)
+    if cached and (now - cached[0]) < _SQ_TTL:
+        return cached[1]
+
+    url = _SWISSQUOTE_URL.format(base=base, quote=quote)
+    try:
+        import aiohttp
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json(content_type=None)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Swissquote fetch {}/{} failed: {}", base, quote, exc)
+        return None
+
+    if not isinstance(data, list):
+        return None
+
+    # Prefer the tightest ("Prime"/"Elite") profile, else the first with a price.
+    best_bid = best_ask = None
+    priority = {"elite": 0, "prime": 1, "premium": 2, "standard": 3}
+    best_rank = 99
+    for platform in data:
+        for sp in platform.get("spreadProfilePrices", []) or []:
+            bid = sp.get("bid")
+            ask = sp.get("ask")
+            if not bid or not ask:
+                continue
+            rank = priority.get(str(sp.get("spreadProfile", "")).lower(), 5)
+            if rank < best_rank:
+                best_rank = rank
+                best_bid, best_ask = float(bid), float(ask)
+
+    if best_bid is None or best_ask is None:
+        return None
+
+    mid = round((best_bid + best_ask) / 2.0, 8)
+    _sq_cache[key] = (now, mid)
+    return mid
+
+
 async def get_forex_price(symbol: str) -> float | None:
     """Return the current mid-price for *symbol* (e.g. 'EURUSD', 'XAUUSD', 'GBPJPY').
 
-    Returns None when the price cannot be determined.
+    Order of sources: Swissquote live BBO feed (real tradeable price) → the free
+    currency-api reference rate. Returns None when neither can price it.
     """
     parsed = _parse_pair(symbol)
     if parsed is None:
@@ -114,6 +173,12 @@ async def get_forex_price(symbol: str) -> float | None:
 
     base, quote = parsed
 
+    # 1) Swissquote — the actual live forex price (per the user's requirement).
+    sq = await _fetch_swissquote(base, quote)
+    if sq is not None and sq > 0:
+        return sq
+
+    # 2) Fallback: free daily reference rates.
     try:
         rates = await _fetch_rates()
         if not rates:

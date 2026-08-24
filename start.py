@@ -154,6 +154,30 @@ AGENTMEMORY_PORT   = int(os.environ.get("AGENTMEMORY_PORT", "8900"))   # shared 
 OPENWA_API_PORT    = int(os.environ.get("OPENWA_API_PORT", "2785"))
 OPENWA_DASHBOARD_PORT = int(os.environ.get("OPENWA_DASHBOARD_PORT", "2886"))
 OPENWA_API_URL     = f"http://localhost:{OPENWA_API_PORT}"
+
+
+# ── Sidecar registry ──────────────────────────────────────────────────────────
+# The single source of truth for every long-lived process this launcher spawns.
+# `--stop` reaps them by port-owner (verifying `markers` are in the cmdline so a
+# reused port can't get an unrelated process killed). `tool=True` sidecars
+# (Headroom, Obsidian) are preserved by `--stop --keep-tools`. DB services
+# (Postgres/Redis) are intentionally NOT here — they are shared and only swept
+# by `--stop --hard`.
+RUN_DIR = (ROOT / ".tradebot" / "run")
+
+# key, label, port, kind (process|docker|app), tool, markers (cmdline substrings)
+SIDECARS: List[Dict[str, object]] = [
+    {"key": "headroom",      "label": "Headroom proxy",     "port": HEADROOM_PORT,           "kind": "process", "tool": True,  "markers": ["headroom"]},
+    {"key": "obsidian",      "label": "Obsidian app",       "port": None,                    "kind": "app",     "tool": True,  "markers": ["obsidian"]},
+    {"key": "speech_engine", "label": "Speech engine",      "port": SPEECH_ENGINE_PORT,      "kind": "process", "tool": False, "markers": ["speech_engine"]},
+    {"key": "vibe_trading",  "label": "Vibe-Trading sidecar","port": VIBE_TRADING_SERVE_PORT, "kind": "process", "tool": False, "markers": ["vibe-trading", "vibe_trading"]},
+    {"key": "agentmemory",   "label": "agentmemory server", "port": AGENTMEMORY_PORT,        "kind": "process", "tool": False, "markers": ["agentmemory"]},
+    {"key": "openmanus",     "label": "OpenManus MCP",      "port": OPENMANUS_MCP_PORT,      "kind": "process", "tool": False, "markers": ["run_mcp", "openmanus", "app.mcp"]},
+    {"key": "openwa",        "label": "OpenWA gateway",     "port": OPENWA_API_PORT,         "kind": "docker",  "tool": False, "markers": ["wa-automate", "open-wa", "openwa"], "container": "openwa-gateway"},
+    {"key": "mt5rest",       "label": "MT5 REST (mtapi-io)","port": None,                    "kind": "docker",  "tool": False, "markers": [], "container": "mt5rest"},
+    {"key": "backend",       "label": "FastAPI backend",    "port": BACKEND_PORT,            "kind": "process", "tool": False, "markers": ["uvicorn", "app.main:app"]},
+    {"key": "frontend",      "label": "Next.js frontend",   "port": FRONTEND_PORT,           "kind": "process", "tool": False, "markers": ["next", "node"]},
+]
 OPENWA_DASHBOARD_URL = f"http://localhost:{OPENWA_DASHBOARD_PORT}"
 
 # ── MT5 REST config (read from .env if present, else defaults) ────────────────
@@ -406,6 +430,17 @@ def _compute_settings(physical: int, logical: int, ram_gb: float) -> Dict[str, o
     else:
         heartbeat_tick_s = 180   # 3 min — more responsive on powerful machines
 
+    # ── Local speech-engine (MLX Parakeet-TDT STT + Qwen3-TTS) capability ──────
+    # The local Jarvis voice models are multi-GB (~6 GB resident) and take
+    # seconds-to-minutes per utterance on CPU/MPS — on a 16 GB machine they get
+    # swapped out and thrash the box. Require 32 GB+ so only workstations run the
+    # LOCAL engine; every other machine uses NVIDIA hosted speech (then OpenAI)
+    # and never touches the local models. Force with TRADEBOT_FORCE_SPEECH_ENGINE=1.
+    # detect_resources() further narrows this to Apple-Silicon / CUDA hosts.
+    speech_engine_local = (
+        ui_tier in ("high", "ultra") and ram_gb >= 32 and physical >= 8
+    )
+
     return {
         "logical": logical,
         "physical": physical,
@@ -420,6 +455,7 @@ def _compute_settings(physical: int, logical: int, ram_gb: float) -> Dict[str, o
         "redis_maxmemory_mb": redis_maxmemory_mb,
         "enable_charts": enable_charts,
         "heartbeat_tick_s": heartbeat_tick_s,
+        "speech_engine_local": speech_engine_local,
     }
 
 
@@ -450,6 +486,7 @@ def _apply_profile_override(settings: Dict[str, object]) -> Dict[str, object]:
             "ml_threads": 1, "node_heap_mb": 512, "db_pool_size": 2,
             "backend_workers": 1, "redis_maxmemory_mb": 64,
             "enable_charts": False, "heartbeat_tick_s": 900,
+            "speech_engine_local": False,
         }
     elif profile == "low":
         overrides = {
@@ -459,6 +496,7 @@ def _apply_profile_override(settings: Dict[str, object]) -> Dict[str, object]:
             "db_pool_size": 2, "backend_workers": 1,
             "redis_maxmemory_mb": 128, "enable_charts": False,
             "heartbeat_tick_s": 600,
+            "speech_engine_local": False,
         }
     elif profile == "medium":
         overrides = {
@@ -468,6 +506,7 @@ def _apply_profile_override(settings: Dict[str, object]) -> Dict[str, object]:
             "db_pool_size": 6, "backend_workers": min(2, int(settings["backend_workers"])),
             "redis_maxmemory_mb": 256, "enable_charts": True,
             "heartbeat_tick_s": 300,
+            "speech_engine_local": False,
         }
     elif profile == "high":
         overrides = {
@@ -497,7 +536,38 @@ def detect_resources() -> Dict[str, object]:
     physical = _physical_cores(logical)
     ram_gb   = _total_ram_bytes() / (1024 ** 3)
     settings = _compute_settings(physical, logical, ram_gb)
+    # The local speech engine's MLX backend only accelerates on Apple Silicon;
+    # an NVIDIA CUDA GPU is the other supported path. On x86 without CUDA the
+    # models run pure-CPU and are unusably slow, so require one of those
+    # accelerators on top of the tier/RAM gate from _compute_settings.
+    # TRADEBOT_FORCE_SPEECH_ENGINE=1 bypasses the whole gate for power users.
+    force = os.environ.get("TRADEBOT_FORCE_SPEECH_ENGINE", "").strip().lower() in ("1", "true", "yes", "on")
+    settings["speech_engine_local"] = force or (
+        bool(settings.get("speech_engine_local")) and _speech_accelerator_available()
+    )
     return _apply_profile_override(settings)
+
+
+def _speech_accelerator_available() -> bool:
+    """True only on hosts where the local speech models actually accelerate.
+
+    Apple Silicon (arm64 macOS → MLX/Metal) or a machine with an NVIDIA CUDA
+    GPU. Everything else runs the Parakeet-TDT/Qwen3-TTS models on CPU, which
+    is far too slow to be usable, so we treat it as incompatible and stay on
+    NVIDIA hosted speech.
+    """
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    if system == "darwin" and machine in ("arm64", "aarch64"):
+        return True
+    if shutil.which("nvidia-smi"):
+        try:
+            r = run(["nvidia-smi", "-L"])
+            if r.returncode == 0 and "GPU" in (r.stdout or ""):
+                return True
+        except Exception:
+            pass
+    return False
 
 
 def get_resources() -> Dict[str, object]:
@@ -518,6 +588,11 @@ def print_resources() -> None:
         info("Low-power GPU profile: 3D/WebGL effects disabled (robot · orb · 3D graph)")
     if not r.get("enable_charts"):
         info("Chart live-feeds disabled on this tier (enable with TRADEBOT_PROFILE=medium+)")
+    if r.get("speech_engine_local"):
+        ok("Local Jarvis speech engine ENABLED (capable hardware) — MLX Parakeet-TDT + Qwen3-TTS")
+    else:
+        info("Local Jarvis speech engine DISABLED on this hardware — using NVIDIA hosted "
+             "speech (force with TRADEBOT_FORCE_SPEECH_ENGINE=1)")
 
 
 def simulate_pc_models() -> None:
@@ -739,6 +814,65 @@ def _kill_pid_tree(pid: int) -> bool:
         return True
     except (OSError, subprocess.SubprocessError):
         return False
+
+
+def _port_pids(port: Optional[int]) -> List[int]:
+    """PIDs listening on `port` (cross-platform)."""
+    if not port:
+        return []
+    try:
+        if IS_WINDOWS:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"(Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue)"
+                 f".OwningProcess"],
+                capture_output=True, text=True, timeout=8,
+            )
+        else:
+            r = subprocess.run(["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
+                               capture_output=True, text=True, timeout=8)
+        return sorted({int(x) for x in r.stdout.split() if x.strip().isdigit()})
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+
+def _proc_cmdline(pid: int) -> str:
+    """Best-effort command line of a pid (for kill verification)."""
+    try:
+        if IS_WINDOWS:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f'(Get-CimInstance Win32_Process -Filter "ProcessId={pid}").CommandLine'],
+                capture_output=True, text=True, timeout=8,
+            )
+        else:
+            r = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                               capture_output=True, text=True, timeout=8)
+        return (r.stdout or "").strip().lower()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _reap_sidecar(sc: Dict[str, object]) -> List[int]:
+    """Kill the process tree owning a sidecar's port, verifying cmdline markers
+    so a reused port can never get an unrelated process killed."""
+    markers = [str(m).lower() for m in (sc.get("markers") or [])]
+    killed: List[int] = []
+    for pid in _port_pids(sc.get("port")):  # type: ignore[arg-type]
+        cmd = _proc_cmdline(pid)
+        if markers and cmd and not any(m in cmd for m in markers):
+            continue  # port reused by something else — leave it alone
+        if _kill_pid_tree(pid):
+            killed.append(pid)
+    return killed
+
+
+def _sweep_ports(ports: List[int]) -> None:
+    """Unconditionally free every listed port (used by --hard)."""
+    for port in ports:
+        for pid in _port_pids(port):
+            if _kill_pid_tree(pid):
+                info(f"  swept :{port} (pid {pid})")
 
 
 def _npm_cmd() -> str:
@@ -3577,6 +3711,25 @@ def ensure_speech_engine() -> bool:
         warn("Speech engine setup skipped (TRADEBOT_SKIP_SPEECH_ENGINE_SETUP set) — OpenAI fallback stays active")
         return True
 
+    # ── Hardware compatibility gate ────────────────────────────────────────────
+    # The local engine's MLX voice models are multi-GB and take seconds-to-minutes
+    # per utterance on weak CPU/MPS — they freeze low-tier machines. If the host
+    # isn't capable (or a low/medium performance profile is active), NEVER run the
+    # local models: force SPEECH_ENGINE_ENABLED=false so voice.py uses NVIDIA
+    # hosted speech (Parakeet ASR + Magpie TTS), then OpenAI — and skip the venv
+    # build, the multi-GB model download, and the sidecar entirely.
+    # Override with TRADEBOT_FORCE_SPEECH_ENGINE=1.
+    caps = get_resources()
+    if not caps.get("speech_engine_local"):
+        if _speech_engine_configured() and _write_env_var("SPEECH_ENGINE_ENABLED", "false"):
+            _DOTENV["SPEECH_ENGINE_ENABLED"] = "false"
+            ok(".env ← SPEECH_ENGINE_ENABLED=false (local speech disabled for this hardware)")
+        info(f"Local speech engine disabled on this hardware "
+             f"(tier={str(caps.get('ui_tier')).upper()}, RAM={caps.get('ram_gb')}GB, "
+             f"{caps.get('physical')} cores) — using NVIDIA hosted speech (Parakeet ASR "
+             f"+ Magpie TTS), OpenAI fallback. Force-enable with TRADEBOT_FORCE_SPEECH_ENGINE=1.")
+        return True
+
     if not SPEECH_ENGINE_DIR.exists():
         warn("speech_engine/ not found — skipping local speech engine setup")
         return True
@@ -4303,6 +4456,18 @@ def start_backend(pg_port: int, redis_port: int, mode: str) -> bool:
     env.setdefault("TRADEBOT_DB_POOL_SIZE",    str(_res["db_pool_size"]))
     env.setdefault("TRADEBOT_POLL_MULTIPLIER", str(_res["poll_multiplier"]))
     env.setdefault("TRADEBOT_ENABLE_CHARTS",   "1" if _res["enable_charts"] else "0")
+
+    # ── Resource-tier contract (backend config.apply_resource_tier reads these) ──
+    # The launcher and the backend must agree on the tier so loop intervals,
+    # autostart flags and concurrency caps all scale together. .env / shell still
+    # win via setdefault, and TRADEBOT_PROFILE (if the user pinned one) is passed
+    # through so both sides resolve the identical tier.
+    env.setdefault("TRADEBOT_TIER", str(_res["ui_tier"]))
+    _tier_profile = os.environ.get("TRADEBOT_PROFILE", "").strip()
+    if _tier_profile:
+        env.setdefault("TRADEBOT_PROFILE", _tier_profile)
+    env.setdefault("TRADEBOT_RAM_GB", str(_res["ram_gb"]))
+    env.setdefault("TRADEBOT_PHYSICAL_CORES", str(_res["physical"]))
     # Override Agent Paul heartbeat tick only if user hasn't pinned it already.
     env.setdefault("PAUL_HEARTBEAT_TICK_SECONDS", str(_res["heartbeat_tick_s"]))
 
@@ -4325,22 +4490,26 @@ def start_backend(pg_port: int, redis_port: int, mode: str) -> bool:
         except Exception:
             pass  # Redis may not be up yet; the cap will be applied on reconnect
 
-    # --reload: disabled on Windows (watchfiles reloader is incompatible with
-    # the SelectorEventLoop policy we set for asyncpg, causes a second crash
-    # on the watchfiles process), on ≤2-core machines (CPU starvation), and
-    # in production.  Override with TRADEBOT_RELOAD=1 to force it on.
+    # --reload defaults OFF now: every plugin file save re-imported torch/MLX/
+    # pandas and orphaned the MT5 auto_manage OS thread. Force it on with
+    # TRADEBOT_RELOAD=1. Still forced off on Windows (watchfiles + SelectorEventLoop
+    # crash) even if requested.
     _reload_override = os.environ.get("TRADEBOT_RELOAD")
-    if _reload_override is not None:
-        use_reload = _reload_override.strip().lower() in ("1", "true", "yes", "on")
-    elif IS_WINDOWS:
+    use_reload = (_reload_override or "").strip().lower() in ("1", "true", "yes", "on")
+    if IS_WINDOWS:
         use_reload = False          # watchfiles + SelectorEventLoop = crash
-    else:
-        use_reload = int(_res["physical"]) > 2
 
-    # Multi-worker mode: only available without --reload (workers fork, reloader
-    # doesn't work with multiple workers). Workers > 1 also only helps on machines
-    # with enough cores and RAM (enforced inside _compute_settings).
-    _workers = int(_res["backend_workers"])
+    # Pin to a single worker. Every background loop in this app is an in-process
+    # singleton — multiple workers would give N signal monitors, N Telegram bot
+    # polling loops (duplicate replies), N schedulers, and N processes contending
+    # on the single SQLite Telethon session, and multiply RSS on the very machine
+    # we're trying to unswap. Override only for API-only deployments where the
+    # loops run in the dedicated workers process.
+    _workers_override = os.environ.get("TRADEBOT_BACKEND_WORKERS", "").strip()
+    if _workers_override.isdigit() and int(_workers_override) > 0:
+        _workers = int(_workers_override)
+    else:
+        _workers = 1
     if use_reload:
         _workers = 1   # --reload + --workers > 1 is unsupported by uvicorn
 
@@ -4349,18 +4518,27 @@ def start_backend(pg_port: int, redis_port: int, mode: str) -> bool:
                    "--loop", "asyncio"]   # explicit: prevents uvloop probe crash on Win
     if _workers > 1:
         uvicorn_cmd += ["--workers", str(_workers)]
-        info(f"Backend workers: {_workers}  (tier {str(_res['ui_tier']).upper()}, {_res['ram_gb']} GB RAM)")
+        info(f"Backend workers: {_workers}  (TRADEBOT_BACKEND_WORKERS override — loops must run in the workers process)")
     if use_reload:
-        uvicorn_cmd += ["--reload",
-                        "--reload-dir", str(BACKEND_DIR / "app"),
-                        "--reload-dir", str(ROOT / "plugins")]
+        # Watch only app/ — watching plugins/ re-imported torch/MLX on every
+        # plugin save and orphaned the MT5 auto_manage OS thread.
+        uvicorn_cmd += ["--reload", "--reload-dir", str(BACKEND_DIR / "app")]
     else:
-        reason = "Windows (incompatible with SelectorEventLoop)" if IS_WINDOWS else "low-core machine"
-        info(f"Reload disabled ({reason}) — set TRADEBOT_RELOAD=1 to force")
+        info("Reload disabled (default) — set TRADEBOT_RELOAD=1 to enable app/ hot-reload")
 
     # Windows: hide the console window that would otherwise flash open for the
-    # uvicorn child process (CREATE_NO_WINDOW = 0x08000000).
+    # uvicorn child process (CREATE_NO_WINDOW = 0x08000000), and give it its own
+    # process group so a Ctrl+C in this console doesn't propagate to it.
     _win_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0
+    if IS_WINDOWS:
+        _win_flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    # start_new_session=True → setsid() in the child (POSIX). Without it the
+    # backend stays in this launcher's process group and attached to the same
+    # controlling terminal, so closing the terminal window or pressing Ctrl+C
+    # SIGINTs the whole group and takes the backend down with it — which reads
+    # as a mystery "backend keeps stopping" with a clean shutdown in the log.
+    # `stop` still reaps it: stop_all() matches on pgrep + backend.pid, not on
+    # parentage.
     with open(log_file, "w") as lf:
         proc = subprocess.Popen(
             uvicorn_cmd,
@@ -4369,6 +4547,7 @@ def start_backend(pg_port: int, redis_port: int, mode: str) -> bool:
             stdout=lf,
             stderr=subprocess.STDOUT,
             creationflags=_win_flags,
+            start_new_session=not IS_WINDOWS,
         )
 
     # Write PID
@@ -4381,7 +4560,9 @@ def start_backend(pg_port: int, redis_port: int, mode: str) -> bool:
     if wait_for_port(_check_host, BACKEND_PORT, "FastAPI backend", max_wait=60):
         # Extra: hit /health or /api/v1 to confirm it responds
         time.sleep(1)
-        if http_ok(f"http://{_check_host}:{BACKEND_PORT}/api/v1/health", timeout=5):
+        # /health is registered at the app root (main.py), not under /api/v1 —
+        # probing /api/v1/health always 404s and reports a false "not ready".
+        if http_ok(f"http://{_check_host}:{BACKEND_PORT}/health", timeout=5):
             ok("Backend /health endpoint OK")
         else:
             warn("Backend port open but /health not ready yet (still loading plugins)")
@@ -4471,15 +4652,15 @@ def start_frontend() -> bool:
 
 
 # ── Stop ──────────────────────────────────────────────────────────────────────
-def stop_all() -> None:
+def stop_all(keep_tools: bool = False, hard: bool = False) -> None:
     header("Stopping TradeBot services")
+
+    # ── backend / frontend via pgrep + PID files ──────────────────────────────
     for pattern in ["uvicorn app.main:app", "next dev"]:
         pids = pgrep(pattern)
         if pids:
             pkill(pattern)
             info(f"Stopped: {pattern} (pids {pids})")
-        else:
-            warn(f"Not running: {pattern}")
 
     # PID-file fallback — REQUIRED on Windows where pgrep/pkill are no-ops, and
     # a safety net elsewhere. start_backend/start_frontend write these files.
@@ -4496,12 +4677,40 @@ def stop_all() -> None:
             info(f"Stopped {label} via PID file (pid {pid})")
         pidfile.unlink(missing_ok=True)
 
-    # MT5 REST container
-    if _docker_available() and _container_running(MT5_CONTAINER):
-        subprocess.run(["docker", "stop", MT5_CONTAINER], capture_output=True, timeout=15)
-        info(f"Stopped Docker container: {MT5_CONTAINER}")
-    # Intentionally do NOT stop Headroom/Obsidian here to preserve continuous context tooling.
-    # Their data and processes are managed independently and are never deleted by this script.
+    # ── Sidecar registry reap ─────────────────────────────────────────────────
+    # Every long-lived process this launcher spawns, reaped by port-owner with
+    # cmdline verification so a reused port can't kill an unrelated process.
+    for sc in SIDECARS:
+        key = str(sc["key"])
+        if key in ("backend", "frontend"):
+            continue  # already handled above
+        if sc.get("tool") and keep_tools:
+            info(f"Preserving tool sidecar: {sc['label']}")
+            continue
+        kind = sc.get("kind")
+        if kind == "docker":
+            container = str(sc.get("container") or "")
+            if container and _docker_available() and _container_running(container):
+                subprocess.run(["docker", "stop", container], capture_output=True, timeout=15)
+                info(f"Stopped Docker container: {container} ({sc['label']})")
+            continue
+        if kind == "app":
+            continue  # never kill the user's Obsidian app
+        killed = _reap_sidecar(sc)
+        if killed:
+            info(f"Stopped {sc['label']} (pids {killed})")
+
+    # ── Hard sweep: also free every known port (incl. shared DB services) ─────
+    if hard:
+        warn("--hard: sweeping all known ports")
+        _sweep_ports([
+            HEADROOM_PORT, SPEECH_ENGINE_PORT, VIBE_TRADING_SERVE_PORT,
+            AGENTMEMORY_PORT, OPENMANUS_MCP_PORT, OPENWA_API_PORT,
+            OPENWA_DASHBOARD_PORT, BACKEND_PORT, FRONTEND_PORT,
+        ])
+
+    if keep_tools:
+        info("Headroom + Obsidian preserved (--keep-tools)")
     ok("Done")
 
 
@@ -4517,6 +4726,11 @@ def status() -> None:
         ("MT5 REST (mtapi-io)", "localhost", _mt5_port()),
         ("FastAPI backend", "localhost", BACKEND_PORT),
         ("Next.js frontend", "localhost", FRONTEND_PORT),
+        ("Speech engine", "localhost", SPEECH_ENGINE_PORT),
+        ("Vibe-Trading sidecar", "localhost", VIBE_TRADING_SERVE_PORT),
+        ("agentmemory server", "localhost", AGENTMEMORY_PORT),
+        ("OpenManus MCP", "localhost", OPENMANUS_MCP_PORT),
+        ("OpenWA gateway", "localhost", OPENWA_API_PORT),
     ]
     for label, host, port in checks:
         running = port_open(host, port, 0.5)
@@ -4527,6 +4741,14 @@ def status() -> None:
     obs_symbol = f"{C.GREEN}●{C.RESET}" if obsidian_open else f"{C.YELLOW}○{C.RESET}"
     obs_state = "running" if obsidian_open else "not running"
     print(f"  {obs_symbol}  {'Obsidian app':<26}  {'-':>5}  {obs_state}")
+
+    # Telegram monitor / connection state (best-effort; backend must be up).
+    tg = http_json(f"http://127.0.0.1:{BACKEND_PORT}/api/v1/plugins/telegram/monitor/status", timeout=3)
+    if tg is not None:
+        running = bool(tg.get("running"))
+        sym = f"{C.GREEN}●{C.RESET}" if running else f"{C.YELLOW}○{C.RESET}"
+        print(f"  {sym}  {'Telegram monitor':<26}  {'-':>5}  {'running' if running else 'stopped'}")
+
 
 
 # ── Summary table ─────────────────────────────────────────────────────────────
@@ -4664,19 +4886,47 @@ def print_summary(results: Dict[str, bool], mode: str, pg_port: int, redis_port:
         sys.exit(1)
 
 
+# ── Optional sidecar gating ───────────────────────────────────────────────────
+# Heavy optional sidecars swap badly on <32GB machines. Default them off below
+# that floor; allow explicit per-sidecar override via TRADEBOT_ENABLE_<KEY>.
+_SIDECAR_MIN_RAM_GB = 32
+
+
+def sidecar_enabled(key: str) -> bool:
+    """Return True if the optional sidecar identified by `key` should launch.
+
+    Precedence: explicit env override (TRADEBOT_ENABLE_<KEY>) wins; otherwise
+    enabled only when the host has at least _SIDECAR_MIN_RAM_GB of RAM.
+    """
+    raw = os.environ.get(f"TRADEBOT_ENABLE_{key.upper()}", "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    try:
+        ram = float(get_resources().get("ram_gb", 0) or 0)
+    except Exception:
+        ram = 0.0
+    return ram >= _SIDECAR_MIN_RAM_GB
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     parser = argparse.ArgumentParser(description="TradeBot startup script")
     parser.add_argument("--brew",     action="store_true", help="Use Homebrew postgres/redis")
     parser.add_argument("--docker",   action="store_true", help="Use Docker postgres/redis")
     parser.add_argument("--stop",     action="store_true", help="Stop all services")
+    parser.add_argument("--keep-tools", action="store_true",
+                        help="With --stop: preserve Headroom + Obsidian")
+    parser.add_argument("--hard",     action="store_true",
+                        help="With --stop: also sweep every known port (incl. DB services)")
     parser.add_argument("--status",   action="store_true", help="Show service status")
     parser.add_argument("--simulate", action="store_true",
                         help="Show resource settings for all PC model classes and exit")
     args = parser.parse_args()
 
     if args.stop:
-        stop_all()
+        stop_all(keep_tools=args.keep_tools, hard=args.hard)
         return
 
     if args.status:
@@ -4756,10 +5006,14 @@ def main() -> None:
 
     # ── 2b. OpenWA Gateway (WhatsApp) ────────────────────────────────────────────
     header("2b/6  OpenWA Gateway (WhatsApp)")
-    openwa_ok, _ = start_openwa_gateway()
-    results["OpenWA Gateway"] = openwa_ok
-    if not openwa_ok:
-        warn("OpenWA Gateway failed to start — WhatsApp features will be unavailable")
+    if sidecar_enabled("openwa"):
+        openwa_ok, _ = start_openwa_gateway()
+        results["OpenWA Gateway"] = openwa_ok
+        if not openwa_ok:
+            warn("OpenWA Gateway failed to start — WhatsApp features will be unavailable")
+    else:
+        info(f"OpenWA Gateway skipped (host RAM < {_SIDECAR_MIN_RAM_GB}GB; "
+             "set TRADEBOT_ENABLE_OPENWA=1 to force)")
 
     # ── 3. Python environment ─────────────────────────────────────────────────
     header("3/6  Python environment")
@@ -4780,12 +5034,20 @@ def main() -> None:
     # Vibe-Trading AI — install vibe-trading-ai into backend venv (one-time).
     # Sidecar auto-starts lazily on first API request to /plugins/vibe-trading/*.
     # Best-effort: never blocks startup.
-    ensure_vibe_trading()
+    if sidecar_enabled("vibe_trading"):
+        ensure_vibe_trading()
+    else:
+        info(f"Vibe-Trading skipped (host RAM < {_SIDECAR_MIN_RAM_GB}GB; "
+             "set TRADEBOT_ENABLE_VIBE_TRADING=1 to force)")
 
     # OpenHuman brain — install agentmemory shared-memory backend (one-time).
     # The OpenHuman desktop app is a separate install (see hint printed below).
     # Best-effort: never blocks startup.
-    ensure_openhuman_deps()
+    if sidecar_enabled("openhuman"):
+        ensure_openhuman_deps()
+    else:
+        info(f"OpenHuman deps skipped (host RAM < {_SIDECAR_MIN_RAM_GB}GB; "
+             "set TRADEBOT_ENABLE_OPENHUMAN=1 to force)")
 
     # Local speech engine — check if configured (venv + .env), configure it if
     # not, then start the STT/TTS sidecar. Best-effort: never blocks startup
@@ -4796,7 +5058,11 @@ def main() -> None:
     # and start run_mcp.py as a background daemon so all AI provider calls route
     # through OpenManus first (with AiMarketAnalyst fallback on failure).
     # Best-effort: never blocks startup.
-    ensure_openmanus()
+    if sidecar_enabled("openmanus"):
+        ensure_openmanus()
+    else:
+        info(f"OpenManus skipped (host RAM < {_SIDECAR_MIN_RAM_GB}GB; "
+             "set TRADEBOT_ENABLE_OPENMANUS=1 to force)")
 
     # ── 4. Backend ────────────────────────────────────────────────────────────
     header("4/6  FastAPI backend")

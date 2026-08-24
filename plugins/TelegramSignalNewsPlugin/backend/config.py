@@ -59,6 +59,13 @@ class TelegramPluginConfig:
     llm_timeout_seconds: int = _as_int("TELEGRAM_PLUGIN_LLM_TIMEOUT_SECONDS", 20)
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
 
+    # Image understanding (photos sent to the bot). Which model reads the image
+    # is no longer set here — ai_router.TASK_MODEL_CHAINS["vision_analysis"]
+    # owns that, so the bot, Paul chat and the extension all use one chain.
+    vision_enabled: bool = _as_bool("TELEGRAM_VISION_ENABLED", True)
+    vision_max_image_bytes: int = _as_int("TELEGRAM_VISION_MAX_IMAGE_BYTES", 8 * 1024 * 1024)
+    vision_timeout_seconds: int = _as_int("TELEGRAM_VISION_TIMEOUT_SECONDS", 60)
+
 
 telegram_plugin_config = TelegramPluginConfig()
 

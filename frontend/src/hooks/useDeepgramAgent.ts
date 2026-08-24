@@ -85,6 +85,8 @@ export interface VoiceTurnOptions {
   getReferenceLevel?: () => number;
   /** True when the current mic frame has been classified as our own echo. */
   isSelfEcho?: () => boolean;
+  /** True when the current mic frame matches the calibrated user (accept-all when voice-match is off). Gates barge-in so JARVIS's own echo can never interrupt him. */
+  isUserVoice?: () => boolean;
   /** Confirmed user speech during SPEAKING/THINKING — after cancellation. */
   onBargeIn?: (reason: BargeInReason) => void;
   /** Every state transition (for visuals / logging). */
@@ -130,16 +132,18 @@ export interface UseVoiceTurnReturn {
 const TURN_DEFAULTS = {
   listenGate: 0.030,
   speakingGate: 0.085,
-  bargeInFrames: 4,
+  bargeInFrames: 5,
   listenFrames: 2,
   frameMs: 40,
-  graceMs: 280,
-  refSuppress: 0.35,
+  graceMs: 400,
+  refSuppress: 0.55,
   thinkingTimeoutMs: 45_000,
 };
 
-// Ceiling on the reference-derived part of the speaking gate (RMS).
-const REF_SUPPRESS_MAX = 0.05;
+// Ceiling on the reference-derived part of the speaking gate (RMS). Raised so a
+// loud reply lifts the gate well above post-AEC residual echo — the user talking
+// over JARVIS still clears it, but his own trailing echo never does.
+const REF_SUPPRESS_MAX = 0.12;
 
 // A frame is "quiet" enough to teach the noise floor when it sits below this
 // multiple of the current floor; the floor then sets a relative gate so the
@@ -282,7 +286,13 @@ export function useVoiceTurn(options: VoiceTurnOptions = {}): UseVoiceTurnReturn
     if (speaking) {
       const needed = Math.max(1, Math.round(cfg('bargeInFrames')));
       const grace = Date.now() - speakStartRef.current < cfg('graceMs');
-      if (!grace && voicedRef.current >= needed) {
+      // A barge-in must be the calibrated user, never JARVIS's own residual
+      // echo — otherwise a loud passage of his own voice cancels the turn and he
+      // stops talking mid-sentence. When voice-match is off this returns true,
+      // preserving the echo-gate-only behaviour.
+      let isUser = true;
+      try { isUser = optsRef.current.isUserVoice?.() ?? true; } catch { isUser = true; }
+      if (!grace && isUser && voicedRef.current >= needed) {
         bargeIn('voice');
         return;
       }

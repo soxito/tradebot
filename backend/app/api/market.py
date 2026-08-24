@@ -386,3 +386,214 @@ async def market_history(days: int = Query(default=30, ge=1, le=90)):
 
     _cache_set(cache_key, records)
     return records
+
+
+@router.get("/fib-overlay/{exchange}/{symbol}")
+async def fib_overlay(
+    exchange: str,
+    symbol: str,
+    timeframe: str = Query(default="1h"),
+    limit: int = Query(default=300, ge=20, le=1000),
+):
+    """Auto fib retracement levels as chart overlay series.
+
+    Shaped as ``IndicatorOverlaySeries`` so it drops straight into
+    TradingViewChart alongside the Kronos forecast overlay.
+    """
+    from app.exchanges.manager import SupportedExchange, exchange_manager
+    from app.signals.technical import (
+        auto_fib_retracement,
+        fib_confluence_score,
+        ohlcv_to_dataframe,
+    )
+
+    empty = {"symbol": symbol, "timeframe": timeframe, "overlays": [], "markers": [], "signal": None}
+
+    try:
+        connector = exchange_manager.get_exchange(SupportedExchange(exchange.lower()))
+        if not connector:
+            return empty
+        ohlcv = await connector.get_ohlcv(symbol=symbol, timeframe=timeframe, limit=limit)
+        if not ohlcv or len(ohlcv) < 20:
+            return empty
+
+        df = ohlcv_to_dataframe(ohlcv)
+        fib = auto_fib_retracement(df)
+        swing = fib.get("swing")
+        if not swing:
+            return empty
+
+        close = float(df["close"].iloc[-1])
+        zone = fib.get("golden_zone") or {}
+        conf = fib_confluence_score(close, fib, swing["direction"])
+        golden = {0.5, 0.618}
+
+        overlays = [
+            {
+                "name": f"Fib {ln['ratio'] * 100:.1f}%",
+                "type": "line",
+                "pane": "main",
+                "color": ln["color"],
+                "lineWidth": 2 if ln["ratio"] in golden else 1,
+                "data": ln["data"],
+            }
+            for ln in fib.get("lines", []) if ln.get("data")
+        ]
+        markers = [{
+            "time": swing["end_time"],
+            "position": "belowBar" if swing["direction"] == "up" else "aboveBar",
+            "color": "#26a69a" if swing["direction"] == "up" else "#ef5350",
+            "shape": "circle",
+            "text": f"Swing {swing['direction']}",
+        }]
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "overlays": overlays,
+            "markers": markers,
+            "signal": {
+                "direction": swing["direction"],
+                "confidence": round(conf, 4) if conf is not None else None,
+                "in_golden_zone": bool(zone and zone.get("low") <= close <= zone.get("high")),
+            },
+        }
+    except Exception as e:  # noqa: BLE001 - an overlay must never break the chart
+        logger.warning(f"[Market] fib overlay {exchange}/{symbol}: {e}")
+        return empty
+
+
+@router.get("/indicator-overlay/{exchange}/{symbol}")
+async def indicator_overlay(
+    exchange: str,
+    symbol: str,
+    timeframe: str = Query(default="1d"),
+    limit: int = Query(default=400, ge=30, le=1500),
+    indicators: str = Query(default="ema,rsi,macd", description="Comma set: ema, rsi, macd"),
+):
+    """Trend + momentum indicators as chart overlay series.
+
+    EMA 20/50/200 mark the trend on the price pane; RSI and MACD ride along
+    for momentum (main-pane fallback, the chart's own convention). Shaped as
+    ``IndicatorOverlaySeries`` so it drops straight into TradingViewChart.
+    """
+    from app.exchanges.manager import SupportedExchange, exchange_manager
+    from app.signals.technical import ema, macd, ohlcv_to_dataframe, rsi
+
+    empty = {"symbol": symbol, "timeframe": timeframe, "overlays": [], "markers": [], "signal": None}
+    wanted = {t.strip().lower() for t in (indicators or "").split(",") if t.strip()}
+
+    try:
+        connector = exchange_manager.get_exchange(SupportedExchange(exchange.lower()))
+        if not connector:
+            return empty
+        ohlcv = await connector.get_ohlcv(symbol=symbol, timeframe=timeframe, limit=limit)
+        if not ohlcv or len(ohlcv) < 30:
+            return empty
+
+        # Venues cap their own history (Bitget serves 90 dailies), which would
+        # leave the 200-day EMA — the trend line this endpoint exists for — as
+        # warm-up NaNs. On the daily, top up from the Yahoo provider, which
+        # carries ~10 years of BTC.
+        if len(ohlcv) < min(limit, 210) and (timeframe or "").upper() in {"1D", "D1"}:
+            try:
+                from app.exchanges import yahoo_provider
+
+                ybars = await yahoo_provider.fetch_candles(
+                    symbol, "D1", limit=max(limit, 400)
+                )
+                converted = [
+                    [int(b["time"]) * 1000, b.get("open"), b.get("high"),
+                     b.get("low"), b.get("close"), b.get("volume") or 0]
+                    for b in (ybars or []) if b.get("time") and b.get("close")
+                ]
+                if len(converted) > len(ohlcv):
+                    ohlcv = converted
+            except Exception as exc:  # noqa: BLE001 — venue bars still work
+                logger.debug(f"[Market] indicator overlay Yahoo top-up failed: {exc}")
+
+        df = ohlcv_to_dataframe(ohlcv)
+        times = [int(ts.timestamp()) for ts in df["timestamp"]]
+        closes = df["close"]
+
+        overlays = []
+
+        if "ema" in wanted or not wanted:
+            for period, color in ((20, "#f59e0b"), (50, "#38bdf8"), (200, "#a78bfa")):
+                if len(closes) < period:
+                    continue
+                vals = ema(closes, period)
+                overlays.append({
+                    "name": f"EMA {period}",
+                    "type": "line",
+                    "pane": "main",
+                    "color": color,
+                    "lineWidth": 2 if period == 200 else 1,
+                    "data": [
+                        {"time": t, "value": round(float(v), 8)}
+                        for t, v in zip(times, vals) if v == v  # drop warm-up NaNs
+                    ],
+                })
+
+        if "rsi" in wanted:
+            vals = rsi(df)
+            overlays.append({
+                "name": "RSI 14",
+                "type": "line",
+                "pane": "main",
+                "color": "#e879f9",
+                "lineWidth": 1,
+                "levels": [
+                    {"value": 70, "color": "rgba(239,68,68,0.5)", "label": "70"},
+                    {"value": 30, "color": "rgba(34,197,94,0.5)", "label": "30"},
+                ],
+                "data": [
+                    {"time": t, "value": round(float(v), 2)}
+                    for t, v in zip(times, vals) if v == v
+                ],
+            })
+
+        if "macd" in wanted:
+            m = macd(df)
+            overlays.append({
+                "name": "MACD 12-26-9",
+                "type": "histogram",
+                "pane": "main",
+                "color": "rgba(56,189,248,0.8)",
+                "histogram_data": [
+                    {"time": t, "value": round(float(v), 8),
+                     "color": "#22c55e" if v >= 0 else "#ef4444"}
+                    for t, v in zip(times, m["histogram"]) if v == v
+                ],
+                "signal_color": "#f59e0b",
+                "extra_lines": [
+                    {"name": "MACD", "color": "#38bdf8",
+                     "data": [{"time": t, "value": round(float(v), 8)}
+                              for t, v in zip(times, m["macd"]) if v == v]},
+                    {"name": "Signal", "color": "#f59e0b",
+                     "data": [{"time": t, "value": round(float(v), 8)}
+                              for t, v in zip(times, m["signal"]) if v == v]},
+                ],
+            })
+
+        last_rsi = next(
+            (float(v) for v in reversed(rsi(df)) if v == v), None
+        ) if "rsi" in wanted else None
+        ema50 = ema(closes, 50) if len(closes) >= 50 else None
+        ema200 = ema(closes, 200) if len(closes) >= 200 else None
+        trend = None
+        if ema50 is not None and ema200 is not None:
+            trend = "up" if float(ema50.iloc[-1]) > float(ema200.iloc[-1]) else "down"
+
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "overlays": overlays,
+            "markers": [],
+            "signal": {
+                "trend": trend,
+                "rsi": round(last_rsi, 1) if last_rsi is not None else None,
+            },
+        }
+    except Exception as e:  # noqa: BLE001 - an overlay must never break the chart
+        logger.warning(f"[Market] indicator overlay {exchange}/{symbol}: {e}")
+        return empty

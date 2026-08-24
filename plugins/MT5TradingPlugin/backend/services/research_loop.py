@@ -88,14 +88,22 @@ async def collect_calendar(symbols: Sequence[str]) -> List[agent_bus.ResearchFin
             title = str(ev.get("title") or ev.get("event") or "").strip()
             if not title:
                 continue
+            # Only the fields this event actually has. A released number is the
+            # point of the card once the event is behind us, and "at=None" was
+            # reading a key the calendar has never used — it is ``time_utc``.
+            parts = [f"impact={ev.get('impact')}"]
+            for field in ("forecast", "previous", "actual"):
+                if ev.get(field) not in (None, ""):
+                    parts.append(f"{field}={ev[field]}")
+            when = ev.get("time_utc") or ev.get("date") or ev.get("time")
+            if when:
+                parts.append(f"at={when} UTC")
+
             out.append(agent_bus.ResearchFindingMessage(
                 kind="calendar",
                 symbol=symbol,
                 headline=f"{ev.get('currency', '')} {title}".strip()[:400],
-                body=(
-                    f"impact={ev.get('impact')} forecast={ev.get('forecast')} "
-                    f"previous={ev.get('previous')} at={ev.get('date') or ev.get('time')}"
-                ),
+                body=" ".join(parts),
                 source="ForexFactory",
                 source_url=url,
                 confidence=SOURCE_CONFIDENCE["calendar"],
@@ -256,6 +264,40 @@ async def idle_provider_labels(db) -> List[str]:
 
 # ── Persistence + gating ─────────────────────────────────────────────────────
 
+async def _live_calendar_row(db, msg) -> Optional[ResearchFinding]:
+    """The undecayed row this calendar event was already stored as, if any.
+
+    Keyed on (symbol, headline) — currency plus title is what identifies a
+    release on the page, and a decayed row is history, not something to revise.
+
+    Any older copies are expired on the way past. One release is one card, so
+    earlier copies of it are superseded the moment a newer reading exists —
+    including the pile left by ticks that ran before this dedup existed.
+    """
+    try:
+        result = await db.execute(
+            select(ResearchFinding)
+            .where(
+                ResearchFinding.kind == "calendar",
+                ResearchFinding.symbol == msg.symbol,
+                ResearchFinding.headline == msg.headline[:400],
+                ResearchFinding.decay_at > datetime.utcnow(),
+            )
+            .order_by(ResearchFinding.created_at.desc())
+        )
+        rows = list(result.scalars().all())
+        if not rows:
+            return None
+        # Expire rather than delete: decay is how a finding leaves the page,
+        # and the row stays on disk as history until the usual cleanup.
+        for superseded in rows[1:]:
+            superseded.decay_at = datetime.utcnow()
+        return rows[0]
+    except Exception as exc:  # noqa: BLE001 — a duplicate beats a lost tick
+        logger.debug(f"[research] calendar dedup lookup skipped: {exc}")
+        return None
+
+
 async def store_findings(
     db, findings: Sequence[agent_bus.ResearchFindingMessage]
 ) -> List[int]:
@@ -265,6 +307,26 @@ async def store_findings(
         return stored
     try:
         for msg in findings:
+            # A calendar event is one fact that changes — the forecast firms up,
+            # then the actual prints. Every 15-minute tick re-collects it, so
+            # insert-only would stack ~300 copies of one release across its life
+            # and leave the pre-release copy on the page beside the printed one.
+            # News and sentiment are genuinely new items each time; they insert.
+            existing = await _live_calendar_row(db, msg) if msg.kind == "calendar" else None
+            if existing is not None:
+                existing.body = msg.body
+                existing.confidence = float(msg.confidence or 0.0)
+                existing.speculative = bool(msg.speculative)
+                existing.decay_at = _parse_dt(msg.decay_at) or _decay_at(msg.kind)
+                # Re-observed now, so it sorts as now. Findings are read newest
+                # first and a tick brings ~100 fresh headlines; on its original
+                # timestamp a revised calendar row would sink out of view within
+                # one cycle — which is how it used to stay visible at all, by
+                # being re-inserted every time.
+                existing.created_at = datetime.utcnow()
+                stored.append(existing.id)
+                continue
+
             row = ResearchFinding(
                 kind=msg.kind,
                 symbol=msg.symbol,

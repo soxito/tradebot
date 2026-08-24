@@ -88,6 +88,30 @@ _SYMBOL_MIN_SL_PIPS: Dict[str, float] = {
 }
 _DEFAULT_MIN_SL_PIPS: float = 5.0  # FX majors / everything else
 
+# Per-symbol take-profit band, in pips (pip = 10 points, gold pip = $0.10).
+# The primary target is placed INSIDE this band, positioned by live flow: a
+# strong, one-sided tape reaches for the top, a quiet one banks nearer the
+# floor. The band is the answer to two failure modes at once — a 30-pip scalp
+# target on gold is too near to be worth the spread and churns the account on
+# chop, while an open-ended target over-holds a winner into the next reversal.
+# Symbols not listed here keep the ATR/RR target unchanged.
+_SYMBOL_TP_PIP_BAND: Dict[str, tuple[float, float]] = {
+    "XAUUSD": (80.0, 110.0),   # gold: 80 pips = $8.00 … 110 pips = $11.00
+}
+
+
+def _flow_strength(volume_z: float, volume_imbalance: float) -> float:
+    """How hard the tape is pushing, 0 (quiet/balanced) … 1 (strong, one-sided).
+
+    Blends the volume z-score (is there unusual participation right now) with the
+    directional imbalance (is it one-sided). Both must be present to reach the
+    top of the band — a volume spike that is evenly matched is a fight, not a
+    run, and does not earn the wider target.
+    """
+    vol = max(0.0, min(1.0, volume_z / 2.0))          # z of 2+ is a clear spike
+    lean = max(0.0, min(1.0, abs(volume_imbalance) / 0.4))  # 0.4 = decisively one-sided
+    return round(vol * 0.6 + lean * 0.4, 4)
+
 # Volume-spike imbalance thresholds for opportunistic stacking orders.
 # A spike is detected when the directional imbalance exceeds these values.
 VOL_SPIKE_STRONG: float = 0.30   # strong spike → stack extra order
@@ -1087,16 +1111,37 @@ class ScalpStrategyEngine:
 
     def _enforce_min_rr(
         self, side: str, entry: float, stop_loss: float, take_profit: float,
+        *, flow: float | None = None,
     ) -> tuple[float, float]:
-        """Guarantee reward:risk ≥ ``self.min_rr`` by widening TP if needed.
+        """Normalise TP: place it in the per-symbol pip band, then hold the RR floor.
 
-        Keeping reward comfortably above risk is the single biggest lever for
-        "hardly loses" behaviour: even a sub-50 % win rate stays net-positive
-        when winners pay more than losers. Returns ``(take_profit, rr)``.
+        Two levers, applied in order:
+
+        * ``flow`` (0..1, from :func:`_flow_strength`) positions the target
+          inside the symbol's TP band when one is configured — gold gets an
+          80-110 pip target sized to how hard the tape is pushing, which stops
+          it both from scalping a too-tight target on chop and from over-holding
+          a winner past its move. Symbols with no band skip this step.
+        * The reward:risk floor is then applied and always wins: even inside a
+          band, TP is widened so reward ≥ risk × ``min_rr``. Keeping winners
+          bigger than losers is the single biggest lever for "hardly loses"
+          behaviour, so it is never traded away for a tidier pip number.
+
+        Returns ``(take_profit, rr)``.
         """
         risk = abs(entry - stop_loss)
         if risk <= 0:
             return take_profit, 0.0
+
+        band = _SYMBOL_TP_PIP_BAND.get((self.symbol or "").upper().replace("/", ""))
+        if band is not None:
+            low, high = band
+            pos = 0.5 if flow is None else max(0.0, min(1.0, flow))
+            target_dist = (low + (high - low) * pos) * self.pip_size
+            take_profit = round(
+                entry + target_dist if side == "buy" else entry - target_dist, 6
+            )
+
         reward = abs(take_profit - entry)
         min_reward = risk * self.min_rr
         if reward < min_reward:
@@ -1240,8 +1285,11 @@ class ScalpStrategyEngine:
         entry = round(entry, 6)
         stop_loss = round(stop_loss, 6)
         take_profit = round(take_profit, 6)
-        # Guarantee reward:risk ≥ the strictness floor before sizing.
-        take_profit, rr = self._enforce_min_rr(side, entry, stop_loss, take_profit)
+        # Place TP in the symbol's pip band by live flow, then hold the RR floor.
+        take_profit, rr = self._enforce_min_rr(
+            side, entry, stop_loss, take_profit,
+            flow=_flow_strength(bias.volume_z, bias.volume_imbalance),
+        )
         sl_dist = abs(entry - stop_loss)
         tp_dist = abs(take_profit - entry)
         lot, risk_amount = self._resolve_lot(balance, sl_dist)
@@ -1468,8 +1516,11 @@ class ScalpStrategyEngine:
                 stop_loss = round(
                     entry_price - sym_min_sl if side == "buy" else entry_price + sym_min_sl, 6
                 )
-            # Enforce the reward:risk floor (widen TP if the zone target is tight).
-            take_profit, rr = self._enforce_min_rr(side, entry_price, stop_loss, take_profit)
+            # Place TP in the symbol's pip band by live flow, then hold the RR floor.
+            take_profit, rr = self._enforce_min_rr(
+                side, entry_price, stop_loss, take_profit,
+                flow=_flow_strength(bias.volume_z, bias.volume_imbalance),
+            )
             quality, kronos_aligned = self._quality_score(
                 confidence, rr, kronos_score, side, momentum_aligned,
             )
@@ -1555,8 +1606,11 @@ class ScalpStrategyEngine:
         _, risk_amount = self._resolve_lot(balance, sl_dist)
         pip = self.pip_size or 1.0
 
-        # Enforce the reward:risk floor on the recovery leg too.
-        take_profit, rr = self._enforce_min_rr(recovery_side, entry_price, stop_loss, take_profit)
+        # Recovery leg: band by flow too, RR floor still authoritative.
+        take_profit, rr = self._enforce_min_rr(
+            recovery_side, entry_price, stop_loss, take_profit,
+            flow=_flow_strength(bias.volume_z, bias.volume_imbalance),
+        )
         quality, _ = self._quality_score(bias.confidence, rr, 0.0, recovery_side, True)
 
         return ScalpEntry(
@@ -1627,7 +1681,10 @@ class ScalpStrategyEngine:
             take_profit = round(entry - tp_dist, 6)
             otype = "sell_stop"
 
-        take_profit, rr = self._enforce_min_rr(side, entry, stop_loss, take_profit)
+        take_profit, rr = self._enforce_min_rr(
+            side, entry, stop_loss, take_profit,
+            flow=_flow_strength(bias.volume_z, bias.volume_imbalance),
+        )
         sl_dist = abs(entry - stop_loss)
         tp_dist = abs(take_profit - entry)
         lot, risk_amount = self._resolve_lot(balance, sl_dist, multiplier=0.8)

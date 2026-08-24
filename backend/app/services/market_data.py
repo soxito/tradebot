@@ -222,6 +222,36 @@ def classify(symbol: str) -> str:
     return UNKNOWN
 
 
+def point_size(symbol: str) -> float:
+    """Smallest price increment ("1 point") for ``symbol``.
+
+    The authoritative copy lives in the MT5 plugin's ``smc_strategy`` because
+    that is where it must match a live order ticket; this mirror keeps the same
+    numbers available to core and to the Telegram plugin without a cross-plugin
+    import. Gold prints to 2dp (0.01), silver to 3dp, JPY pairs to 3dp, other FX
+    to 5dp; everything else falls back to 0.01.
+    """
+    s = normalize_symbol(symbol)
+    if s.startswith("XAU"):
+        return 0.01
+    if s.startswith("XAG"):
+        return 0.001
+    if s.endswith("JPY"):
+        return 0.001
+    if len(s) == 6 and s.isalpha():
+        return 0.00001
+    return 0.01
+
+
+def pip_size(symbol: str) -> float:
+    """Price move of 1 pip = 10 points (MT5's fractional-pip convention).
+
+    For gold this makes 1 pip = 0.10, so 110 pips = 11.0 in price — the unit the
+    signal desk and the scalp bot both size their minimum targets in.
+    """
+    return point_size(symbol) * 10.0
+
+
 def is_universal_symbol(symbol: str) -> bool:
     """True for a non-crypto instrument this platform can price and chart.
 
@@ -279,6 +309,64 @@ def canonicalize_for_analysis(token: str) -> Tuple[str, str]:
 #: marker and the whole token was skipped — the one spelling in the MT5 matrix
 #: that named no instrument at all. ``normalize_symbol`` strips the tail.
 _TOKEN_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9]{1,11}(?:_[A-Za-z0-9]{1,5})?\b")
+
+
+#: Metal bases that pair with a currency the same way a currency leg does.
+_METAL_BASES_FOR_PAIRS = frozenset({"XAU", "XAG", "XPT", "XPD"})
+
+
+def _is_unambiguous_spelling(raw: str) -> bool:
+    """True when *raw* can only be an instrument, never an English word.
+
+    A digit anywhere (US30, NAS100), a six-character currency/metal pair
+    (CADJPY, XAUUSD), or a crypto base carrying its quote (BTCUSDT).  "GOLD",
+    "OIL" and "DAX" deliberately fail: mid-sentence they are words first.
+    """
+    if any(ch.isdigit() for ch in raw):
+        return True
+    if len(raw) == 6 and raw.isalpha():
+        base, quote = raw[:3], raw[3:]
+        if base in (_CURRENCIES | _METAL_BASES_FOR_PAIRS) and quote in _CURRENCIES:
+            return True
+    for suffix in _QUOTE_SUFFIXES:
+        if raw.endswith(suffix) and len(raw) > len(suffix):
+            return True
+    return False
+
+
+def symbol_from_token(token: str, *, strict: bool = False) -> Optional[str]:
+    """The instrument a single command token names, or ``None``.
+
+    This is the resolver a command parser wants: ``extract_symbols`` scans
+    prose, whereas here one token is offered and either is an instrument or is
+    not.  It replaced a hand-written regex in the ``/room`` parser that knew
+    seven currency bases, so every other cross — CADJPY among them — was read
+    as a word and sent to the chat model instead of to the board.
+
+    ``strict`` demands a spelling that cannot be anything but an instrument
+    (see ``_is_unambiguous_spelling``).  Use it when the token sits inside a
+    sentence; leave it off when the user typed the token on its own.
+    """
+    raw = (token or "").strip().upper().replace("/", "").replace("-", "")
+    if len(raw) < 3 or raw in _STOPWORDS or not re.fullmatch(r"[A-Z0-9]{3,12}", raw):
+        return None
+    if strict and not _is_unambiguous_spelling(raw):
+        return None
+
+    candidate = _ALIASES.get(raw)
+    if candidate is None:
+        s = normalize_symbol(raw)
+        if not s:
+            return None
+        cls = classify(s)
+        if cls == UNKNOWN:
+            return None
+        # A bare crypto base is only tradeable once quoted; every other class
+        # already names a complete instrument.
+        if cls == CRYPTO and s in _CRYPTO_BASES:
+            s = f"{s}USDT"
+        return s
+    return normalize_symbol(candidate) or candidate
 
 
 def extract_symbols(text: str, *, limit: int = 8) -> List[str]:

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -37,6 +38,8 @@ from plugins.TelegramSignalNewsPlugin.backend.services.strategy_analysis import 
     _fetch_ohlcv as _fetch_ta_ohlcv,
 )
 from plugins.TelegramSignalNewsPlugin.backend.timezone_utils import now_utc_naive
+
+from app.trading.order_tags import SOURCE_TELEGRAM, build_comment, is_app_order
 
 
 def _utcnow() -> datetime:
@@ -78,6 +81,8 @@ def volume_gate_note(ctx: Any) -> str:
 
     if ctx is None:
         return "NO_TRADE · volume context unresolved"
+    if ctx.status == "NOT_APPLICABLE":
+        return f"volume not required for this market · {ctx.detail}"[:400]
     if ctx.status != "OK":
         return f"NO_TRADE · volume {ctx.status} · {ctx.detail}"[:400]
     return " · ".join(volctx.volume_evidence_lines(ctx))[:400]
@@ -96,6 +101,10 @@ def volume_supports(direction: str, ctx: Any) -> tuple[bool, str]:
     """
     from plugins.KronosForecastPlugin.backend.services import volume_context as volctx
 
+    if ctx is not None and ctx.status == "NOT_APPLICABLE":
+        # Weekend/volumeless market (gold, FX, indices) — volume cannot argue for
+        # or against the side, so it never blocks; trade on price/structure.
+        return True, "volume not required for this market"
     if ctx is None or ctx.status != "OK":
         return False, f"volume {(ctx.status.lower() if ctx else 'unresolved')}"
 
@@ -245,6 +254,16 @@ async def _count_open_positions(db: AsyncSession, mode: str) -> int:
     return int(res.scalar() or 0)
 
 
+def _entry_floor(stop_loss: float, live_price: float, *, is_long: bool) -> float:
+    """Closest the planned entry may sit to the stop: 25 % of the stop distance.
+
+    Keeps the sniper offset from chasing a fill on the wrong side of the stop
+    while still leaving room to improve on the live price.
+    """
+    keep = abs(live_price - stop_loss) * 0.25
+    return stop_loss + keep if is_long else stop_loss - keep
+
+
 def reanalyze_signal(
     *,
     direction: str,
@@ -291,6 +310,12 @@ def reanalyze_signal(
         # Optimised entry: the better (lower) of signal entry and live, minus offset.
         sniper_entry = min(ref, live_price) * (1.0 - offset)
         sniper_entry = min(sniper_entry, live_price)  # never above live
+        # …but never through the stop. A percentage offset is far too wide for a
+        # tight-stop instrument (0.3 % of gold ≈ 13 pts vs an 8 pt stop), which
+        # put the planned entry BELOW the stop — an already-losing fill, and an
+        # inflated reward/risk that let the plan pass its own quality gate.
+        if stop_loss:
+            sniper_entry = max(sniper_entry, _entry_floor(stop_loss, live_price, is_long=True))
         trigger_now = live_price <= sniper_entry
         # Fallback protective stop below entry
         if not stop_loss:
@@ -304,6 +329,8 @@ def reanalyze_signal(
         take_profit = targets[0] if targets else None
         sniper_entry = max(ref, live_price) * (1.0 + offset)
         sniper_entry = max(sniper_entry, live_price)  # never below live
+        if stop_loss:
+            sniper_entry = min(sniper_entry, _entry_floor(stop_loss, live_price, is_long=False))
         trigger_now = live_price >= sniper_entry
         # Fallback protective stop above entry
         if not stop_loss:
@@ -458,9 +485,19 @@ async def _agent_confirm(symbol: str, direction: str) -> dict | None:
     """
     try:
         from app.core.database import AsyncSessionLocal
+        from app.agents import room
         from app.agents.orchestrator import AgentOrchestrator
     except Exception:
         return None
+    # Focus gate: when pair(s) are pinned in the trading room, signals on any
+    # other pair never convene a board meeting — the desk works the pinned set
+    # only until focus is cleared.
+    try:
+        if room.get_focus_symbols() and not room.is_focused(symbol):
+            logger.debug("Focus locked — skipping agent confirmation for {}", symbol)
+            return None
+    except Exception:  # noqa: BLE001 — a room import failure must not block trading
+        pass
     try:
         async with AsyncSessionLocal() as adb:
             res = await AgentOrchestrator.analyze_symbol(adb, symbol, "1h", trigger="telegram")
@@ -604,6 +641,710 @@ async def _place_sim_order(
     )
 
 
+async def _get_portfolio_equity() -> float | None:
+    """Best-effort futures portfolio equity in USDT for margin risk gate."""
+    try:
+        from app.exchanges.manager import exchange_manager, SupportedExchange
+        connector = exchange_manager.get_exchange(SupportedExchange.BITGET)
+        if connector is not None:
+            try:
+                bal = await connector.get_futures_balance()
+                if isinstance(bal, dict):
+                    eq = float(bal.get("equity") or bal.get("usdtEquity") or 0)
+                    if eq > 0:
+                        return eq
+                if isinstance(bal, list):
+                    eq = sum(float(b.get("equity", 0) or 0) for b in bal if isinstance(b, dict))
+                    if eq > 0:
+                        return eq
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+
+async def _compute_telegram_margin_exposure(db: AsyncSession) -> float:
+    """Sum of margin (position_size / leverage) across all PLACED sniper trades."""
+    res = await db.execute(
+        select(TelegramSniperTrade.position_size_usdt, TelegramSniperTrade.leverage)
+        .where(TelegramSniperTrade.status == SniperTradeStatus.PLACED)
+    )
+    total = 0.0
+    for pos_usdt, lev in res.all():
+        pos = float(pos_usdt or 0)
+        lvg = max(1, int(lev or 1))
+        total += pos / lvg
+    return total
+
+
+async def _margin_risk_ok(
+    db: AsyncSession,
+    settings: TelegramSniperSettings,
+    new_pos_usdt: float,
+    new_leverage: int,
+) -> tuple[bool, str]:
+    """Return (ok, reason). Blocks the trade if adding it would breach the margin risk limit."""
+    max_pct = float(getattr(settings, "max_margin_risk_pct", 20.0) or 20.0)
+    if max_pct <= 0:
+        return True, "margin risk check disabled"
+
+    lvg = max(1, new_leverage)
+    new_margin = new_pos_usdt / lvg
+    existing_margin = await _compute_telegram_margin_exposure(db)
+    total_margin = existing_margin + new_margin
+
+    equity = await _get_portfolio_equity()
+    if equity is None or equity <= 0:
+        return True, "equity unavailable — count limit applies"
+
+    risk_pct = (total_margin / equity) * 100.0
+    if risk_pct > max_pct:
+        return False, (
+            f"margin risk {risk_pct:.1f}% > limit {max_pct:.0f}% "
+            f"(used {existing_margin:.0f} + new {new_margin:.0f} = {total_margin:.0f} USDT "
+            f"on {equity:.0f} USDT equity)"
+        )
+    return True, f"margin ok {risk_pct:.1f}%/{max_pct:.0f}%"
+
+
+# ── MT5 (forex) execution ─────────────────────────────────────────────────────
+
+async def _get_live_mt5_account(db: AsyncSession, account_id: int | None = None):
+    """Return a live, api-reachable MT5 account (specific id, or first available)."""
+    try:
+        from plugins.MT5TradingPlugin.backend.models import MT5Account, MT5AccountType
+    except Exception:
+        return None
+    q = select(MT5Account).where(MT5Account.api_reachable.is_(True))
+    if account_id is not None:
+        q = q.where(MT5Account.id == account_id)
+    else:
+        q = q.where(MT5Account.account_type == MT5AccountType.LIVE)
+    q = q.order_by(MT5Account.id)
+    return (await db.execute(q)).scalars().first()
+
+
+async def _get_live_mt5_accounts(db: AsyncSession, account_id: int | None = None) -> list:
+    """Return the MT5 accounts a forex signal should execute on.
+
+    A specific ``account_id`` targets that one account; otherwise every live,
+    api-reachable account is returned so a signal fans out to all linked books.
+    """
+    try:
+        from plugins.MT5TradingPlugin.backend.models import MT5Account, MT5AccountType
+    except Exception:  # noqa: BLE001
+        return []
+    q = select(MT5Account).where(MT5Account.api_reachable.is_(True))
+    if account_id is not None:
+        q = q.where(MT5Account.id == account_id)
+    else:
+        q = q.where(MT5Account.account_type == MT5AccountType.LIVE)
+    return list((await db.execute(q.order_by(MT5Account.id))).scalars().all())
+
+
+def _mt5_ticket(result: Any) -> str | None:
+    if not isinstance(result, dict):
+        return None
+    for k in ("ticket", "order", "orderId", "id"):
+        v = result.get(k)
+        if v:
+            return str(v)
+    inner = result.get("orderInternal") or {}
+    if isinstance(inner, dict) and inner.get("ticket"):
+        return str(inner["ticket"])
+    return None
+
+
+async def _execute_mt5(
+    db: AsyncSession,
+    *,
+    symbol: str,
+    direction: str,
+    stop_loss: float | None,
+    take_profit: float | None,
+    lot_size: float,
+    account_id: int | None,
+    comment: str = "TG-Sniper",
+) -> dict[str, Any]:
+    """Place a market forex order on a live-linked MT5 account."""
+    try:
+        from plugins.MT5TradingPlugin.backend.services.mt5_client import mt5_client
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "error": f"MT5 plugin unavailable: {exc}"}
+
+    acct = await _get_live_mt5_account(db, account_id)
+    if acct is None:
+        return {"success": False, "error": "No live MT5 account linked/reachable"}
+
+    side = "buy" if direction.lower() == "long" else "sell"
+    mt5_symbol = (symbol or "").upper().replace("/", "")
+    try:
+        result = await mt5_client.place_order(
+            login=acct.login, server=acct.server, password=acct.password_encrypted,
+            symbol=mt5_symbol, order_type=side, volume=lot_size, price=0,
+            sl=stop_loss, tp=take_profit, comment=comment,
+        )
+        ticket = _mt5_ticket(result)
+        if ticket is None:
+            # No ticket means no position. Treating this as a fill created
+            # phantom PLACED trades: the row claimed an open order the broker
+            # had never accepted, and the monitor then trailed a stop against
+            # nothing. A fill is only a fill when the broker names the ticket.
+            return {
+                "success": False,
+                "error": f"broker returned no ticket: {str(result)[:160]}",
+                "account_id": acct.id,
+                "account_name": acct.name,
+            }
+        return {"success": True, "order_id": ticket, "account_id": acct.id,
+                "account_name": acct.name, "raw": result}
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "error": str(exc)[:200], "account_id": acct.id}
+
+
+async def _count_open_mt5_positions(db: AsyncSession) -> int:
+    """PLACED sniper trades executed on MT5 (executed_mode contains 'mt5')."""
+    res = await db.execute(
+        select(func.count(TelegramSniperTrade.id)).where(
+            TelegramSniperTrade.status == SniperTradeStatus.PLACED,
+            TelegramSniperTrade.executed_mode.ilike("%mt5%"),
+        )
+    )
+    return int(res.scalar() or 0)
+
+
+async def _get_room_settings(db: AsyncSession):
+    """Load the Trading Room execution policy (risk %, max orders). Graceful."""
+    try:
+        from app.models.database import RoomSettings
+        return await db.get(RoomSettings, 1)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _ccy_per_usd(cur: str | None) -> float | None:
+    """Units of *cur* per 1 USD (live Swissquote, then daily currency-api)."""
+    c = (cur or "USD").upper().strip()
+    if c in ("", "USD"):
+        return 1.0
+    from plugins.TelegramSignalNewsPlugin.backend.services.forex_price_service import (
+        get_forex_price,
+        _fetch_rates,
+    )
+    rate = await get_forex_price(f"USD{c}")
+    if rate and rate > 0:
+        return float(rate)
+    try:
+        rates = await _fetch_rates()
+        r = float(rates.get(c.lower()) or 0)
+        if r > 0:
+            return r
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+async def _equity_in_quote(
+    equity: float, account_ccy: str | None, quote_ccy: str | None
+) -> float | None:
+    """Convert account equity into the instrument's quote currency.
+
+    Risk sizing divides a risk *amount* by a per-lot loss expressed in the
+    pair's quote currency, so a ZAR balance must be converted to USD (for
+    XAUUSD/EURUSD) first or the lot is over-sized by the FX rate. Returns None
+    when a foreign balance cannot be priced, so the caller sizes at the floor.
+    """
+    if equity is None or equity <= 0:
+        return equity
+    a = ((account_ccy or "USD").upper().strip()) or "USD"
+    q = ((quote_ccy or "USD").upper().strip()) or "USD"
+    if a == q:
+        return equity
+    ra = await _ccy_per_usd(a)   # account units per USD
+    rq = await _ccy_per_usd(q)   # quote units per USD
+    if ra and ra > 0 and rq and rq > 0:
+        return equity * (rq / ra)
+    return None
+
+
+def _mt5_risk_lot(
+    *, equity: float, risk_pct: float, entry: float | None,
+    stop_loss: float | None, symbol: str, floor_lot: float,
+) -> float:
+    """Risk-based MT5 lot from the room risk %; never below floor_lot (0.01).
+
+    Gold defaults to 0.01 and is scaled up automatically as equity/risk allows,
+    so position size tracks the portfolio's margin instead of a fixed lot.
+    """
+    try:
+        from app.agents.execution import mt5_volume_for_risk
+        if (
+            equity and equity > 0 and risk_pct and risk_pct > 0
+            and entry and stop_loss and abs(float(entry) - float(stop_loss)) > 0
+        ):
+            lot = mt5_volume_for_risk(
+                equity=float(equity), risk_pct=float(risk_pct),
+                entry=float(entry), stop_loss=float(stop_loss), symbol=symbol,
+            )
+            if lot and lot > 0:
+                return max(round(float(lot), 2), floor_lot)
+    except Exception:  # noqa: BLE001 — sizing must never break execution
+        pass
+    return floor_lot
+
+
+async def _count_open_app_positions_for_account(db: AsyncSession, account_id: int) -> int:
+    """Open positions on one MT5 account that this app placed.
+
+    Manual positions are excluded — the small-account limit governs what the
+    app opens, and must not be tripped by trades the user placed themselves.
+    """
+    try:
+        from plugins.MT5TradingPlugin.backend.models import MT5Position
+    except Exception:  # noqa: BLE001 — plugin-optional
+        return 0
+    rows = await db.execute(
+        select(MT5Position.comment).where(MT5Position.account_id == account_id)
+    )
+    return sum(1 for (comment,) in rows.all() if is_app_order(comment))
+
+
+def _lot_contract_size(symbol: str) -> float:
+    """Units per lot for the instrument (100 oz for gold, 100k for FX)."""
+    try:
+        from app.agents.execution import _contract_size
+        return float(_contract_size(symbol))
+    except Exception:  # noqa: BLE001
+        s = (symbol or "").upper().replace("/", "")
+        if s.startswith("XAU"):
+            return 100.0
+        if s.startswith("XAG"):
+            return 5000.0
+        return 100000.0 if (len(s) == 6 and s.isalpha()) else 100.0
+
+
+def affordable_mt5_lot(
+    *,
+    equity: float,
+    free_margin: float | None,
+    leverage: int | None,
+    risk_pct: float,
+    entry: float | None,
+    stop_loss: float | None,
+    symbol: str,
+    floor_lot: float,
+    max_risk_pct: float,
+    small_account_mode: bool = False,
+) -> tuple[float | None, str]:
+    """Largest lot that fits BOTH the risk budget and the margin actually free.
+
+    Returns ``(lot, note)``, or ``(None, reason)`` when even one floor lot is
+    more than the account can afford — in which case the trade must not be
+    placed at all.
+
+    The old sizing took the risk-based lot and floored it up to the broker
+    minimum, which quietly inverted the intent on a small account: a 1 % budget
+    on ~$110 of equity wants 0.0014 lots of gold, but 0.01 lots against an
+    8-point stop loses $8 — over 7 % of the account, on every trade. Sizing up
+    from a floor is only safe when the floor itself is affordable, so that is
+    now checked explicitly and the trade is skipped when it is not.
+    """
+    contract = _lot_contract_size(symbol)
+    distance = abs(float(entry) - float(stop_loss)) if (entry and stop_loss) else 0.0
+    if distance <= 0 or contract <= 0:
+        return floor_lot, "no stop distance — floor lot"
+
+    loss_per_lot = distance * contract
+    risk_budget = max(equity, 0.0) * (max(risk_pct, 0.0) / 100.0)
+    risk_lot = risk_budget / loss_per_lot if loss_per_lot > 0 else 0.0
+
+    # Margin the broker will hold per lot. Without a usable leverage figure we
+    # cannot bound it, so margin simply does not constrain the size.
+    margin_lot = None
+    lev = int(leverage or 0)
+    if lev > 0 and entry:
+        margin_per_lot = (contract * float(entry)) / lev
+        usable = float(free_margin if free_margin is not None else equity) * 0.80
+        if margin_per_lot > 0:
+            margin_lot = max(usable, 0.0) / margin_per_lot
+
+    lot = risk_lot if margin_lot is None else min(risk_lot, margin_lot)
+    lot = math.floor(lot / 0.01) * 0.01  # never round UP past the budget
+    lot = round(lot, 2)
+
+    if lot >= floor_lot:
+        capped_by = "margin" if (margin_lot is not None and margin_lot < risk_lot) else "risk"
+        return lot, f"{lot:g} lots ({capped_by}-capped, {risk_pct:g}% of {equity:,.0f})"
+
+    # Below the broker minimum — the only tradeable size is one floor lot.
+    floor_loss = loss_per_lot * floor_lot
+    affordable_loss = max(equity, 0.0) * (max(max_risk_pct, 0.0) / 100.0)
+    # An unfunded or unpriceable account can afford nothing; guard the ratio so
+    # the percentage in the message never divides by a zero balance.
+    pct_of_equity = (floor_loss / equity * 100) if equity > 0 else float("inf")
+    if equity <= 0:
+        return None, (
+            f"account holds no usable equity ({equity:,.2f}) — cannot fund "
+            f"even the {floor_lot:g} broker minimum"
+        )
+    if floor_loss > affordable_loss:
+        if small_account_mode:
+            # Small-account mode: a tiny book would otherwise sit out every
+            # signal, because one broker-minimum lot always exceeds a sane
+            # percentage of it. Rather than miss the signals entirely, take
+            # the trade at exactly the floor lot — and the caller limits the
+            # account to a single open trade so the exposure stays bounded.
+            if margin_lot is not None and margin_lot < floor_lot:
+                return None, (
+                    f"free margin covers only {margin_lot:.4f} lots — under the "
+                    f"{floor_lot:g} broker minimum"
+                )
+            return floor_lot, (
+                f"floor lot {floor_lot:g} (small-account mode) — risks "
+                f"{floor_loss:,.2f}, {pct_of_equity:.1f}% of {equity:,.2f}; "
+                f"capped at one open trade"
+            )
+        return None, (
+            f"floor lot {floor_lot:g} risks {floor_loss:,.2f} "
+            f"({pct_of_equity:.1f}% of {equity:,.2f}) — over the "
+            f"{max_risk_pct:g}% ceiling; account too small for this stop"
+        )
+    if margin_lot is not None and margin_lot < floor_lot:
+        return None, (
+            f"free margin covers only {margin_lot:.4f} lots — under the "
+            f"{floor_lot:g} broker minimum"
+        )
+    return floor_lot, (
+        f"floor lot {floor_lot:g} — risks {floor_loss:,.2f} "
+        f"({pct_of_equity:.1f}%) vs {risk_pct:g}% target"
+    )
+
+
+async def _handle_forex_signal(
+    db: AsyncSession,
+    sig: TelegramParsedSignal,
+    settings: TelegramSniperSettings,
+    *,
+    immediate_conf: float = 0.8,
+) -> str:
+    """Plan + execute a forex signal on MT5. Returns 'placed'|'skipped'|'pending'.
+
+    Uses the live Swissquote price, skips the crypto volume/TA gate (which has no
+    forex data), sizes the lot from the Trading Room risk % against account
+    equity (gold floor 0.01), and caps concurrent orders at the room's max
+    orders. High-confidence signals (>= immediate_conf) enter at the SIGNAL
+    ENTRY; weaker ones stay PENDING for the sniper limit / manual execution.
+    """
+    from plugins.TelegramSignalNewsPlugin.backend.services.forex_price_service import get_forex_price
+    from plugins.TelegramSignalNewsPlugin.backend.services import notifications as notif
+
+    live = await get_forex_price(sig.symbol)
+    if live is None or live <= 0:
+        db.add(_skip_record(sig, settings, "No Swissquote price for forex symbol"))
+        return "skipped"
+
+    # High-conviction signals bypass the reward/risk floor. These ladder signals
+    # quote a near TP1 against a wider stop, so RR-to-TP1 reads poor even when
+    # the run to the final TP is worth several times the risk.
+    hc = is_high_conviction(sig, settings)
+    plan = reanalyze_signal(
+        direction=sig.direction,
+        signal_entry=sig.entry,
+        stop_loss=sig.stop_loss,
+        take_profits=sig.take_profits_json or [],
+        live_price=live,
+        offset_pct=settings.sniper_offset_pct,
+        min_rr=0.0 if hc else settings.min_risk_reward,
+    )
+    if not plan.ok:
+        db.add(_skip_record(sig, settings, plan.reason, live=live))
+        return "skipped"
+
+    # ── Target: the channel's FINAL take-profit ──────────────────────────
+    # One position, aimed at the last target the channel published. Placing a
+    # separate order per TP level meant the TP4 and TP5 slices closed on the
+    # way up, cashing out a move that was still running — so the ladder is
+    # collapsed to its furthest target and the trailing stop (locked at TP3 by
+    # the monitor) is what protects the position on the way there. A single
+    # ticket is also what lets that locked stop be pushed to the broker.
+    # Turning ``multi_tp_execute`` off restores nearest-TP exits.
+    _is_long = (sig.direction or "").lower() == "long"
+    _ref = sig.entry if (sig.entry and sig.entry > 0) else live
+    _ladder_tps = sorted(
+        [
+            float(t) for t in (sig.take_profits_json or [])
+            if t and float(t) > 0 and (float(t) > _ref if _is_long else float(t) < _ref)
+        ],
+        reverse=not _is_long,
+    )
+    _ride_to_final = getattr(settings, "multi_tp_execute", True)
+    final_tp = _ladder_tps[-1] if (_ride_to_final and _ladder_tps) else plan.take_profit
+    # A signal can arrive with no usable target at all (no TPs, or every TP on
+    # the wrong side of the entry). The order is still valid — it just runs on
+    # the stop alone — so callers must never assume a number here.
+    _tp_label = f"{final_tp:g}" if final_tp else "none (stop only)"
+
+    trade = TelegramSniperTrade(
+        signal_id=sig.id,
+        channel_title=sig.channel_title,
+        symbol=sig.symbol,
+        direction=sig.direction,
+        leverage=_leverage_int(sig.leverage) or settings.leverage,
+        signal_entry=sig.entry,
+        sniper_entry=plan.sniper_entry,
+        live_price_at_plan=live,
+        stop_loss=plan.stop_loss,
+        take_profit=final_tp,
+        position_size_usdt=settings.position_size_usdt,
+        risk_reward=plan.risk_reward,
+        status=SniperTradeStatus.PENDING,
+        reason=f"Forex signal · {plan.reason}",
+        entry_strategy=f"forex/mt5 · Swissquote {live:g}"[:200],
+        volume_confirmed=True,
+        executed_mode=None,
+    )
+
+    # ── Sizing & caps from the Trading Room "Risk limits" ───────────────
+    room = await _get_room_settings(db)
+    room_risk_pct = float(getattr(room, "risk_pct", 0) or 0) if room else 0.0
+    room_max_orders = int(getattr(room, "max_open_positions", 0) or 0) if room else 0
+    mt5_cap = room_max_orders if room_max_orders > 0 else settings.max_positions_live
+
+    # Demo and live are independent switches: demo-only execution must not
+    # require the live one to be armed first.
+    _demo_id = getattr(settings, "mt5_demo_account_id", None)
+    _use_demo = bool(getattr(settings, "mt5_demo_execute", False) and _demo_id)
+    if not settings.mt5_execute and not _use_demo:
+        trade.reason += (
+            " · MT5 execution disabled — enable Demo or Live MT5 execution in "
+            "Sniper settings (awaiting manual exec)"
+        )
+        db.add(trade)
+        return "pending"
+    # Only high-conviction signals fire immediately; weaker ones wait for the
+    # sniper limit / manual execution so we don't chase low-quality fills.
+    _force = getattr(settings, 'force_telegram_signals', False)
+    high_conf = _force or hc or (sig.confidence or 0.0) >= immediate_conf
+    if not high_conf and not settings.execute_immediately:
+        trade.reason += (
+            f" · confidence {(sig.confidence or 0)*100:.0f}% below immediate threshold "
+            "— awaiting sniper limit / manual"
+        )
+        db.add(trade)
+        return "pending"
+
+    # Target demo account when mt5_demo_execute is set; otherwise fan out to live accounts.
+    if _use_demo:
+        try:
+            from plugins.MT5TradingPlugin.backend.models import MT5Account as _MT5Acct
+            _demo_row = (await db.execute(select(_MT5Acct).where(_MT5Acct.id == _demo_id))).scalars().first()
+            accounts = [_demo_row] if _demo_row else []
+        except Exception:  # noqa: BLE001
+            accounts = []
+    else:
+        accounts = await _get_live_mt5_accounts(db, getattr(settings, "mt5_account_id", None))
+    if not accounts:
+        trade.reason += (
+            " · no demo MT5 account linked/reachable"
+            if _use_demo else " · no live MT5 account linked/reachable"
+        )
+        db.add(trade)
+        return "pending"
+
+    open_mt5 = await _count_open_mt5_positions(db)
+    if open_mt5 >= mt5_cap:
+        trade.reason += f" · MT5 order cap reached ({open_mt5}/{mt5_cap})"
+        db.add(trade)
+        return "pending"
+
+    # High-conf enters at the SIGNAL ENTRY (never missed); weaker at sniper limit.
+    exec_entry = sig.entry if (high_conf and sig.entry and sig.entry > 0) else (plan.sniper_entry or live)
+    floor_lot = float(getattr(settings, "mt5_lot_size", 0.01) or 0.01)
+    risk_pct = room_risk_pct or 1.0
+
+    # Quote currency of the instrument (USD for XAUUSD/EURUSD) — the currency the
+    # per-lot loss is expressed in, so each account's equity is converted to it.
+    from plugins.TelegramSignalNewsPlugin.backend.services.forex_price_service import _parse_pair
+    _pp = _parse_pair(sig.symbol)
+    quote_ccy = _pp[1] if _pp else "USD"
+
+    tickets: list[str] = []
+    lines: list[str] = []
+    ok_names: list[str] = []
+    max_risk_pct = float(getattr(settings, "mt5_max_risk_pct", 5.0) or 5.0)
+    for acct in accounts:
+        equity_native = float(getattr(acct, "equity", 0) or getattr(acct, "balance", 0) or 0)
+        acct_ccy = (getattr(acct, "currency", None) or "USD").upper()
+        equity_q = await _equity_in_quote(equity_native, acct_ccy, quote_ccy)
+        # Unpriceable foreign balance → size at the floor (never over-risk).
+        eff_equity = equity_q if equity_q is not None else 0.0
+        free_native = getattr(acct, "free_margin", None)
+        free_q = await _equity_in_quote(float(free_native), acct_ccy, quote_ccy) if free_native else None
+        small_mode = bool(getattr(settings, "mt5_small_account_mode", True))
+        lot, size_note = affordable_mt5_lot(
+            equity=eff_equity,
+            free_margin=free_q,
+            leverage=getattr(acct, "leverage", None),
+            risk_pct=risk_pct,
+            entry=exec_entry,
+            stop_loss=plan.stop_loss,
+            symbol=sig.symbol,
+            floor_lot=floor_lot,
+            max_risk_pct=max_risk_pct,
+            small_account_mode=small_mode,
+        )
+        acct_label = getattr(acct, "name", None) or f"acct {acct.id}"
+        if lot is None:
+            # Cannot size this account without risking more than it can lose.
+            lines.append(f"⛔ {acct_label}: {size_note}")
+            continue
+        # Small-account mode buys signal coverage with concentration, so the
+        # account is held to a single open app trade at a time.
+        if "small-account mode" in size_note:
+            already = await _count_open_app_positions_for_account(db, acct.id)
+            if already:
+                lines.append(
+                    f"⏸ {acct_label}: small-account mode allows one open trade "
+                    f"at a time ({already} already open)"
+                )
+                continue
+        res = await _execute_mt5(
+            db,
+            symbol=sig.symbol,
+            direction=sig.direction,
+            stop_loss=plan.stop_loss,
+            take_profit=final_tp,
+            lot_size=lot,
+            account_id=acct.id,
+            comment=build_comment(SOURCE_TELEGRAM, sig.id),
+        )
+        acct_name = res.get("account_name") or getattr(acct, "name", None) or f"acct {acct.id}"
+        ccy_note = (
+            f" ({acct_ccy} {equity_native:g}→{quote_ccy} {eff_equity:g})"
+            if acct_ccy != quote_ccy else ""
+        )
+        if res.get("success"):
+            oid = res.get("order_id")
+            if oid:
+                tickets.append(str(oid))
+            ok_names.append(acct_name)
+            lines.append(
+                f"✅ {acct_name}: {size_note} → final TP {_tp_label}"
+                f" · #{oid or '—'}{ccy_note}"
+            )
+        else:
+            lines.append(f"❌ {acct_name}: {str(res.get('error'))[:120]}")
+
+    n_ok = len(ok_names)
+    if n_ok:
+        trade.status = SniperTradeStatus.PLACED
+        trade.executed_mode = "mt5-demo" if _use_demo else "mt5-live"
+        trade.live_order_id = (",".join(tickets))[:60] or None
+        trade.reason = (
+            f"Auto-executed on {n_ok}/{len(accounts)} MT5 account(s) — forex @ {exec_entry:g}, "
+            f"risk {risk_pct:g}%. " + " | ".join(lines)
+        )[:2000]
+        trade.entry_strategy = (
+            f"forex/mt5 · {n_ok}/{len(accounts)} acct · risk {risk_pct:g}% · → final TP"
+        )[:200]
+        db.add(trade)
+
+        if getattr(settings, "notify_executions", True):
+            reason = (
+                f"Confirmed forex entry @ {exec_entry:g}, running to the final TP "
+                f"{_tp_label} with the stop moving to break-even at TP3. "
+                f"Executed on {n_ok}/{len(accounts)} account(s): " + " | ".join(lines)
+            )
+            await notif.notify(
+                notif.format_execution(
+                    source="telegram", symbol=sig.symbol, direction=sig.direction,
+                    entry=exec_entry, stop_loss=plan.stop_loss,
+                    take_profit=final_tp, take_profits=sig.take_profits_json,
+                    venue=("MT5 demo" if _use_demo else "MT5 live") + " — " + ", ".join(ok_names),
+                    reason=reason,
+                    channel=sig.channel_title,
+                ),
+                db,
+            )
+        return "placed"
+
+    trade.status = SniperTradeStatus.FAILED
+    trade.reason = "MT5 execution failed on all accounts: " + " | ".join(lines)
+    db.add(trade)
+    return "skipped"
+
+
+def is_high_conviction(sig: TelegramParsedSignal, settings: TelegramSniperSettings) -> bool:
+    """True when a signal's confidence clears the never-skip threshold (90 % default).
+
+    High-conviction signals are exempt from every *discretionary* gate — the
+    reward/risk floor, the volume regime, the AI opinion and the same-direction
+    cap — because those were dropping the strongest calls in the feed. They stay
+    subject to *structural* rejections, which are not opinions about quality but
+    facts that make the trade impossible: no live price, price already through
+    the stop, or every take-profit already passed.
+    """
+    if getattr(settings, "force_telegram_signals", False):
+        return True
+    threshold = float(getattr(settings, "never_skip_confidence_pct", 90.0) or 90.0) / 100.0
+    return (sig.confidence or 0.0) >= threshold
+
+
+async def _count_open_by_direction(db: AsyncSession) -> dict[str, int]:
+    """Count genuinely-open PLACED sniper trades by direction (long/short).
+
+    Only counts trades whose linked signal is still ACTIVE — a signal that hit
+    TP/SL is closed, so its PLACED trade row must not keep occupying a slot.
+    """
+    res = await db.execute(
+        select(TelegramSniperTrade.direction, func.count(TelegramSniperTrade.id))
+        .join(TelegramParsedSignal, TelegramParsedSignal.id == TelegramSniperTrade.signal_id)
+        .where(
+            TelegramSniperTrade.status == SniperTradeStatus.PLACED,
+            TelegramParsedSignal.status == SignalStatus.ACTIVE,
+        )
+        .group_by(TelegramSniperTrade.direction)
+    )
+    out = {"long": 0, "short": 0}
+    for direction, n in res.all():
+        d = (direction or "").lower()
+        if d in out:
+            out[d] = int(n or 0)
+    return out
+
+
+def _signal_profit_score(sig: TelegramParsedSignal) -> float:
+    """Profit potential of a signal = pips/distance from entry to its furthest TP.
+
+    Used to break confidence ties so the two same-direction trades we keep are
+    the ones with the best reward.
+    """
+    tps = [float(t) for t in (sig.take_profits_json or []) if isinstance(t, (int, float)) and t > 0]
+    if not tps:
+        return 0.0
+    ref = sig.entry if isinstance(sig.entry, (int, float)) and sig.entry > 0 else None
+    if ref is None:
+        # Without an entry, use the TP spread as a proxy for reward width.
+        return abs(max(tps) - min(tps))
+    is_long = (sig.direction or "").lower() == "long"
+    furthest = max(tps) if is_long else min(tps)
+    return abs(furthest - ref)
+
+
+def _rank_signals_best_first(sigs: list[TelegramParsedSignal]) -> list[TelegramParsedSignal]:
+    """Sort so the best trades come first: confidence desc, then profit/pips desc.
+
+    This makes the same-direction cap keep the highest-conviction signals, and
+    on a confidence tie keep the ones with the best profit potential.
+    """
+    return sorted(
+        sigs,
+        key=lambda s: ((s.confidence or 0.0), _signal_profit_score(s)),
+        reverse=True,
+    )
+
+
 async def run_sniper_cycle(db: AsyncSession) -> dict[str, Any]:
     """One sniper tick: re-analyse new signals and fill pending plans."""
     settings = await get_or_create_settings(db)
@@ -619,6 +1360,13 @@ async def run_sniper_cycle(db: AsyncSession) -> dict[str, Any]:
     open_sandbox = await _count_open_positions(db, "sandbox")
     open_live = await _count_open_positions(db, "live")
     open_positions = open_sandbox + open_live
+
+    # Same-direction concurrency: never hold more than max_same_direction open
+    # trades on one side. Seeded with the current open count and incremented as
+    # we place this cycle so only the best N per direction get through.
+    dir_open = await _count_open_by_direction(db)
+    max_same = int(getattr(settings, "max_same_direction", 2) or 2)
+    immediate_conf = float(getattr(settings, "immediate_confidence_pct", 80.0) or 80.0) / 100.0
 
     # ── 1. Re-check existing PENDING plans ───────────────────────────────
     pend_res = await db.execute(
@@ -675,6 +1423,23 @@ async def run_sniper_cycle(db: AsyncSession) -> dict[str, Any]:
                 continue
             trade.volume_confirmed = True
         if triggered and open_positions < settings.max_positions:
+            if dir_open.get(d, 0) >= max_same:
+                # Too many same-direction positions already open — hold pending.
+                trade.reason = f"Same-direction cap ({max_same} {d}s open) — holding"
+                trade.updated_at = _utcnow()
+                pending += 1
+                continue
+            margin_ok, margin_why = await _margin_risk_ok(
+                db, settings,
+                float(trade.position_size_usdt or settings.position_size_usdt),
+                int(trade.leverage or settings.leverage),
+            )
+            if not margin_ok:
+                # Keep PENDING — margin may free up next cycle
+                trade.reason = f"Margin blocked — {margin_why}"
+                trade.updated_at = _utcnow()
+                pending += 1
+                continue
             result = await _place_sim_order(
                 db,
                 symbol=trade.symbol,
@@ -693,6 +1458,8 @@ async def run_sniper_cycle(db: AsyncSession) -> dict[str, Any]:
                 trade.sim_order_id = result.get("order_id")
                 trade.updated_at = _utcnow()
                 open_positions += 1
+                if d in dir_open:
+                    dir_open[d] += 1
                 placed += 1
             else:
                 trade.status = SniperTradeStatus.FAILED
@@ -712,14 +1479,46 @@ async def run_sniper_cycle(db: AsyncSession) -> dict[str, Any]:
         .limit(50)
     )
     sig_res = await db.execute(sig_q)
-    for sig in sig_res.scalars().all():
+    # Rank best-first (confidence desc, then profit/pips desc) so the
+    # same-direction cap keeps the strongest signals, not just the newest.
+    candidate_sigs = _rank_signals_best_first(list(sig_res.scalars().all()))
+    for sig in candidate_sigs:
         if sig.id in sniped_ids:
             continue
         if allowed is not None and sig.channel_source_id not in allowed:
             continue
-        if (sig.confidence or 0) < settings.min_confidence:
+        if (sig.confidence or 0) < settings.min_confidence and not getattr(settings, 'force_telegram_signals', False):
             db.add(_skip_record(sig, settings, "Below confidence threshold"))
             skipped += 1
+            continue
+
+        # High-conviction signals are never dropped by a discretionary gate.
+        _hc = is_high_conviction(sig, settings)
+
+        # ── Same-direction cap: keep only the best N per side ────────────────
+        _d = (sig.direction or "").lower()
+        if not _hc and _d in ("long", "short") and dir_open.get(_d, 0) >= max_same:
+            db.add(_skip_record(
+                sig, settings,
+                f"Same-direction cap — {max_same} {_d}s already open; kept best by confidence/pips",
+            ))
+            skipped += 1
+            continue
+
+        # ── Forex signals → MT5 live account (Swissquote price) ──────────────
+        # Bitget has no forex; XAUUSD/EURUSD/… execute on a live-linked MT5
+        # account and use the Swissquote feed. This branch fully owns the signal.
+        from plugins.TelegramSignalNewsPlugin.backend.services.forex_price_service import is_forex_pair
+        if (getattr(sig, "market_type", "") == "forex") or is_forex_pair(sig.symbol):
+            outcome = await _handle_forex_signal(db, sig, settings, immediate_conf=immediate_conf)
+            if outcome == "placed":
+                placed += 1
+                if _d in dir_open:
+                    dir_open[_d] += 1
+            elif outcome == "skipped":
+                skipped += 1
+            else:
+                pending += 1
             continue
 
         live = await _get_live_price(sig.symbol)
@@ -733,7 +1532,7 @@ async def run_sniper_cycle(db: AsyncSession) -> dict[str, Any]:
         # volume cannot be established is recorded as NO_TRADE, never sniped on
         # price alone. ───────────────────────────────────────────────────────
         vol_ctx = await resolve_volume(sig.symbol)
-        if vol_ctx.status != "OK":
+        if vol_ctx.status not in ("OK", "NOT_APPLICABLE") and not _hc:
             rec = _skip_record(
                 sig, settings,
                 f"NO_TRADE — volume {vol_ctx.status.lower()}: {vol_ctx.detail}",
@@ -753,7 +1552,7 @@ async def run_sniper_cycle(db: AsyncSession) -> dict[str, Any]:
             take_profits=sig.take_profits_json or [],
             live_price=live,
             offset_pct=settings.sniper_offset_pct,
-            min_rr=settings.min_risk_reward,
+            min_rr=0.0 if _hc else settings.min_risk_reward,
         )
         if not plan.ok:
             db.add(_skip_record(sig, settings, plan.reason, live=live))
@@ -843,9 +1642,11 @@ async def run_sniper_cycle(db: AsyncSession) -> dict[str, Any]:
                         plan.sniper_entry = float(ai_entry)
                         plan.trigger_now = live >= plan.sniper_entry
                 if decision == "skip":
-                    db.add(_skip_record(sig, settings, f"AI advised skip · {ai_note}", live=live))
-                    skipped += 1
-                    continue
+                    if not _hc:
+                        db.add(_skip_record(sig, settings, f"AI advised skip · {ai_note}", live=live))
+                        skipped += 1
+                        continue
+                    ai_note += " · overridden (high-conviction signal)"
                 if decision == "wait":
                     plan.trigger_now = False
 
@@ -864,6 +1665,14 @@ async def run_sniper_cycle(db: AsyncSession) -> dict[str, Any]:
                 ai_confirmed = False  # agents unavailable → not auto-confirmed
                 agent_note = "AI agents unavailable"
         overall_confirmed = volume_confirmed and (ai_confirmed if settings.require_ai_confirmation else True)
+        if _hc and not overall_confirmed:
+            # A high-conviction signal is not left parked as PENDING waiting for
+            # a confirmation that may never come — that is a skip by another name.
+            overall_confirmed = True
+            agent_note = (agent_note + " · " if agent_note else "") + (
+                f"confirmation bypassed — confidence {(sig.confidence or 0) * 100:.0f}% "
+                f">= never-skip {float(getattr(settings, 'never_skip_confidence_pct', 90.0)):g}%"
+            )
 
         trade = TelegramSniperTrade(
             signal_id=sig.id,
@@ -903,14 +1712,32 @@ async def run_sniper_cycle(db: AsyncSession) -> dict[str, Any]:
             executed_mode=None,
         )
 
-        # Auto-execute when confirmed (volume + AI agents). With
-        # execute_immediately the order is placed at market right away (so it
-        # shows on /trading); otherwise it waits for the optimised limit entry.
-        ready = overall_confirmed and (settings.execute_immediately or plan.trigger_now)
+        # Auto-execute when confirmed (volume + AI agents). Confidence decides
+        # HOW we enter: a high-conviction signal (>= immediate_confidence_pct)
+        # is taken at MARKET right away so it is never missed; a weaker signal
+        # waits for the optimised sniper LIMIT entry.
+        high_conf = _hc or (sig.confidence or 0.0) >= immediate_conf
+        immediate = high_conf or settings.execute_immediately
+        ready = overall_confirmed and (immediate or plan.trigger_now)
         can_sandbox = settings.execute_sandbox and open_sandbox < settings.max_positions_sandbox
         can_live = settings.execute_live and open_live < settings.max_positions_live
         if ready and (can_sandbox or can_live):
-            entry_px = live if settings.execute_immediately else (plan.sniper_entry or live)
+            margin_ok, margin_why = await _margin_risk_ok(
+                db, settings,
+                settings.position_size_usdt,
+                int(trade.leverage or settings.leverage),
+            )
+            if not margin_ok:
+                db.add(_skip_record(sig, settings, f"NO_TRADE — {margin_why}", live=live))
+                skipped += 1
+                continue
+            # High-conf → the SIGNAL ENTRY (never missed); weaker → sniper limit.
+            if high_conf and sig.entry and sig.entry > 0:
+                entry_px = float(sig.entry)
+            elif immediate:
+                entry_px = live
+            else:
+                entry_px = plan.sniper_entry or live
             placed_any = False
             extra_reason = ""
             # Sandbox (simulation account on /trading)
@@ -965,11 +1792,26 @@ async def run_sniper_cycle(db: AsyncSession) -> dict[str, Any]:
                 trade.status = SniperTradeStatus.PLACED
                 trade.reason = f"Auto-executed ({trade.executed_mode}) — confirmed{extra_reason}"
                 placed += 1
+                if _d in dir_open:
+                    dir_open[_d] += 1
                 await _store_trade_knowledge(
                     db, symbol=sig.symbol, direction=sig.direction,
                     mode=trade.executed_mode, entry=entry_px, confirmed=True,
                     note=(agent_note or ai_note or "confirmed"),
                 )
+                if getattr(settings, "notify_executions", True):
+                    from plugins.TelegramSignalNewsPlugin.backend.services import notifications as _notif
+                    _reason = (agent_note or ai_note or vol_why or "confirmed")
+                    await _notif.notify(
+                        _notif.format_execution(
+                            source="telegram", symbol=sig.symbol, direction=sig.direction,
+                            entry=entry_px, stop_loss=plan.stop_loss,
+                            take_profit=plan.take_profit, take_profits=sig.take_profits_json,
+                            venue=f"Bitget {trade.executed_mode}", reason=str(_reason),
+                            channel=sig.channel_title,
+                        ),
+                        db,
+                    )
             else:
                 trade.status = SniperTradeStatus.FAILED
                 trade.reason = f"Execution failed{extra_reason}"
@@ -1189,6 +2031,7 @@ async def auto_close_positions_for_signal(
     result: dict[str, Any] = {
         "sandbox_closed": [],
         "live_closed": [],
+        "mt5_closed": [],
         "errors": [],
     }
 
@@ -1283,12 +2126,68 @@ async def auto_close_positions_for_signal(
     except Exception as exc:  # noqa: BLE001
         result["errors"].append(f"Live close error: {exc}")
 
+    # ── 4. Close live MT5 positions (forex/gold) ────────────────────
+    # Forex signals fan out to one or more MT5 accounts; the tickets are stored
+    # comma-joined on ``live_order_id`` with ``executed_mode`` == 'mt5-live'. A
+    # ticket lives on exactly one account, so we try each linked account and
+    # stop at the first that accepts the close.
+    mt5_trades = [
+        t for t in placed_trades
+        if "mt5" in (t.executed_mode or "").lower() and t.live_order_id
+    ]
+    if mt5_trades:
+        try:
+            from plugins.MT5TradingPlugin.backend.services.mt5_client import mt5_client
+
+            accounts = await _get_live_mt5_accounts(db, None)
+            for trade in mt5_trades:
+                tickets = [
+                    tk.strip() for tk in str(trade.live_order_id).split(",") if tk.strip()
+                ]
+                closed_any = False
+                for tk in tickets:
+                    try:
+                        tk_int = int(tk)
+                    except ValueError:
+                        continue
+                    for acct in accounts:
+                        try:
+                            res = await mt5_client.close_position(
+                                acct.login, acct.server, acct.password_encrypted, tk_int,
+                            )
+                        except Exception:  # noqa: BLE001
+                            continue  # wrong account / ticket not here
+                        if not isinstance(res, dict) or res.get("error"):
+                            continue
+                        rc = str(res.get("retcode")) if res.get("retcode") is not None else None
+                        ok = (
+                            rc in ("10009", "0")
+                            or any(res.get(k) for k in ("ticket", "order", "closed", "message"))
+                            or rc is None
+                        )
+                        if ok:
+                            result["mt5_closed"].append({
+                                "symbol": trade.symbol,
+                                "ticket": tk_int,
+                                "account_id": acct.id,
+                                "trade_id": trade.id,
+                            })
+                            closed_any = True
+                            break  # ticket handled by this account
+                if closed_any:
+                    trade.status = SniperTradeStatus.SKIPPED
+                    trade.reason = reason + " (mt5)"
+                    trade.updated_at = _utcnow()
+        except Exception as exc:  # noqa: BLE001
+            result["errors"].append(f"MT5 close error: {exc}")
+
     await db.commit()
     logger.info(
-        "[AutoClose] signal={} sandbox={} live={} errors={}",
+        "[AutoClose] signal={} sandbox={} live={} mt5={} errors={}",
         signal_id,
         len(result["sandbox_closed"]),
         len(result["live_closed"]),
+        len(result["mt5_closed"]),
         len(result["errors"]),
     )
     return result
@@ -1383,30 +2282,46 @@ async def analyze_signal_full(db: AsyncSession, signal_id: int) -> dict[str, Any
     ai_report: dict[str, Any] | None = None
     try:
         from app.core.database import AsyncSessionLocal
+        from app.agents import room
         from app.agents.orchestrator import AgentOrchestrator
-        async with AsyncSessionLocal() as adb:
-            res = await AgentOrchestrator.analyze_symbol(
-                adb, normalize_symbol(sig.symbol), "1h", trigger="telegram"
-            )
-        if isinstance(res, dict) and not res.get("error"):
-            ai_report = {
-                "final_action": (res.get("final_action") or "hold"),
-                "final_confidence": res.get("final_confidence") or 0,
-                "reasoning": res.get("final_reasoning") or "",
-                "ai_calls": res.get("ai_calls") or 0,
-                "decisions": [
-                    {
-                        "role": d.get("agent_role"),
-                        "action": d.get("action"),
-                        "confidence": d.get("confidence"),
-                        "reasoning": d.get("reasoning"),
-                        "provider": d.get("provider"),
-                    }
-                    for d in (res.get("decisions") or [])
-                ],
-            }
     except Exception as exc:  # noqa: BLE001
         logger.warning("Full analysis AI step failed for {}: {}", sig.symbol, exc)
+    else:
+        # Focus gate: while pair(s) are pinned in the trading room, a signal on
+        # any other pair is recorded but never given a board meeting.
+        sym = normalize_symbol(sig.symbol)
+        focus_skipped = False
+        try:
+            focus_skipped = bool(room.get_focus_symbols()) and not room.is_focused(sym)
+        except Exception:  # noqa: BLE001
+            pass
+        if focus_skipped:
+            logger.debug("Focus locked — skipping full agent analysis for {}", sig.symbol)
+        else:
+            try:
+                async with AsyncSessionLocal() as adb:
+                    res = await AgentOrchestrator.analyze_symbol(
+                        adb, sym, "1h", trigger="telegram"
+                    )
+                if isinstance(res, dict) and not res.get("error"):
+                    ai_report = {
+                        "final_action": (res.get("final_action") or "hold"),
+                        "final_confidence": res.get("final_confidence") or 0,
+                        "reasoning": res.get("final_reasoning") or "",
+                        "ai_calls": res.get("ai_calls") or 0,
+                        "decisions": [
+                            {
+                                "role": d.get("agent_role"),
+                                "action": d.get("action"),
+                                "confidence": d.get("confidence"),
+                                "reasoning": d.get("reasoning"),
+                                "provider": d.get("provider"),
+                            }
+                            for d in (res.get("decisions") or [])
+                        ],
+                    }
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Full analysis AI step failed for {}: {}", sig.symbol, exc)
 
     ai_action = (ai_report or {}).get("final_action")
     ai_conf = float((ai_report or {}).get("final_confidence") or 0)
@@ -1430,7 +2345,7 @@ async def analyze_signal_full(db: AsyncSession, signal_id: int) -> dict[str, Any
     # ── Decision ──
     # The volume gate outranks everything else: without a resolved context there
     # is no tradeable call to make, whatever the agents say.
-    if vol_ctx.status != "OK":
+    if vol_ctx.status not in ("OK", "NOT_APPLICABLE"):
         decision, reason = "no_trade", (
             f"Volume is a hard precondition and it is {vol_ctx.status.lower()} "
             f"for {sig.symbol}. {vol_ctx.detail}"
@@ -1582,22 +2497,24 @@ async def reanalyze_skipped_signals(db: AsyncSession) -> dict[str, Any]:
             take_profits=sig.take_profits_json or [],
             live_price=live,
             offset_pct=settings.sniper_offset_pct,
-            min_rr=settings.min_risk_reward,
+            min_rr=0.0 if is_high_conviction(sig, settings) else settings.min_risk_reward,
         )
         if not plan.ok:
             continue
         # Volume gate — a skipped signal is only re-promoted when volume can be
-        # established AND supports its direction.
+        # established AND supports its direction. High-conviction signals are
+        # exempt, same as on the first pass.
+        _hc = is_high_conviction(sig, settings)
         vol_ctx = await resolve_volume(sig.symbol)
         vol_ok, vol_why = volume_supports(sig.direction, vol_ctx)
-        if not vol_ok:
+        if not vol_ok and not _hc:
             trade.volume_confirmed = False
             trade.reason = f"Still NO_TRADE — {vol_why} · {volume_gate_note(vol_ctx)}"
             trade.updated_at = _utcnow()
             continue
         # Quick order-flow read (no agent call — saves tokens)
         vol = await volume_snapshot(sig.symbol, sig.direction)
-        if vol.get("opposite_volume"):
+        if vol.get("opposite_volume") and not _hc:
             continue
         # Upgrade the existing skipped trade back to PENDING
         trade.sniper_entry = plan.sniper_entry
@@ -1639,13 +2556,13 @@ async def reanalyze_skipped_signals(db: AsyncSession) -> dict[str, Any]:
             take_profits=sig.take_profits_json or [],
             live_price=live,
             offset_pct=settings.sniper_offset_pct,
-            min_rr=settings.min_risk_reward,
+            min_rr=0.0 if is_high_conviction(sig, settings) else settings.min_risk_reward,
         )
         if not plan.ok:
             continue
         vol_ctx = await resolve_volume(sig.symbol)
         vol_ok, vol_why = volume_supports(sig.direction, vol_ctx)
-        if not vol_ok:
+        if not vol_ok and not is_high_conviction(sig, settings):
             continue  # no volume, no queue — nothing to snipe
         trade = TelegramSniperTrade(
             signal_id=sig.id,

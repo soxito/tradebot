@@ -18,10 +18,14 @@ import {
   createChart, IChartApi, ISeriesApi, SeriesMarker, Time, LineStyle,
   CrosshairMode, ColorType,
 } from 'lightweight-charts'
+import { attachZonesOverlay, type CycleWindowBox, type ZonesData, type ZonesOverlay } from '@/utils/zonesOverlay'
+import { useZonesData } from '@/hooks/useZonesData'
+import { useBtcCycleWindows } from '@/hooks/useBtcCycle'
+import { toCycleBoxes } from '@/utils/cycleOverlay'
 import { apiClient } from '@/services/api'
 import {
   Search, RefreshCw, ChevronDown, TrendingUp, CandlestickChart, LineChart,
-  Maximize2, Minimize2, Ruler, Eraser, Activity,
+  Maximize2, Minimize2, Ruler, Eraser, Activity, GitBranch,
 } from 'lucide-react'
 import { formatTimeZA } from '@/utils/datetime'
 import { pollMultiplier } from '@/utils/devicePerformance'
@@ -74,6 +78,23 @@ interface MT5AdvancedChartProps {
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────
+
+/** Bases that ride the Bitcoin cycle — mirrors backend cycle_applies. */
+const CYCLE_BASES = /^(BTC|ETH|SOL|XRP|DOGE|ADA|AVAX|LINK|BNB|LTC)(USD|USDT|USDC)?$/i
+
+/** Compose the overlay payload: zones when on, cycle boxes when this is a
+ *  cycle-driven symbol. Either alone renders. */
+function composeOverlayData(
+  zones: ZonesData | null,
+  cycle: CycleWindowBox[] | undefined,
+  includeZones: boolean,
+): ZonesData | null {
+  if (cycle?.length) {
+    const base: ZonesData = includeZones && zones ? zones : { supply_zones: [], demand_zones: [] };
+    return { ...base, cycle_windows: cycle };
+  }
+  return includeZones ? zones : null;
+}
 
 const TIMEFRAMES = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1'] as const
 
@@ -269,6 +290,7 @@ export default function MT5AdvancedChart({
 
   const positionLines = useRef<any[]>([])
   const levelLines = useRef<any[]>([])
+  const fibLines = useRef<any[]>([])
   const manualLines = useRef<any[]>([])
   const livePriceLine = useRef<any>(null)
 
@@ -287,6 +309,7 @@ export default function MT5AdvancedChart({
   const [chartType, setChartType] = useState<'candles' | 'line'>('candles')
   const [showEMA, setShowEMA] = useState(true)
   const [showLevels, setShowLevels] = useState(true)
+  const [showFib, setShowFib] = useState(false)
   const [showVolume, setShowVolume] = useState(true)
   const [showRSI, setShowRSI] = useState(true)
   const [drawMode, setDrawMode] = useState(false)
@@ -300,8 +323,32 @@ export default function MT5AdvancedChart({
   const [showSymbolList, setShowSymbolList] = useState(false)
   const [dataSource, setDataSource] = useState<string>('mt5')
   const [sourceReason, setSourceReason] = useState<SourceReason>('mt5-live')
+  const [fibLevels, setFibLevels] = useState<{ ratio: number; price: number; label: string; color: string }[]>([])
   const [tradeBusy, setTradeBusy] = useState<'buy' | 'sell' | null>(null)
   const [lot, setLot] = useState('0.01')
+
+  // Zone overlay state. The API speaks lowercase timeframes ("1h"); the chart
+  // uses MT5 style ("H1") — normalise for the fetch only.
+  const [showZones, setShowZones] = useState(true)
+  const [zonesVisible, setZonesVisible] = useState(true)
+  const zonesApiTf = timeframe.toLowerCase().replace(/^(\d)([hdw])$/, '$1$2')
+  const zonesData = useZonesData(symbol, zonesApiTf, showZones && zonesVisible)
+  const zonesDataRef = useRef(zonesData)
+  zonesDataRef.current = zonesData
+  const zonesOverlay = useRef<ZonesOverlay | null>(null)
+
+  // The Bitcoin calendar rides along on cycle-driven symbols (BTC, ETH, …):
+  // fetched once per mount, drawn as full-height green/red boxes behind price.
+  const cycleWins = useBtcCycleWindows()
+  const isCycleSymbol = CYCLE_BASES.test(symbol.replace(/[/\-:]/g, ''))
+  const cycleBoxes = isCycleSymbol ? toCycleBoxes(cycleWins) : undefined
+  const cycleBoxesRef = useRef<CycleWindowBox[] | undefined>(cycleBoxes)
+  cycleBoxesRef.current = cycleBoxes
+
+  // Rebuild primitive contents whenever data or visibility changes.
+  useEffect(() => {
+    zonesOverlay.current?.setData(composeOverlayData(zonesData, cycleBoxes, zonesVisible))
+  }, [zonesData, zonesVisible, cycleBoxes])
 
   const priceHeight = maximized ? () => window.innerHeight - 230 : () => 460
 
@@ -364,6 +411,12 @@ export default function MT5AdvancedChart({
     ema50Series.current = e50
     rsiSeries.current = rsiS
 
+    // Zone overlay (supply/demand, fib bands, channels) on the price pane.
+    zonesOverlay.current = attachZonesOverlay(cs, pc)
+    zonesOverlay.current.setData(
+      composeOverlayData(zonesDataRef.current, cycleBoxesRef.current, zonesVisible),
+    )
+
     // Time-scale sync between the price and study panes (guarded against loops).
     const linkRange = (from: IChartApi, to: IChartApi) =>
       from.timeScale().subscribeVisibleLogicalRangeChange(range => {
@@ -392,6 +445,7 @@ export default function MT5AdvancedChart({
       try { sc.remove() } catch {}
       priceChart.current = null
       studyChart.current = null
+      zonesOverlay.current = null
     }
   }, [])
 
@@ -658,6 +712,43 @@ export default function MT5AdvancedChart({
     })
   }, [candles, showLevels])
 
+  // ── Auto fib retracement ────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!showFib || !accountId) { setFibLevels([]); return }
+    let cancelled = false
+    // Levels are only meaningful against the candles actually on screen, so when
+    // the chart is on a fallback feed the fib request follows it there — same
+    // exchange, same symbol spelling, same timeframe.
+    const onFallback = dataSource !== 'mt5'
+    const sym = onFallback ? normaliseSymbolForExchange(symbol, dataSource) : symbol
+    const tf = onFallback ? (MT5_TF_TO_EXCHANGE[timeframe] ?? '1h') : timeframe
+    apiClient.mt5.getFibOverlay(accountId, sym, tf, onFallback ? dataSource : undefined)
+      .then(res => { if (!cancelled) setFibLevels(res.data?.levels || []) })
+      .catch(() => { if (!cancelled) setFibLevels([]) })
+    return () => { cancelled = true }
+  }, [showFib, accountId, symbol, timeframe, dataSource])
+
+  useEffect(() => {
+    const cs = candleSeries.current
+    if (!cs) return
+    fibLines.current.forEach(l => { try { cs.removePriceLine(l) } catch {} })
+    fibLines.current = []
+    if (!showFib) return
+    fibLevels.forEach(lvl => {
+      // The 0.5-0.618 golden zone is the part traders act on — everything else
+      // is context, so it stays dashed and quiet.
+      const golden = lvl.ratio === 0.5 || lvl.ratio === 0.618
+      fibLines.current.push(cs.createPriceLine({
+        price: lvl.price,
+        color: lvl.color,
+        lineWidth: golden ? 2 : 1,
+        lineStyle: golden ? LineStyle.Solid : LineStyle.Dotted,
+        axisLabelVisible: true,
+        title: `Fib ${lvl.label}`,
+      }))
+    })
+  }, [fibLevels, showFib])
+
   // ── Position / SL / TP overlays ─────────────────────────────────────────────
   useEffect(() => {
     const cs = candleSeries.current
@@ -808,8 +899,10 @@ export default function MT5AdvancedChart({
           <IconToggle active={chartType === 'candles'} onClick={() => setChartType('candles')} title="Candles"><CandlestickChart className="w-3.5 h-3.5" /></IconToggle>
           <IconToggle active={chartType === 'line'} onClick={() => setChartType('line')} title="Line"><LineChart className="w-3.5 h-3.5" /></IconToggle>
           <span className="w-px h-4 bg-gray-700 mx-0.5" />
+          <IconToggle active={showZones && zonesVisible} onClick={() => { setShowZones(true); setZonesVisible(v => !v) }} title="Supply/demand zones + fib bands + channels"><Activity className="w-3.5 h-3.5" /></IconToggle>
           <IconToggle active={showEMA} onClick={() => setShowEMA(v => !v)} title="EMA 9/21/50"><TrendingUp className="w-3.5 h-3.5" /></IconToggle>
           <IconToggle active={showLevels} onClick={() => setShowLevels(v => !v)} title="S/R levels"><Activity className="w-3.5 h-3.5" /></IconToggle>
+          <IconToggle active={showFib} onClick={() => setShowFib(v => !v)} title="Auto fib retracement"><GitBranch className="w-3.5 h-3.5" /></IconToggle>
           <IconToggle active={drawMode} onClick={() => setDrawMode(v => !v)} title="Draw level (click chart)"><Ruler className="w-3.5 h-3.5" /></IconToggle>
           <IconToggle active={false} onClick={clearManualLevels} title="Clear drawn levels"><Eraser className="w-3.5 h-3.5" /></IconToggle>
         </div>

@@ -428,4 +428,8 @@ def _warmup_in_background() -> None:
     threading.Thread(target=_run, name="kronos-warmup", daemon=True).start()
 
 
-_warmup_in_background()
+# Public, explicit warmup trigger. The model is NOT loaded at import time any
+# more — that pulled a 102M-param torch model into RAM on every backend boot
+# even when forecasting was never used, contributing to memory pressure. The
+# first real forecast lazy-loads via _load(); call this only to pre-warm.
+warmup = _warmup_in_background

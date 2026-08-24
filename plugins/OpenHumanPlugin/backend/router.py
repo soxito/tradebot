@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import AsyncSessionLocal
@@ -57,8 +57,8 @@ async def get_status(db: AsyncSession = Depends(get_db)):
     # am_ok = memory_tree_db component is healthy
     # oh_ok = OpenHuman process is alive and healthy
 
-    count_result = await db.execute(select(OpenHumanMemoryEntry))
-    count = len(count_result.scalars().all())
+    count_result = await db.execute(select(func.count()).select_from(OpenHumanMemoryEntry))
+    count = int(count_result.scalar() or 0)
 
     msg = []
     if not oh_ok:

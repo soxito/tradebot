@@ -192,6 +192,124 @@ async def test_stored_findings_keep_their_confidence_and_provenance(db):
     assert row.decay_at > datetime.utcnow()
 
 
+@pytest.mark.asyncio
+async def test_a_calendar_card_states_the_released_number_and_when(monkeypatch):
+    """The finding card is what the Research page shows — it must carry the print."""
+    async def _events(_symbol):
+        return [{
+            "title": "Non-Farm Employment Change", "currency": "USD", "impact": "high",
+            "time_utc": "2026-08-07 12:30", "hours_away": -2.0,
+            "forecast": "85K", "previous": "57K", "actual": "-23K",
+        }]
+
+    from plugins.MT5TradingPlugin.backend.services import smc_ai
+    monkeypatch.setattr(smc_ai, "fetch_economic_events", _events)
+
+    found = await research_loop.collect_calendar(["BTCUSD"])
+
+    assert len(found) == 1
+    assert found[0].body == (
+        "impact=high forecast=85K previous=57K actual=-23K at=2026-08-07 12:30 UTC"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_unreleased_event_claims_no_actual(monkeypatch):
+    async def _events(_symbol):
+        return [{
+            "title": "CPI y/y", "currency": "USD", "impact": "high",
+            "time_utc": "2026-08-12 12:30", "hours_away": 96.0,
+            "forecast": "3.1%", "previous": "3.0%", "actual": None,
+        }]
+
+    from plugins.MT5TradingPlugin.backend.services import smc_ai
+    monkeypatch.setattr(smc_ai, "fetch_economic_events", _events)
+
+    body = (await research_loop.collect_calendar(["BTCUSD"]))[0].body
+    assert "actual" not in body
+    assert body.endswith("at=2026-08-12 12:30 UTC")
+
+
+@pytest.mark.asyncio
+async def test_a_calendar_event_is_revised_in_place_not_stacked(db):
+    """One release, one card — the forecast firms up and then the actual prints."""
+    before = _finding(kind="calendar", symbol="BTCUSD", headline="USD Unemployment Rate",
+                      body="impact=high forecast=4.2% previous=4.2% at=2026-08-07 12:30 UTC")
+    first = await research_loop.store_findings(db, [before])
+
+    after = _finding(kind="calendar", symbol="BTCUSD", headline="USD Unemployment Rate",
+                     body="impact=high forecast=4.2% previous=4.2% actual=4.1% "
+                          "at=2026-08-07 12:30 UTC")
+    second = await research_loop.store_findings(db, [after])
+
+    assert second == first, "the same release must revise its own row"
+    active = await research_loop.active_findings(db, kinds=["calendar"])
+    assert len(active) == 1
+    assert "actual=4.1%" in active[0].body
+
+
+@pytest.mark.asyncio
+async def test_a_revised_release_sorts_as_freshly_seen(db):
+    """Findings are read newest-first; a revision must not sink out of the page."""
+    await research_loop.store_findings(db, [
+        _finding(kind="calendar", symbol="BTCUSD", headline="USD Unemployment Rate"),
+    ])
+    await research_loop.store_findings(db, [_finding(kind="news", headline="Later story")])
+    await research_loop.store_findings(db, [
+        _finding(kind="calendar", symbol="BTCUSD", headline="USD Unemployment Rate",
+                 body="impact=high actual=4.1%"),
+    ])
+
+    newest = (await research_loop.active_findings(db, limit=5))[0]
+    assert newest.kind == "calendar"
+    assert "actual=4.1%" in newest.body
+
+
+@pytest.mark.asyncio
+async def test_copies_left_by_earlier_ticks_are_superseded(db):
+    """Ticks that ran before dedup existed stacked one release many times over."""
+    for _ in range(4):
+        db.add(ResearchFinding(
+            kind="calendar", symbol="BTCUSD", headline="USD Unemployment Rate",
+            body="impact=high forecast=4.2% previous=4.2% at=None",
+            source="ForexFactory", source_url="https://www.forexfactory.com/calendar",
+            confidence=0.9, speculative=False,
+            decay_at=research_loop._decay_at("calendar"),
+        ))
+    await db.commit()
+    assert len(await research_loop.active_findings(db, kinds=["calendar"])) == 4
+
+    await research_loop.store_findings(db, [
+        _finding(kind="calendar", symbol="BTCUSD", headline="USD Unemployment Rate",
+                 body="impact=high forecast=4.2% previous=4.2% actual=4.1% "
+                      "at=2026-08-07 12:30 UTC"),
+    ])
+
+    active = await research_loop.active_findings(db, kinds=["calendar"])
+    assert len(active) == 1, "the stack collapses to the one live card"
+    assert "actual=4.1%" in active[0].body
+
+
+@pytest.mark.asyncio
+async def test_two_symbols_watching_one_release_keep_their_own_cards(db):
+    await research_loop.store_findings(db, [
+        _finding(kind="calendar", symbol="BTCUSD", headline="USD Unemployment Rate"),
+        _finding(kind="calendar", symbol="XAUUSD", headline="USD Unemployment Rate"),
+        _finding(kind="calendar", symbol="BTCUSD", headline="USD Non-Farm Employment Change"),
+    ])
+    assert len(await research_loop.active_findings(db, kinds=["calendar"])) == 3
+
+
+@pytest.mark.asyncio
+async def test_news_still_stores_every_item(db):
+    """Only the calendar repeats itself; two headlines are two stories."""
+    await research_loop.store_findings(db, [
+        _finding(kind="news", headline="Fed speaks"),
+        _finding(kind="news", headline="Fed speaks"),
+    ])
+    assert len(await research_loop.active_findings(db, kinds=["news"])) == 2
+
+
 # ── Decay ────────────────────────────────────────────────────────────────────
 
 def test_decay_horizon_differs_by_kind():
@@ -379,7 +497,7 @@ async def test_tradingview_only_extends_past_the_forexfactory_week(monkeypatch):
     async def _ff():
         return ff
 
-    async def _tv(after):
+    async def _tv():
         return tv
 
     monkeypatch.setattr(economic_calendar, "_fetch_forexfactory", _ff)
@@ -395,7 +513,7 @@ async def test_a_dead_calendar_feed_keeps_the_previous_window(monkeypatch):
     async def _empty():
         return []
 
-    async def _none(_after):
+    async def _none():
         return []
 
     monkeypatch.setattr(economic_calendar, "_fetch_forexfactory", _empty)

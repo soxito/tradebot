@@ -298,9 +298,20 @@ start_backend_bg() {
   export AUTO_START_SCHEDULER="true"
   echo -e "${CYAN}▶ Starting backend (FastAPI) on port ${BACKEND_PORT} (background)...${NC}"
   cd "$ROOT/backend"
-  nohup "$VENV/bin/uvicorn" app.main:app --host 0.0.0.0 --port "$BACKEND_PORT" --reload \
+  # Detach into a session of its own. nohup alone only blocks SIGHUP — the
+  # process stays in this shell's process group and dies with the terminal.
+  # --reload-dir keeps the watcher off data/ and logs/; --timeout-graceful-shutdown
+  # stops reloads hanging forever on open SSE streams.
+  # macOS has no setsid(1), so call setsid(2) via python and exec over it —
+  # execv keeps the pid, so $! below is still the uvicorn process.
+  nohup "$VENV/bin/python" -c \
+    'import os,sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])' \
+    "$VENV/bin/uvicorn" app.main:app --host 0.0.0.0 --port "$BACKEND_PORT" \
+    --loop asyncio --reload --reload-dir app --reload-dir ../plugins \
+    --timeout-graceful-shutdown 5 \
     > "$ROOT/backend.log" 2>&1 &
   echo $! > "$ROOT/.backend.pid"
+  disown 2>/dev/null || true
   echo -e "${GREEN}✓ Backend PID $(cat "$ROOT/.backend.pid") — log: backend.log${NC}"
 }
 

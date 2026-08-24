@@ -22,6 +22,10 @@ from app.api.market import router as market_router
 from app.api.stream import router as stream_router
 from app.api.ngrok import router as ngrok_router
 from app.api.research import router as research_router
+from app.api.system import router as system_router
+from app.api.tasks import router as tasks_router
+from app.api.market_cycle import router as market_cycle_router
+from app.api.whale import router as whale_router
 
 # WhatsApp Plugin - loaded via plugin system
 # Fallback import if plugin system doesn't load it
@@ -59,6 +63,10 @@ api_router.include_router(market_router)
 api_router.include_router(stream_router)
 api_router.include_router(ngrok_router)
 api_router.include_router(research_router)
+api_router.include_router(system_router)
+api_router.include_router(tasks_router)
+api_router.include_router(market_cycle_router)
+api_router.include_router(whale_router)
 
 if HAS_WHATSAPP:
     api_router.include_router(whatsapp_router)

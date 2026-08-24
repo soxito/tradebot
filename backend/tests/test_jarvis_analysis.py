@@ -148,6 +148,37 @@ def test_short_entry_never_sits_below_current_price():
     assert s is None or s["entry"] >= 109
 
 
+def test_targets_never_sit_behind_current_price():
+    """The real XAUUSD case: price 4376, pullback entry 4321, TP1 4369.
+
+    Ordering against the *entry* was satisfied, so this passed every check and
+    shipped — but TP1 sat below where price was already trading. "Buy the dip at
+    4321, take profit at 4369" is an instruction to sell into a level the market
+    has gone past, and it read as if the plan contradicted the chart beside it.
+    """
+    s = H._build_setup("long", current=4376.0, swing_high=4447.0, swing_low=4305.0, atr=32.25)
+    assert s is not None
+    assert s["entry"] < 4376.0, "a pullback entry should still sit below market"
+    assert s["tp1"] > 4376.0, f"TP1 {s['tp1']} is behind current price"
+    assert s["tp2"] > s["tp1"]
+
+    t = H._build_setup("short", current=4376.0, swing_high=4447.0, swing_low=4305.0, atr=32.25)
+    assert t is not None
+    assert t["entry"] > 4376.0
+    assert t["tp1"] < 4376.0, f"TP1 {t['tp1']} is behind current price"
+    assert t["tp2"] < t["tp1"]
+
+
+@pytest.mark.parametrize("bias", ["long", "short"])
+def test_reward_to_risk_is_measured_from_the_published_levels(bias):
+    """R:R must describe the levels actually quoted, not the ones first computed."""
+    s = H._build_setup(bias, current=4376.0, swing_high=4447.0, swing_low=4305.0, atr=32.25)
+    assert s is not None
+    risk = abs(s["entry"] - s["sl"])
+    reward1 = abs(s["tp1"] - s["entry"])
+    assert s["rr1"] == pytest.approx(reward1 / risk, abs=0.05)
+
+
 def test_degenerate_range_yields_no_setup_rather_than_a_fake_one():
     """Previously this produced targets on the wrong side of entry, which
     ``abs()`` then reported as a healthy positive reward-to-risk."""

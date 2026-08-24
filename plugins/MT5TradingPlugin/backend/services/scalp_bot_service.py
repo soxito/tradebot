@@ -1332,6 +1332,20 @@ class ScalpBotManager:
             f"@{entry.entry} SL {entry.stop_loss} TP {entry.take_profit} "
             f"ticket={ticket} recovery={recovery}"
         )
+        # Notify via the linked Telegram bot (best-effort — only sends if the
+        # bot + a chat id are configured on the TelegramSignalNewsPlugin).
+        try:
+            from plugins.TelegramSignalNewsPlugin.backend.services import notifications as _notif
+            _why = (note or entry.reason or "SMC multi-timeframe scalp entry")
+            if recovery:
+                _why = "Recovery hedge — " + _why
+            await _notif.notify(_notif.format_execution(
+                source="scalp", symbol=symbol, direction=entry.side,
+                entry=entry.entry, stop_loss=entry.stop_loss, take_profit=entry.take_profit,
+                venue=f"MT5 scalp (acct {session.account_id})", reason=str(_why)[:280],
+            ))
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _recover_ticket_by_comment(self, login: str, server: str, password: str,
                                          comment: str) -> Optional[int]:

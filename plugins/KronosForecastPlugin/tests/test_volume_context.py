@@ -44,15 +44,26 @@ def test_no_rows_is_unavailable():
     assert ctx.relative_volume is None
 
 
-def test_all_zero_volume_is_unavailable_not_dead():
-    """A feed hard-coding 0.0 volume (e.g. Frankfurter FX) must report
-    UNAVAILABLE, never a DEAD regime, so callers return NO_TRADE."""
+def test_all_zero_volume_fx_is_not_applicable_not_dead():
+    """A weekend-closing feed hard-coding 0.0 volume (e.g. Frankfurter FX) must
+    report NOT_APPLICABLE — volume is not required to forecast it — never a DEAD
+    regime and never a hard NO_TRADE."""
     ctx = vc.build_volume_context(
         rows_1h([0.0] * 30), symbol="EURUSD", timeframe="1h", source="t", now=NOW
     )
-    assert ctx.status == "UNAVAILABLE"
+    assert ctx.status == "NOT_APPLICABLE"
     assert ctx.regime == "UNKNOWN"
     assert "does not carry volume" in ctx.detail
+
+
+def test_all_zero_volume_crypto_is_unavailable():
+    """Crypto trades 24/7, so a zero-volume feed there is a broken feed and must
+    still refuse — volume stays a hard precondition for coins."""
+    ctx = vc.build_volume_context(
+        rows_1h([0.0] * 30), symbol="BTC/USDT", timeframe="1h", source="t", now=NOW
+    )
+    assert ctx.status == "UNAVAILABLE"
+    assert ctx.regime == "UNKNOWN"
 
 
 def test_short_history_is_insufficient():
@@ -339,9 +350,16 @@ def test_resolver_uses_caller_rows_without_fetching():
 
 def test_resolver_without_fetcher_reports_unavailable():
     ctx = asyncio.run(vc.resolve_volume_context(
-        symbol="XAUUSD", timeframe="1d", rows=None, fetcher=None, now=NOW,
+        symbol="BTC/USDT", timeframe="1d", rows=None, fetcher=None, now=NOW,
     ))
     assert ctx.status == "UNAVAILABLE"
+
+
+def test_resolver_without_fetcher_is_not_applicable_for_metals():
+    ctx = asyncio.run(vc.resolve_volume_context(
+        symbol="XAUUSD", timeframe="1d", rows=None, fetcher=None, now=NOW,
+    ))
+    assert ctx.status == "NOT_APPLICABLE"
 
 
 def test_resolver_survives_a_failing_fetcher():

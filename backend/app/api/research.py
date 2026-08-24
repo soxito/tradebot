@@ -142,7 +142,9 @@ async def get_calendar(
         # without a second request.
         "currencies": eco.currencies_in(window),
         "next_event": eco.next_event(window),
-        "source": "ForexFactory",
+        # ForexFactory owns this week's rows; TradingView extends the horizon
+        # and supplies the ``actual`` values ForexFactory's feed never carries.
+        "source": "ForexFactory + TradingView",
         "available": True,
     }
 

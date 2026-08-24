@@ -243,6 +243,14 @@ class AILLMProvider(AIBase):
     priority = Column(Integer, nullable=False, default=100)  # lower = tried first
     free_tier = Column(Boolean, nullable=False, default=True)
 
+    #: Dedicate this profile to one task category (a key of TASK_MODEL_CHAINS).
+    #: A profile carrying a task serves ONLY that task and is held out of the
+    #: general pool, so a slow vision read can never occupy the same rate limit
+    #: as the chat path. Unique: two profiles cannot claim the same task, which
+    #: is what keeps "one profile, one job" true rather than merely intended.
+    #: NULL means the profile is part of the shared pool, as before.
+    assigned_task = Column(String(40), nullable=True, unique=True, index=True)
+
     status = Column(String(20), nullable=False, default="unknown")  # unknown/ok/error
     last_error = Column(Text, nullable=True)
     last_tested_at = Column(DateTime, nullable=True)

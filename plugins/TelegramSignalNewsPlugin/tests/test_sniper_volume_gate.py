@@ -138,15 +138,15 @@ def test_resolve_volume_ok_from_exchange_rows(monkeypatch):
     assert resolved.volume_1h == pytest.approx(300.0)
 
 
-def test_resolve_volume_reports_unavailable_when_the_feed_has_none(monkeypatch):
+def test_resolve_volume_is_not_applicable_for_fx_without_volume(monkeypatch):
     async def fake_fetch(*_a, **_k):
         return _rows_15m([0.0] * 30)
 
     monkeypatch.setattr(ss, "_fetch_ta_ohlcv", fake_fetch)
     resolved = asyncio.run(ss.resolve_volume("EURUSD"))
-    assert resolved.status == "UNAVAILABLE"
+    assert resolved.status == "NOT_APPLICABLE"
     ok, _ = ss.volume_supports("long", resolved)
-    assert ok is False
+    assert ok is True
 
 
 def test_resolve_volume_reports_stale(monkeypatch):

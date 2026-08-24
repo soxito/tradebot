@@ -8,6 +8,7 @@ import httpx
 from loguru import logger
 
 from app.core.config import settings
+from app.core.ai_key_routing import is_openai_key
 
 try:
     from openai import AsyncOpenAI
@@ -171,7 +172,33 @@ async def deepgram_stt(file: UploadFile = File(...)):
     """
     from app.services import deepgram_budget
 
-    # 1. Budget guard — silently stay on the free engine when capped/disabled.
+    try:
+        audio = await file.read()
+    except Exception:
+        audio = b""
+
+    # Empty/too-short clip → skip everything (no spend).
+    if not audio or len(audio) < 1024:
+        return {
+            "used_deepgram": False,
+            "reason": "empty_audio",
+            "budget": deepgram_budget.summary(),
+        }
+
+    # 1. Local engine first — a missed Web Speech clip is usually still a
+    # good recording, and Parakeet transcribes it for free with no budget
+    # impact and no key requirement. Deepgram only pays when local is down.
+    local_text = await _local_stt(audio, "clip.webm")
+    if local_text is not None:
+        return {
+            "used_deepgram": False,
+            "reason": "local_engine",
+            "text": local_text,
+            "engine": "local",
+            "budget": deepgram_budget.summary(),
+        }
+
+    # 2. Budget guard — silently stay on the free engine when capped/disabled.
     if not deepgram_budget.can_spend():
         return {
             "used_deepgram": False,
@@ -179,24 +206,12 @@ async def deepgram_stt(file: UploadFile = File(...)):
             "budget": deepgram_budget.summary(),
         }
 
+    # 3. Deepgram needs a key; without one the client stays on Web Speech.
     key = _dg_key()
     if not key:
         return {
             "used_deepgram": False,
             "reason": "key_missing",
-            "budget": deepgram_budget.summary(),
-        }
-
-    try:
-        audio = await file.read()
-    except Exception:
-        audio = b""
-
-    # Empty/too-short clip → skip the call entirely (no spend).
-    if not audio or len(audio) < 1024:
-        return {
-            "used_deepgram": False,
-            "reason": "empty_audio",
             "budget": deepgram_budget.summary(),
         }
 
@@ -329,10 +344,17 @@ async def dg_fn_get_position_summary():
         return await _fn_response({"error": str(e)})
 
 async def get_client():
+    """OpenAI client for the last-resort Whisper/TTS hop, or None.
+
+    whisper-1 and tts-1 are OpenAI-only endpoints, so this hop needs a real
+    OpenAI key. OPENAI_API_KEY normally holds whichever free provider the user
+    connected instead — sending that here just buys a 401 dressed up as "your
+    OpenAI key is wrong", so treat a non-OpenAI key as no key at all.
+    """
     if AsyncOpenAI is None:
         return None
     api_key = settings.OPENAI_API_KEY or os.getenv("OPENAI_API_KEY", "")
-    if not api_key:
+    if not api_key or not is_openai_key(api_key):
         return None
     return AsyncOpenAI(api_key=api_key)
 
@@ -447,7 +469,10 @@ def _warm_nvidia_tts_in_background() -> None:
     threading.Thread(target=_run, daemon=True).start()
 
 
-_warm_nvidia_tts_in_background()
+# Explicit trigger — no longer fired at import time so a plain backend boot
+# doesn't spawn a background thread + network handshake before it's needed. The
+# first real TTS request warms lazily on its own.
+warm_nvidia_tts = _warm_nvidia_tts_in_background
 
 
 # ── Local speech engine (huggingface/speech-to-speech, Parakeet-TDT + Qwen3-TTS) ─
@@ -497,18 +522,23 @@ async def _local_tts(text: str) -> Optional[tuple[bytes, str]]:
 
 @router.post("/stt")
 async def speech_to_text(file: UploadFile = File(...)):
-    """Convert speech to text — NVIDIA NIM (fast) -> local engine -> OpenAI Whisper."""
+    """Convert speech to text — local engine -> NVIDIA NIM -> OpenAI Whisper.
+
+    Local (Parakeet) leads when the speech engine is up: no network
+    round-trip, no per-minute cost, and it keeps working offline. NVIDIA and
+    Whisper remain as quality/availability fallbacks.
+    """
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="Empty audio file")
 
-    nvidia_text = await _nvidia_stt(content, file.filename or "audio.wav")
-    if nvidia_text is not None:
-        return {"text": nvidia_text, "engine": "nvidia"}
-
     local_text = await _local_stt(content, file.filename or "audio.wav")
     if local_text is not None:
         return {"text": local_text, "engine": "local"}
+
+    nvidia_text = await _nvidia_stt(content, file.filename or "audio.wav")
+    if nvidia_text is not None:
+        return {"text": nvidia_text, "engine": "nvidia"}
 
     client = await get_client()
     if not client:
@@ -528,16 +558,20 @@ async def speech_to_text(file: UploadFile = File(...)):
 
 @router.post("/tts")
 async def text_to_speech(text: str = Form(...), voice: str = Form("alloy")):
-    """Convert text to speech — NVIDIA NIM (fast) -> local engine -> OpenAI TTS."""
-    nvidia_result = await _nvidia_tts(text)
-    if nvidia_result is not None:
-        nvidia_audio, content_type = nvidia_result
-        return Response(content=nvidia_audio, media_type=content_type)
+    """Convert text to speech — local engine -> NVIDIA NIM -> OpenAI TTS.
 
+    Local (Qwen3-TTS) leads when the speech engine is up — lowest latency and
+    no spend; cloud voices remain as fallbacks.
+    """
     local_result = await _local_tts(text)
     if local_result is not None:
         local_audio, content_type = local_result
         return Response(content=local_audio, media_type=content_type)
+
+    nvidia_result = await _nvidia_tts(text)
+    if nvidia_result is not None:
+        nvidia_audio, content_type = nvidia_result
+        return Response(content=nvidia_audio, media_type=content_type)
 
     client = await get_client()
     if not client:

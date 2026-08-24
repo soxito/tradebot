@@ -94,13 +94,29 @@
   }
   // True when the transcript is mostly words JARVIS just spoke → it's our own
   // TTS echoing back through the mic, not the user.
+  // Conservative on purpose (a false positive eats genuine user commands):
+  //   • whole-word matching only — substring hits anywhere in a long reply made
+  //     ordinary follow-ups look like echoes and got silently dropped;
+  //   • verbatim containment of the utterance (or a 5+-word run of it) = echo;
+  //   • otherwise need BOTH ≥70% overlap AND ≥4 shared content words.
   function isSelfEcho(transcript) {
     if (!lastSpokenText) return false
-    const words = normSpeech(transcript).split(' ').filter(w => w.length > 2)
-    if (words.length === 0) return false
+    const t = normSpeech(transcript)
+    const l = normSpeech(lastSpokenText)
+    if (!t || !l) return false
+    if (l.includes(t)) return true
+    const tWords = t.split(' ').filter(w => w.length > 2)
+    const lWords = l.split(' ').filter(w => w.length > 2)
+    if (tWords.length >= 5) {
+      for (let i = 0; i + 5 <= tWords.length; i++) {
+        if (l.includes(tWords.slice(i, i + 5).join(' '))) return true
+      }
+    }
+    if (!tWords.length || !lWords.length) return false
+    const vocab = new Set(lWords)
     let hit = 0
-    for (const w of words) if (lastSpokenText.includes(w)) hit++
-    return (hit / words.length) >= 0.6
+    for (const w of tWords) if (vocab.has(w)) hit++
+    return hit >= 4 && hit / tWords.length >= 0.7
   }
   // True when speech was recently loud enough to be the user (not faint noise).
   // Fails open when the frequency analyser isn't running (can't measure).
@@ -409,7 +425,21 @@
     pageSpeaking = true
     pageSpeakingSetAt = Date.now()
     toPage({ type: 'speak-status', speaking: true, allowBargeIn: true })
-    utt.onend  = () => {
+    // Chrome silently stalls speechSynthesis after ~15s (onend never fires),
+    // which would leave speechBusy stuck true and permanently silence JARVIS. A
+    // periodic resume() revives a stalled utterance; a watchdog guarantees the
+    // queue drains even if the engine dies outright.
+    let uttDone = false
+    let keepAlive = null
+    let watchdog  = null
+    const clearUttTimers = () => {
+      if (keepAlive) { clearInterval(keepAlive); keepAlive = null }
+      if (watchdog)  { clearTimeout(watchdog);   watchdog  = null }
+    }
+    const finishUtterance = () => {
+      if (uttDone) return
+      uttDone = true
+      clearUttTimers()
       speechBusy = false
       drainSpeechQueue()
       // If nothing else is queued, clear pageSpeaking after a longer echo-tail delay
@@ -424,21 +454,22 @@
         }, 900)
       }
     }
-    utt.onerror = () => {
-      speechBusy = false
-      drainSpeechQueue()
-      if (!speechBusy) {
-        clearTimeout(restartTimer)
-        restartTimer = setTimeout(() => {
-          pageSpeaking = false
-          pageSpeakingSetAt = 0
-          echoGuardUntil = Date.now() + 900
-          toPage({ type: 'speak-status', speaking: false, allowBargeIn: false })
-        }, 900)
-      }
-    }
+    utt.onend   = finishUtterance
+    utt.onerror = finishUtterance
     speechBusy = true
     window.speechSynthesis.speak(utt)
+    keepAlive = setInterval(() => {
+      if (uttDone || !window.speechSynthesis.speaking) { clearUttTimers(); return }
+      try { window.speechSynthesis.resume() } catch { /* noop */ }
+    }, 10000)
+    // Upper bound (~11 chars/sec at rate 1.0) + buffer; on overrun the engine has
+    // died — force the queue forward rather than freeze JARVIS forever.
+    const estMs = (String(text).length / (11 * (utt.rate || 1))) * 1000 + 8000
+    watchdog = setTimeout(() => {
+      if (uttDone) return
+      try { window.speechSynthesis.cancel() } catch { /* noop */ }
+      finishUtterance()
+    }, Math.min(estMs, 120000))
   }
 
   function drainSpeechQueue() {
@@ -528,6 +559,28 @@
     return CRYPTO_PATTERNS.some((rx) => rx.test(cmd))
   }
 
+  // "read my screen", "what's on this chart", "analyse the screen" — grab the
+  // visible tab and hand it to the page's chat, which owns the vision request.
+  const SCREEN_PATTERNS = [
+    /\b(?:read|analy[sz]e|look at|check|what(?:'s| is) on)\s+(?:my\s+|the\s+|this\s+)?(?:screen|chart|page|tab)\b/i,
+    /\b(?:screenshot|screen\s?grab)\b/i,
+  ]
+
+  function interceptScreenCommand(command) {
+    if (!SCREEN_PATTERNS.some((rx) => rx.test(command))) return false
+    queueSpeak('Looking at your screen, Sir.')
+    try {
+      api.runtime.sendMessage({ type: 'capture-tab' }, (result) => {
+        if (api.runtime.lastError || !result || !result.ok) {
+          queueSpeak('I could not capture the screen.')
+          return
+        }
+        toPage({ type: 'screenshot', image: result.image, prompt: command.trim() })
+      })
+    } catch { /* noop */ }
+    return true
+  }
+
   function interceptCryptoCommand(command) {
     if (!isCryptoCommand(command)) return false
     // Give immediate verbal acknowledgment for trade execution commands so the
@@ -568,6 +621,12 @@
     // Crypto position commands are handled entirely by the backend via
     // background.js. We do NOT also send them to the page, which would
     // trigger the page's own handler and cause DNS/network errors.
+    let wasScreen = false
+    try { wasScreen = interceptScreenCommand(command) } catch { wasScreen = false }
+    if (wasScreen) {
+      try { notify('JARVIS heard you', command) } catch { /* noop */ }
+      return
+    }
     let wasCrypto = false
     try { wasCrypto = interceptCryptoCommand(command) } catch { wasCrypto = false }
     if (!wasCrypto) {
@@ -663,7 +722,10 @@
       rec.ondataavailable = (ev) => {
         if (!ev.data || ev.data.size === 0) return
         const now = Date.now()
-        dgChunks.push({ t: now, blob: ev.data })
+        // Tag chunks captured while JARVIS is speaking (or in his echo tail) so
+        // escalation can exclude his own voice from the clip it sends.
+        const self = pageSpeaking || speechBusy || now < echoGuardUntil
+        dgChunks.push({ t: now, blob: ev.data, self })
         const cutoff = now - DG_BUFFER_MS
         while (dgChunks.length && dgChunks[0].t < cutoff) dgChunks.shift()
       }
@@ -700,14 +762,21 @@
   // Silent on cap/error: JARVIS just stays on the free Web Speech engine.
   async function escalateDeepgram(reason) {
     if (dgInFlight || dgPaused || !dgRecorder) return
+    // Never escalate while JARVIS is speaking or within his echo tail — the
+    // buffered audio is his own voice, which is exactly what must not be sent.
+    if (pageSpeaking || speechBusy || Date.now() < echoGuardUntil) return
     // Speaker gate: only ever send the calibrated user's OWN voice to Deepgram.
     // pageVoiceMatch is fed by the page's live voice-ID loop (voice-match-update);
     // when voice-ID is off the page never reports a non-match so this stays true
     // and all misses can still escalate, exactly like the free engine.
     if (!pageVoiceMatch) return
     if (!dgChunks.length) return
+    // Exclude any chunk recorded while JARVIS was speaking so his voice is never
+    // part of the clip — the root cause of him hearing and analysing himself.
+    const userChunks = dgChunks.filter(c => !c.self)
+    if (!userChunks.length) return
     const type = (dgRecorder && dgRecorder.mimeType) || 'audio/webm'
-    const clip = new Blob(dgChunks.map(c => c.blob), { type })
+    const clip = new Blob(userChunks.map(c => c.blob), { type })
     if (clip.size < DG_MIN_CLIP_BYTES) return  // too short → no spend
     dgInFlight = true
     try {
@@ -719,6 +788,8 @@
           if (api.runtime.lastError) return  // background unreachable → silent
           if (!res) return
           if (res.used_deepgram && res.text && res.text.trim()) {
+            // Belt-and-suspenders: drop a clip that is mostly JARVIS's own words.
+            if (isSelfEcho(res.text)) return
             dispatchCommand(res.text.trim())
           } else if (res.used_deepgram === false && res.reason === 'budget_capped') {
             dgPaused = true  // cap reached — stop escalating until reload

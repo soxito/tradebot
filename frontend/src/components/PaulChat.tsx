@@ -21,6 +21,7 @@ import {
   Bot, X, Send, Minimize2, Bell, Trash2, ChevronDown,
   AlertTriangle, TrendingUp, TrendingDown, Zap,
   Mic, MicOff, Volume2, VolumeX, Ear, Settings, Play,
+  Image as ImageIcon,
 } from 'lucide-react'
 import type { RobotState, AvatarStyle } from './JarvisRobot'
 import { useVoiceTurn, type BargeInReason, type VoiceTurnState } from '@/hooks/useDeepgramAgent'
@@ -158,6 +159,7 @@ interface Message {
   pending?: boolean
   fromHistory?: boolean  // loaded from server history on mount — must NOT be auto-spoken
   sniperSetups?: SniperSetupAction[]  // ranked sniper setups → rendered as Execute cards
+  image?: string  // data: URI — the screenshot the user attached, or Jarvis's marked-up copy
 }
 
 // ── Conversation persistence (survives page refresh) ──────────────────────
@@ -645,6 +647,48 @@ function cleanForSpeech(text: string): string {
     .trim()
 }
 
+// Normalise a transcript for self-echo comparison: lowercase, strip punctuation.
+function normSpeech(s: string): string {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim()
+}
+
+// True when `transcript` is mostly words JARVIS just spoke — i.e. it is our own
+// TTS echoing back through the mic, not the user.
+//
+// Matching rules (deliberately conservative — this gate can eat GENUINE user
+// speech, so a false positive means "I talk to JARVIS and he ignores me"):
+//   • Whole-word comparison only. The old substring test (`reply.includes(word)`)
+//     matched fragments anywhere in a long reply ("cat" in "concatenate"), so a
+//     short follow-up reusing two or three ordinary words of the previous answer
+//     was misclassified as echo and silently dropped.
+//   • A transcript that appears CONTIGUOUSLY inside the reply is an echo — real
+//     echoes reproduce runs of the readout verbatim ("yes sir", a lifted phrase).
+//   • Otherwise require BOTH a heavy overlap (≥70%) AND at least 4 shared content
+//     words. A human rephrasing a question almost never clears both bars; a mic
+//     that caught a stretch of the speaker almost always does.
+function isSelfEchoText(transcript: string, lastSpoken: string): boolean {
+  if (!lastSpoken) return false
+  const t = normSpeech(transcript)
+  const l = normSpeech(lastSpoken)
+  if (!t || !l) return false
+  // Verbatim containment: the whole utterance (or any 5+-word run of it) was
+  // just spoken by us. Check the full transcript first, then sliding windows so
+  // an echo padded with a stray word is still caught.
+  if (l.includes(t)) return true
+  const tWords = t.split(' ').filter(w => w.length > 2)
+  const lWords = l.split(' ').filter(w => w.length > 2)
+  if (tWords.length >= 5) {
+    for (let i = 0; i + 5 <= tWords.length; i++) {
+      if (l.includes(tWords.slice(i, i + 5).join(' '))) return true
+    }
+  }
+  if (tWords.length === 0 || lWords.length === 0) return false
+  const vocab = new Set(lWords)
+  let hit = 0
+  for (const w of tWords) if (vocab.has(w)) hit++
+  return hit >= 4 && hit / tWords.length >= 0.7
+}
+
 // Detect a deliberate wake phrase. By default the bare name ("Jarvis, ...")
 // wakes the assistant; when `requireGreeting` is true a greeting word MUST
 // precede the name (strict mode for noisy rooms). Minor mis-hearings of the
@@ -671,11 +715,55 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
   })
   const [input, setInput] = useState('')
   const [streaming, setStreaming] = useState(false)
+  // Screenshot staged for the next turn, as a data: URI. Cleared once sent.
+  const [attachment, setAttachment] = useState<string | null>(null)
   const [alerts, setAlerts] = useState<Alert[]>([])
   const [alertsOpen, setAlertsOpen] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const abortRef = useRef<AbortController | null>(null)
+
+  // ── Screenshot attachment ─────────────────────────────────────────────────
+  // Downscaled before it is staged: a 4K monitor grab is several megabytes of
+  // base64 on a JSON body, and the vision model gains nothing from the extra
+  // pixels. 1600px on the long edge keeps chart labels legible.
+  const attachImage = useCallback(async (file: File) => {
+    if (!file.type.startsWith('image/')) return
+    const dataUri = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => resolve(String(reader.result))
+      reader.onerror = () => reject(reader.error)
+      reader.readAsDataURL(file)
+    })
+
+    const img = new window.Image()
+    const shrunk = await new Promise<string>(resolve => {
+      img.onload = () => {
+        const scale = Math.min(1, 1600 / Math.max(img.width, img.height))
+        if (scale === 1) return resolve(dataUri)
+        const canvas = document.createElement('canvas')
+        canvas.width = Math.round(img.width * scale)
+        canvas.height = Math.round(img.height * scale)
+        const ctx = canvas.getContext('2d')
+        if (!ctx) return resolve(dataUri)
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
+        resolve(canvas.toDataURL('image/png'))
+      }
+      img.onerror = () => resolve(dataUri)
+      img.src = dataUri
+    })
+    setAttachment(shrunk)
+  }, [])
+
+  const handlePaste = useCallback((e: React.ClipboardEvent) => {
+    const file = Array.from(e.clipboardData?.items || [])
+      .find(i => i.type.startsWith('image/'))?.getAsFile()
+    if (file) {
+      e.preventDefault()
+      void attachImage(file)
+    }
+  }, [attachImage])
 
   // ── Persistent session id (so JARVIS remembers across reloads) ────────────
   const sessionKeyRef = useRef<string>('default')
@@ -832,7 +920,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
   const preCountTickRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const startDictationRef = useRef<() => void>(() => {})
   const startWakeRef = useRef<() => void>(() => {})
-  const sendRef = useRef<(text?: string) => void>(() => {})
+  const sendRef = useRef<(text?: string, image?: string) => void>(() => {})
   // Voice / extension commands that arrive while a response is still streaming
   // are queued here (instead of being dropped) and flushed when the stream
   // ends — so "I talk to JARVIS and nothing happens" can no longer occur.
@@ -926,6 +1014,21 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
   // True when the most recent analysed mic frame was identified as JARVIS's own
   // echo. Read by the recognizer gates so echo can never wake or command.
   const echoDetectedRef  = useRef(false)
+  // Text of what JARVIS is currently / just spoke (normalised) plus a hard
+  // echo-tail window. The acoustic guards above are imperfect for the system-voice
+  // path and always lag the physical speaker echo, so these two provide a
+  // deterministic belt: any transcript that matches JARVIS's own words while he
+  // is speaking OR within the echo tail after he stops is dropped outright — he
+  // can never transcribe (write) what he is reading from the chat.
+  const lastSpokenTextRef = useRef('')
+  const selfEchoUntilRef  = useRef(0)
+  // When the last utterance was handed to the speakers. Used to drop a duplicate
+  // speak() for the same text (e.g. an announcement posted twice or arriving
+  // from two sources) so JARVIS never speaks in two overlapping voices.
+  const lastSpeakStartedAtRef = useRef(0)
+  // ms of speaker reverb + recognition lag after speech ends during which
+  // JARVIS's own words may still reach the mic. Matches the extension's guard.
+  const ECHO_TAIL_MS = 1200
   // Live LEVEL (0–1) of what JARVIS is emitting this instant, sampled from the
   // same TTS tap as `ttsBandsRef` (which is shape-normalised and so carries no
   // loudness). The turn machine subtracts it from the barge-in threshold, so the
@@ -948,6 +1051,10 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     speakingGate: bargeInGate,
     getReferenceLevel: () => ttsLevelRef.current,
     isSelfEcho: () => echoDetectedRef.current,
+    // Only the calibrated user may interrupt; JARVIS's own voice never matches,
+    // so his residual echo can't barge in and cut him off. Accept-all when
+    // voice-match is disabled so uncalibrated users keep normal barge-in.
+    isUserVoice: () => !voiceMatchEnabledRef.current || voiceMatchRef.current,
     onBargeIn: reason => bargeInHandlerRef.current(reason),
     onStateChange: next => {
       voiceStateRef.current = next
@@ -1097,7 +1204,9 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
   const DG_MISS_ESCALATE_AFTER = 2   // escalate after N consecutive misses (or immediately on low-conf)
   const dgStreamRef = useRef<MediaStream | null>(null)
   const dgRecorderRef = useRef<MediaRecorder | null>(null)
-  const dgChunksRef = useRef<{ t: number; blob: Blob }[]>([])
+  // Each chunk is tagged with whether JARVIS was speaking (or in his echo tail)
+  // when it was captured, so escalation can exclude his own voice from the clip.
+  const dgChunksRef = useRef<{ t: number; blob: Blob; self: boolean }[]>([])
   const dgArmedRef = useRef(false)
   const dgInFlightRef = useRef(false)
   const dgMissCountRef = useRef(0)
@@ -1268,9 +1377,12 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
   }, [listening, streaming, turn.state, turn.userSpeaking])
 
   // ── Send message ──────────────────────────────────────────────────────────
-  const send = useCallback(async (overrideText?: string) => {
+  const send = useCallback(async (overrideText?: string, overrideImage?: string) => {
     const text = (overrideText ?? input).trim()
-    if (!text) return
+    // A screenshot on its own is a complete request — "look at this".
+    // overrideImage lets a caller supply one without waiting for a state flush.
+    const pendingImage = overrideImage ?? attachment
+    if (!text && !pendingImage) return
     if (streaming) {
       // A response is still streaming. Don't silently drop spoken/extension
       // commands (overrideText is set for those) — queue them and flush once
@@ -1423,10 +1535,15 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
       // Fell through from a failed analysis — continue into the AI chat below.
     }
 
-    const userMsg: Message = { id: nanoid(), role: 'user', content: text }
+    const userMsg: Message = {
+      id: nanoid(), role: 'user',
+      content: text || 'Read this screenshot.',
+      ...(pendingImage ? { image: pendingImage } : {}),
+    }
     const assistantMsg: Message = { id: nanoid(), role: 'assistant', content: '', pending: true }
 
     setMessages(prev => [...prev, userMsg, assistantMsg])
+    setAttachment(null)
     setStreaming(true)
 
     const historyForApi = [...messages, userMsg]
@@ -1445,7 +1562,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ messages: historyForApi, pathname: router.pathname, session_key: sessionKeyRef.current }),
+          body: JSON.stringify({ messages: historyForApi, pathname: router.pathname, session_key: sessionKeyRef.current, image: pendingImage }),
           signal: abortRef.current.signal,
         }
       )
@@ -1468,6 +1585,12 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
               accumulated += data.delta
               setMessages(prev => prev.map(m =>
                 m.id === assistantMsg.id ? { ...m, content: accumulated, pending: false } : m
+              ))
+            }
+            // Marked-up copy of the attached screenshot; arrives before the prose.
+            if (data.image) {
+              setMessages(prev => prev.map(m =>
+                m.id === assistantMsg.id ? { ...m, image: data.image } : m
               ))
             }
             if (data.error) {
@@ -1501,7 +1624,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     } finally {
       setStreaming(false)
     }
-  }, [input, streaming, messages, router.pathname])
+  }, [input, streaming, messages, router.pathname, attachment])
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() }
@@ -1509,7 +1632,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
   }
 
   // ── Keep refs in sync for use inside speech callbacks ─────────────────────
-  useEffect(() => { sendRef.current = (t?: string) => { void send(t) } }, [send])
+  useEffect(() => { sendRef.current = (t?: string, img?: string) => { void send(t, img) } }, [send])
   // Flush any voice/extension command that arrived while the previous response
   // was streaming, the moment streaming ends — so queued speech is never lost.
   useEffect(() => {
@@ -1671,7 +1794,10 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
       rec.ondataavailable = (ev: BlobEvent) => {
         if (!ev.data || ev.data.size === 0) return
         const now = Date.now()
-        dgChunksRef.current.push({ t: now, blob: ev.data })
+        // Tag the chunk if JARVIS was speaking (or within his echo tail) while it
+        // was recorded — those chunks carry his own voice and must never be sent.
+        const self = voiceStateRef.current === 'SPEAKING' || now < selfEchoUntilRef.current
+        dgChunksRef.current.push({ t: now, blob: ev.data, self })
         // Drop chunks older than the ring-buffer window.
         const cutoff = now - DG_BUFFER_MS
         while (dgChunksRef.current.length && dgChunksRef.current[0].t < cutoff) {
@@ -1706,6 +1832,12 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     if (!dgArmedRef.current || dgInFlightRef.current) return
     // The extension owns the mic when connected — let it handle escalation.
     if (extConnectedRef.current) return
+    // Never escalate while JARVIS is speaking or within his echo tail — the
+    // buffered audio is his own voice, and transcribing it is exactly the bug.
+    if (voiceStateRef.current === 'SPEAKING' || Date.now() < selfEchoUntilRef.current) {
+      dgMissCountRef.current = 0
+      return
+    }
     // Speaker gate: only ever send the user's OWN voice to Deepgram. When
     // voice-ID is enabled and its analyser is live, require a positive match so
     // a TV / other person's speech is never transcribed (or charged) by the
@@ -1715,7 +1847,9 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
       dgMissCountRef.current = 0
       return
     }
-    const chunks = dgChunksRef.current.map(c => c.blob)
+    // Exclude any chunk captured while JARVIS was speaking so his voice is never
+    // part of the clip — the root cause of him "hearing" and analysing himself.
+    const chunks = dgChunksRef.current.filter(c => !c.self).map(c => c.blob)
     if (!chunks.length) return
     const type = dgRecorderRef.current?.mimeType || 'audio/webm'
     const clip = new Blob(chunks, { type })
@@ -1726,6 +1860,9 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
       if (res?.used_deepgram && res.text && res.text.trim()) {
         dgMissCountRef.current = 0
         setDgFallbackState('armed')
+        // Belt-and-suspenders: even a self-voice clip that slipped through must
+        // not be dispatched if it matches what JARVIS just said.
+        if (isSelfEchoText(res.text, lastSpokenTextRef.current)) return
         dispatchVoiceCommandRef.current(res.text.trim())
       } else if (res && res.used_deepgram === false && res.reason === 'budget_capped') {
         setDgFallbackState('paused')  // cap reached — stay on free engine
@@ -2040,6 +2177,20 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     const clean = cleanForSpeech(text)
     if (!clean) return
     const t = turnRef.current
+    // De-dupe rapid duplicate requests: if the identical utterance is already on
+    // the speakers or was started in the last few seconds, ignore the repeat so
+    // JARVIS never doubles up into two overlapping voices.
+    const normNow = normSpeech(clean)
+    if (normNow && normNow === lastSpokenTextRef.current
+        && Date.now() - lastSpeakStartedAtRef.current < 6000) {
+      return
+    }
+    lastSpeakStartedAtRef.current = Date.now()
+    // Remember what JARVIS is about to say and guard the whole utterance up front,
+    // so even if the SPEAKING state briefly lapses the self-echo filter still
+    // rejects our own words. The end paths trim this down to the echo-tail window.
+    lastSpokenTextRef.current = normNow
+    selfEchoUntilRef.current = Date.now() + 60000
     // Superseding an utterance already on the speakers ("One moment, Sir." → the
     // answer): silence it first so the two never overlap. This is a handover, not
     // a barge-in, so the state stays SPEAKING.
@@ -2074,6 +2225,9 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
         if (activeSpeechRef.current === token) activeSpeechRef.current = null
         detachTtsReference()
         emitSpeaking(false)
+        // Speaker echo lingers after playback stops — hold the self-echo filter
+        // open for the tail so the mic never transcribes our own trailing words.
+        selfEchoUntilRef.current = Date.now() + ECHO_TAIL_MS
         if (url) { try { URL.revokeObjectURL(url) } catch { /* noop */ } ; url = null }
         if (spokenFully) onEnd?.()
       }
@@ -2151,11 +2305,24 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     u.pitch = voicePitchRef.current || 0.9
     u.volume = 1
     let synthSettled = false
+    // Chrome silently stalls speechSynthesis after ~15s (onend never fires),
+    // which would leave the turn stuck in SPEAKING and Jarvis frozen. A periodic
+    // resume() revives a stalled utterance without introducing audible gaps, and
+    // a hard watchdog guarantees the turn ends even if the engine dies outright.
+    let keepAlive: ReturnType<typeof setInterval> | null = null
+    let watchdog: ReturnType<typeof setTimeout> | null = null
+    const clearTimers = () => {
+      if (keepAlive) { clearInterval(keepAlive); keepAlive = null }
+      if (watchdog) { clearTimeout(watchdog); watchdog = null }
+    }
     const synthFinish = (spokenFully: boolean) => {
       if (synthSettled) return
       synthSettled = true
+      clearTimers()
       if (activeSpeechRef.current === synthToken) activeSpeechRef.current = null
       emitSpeaking(false)
+      // Hold the self-echo filter open through the speaker echo tail.
+      selfEchoUntilRef.current = Date.now() + ECHO_TAIL_MS
       if (spokenFully) onEnd?.()
     }
     const synthToken = { cancel: () => synthFinish(false) }
@@ -2173,6 +2340,19 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     u.onend   = () => synthEnd(true)
     u.onerror = () => synthEnd(false)
     window.speechSynthesis.speak(u)
+    keepAlive = setInterval(() => {
+      if (synthSettled || !window.speechSynthesis.speaking) { clearTimers(); return }
+      try { window.speechSynthesis.resume() } catch { /* noop */ }
+    }, 10000)
+    // Upper bound on how long this clip can possibly take (~11 chars/sec at rate
+    // 1.0) plus a generous buffer; if we blow past it the engine has died, so
+    // release the turn and hand the mic back rather than freeze forever.
+    const estMs = (clean.length / (11 * (u.rate || 1))) * 1000 + 8000
+    watchdog = setTimeout(() => {
+      if (synthSettled) return
+      try { window.speechSynthesis.cancel() } catch { /* noop */ }
+      synthEnd(true)
+    }, Math.min(estMs, 120000))
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [aiVoiceEnabled, aiVoice, attachTtsReference, detachTtsReference, holdFloorForSpeech, resumeListeningAfterSpeech])
 
@@ -2193,6 +2373,11 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     try { activeSpeechRef.current?.cancel() } catch { /* noop */ }
     activeSpeechRef.current = null
     detachTtsReference()
+    // The machine only barges in on confirmed USER speech — so from this instant
+    // the self-echo filter must stand down. Its window was armed for the reply
+    // we just cancelled; leaving it open would eat exactly the words the user is
+    // saying right now (the classic "I interrupted and JARVIS ignored me").
+    selfEchoUntilRef.current = 0
     // Abort the in-flight chat stream too — the user has moved on, and a reply
     // that keeps streaming would be spoken over the new question.
     try { abortRef.current?.abort() } catch { /* noop */ }
@@ -3466,6 +3651,13 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
         case 'connected':
           markExtConnected(d)
           break
+        // The extension grabbed the visible tab — stage it and ask straight away,
+        // so "Jarvis, read my screen" needs no second interaction.
+        case 'screenshot':
+          if (typeof d.image === 'string' && d.image.startsWith('data:image/')) {
+            sendRef.current(d.prompt || 'Read this screenshot.', d.image)
+          }
+          break
         case 'avatar-style':
           // Extension popup changed the robot avatar — apply it to the 3D robot
           if (typeof d.style === 'string') {
@@ -3712,6 +3904,14 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
               })
               const data = await resp.json()
               if (data.text) {
+                // Self-echo backstop: this Whisper clip can span one of JARVIS's
+                // replies, so drop any transcription that is mostly his own words.
+                if (
+                  Date.now() < selfEchoUntilRef.current + 500 &&
+                  isSelfEchoText(data.text, lastSpokenTextRef.current)
+                ) {
+                  setInput('')
+                } else {
                 // Learn the user's words + auto-correct toward their vocabulary.
                 const text = learnAndCorrect(data.text)
                 setInput(text)
@@ -3732,6 +3932,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
                     // AI intent fallback before chat.
                     resolveIntentRef.current(text).then(done => { if (!done) sendRef.current(text) })
                   }
+                }
                 }
               }
             } catch (err) {
@@ -3796,6 +3997,14 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
       // Self-voice gate: the mic analyser identified this audio as JARVIS's own
       // output returning through the speakers. Never transcribe it.
       if (echoDetectedRef.current) return
+      // Text self-echo gate: while JARVIS is speaking OR within the echo tail
+      // after he stops, drop any result whose words are mostly what he just said.
+      // This is the deterministic backstop that stops him writing what he reads.
+      if (voiceStateRef.current === 'SPEAKING' || Date.now() < selfEchoUntilRef.current) {
+        let evText = ''
+        for (let i = e.resultIndex; i < e.results.length; i++) evText += e.results[i][0].transcript
+        if (isSelfEchoText(evText, lastSpokenTextRef.current)) return
+      }
       // Camera gate: when the camera is live, only accept speech while the
       // user's mouth is (or was just) moving.
       if (!mouthGateOpen()) return
@@ -3833,6 +4042,17 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
       // what guarantees silence always leaves the listening state.
       markCapturingRef.current(false, 'page')
       if (dictationRef.current === rec) dictationRef.current = null
+      // Final self-echo backstop: if everything captured this turn was JARVIS's
+      // own words leaking in (within the echo window), discard it — never dispatch
+      // or write it to the chat, and clear the stray input it may have shown.
+      if (
+        finalText.trim() &&
+        Date.now() < selfEchoUntilRef.current + 500 &&
+        isSelfEchoText(finalText, lastSpokenTextRef.current)
+      ) {
+        finalText = ''
+        setInput('')
+      }
       // Learn the user's words + auto-correct toward their vocabulary.
       const text = learnAndCorrect(finalText)
       if (text) {
@@ -3959,6 +4179,14 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
         // Self-voice gate: the mic analyser identified this moment's audio as
         // JARVIS's own output coming back in. Never act on it.
         if (echoDetectedRef.current) continue
+
+        // Text self-echo gate: while JARVIS is speaking OR within his echo tail,
+        // ignore anything that is mostly his own words echoing back — so his
+        // reply can never wake, interrupt, or command him.
+        if (
+          (voiceStateRef.current === 'SPEAKING' || Date.now() < selfEchoUntilRef.current) &&
+          isSelfEchoText(t, lastSpokenTextRef.current)
+        ) continue
 
         // Voice profile gate: when speaker ID is enabled, reject non-matching voices.
         // This is the PRIMARY defence against TV/background voices.
@@ -4989,6 +5217,15 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
                   </div>
                 )}
                 <div className={`max-w-[85%] flex flex-col gap-1.5 ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
+                  {msg.image && (
+                    <a href={msg.image} target="_blank" rel="noreferrer">
+                      <img
+                        src={msg.image}
+                        alt={msg.role === 'user' ? 'Attached screenshot' : 'Marked-up chart'}
+                        className="max-w-full rounded-lg border border-gray-700"
+                      />
+                    </a>
+                  )}
                   <div
                     className={`px-3 py-2 rounded-xl text-[13px] leading-relaxed whitespace-pre-wrap ${
                       msg.role === 'user'
@@ -5066,13 +5303,49 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
             <div ref={messagesEndRef} />
           </div>
 
+          {/* Staged screenshot — shown until the turn is sent */}
+          {attachment && (
+            <div className="flex items-center gap-2 px-3 pt-2 shrink-0">
+              <img src={attachment} alt="Attached screenshot" className="h-12 rounded border border-gray-700" />
+              <span className="text-[11px] text-gray-400 flex-1">Screenshot attached</span>
+              <button
+                onClick={() => setAttachment(null)}
+                aria-label="Remove attached screenshot"
+                className="text-gray-400 hover:text-white text-xs px-2 py-1"
+              >
+                Remove
+              </button>
+            </div>
+          )}
+
           {/* Input */}
           <div className="flex items-center gap-2 px-3 py-2.5 border-t border-gray-700/50 shrink-0 relative">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              className="hidden"
+              onChange={e => {
+                const file = e.target.files?.[0]
+                if (file) void attachImage(file)
+                e.target.value = ''  // let the same file be picked twice in a row
+              }}
+            />
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              disabled={streaming}
+              aria-label="Attach a screenshot"
+              title="Attach a screenshot (or paste one)"
+              className="w-8 h-8 rounded-xl bg-gray-700 hover:bg-gray-600 disabled:opacity-40 flex items-center justify-center transition shrink-0"
+            >
+              <ImageIcon className="w-3.5 h-3.5 text-white" />
+            </button>
             <input
               ref={inputRef}
               value={input}
               onChange={e => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
+              onPaste={handlePaste}
               placeholder={listening ? (recording ? 'Recording…' : 'Listening…') : 'Ask PAUL anything…'}
               disabled={streaming}
               className="flex-1 bg-gray-800 border border-gray-700 rounded-xl px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-cyan-600 disabled:opacity-50"
@@ -5110,7 +5383,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
             )}
             <button
               onClick={() => send()}
-              disabled={!input.trim() || streaming}
+              disabled={(!input.trim() && !attachment) || streaming}
               className="w-8 h-8 rounded-xl bg-cyan-600 hover:bg-cyan-500 disabled:opacity-40 flex items-center justify-center transition"
             >
               <Send className="w-3.5 h-3.5 text-white" />

@@ -13,6 +13,7 @@ from loguru import logger
 
 from app.core.database import AsyncSessionLocal
 from app.services.macro_context import resolve_macro_bias
+from app.core.offload import run_cpu, OffloadRejected, OffloadTimeout
 from plugins.MT5TradingPlugin.backend.models import (
     MT5Base, MT5Account, MT5AccountGroup, MT5AccountGroupMember,
     MT5Order, MT5Position, MT5Deal, MT5CopyProfile, MT5CopySimTrade,
@@ -373,8 +374,19 @@ async def cancel_order(ticket: int, account_id: int = Query(...)):
 # ── Positions ──────────────────────────────────────────────
 
 @router.get("/accounts/{account_id}/positions", response_model=List[MT5PositionResponse])
-async def list_positions(account_id: int, symbol: Optional[str] = None):
-    """List open positions for an account."""
+async def list_positions(
+    account_id: int,
+    symbol: Optional[str] = None,
+    origin: Optional[str] = Query(default=None, pattern=r"^(app|manual)$"),
+):
+    """List open positions for an account.
+
+    ``origin`` filters to just the app's own orders or just the ones placed by
+    hand in MetaTrader — the two are told apart by the tag the app writes into
+    every comment it sends.
+    """
+    from app.trading.order_tags import classify, describe
+
     async with AsyncSessionLocal() as db:
         query = select(MT5Position).where(MT5Position.account_id == account_id)
         if symbol:
@@ -384,6 +396,9 @@ async def list_positions(account_id: int, symbol: Optional[str] = None):
 
         items = []
         for p in positions:
+            info = classify(p.comment)
+            if origin and info["origin"] != origin:
+                continue
             rr = MT5RiskMetricsService.calc_rr(p.price_open, p.sl, p.tp)
             items.append(MT5PositionResponse(
                 id=p.id, account_id=p.account_id, mt5_ticket=p.mt5_ticket,
@@ -397,6 +412,10 @@ async def list_positions(account_id: int, symbol: Optional[str] = None):
                 rr_ratio=rr["rr_ratio"],
                 risk_pips=rr["risk_pips"],
                 reward_pips=rr["reward_pips"],
+                origin=info["origin"],
+                source=info["source"],
+                source_ref=info["ref"],
+                origin_label=describe(p.comment),
             ))
         return items
 
@@ -1024,6 +1043,119 @@ async def get_candles(
         return MT5CandlesResponse(symbol=symbol, timeframe=timeframe, candles=candles)
 
 
+# ── Auto Fib Retracement overlay ─────────────────────────────────────────
+
+@router.get("/fib-overlay")
+async def get_fib_overlay(
+    account_id: int,
+    symbol: str,
+    timeframe: str = Query(default="H1"),
+    count: int = Query(default=300, ge=20, le=1000),
+    exchange: Optional[str] = Query(
+        default=None,
+        description="Feed the chart is actually drawing, when it fell back off MT5. "
+                    "Levels must come from the same feed or they land off-chart.",
+    ),
+):
+    """Fib retracement levels off the latest ZigZag swing, for chart overlay.
+
+    Prefers the broker's own bars so the levels match what the account actually
+    trades against. When MT5 has no history the chart draws a fallback feed, and
+    feeds disagree on price by whole percent on metals — so the fallback here has
+    to be the same one the caller is showing, not merely a working one.
+    """
+    from app.exchanges.yahoo_provider import fetch_candles as yahoo_candles
+    from app.signals.technical import (
+        auto_fib_retracement,
+        fib_confluence_score,
+        ohlcv_to_dataframe,
+    )
+
+    empty = {"symbol": symbol, "timeframe": timeframe, "levels": [], "swing": None,
+             "golden_zone": None, "signal": None}
+
+    async with AsyncSessionLocal() as db:
+        account = await db.get(MT5Account, account_id)
+        if not account:
+            raise HTTPException(404, "Account not found")
+        try:
+            bars = await mt5_client.get_candles(
+                account.login, account.server, account.password_encrypted,
+                symbol, timeframe, count,
+            )
+        except Exception as e:
+            logger.warning(f"[MT5/fib-overlay] {symbol}: {e}")
+            bars = []
+
+    source = "mt5"
+    ohlcv: List[List[float]] = []
+    if bars and len(bars) >= 20:
+        ohlcv = sorted(
+            [[int(b["time"]) * 1000, float(b["open"]), float(b["high"]),
+              float(b["low"]), float(b["close"]), float(b.get("volume") or 0)]
+             for b in bars],
+            key=lambda r: r[0],
+        )
+    elif exchange and exchange.lower() != "mt5":
+        source = exchange.lower()
+        try:
+            from app.exchanges.manager import SupportedExchange, exchange_manager
+            connector = exchange_manager.get_exchange(SupportedExchange(source))
+            if connector:
+                ohlcv = await connector.get_ohlcv(
+                    symbol=symbol, timeframe=timeframe, limit=count,
+                ) or []
+        except Exception as e:
+            logger.warning(f"[MT5/fib-overlay] {source} fallback {symbol}: {e}")
+    if not ohlcv:
+        source = "yahoo"
+        try:
+            rows = await yahoo_candles(symbol, timeframe, count)
+            ohlcv = sorted(
+                [[int(r["time"]) * 1000, float(r["open"]), float(r["high"]),
+                  float(r["low"]), float(r["close"]), float(r.get("volume") or 0)]
+                 for r in rows],
+                key=lambda r: r[0],
+            )
+        except Exception as e:
+            logger.warning(f"[MT5/fib-overlay] yahoo fallback {symbol}: {e}")
+            return empty
+
+    if len(ohlcv) < 20:
+        return empty
+
+    try:
+        df = ohlcv_to_dataframe(ohlcv)
+        fib = auto_fib_retracement(df, extend_lines=False)
+        swing = fib.get("swing")
+        if not swing:
+            return empty
+
+        close = float(df["close"].iloc[-1])
+        zone = fib.get("golden_zone") or {}
+        conf = fib_confluence_score(close, fib, swing["direction"])
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "source": source,
+            "levels": [
+                {"ratio": lv["ratio"], "price": lv["price"],
+                 "label": lv["label"], "color": lv["color"]}
+                for lv in fib.get("levels", []) if lv.get("enabled")
+            ],
+            "swing": swing,
+            "golden_zone": zone or None,
+            "signal": {
+                "direction": swing["direction"],
+                "confidence": round(conf, 4) if conf is not None else None,
+                "in_golden_zone": bool(zone and zone.get("low") <= close <= zone.get("high")),
+            },
+        }
+    except Exception as e:  # noqa: BLE001 - an overlay must never break the chart
+        logger.warning(f"[MT5/fib-overlay] compute {symbol}: {e}")
+        return empty
+
+
 # ── Live Price ──────────────────────────────────────────────────────────
 
 @router.get("/price", response_model=MT5PriceResponse)
@@ -1378,7 +1510,10 @@ async def smc_analyze(
     # analyze() is synchronous and backtest() re-enters it once per bar; a
     # failure returns an inapplicable bias, which scores the setup without it.
     macro = await resolve_macro_bias(symbol)
-    analysis = engine.analyze(candles, htf_candles=htf_candles, macro=macro)
+    analysis = await run_cpu(
+        engine.analyze, candles, htf_candles=htf_candles, macro=macro,
+        name="smc.analyze",
+    )
 
     kronos_block = await _kronos_from_candles(candles, symbol, timeframe)
     # Fuse Kronos into signal selection (tags alignment, re-ranks setups).
@@ -1426,7 +1561,15 @@ async def smc_backtest(data: MT5BacktestRequest):
         min_confidence=data.min_confidence, symbol=data.symbol,
         contract_size=contract_size_for_symbol(data.symbol),
     )
-    result = engine.backtest(candles, expiry_bars=data.expiry_bars)
+    try:
+        result = await run_cpu(
+            engine.backtest, candles, expiry_bars=data.expiry_bars,
+            name="smc.backtest", heavy=True, timeout=120,
+        )
+    except OffloadRejected as exc:
+        raise HTTPException(status_code=503, detail="Backtest queue full, retry shortly") from exc
+    except OffloadTimeout as exc:
+        raise HTTPException(status_code=504, detail="Backtest exceeded time limit") from exc
     return MT5BacktestResponse(
         symbol=data.symbol, timeframe=data.timeframe,
         stats=result.get("stats", {}), trades=result.get("trades", []),
@@ -1464,7 +1607,10 @@ async def smc_analyze_data(data: MT5SmcAnalyzeDataRequest):
         factor_weights=weights,
     )
     macro = await resolve_macro_bias(data.symbol)
-    analysis = engine.analyze(candles, htf_candles=htf_candles, macro=macro)
+    analysis = await run_cpu(
+        engine.analyze, candles, htf_candles=htf_candles, macro=macro,
+        name="smc.analyze",
+    )
 
     kronos_block = await _kronos_from_candles(candles, data.symbol, data.timeframe)
     # Fuse Kronos into signal selection (tags alignment, re-ranks setups).
@@ -1515,11 +1661,17 @@ async def smc_backtest_data(data: MT5BacktestDataRequest):
         max_total_loss=data.max_total_loss,
         daily_profit_target_pct=data.daily_profit_target_pct,
     )
-    result = engine.backtest(
-        candles, expiry_bars=data.expiry_bars,
-        starting_balance=data.starting_balance,
-    )
-    
+    try:
+        result = await run_cpu(
+            engine.backtest, candles, expiry_bars=data.expiry_bars,
+            starting_balance=data.starting_balance,
+            name="smc.backtest", heavy=True, timeout=120,
+        )
+    except OffloadRejected as exc:
+        raise HTTPException(status_code=503, detail="Backtest queue full, retry shortly") from exc
+    except OffloadTimeout as exc:
+        raise HTTPException(status_code=504, detail="Backtest exceeded time limit") from exc
+
     ai_block = None
     if data.use_ai and result.get("stats", {}).get("total", 0) > 0:
         async with AsyncSessionLocal() as db:

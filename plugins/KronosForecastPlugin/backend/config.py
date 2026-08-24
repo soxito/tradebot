@@ -70,7 +70,10 @@ class KronosConfig:
     max_context: int = int(os.getenv("KRONOS_MAX_CONTEXT", "512"))
 
     # Forecast defaults
-    default_lookback: int = int(os.getenv("KRONOS_DEFAULT_LOOKBACK", "400"))
+    # Feed the model as many closed candles as its context allows (max_context)
+    # so the forecast weighs deep history, not a 24h slice. Override lower/higher
+    # per request via ?lookback= or with KRONOS_DEFAULT_LOOKBACK.
+    default_lookback: int = int(os.getenv("KRONOS_DEFAULT_LOOKBACK", os.getenv("KRONOS_MAX_CONTEXT", "512")))
     default_pred_len: int = int(os.getenv("KRONOS_DEFAULT_PRED_LEN", "24"))
     default_samples: int = int(os.getenv("KRONOS_DEFAULT_SAMPLES", "10"))
 

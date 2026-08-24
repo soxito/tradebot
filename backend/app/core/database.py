@@ -14,12 +14,30 @@ from app.models.database import Base, AgentDecision, PineScript
 from loguru import logger
 
 
-# Create async engine
-engine = create_async_engine(
-    settings.DATABASE_URL,
-    echo=settings.SQL_ECHO,
-    poolclass=NullPool,  # Use NullPool for better async compatibility
-)
+# Create async engine.
+# Pooling is opt-in (TRADEBOT_DB_POOL_ENABLED) and never applied to SQLite —
+# aiosqlite + pooling is a file-lock footgun and the desktop build uses SQLite.
+# NullPool has masked sessions held across slow awaits, so a pool must only be
+# turned on after those are audited.
+_is_sqlite = settings.DATABASE_URL.startswith("sqlite")
+if settings.TRADEBOT_DB_POOL_ENABLED and not _is_sqlite:
+    engine = create_async_engine(
+        settings.DATABASE_URL,
+        echo=settings.SQL_ECHO,
+        pool_size=settings.TRADEBOT_DB_POOL_SIZE,
+        max_overflow=4,
+        pool_pre_ping=True,
+        pool_recycle=1800,
+    )
+    logger.info(
+        f"DB engine: pooled (size={settings.TRADEBOT_DB_POOL_SIZE}, overflow=4, pre_ping, recycle=1800s)"
+    )
+else:
+    engine = create_async_engine(
+        settings.DATABASE_URL,
+        echo=settings.SQL_ECHO,
+        poolclass=NullPool,  # Use NullPool for better async compatibility
+    )
 
 # Create async session factory
 AsyncSessionLocal = async_sessionmaker(
@@ -218,12 +236,30 @@ async def init_db():
             ("sim_accounts", "tradingagents_max_debate_rounds", "INTEGER DEFAULT 2"),
             ("live_trade_settings", "tradingagents_max_risk_discuss_rounds", "INTEGER DEFAULT 2"),
             ("sim_accounts", "tradingagents_max_risk_discuss_rounds", "INTEGER DEFAULT 2"),
+            ("room_settings", "focus_interval_s", "INTEGER DEFAULT 300"),
+            ("room_settings", "worker_enabled", "BOOLEAN DEFAULT TRUE"),
+            ("room_settings", "focus_symbol", "VARCHAR"),
+            ("room_settings", "focus_timeframe", "VARCHAR DEFAULT '1h'"),
+            ("room_settings", "mt5_live_mode", "BOOLEAN DEFAULT FALSE"),
+            ("room_settings", "mt5_demo_account_id", "INTEGER"),
+            # Bitcoin 1064-day cycle settings (editable from the room settings page)
+            ("room_settings", "cycle_anchors", "TEXT"),
+            ("room_settings", "cycle_bull_days", "INTEGER DEFAULT 1064"),
+            ("room_settings", "cycle_bear_days", "INTEGER DEFAULT 365"),
+            ("room_settings", "cycle_auto_risk", "BOOLEAN DEFAULT FALSE"),
+            ("room_settings", "cycle_risk_multiplier", "FLOAT DEFAULT 0.5"),
+            ("room_agent_profiles", "gender", "VARCHAR DEFAULT 'male'"),
+            # Dedicates an AI provider profile to a single task category.
+            ("ai_llm_providers", "assigned_task", "VARCHAR"),
         ]
         _VALID_TABLES.add("signal_monitor_pairs")
         _VALID_TABLES.add("ngrok_config")
         # Created by create_all above; whitelisted so later columns can be added
         # through this same list rather than needing a schema drop.
         _VALID_TABLES.add("jarvis_analysis_journal")
+        _VALID_TABLES.add("room_settings")
+        _VALID_TABLES.add("room_agent_profiles")
+        _VALID_TABLES.add("ai_llm_providers")
         async with engine.begin() as conn:
             # Read the live schema once and only ALTER what is genuinely missing.
             # SQLite (the desktop build's database) has no

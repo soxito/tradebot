@@ -309,7 +309,7 @@ class TelegramAuthStatusResponse(BaseModel):
 
 # ── Parsed signals & monitor ────────────────────────────────────────────────
 
-SignalStatusLiteral = Literal["active", "filled", "tp_hit", "sl_hit", "closed"]
+SignalStatusLiteral = Literal["active", "filled", "tp_hit", "sl_hit", "closed", "expired"]
 
 
 class TelegramParsedSignalResponse(BaseModel):
@@ -376,6 +376,20 @@ class TelegramSniperSettingsResponse(BaseModel):
     execute_immediately: bool = True
     skipped_reanalyze_minutes: int = 15
     tp_trail_pct: float = 1.5
+    max_margin_risk_pct: float = 20.0
+    mt5_execute: bool = False
+    mt5_account_id: int | None = None
+    mt5_lot_size: float = 0.01
+    mt5_demo_execute: bool = False
+    mt5_demo_account_id: int | None = None
+    multi_tp_execute: bool = True
+    force_telegram_signals: bool = False
+    never_skip_confidence_pct: float = 90.0
+    mt5_max_risk_pct: float = 5.0
+    mt5_small_account_mode: bool = True
+    notify_executions: bool = True
+    immediate_confidence_pct: float = 80.0
+    max_same_direction: int = 2
     volume_channel_id: int | None = None
     allowed_channel_ids: list[int] | None = None
 
@@ -400,6 +414,20 @@ class TelegramSniperSettingsUpdate(BaseModel):
     execute_immediately: bool | None = None
     skipped_reanalyze_minutes: int | None = Field(default=None, ge=0, le=1440)
     tp_trail_pct: float | None = Field(default=None, ge=0.1, le=20.0)
+    max_margin_risk_pct: float | None = Field(default=None, ge=0, le=100)
+    mt5_execute: bool | None = None
+    mt5_account_id: int | None = None
+    mt5_lot_size: float | None = Field(default=None, gt=0, le=100)
+    mt5_demo_execute: bool | None = None
+    mt5_demo_account_id: int | None = None
+    multi_tp_execute: bool | None = None
+    force_telegram_signals: bool | None = None
+    never_skip_confidence_pct: float | None = Field(default=None, ge=0, le=100)
+    mt5_max_risk_pct: float | None = Field(default=None, gt=0, le=100)
+    mt5_small_account_mode: bool | None = None
+    notify_executions: bool | None = None
+    immediate_confidence_pct: float | None = Field(default=None, ge=0, le=100)
+    max_same_direction: int | None = Field(default=None, ge=1, le=20)
     volume_channel_id: int | None = None
     allowed_channel_ids: list[int] | None = None
 

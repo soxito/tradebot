@@ -25,6 +25,7 @@ at the next opposing liquidity pool, filtered by a minimum reward:risk.
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -102,6 +103,9 @@ class Signal:
     # Numeric audit trail for `confidence` — which factors contributed and by
     # how much. See services/smc_scoring.py.
     score_breakdown: Dict[str, Any] = field(default_factory=dict)
+    # Auto fib retracement golden-zone this entry sits in, if any (see
+    # smc_scoring.py's fib_confluence factor / _zigzag_fib above).
+    fib_zone: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -158,6 +162,84 @@ def _volume_zscore(candles: List[Candle], lookback: int = 20) -> float:
     if std == 0:
         return 0.0
     return (candles[-1].volume - mean) / std
+
+
+def _zigzag_fib(
+    candles: List[Candle],
+    deviation_pct: Optional[float] = None,
+    depth: int = 10,
+) -> Optional[Dict[str, Any]]:
+    """
+    ZigZag-based auto fib retracement for the latest confirmed swing.
+
+    Delegates to backend/app/signals/technical.py rather than reimplementing the
+    algorithm. This used to be a hand-ported copy, which drifted: it kept a fixed
+    5% deviation, so it silently found no swing at all on the FX and metals pairs
+    the sniper actually trades, and it inherited a depth-guard deadlock that could
+    freeze the tracker on a stale swing. `deviation_pct=None` now scales the
+    threshold to the instrument's own volatility.
+
+    Returns {"direction": "up"|"down", "golden_zone": {"low","high"}, "swing":
+    {...}}, or None when no swing is confirmed yet.
+    """
+    if len(candles) < 2:
+        return None
+    from app.signals.technical import auto_fib_retracement, ohlcv_to_dataframe
+
+    try:
+        df = ohlcv_to_dataframe([
+            [c.time * 1000, c.open, c.high, c.low, c.close, c.volume] for c in candles
+        ])
+        fib = auto_fib_retracement(
+            df, deviation_pct=deviation_pct, depth=depth,
+            levels=(0.5, 0.618), extend_lines=False,
+        )
+    except Exception:  # noqa: BLE001 - one context input must not fail the scan
+        return None
+
+    swing = fib.get("swing")
+    zone = fib.get("golden_zone")
+    if not swing or not zone:
+        return None
+    return {
+        "direction": swing["direction"],
+        "golden_zone": {"low": float(zone["low"]), "high": float(zone["high"])},
+        "swing": {
+            "start_time": int(swing["start_time"]), "start_price": float(swing["start_price"]),
+            "end_time": int(swing["end_time"]), "end_price": float(swing["end_price"]),
+        },
+    }
+
+
+def _fib_payload(fib: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Expand a scored fib context into drawable levels for the chart.
+
+    The scan only needs the golden zone, so that is all `_zigzag_fib` returns.
+    The chart wants the full ladder, which is pure arithmetic off the same swing
+    — no second ZigZag pass, so the drawn levels cannot disagree with the scored
+    ones.
+    """
+    if not fib or not fib.get("swing"):
+        return None
+    from app.signals.technical import DEFAULT_FIB_LEVELS, _FIB_DEFAULT_COLORS
+
+    swing = fib["swing"]
+    start, end = float(swing["start_price"]), float(swing["end_price"])
+    height = end - start
+    return {
+        "direction": fib.get("direction"),
+        "swing": swing,
+        "golden_zone": fib.get("golden_zone"),
+        "levels": [
+            {
+                "ratio": r,
+                "price": round(end - height * r, 6),
+                "label": f"{r * 100:.1f}%",
+                "color": _FIB_DEFAULT_COLORS.get(r, "#9598a1"),
+            }
+            for r in DEFAULT_FIB_LEVELS
+        ],
+    }
 
 
 # ── Structure detection ────────────────────────────────────────────────────────
@@ -765,10 +847,16 @@ class SMCStrategyEngine:
         # ── False breakout / stop-hunt context ────────────────────────────────
         sweeps = _detect_liquidity_sweeps(candles, swings, atr)
 
+        # ── Auto fib retracement (ZigZag) context ─────────────────────────────
+        # Computed once per analyze() call, not once per candidate signal —
+        # same reasoning as macro context below.
+        fib = _zigzag_fib(candles)
+
         return {
             "atr": atr, "swings": swings, "bias": bias, "events": events,
             "order_blocks": obs, "fvgs": fvgs, "liquidity": liquidity,
             "range": rng, "rsi": _rsi(candles), "vol_z": _volume_zscore(candles),
+            "fib": fib,
             # Bullish CHoCH context (used for buy signals)
             "choch_bull_index":        recent_bull_choch["index"]          if recent_bull_choch else -1,
             "choch_bull_protected_low": recent_bull_choch.get("protected_low") if recent_bull_choch else None,
@@ -1056,7 +1144,19 @@ class SMCStrategyEngine:
             htf_bias=prim.get("htf_bias"),
             weights=self.factor_weights,
             macro=prim.get("macro"),
+            fib=prim.get("fib"),
         )
+
+        # Surface the fib golden-zone confluence in the human-readable tags,
+        # same treatment as the other confluence factors above.
+        fib_ctx = prim.get("fib")
+        fib_zone_hit = None
+        if fib_ctx and fib_ctx.get("golden_zone"):
+            fzone = fib_ctx["golden_zone"]
+            if fzone["low"] <= entry <= fzone["high"]:
+                dir_aligned = (fib_ctx.get("direction") == "up") == (side == "buy")
+                confluence.append("fib_golden_zone" if dir_aligned else "fib_golden_zone_counter_trend")
+                fib_zone_hit = {"low": fzone["low"], "high": fzone["high"], "direction": fib_ctx.get("direction")}
 
         # Hard gate 1: no signal fires without volume confirmation. The
         # zone-forming candle must have traded above its rolling mean, and any
@@ -1221,6 +1321,7 @@ class SMCStrategyEngine:
             sl_points=sl_points, tp_points=tp_points,
             sl_pips=sl_pips, tp_pips=tp_pips, pip_value=pip_value,
             score_breakdown=breakdown.to_dict(),
+            fib_zone=fib_zone_hit,
         )
 
     # -- higher-timeframe bias --------------------------------------------------
@@ -1434,7 +1535,7 @@ class SMCStrategyEngine:
         else:
             momentum = "normal"
 
-        return {
+        analysis = {
             "bias": bias,
             "htf_bias": prim.get("htf_bias"),
             "last_price": round(last_price, 6),
@@ -1445,6 +1546,10 @@ class SMCStrategyEngine:
             "momentum": momentum,
             "equilibrium": round((prim["range"][0] + prim["range"][1]) / 2, 6) if prim["range"] else None,
             "range": {"low": round(prim["range"][0], 6), "high": round(prim["range"][1], 6)} if prim["range"] else None,
+            # Auto fib retracement of the latest ZigZag swing. Already scored as
+            # a confluence factor; reported so the chart can draw the same levels
+            # the score was derived from.
+            "fib": _fib_payload(prim.get("fib")),
             "structure_events": prim["events"][-12:],
             "liquidity": {
                 "buyside": [round(p, 6) for p in prim["liquidity"]["buyside"][-6:]],
@@ -1474,6 +1579,18 @@ class SMCStrategyEngine:
             "macro": _macro_payload(macro),
         }
 
+        # ── Supply/demand + channel context from the shared core module ────
+        # Same zone read the crypto pipeline and chart overlays use, so every
+        # surface describes the same bases and rails. Guarded: the core import
+        # must never break a standalone plugin deployment.
+        try:
+            from app.signals.zones import compact_payload as _zones_compact
+
+            analysis["zones_context"] = _zones_compact(candles)
+        except Exception:  # noqa: BLE001 — enrichment only
+            pass
+        return analysis
+
     # -- public: backtest -------------------------------------------------------
 
     def backtest(
@@ -1488,6 +1605,7 @@ class SMCStrategyEngine:
         trail_start_pct: float = 0.0,   # start trailing right after TP1 (0 = immediate)
         trail_capture_pct: float = 0.90,  # trail is 10% of target_dist behind best price
         min_entry_confidence: float = 0.7,  # only take high-conviction opportunities
+        cancel_token: Any = None,  # cooperative cancel flag from core.offload (timeout/disconnect)
     ) -> Dict[str, Any]:
         """
         Walk-forward simulation of the sniper model.
@@ -1510,6 +1628,8 @@ class SMCStrategyEngine:
         _last_breakeven_bar: int = -1   # tracks bar where last breakeven re-scan was done
         while i < n - 1 and guard < n * 2:
             guard += 1
+            if cancel_token is not None and getattr(cancel_token, "cancelled", False):
+                raise asyncio.CancelledError("backtest cancelled")
             window = candles[max(0, i - 300):i + 1]
             res = self.analyze(window)
             sigs = res.get("signals", [])

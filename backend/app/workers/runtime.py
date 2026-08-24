@@ -1,6 +1,8 @@
 """Runtime orchestration for background workers."""
 from __future__ import annotations
 
+import asyncio
+
 from loguru import logger
 
 from app.core.config import settings
@@ -28,6 +30,7 @@ from app.core.scheduler import (
     stop_vault_sync_loop,
     stop_sniper_loop,
 )
+from app.workers.room_worker import arm_from_settings, start_room_worker, stop_room_worker
 
 
 def start_background_workers(allow_in_api: bool = False) -> dict[str, bool]:
@@ -123,6 +126,25 @@ def start_background_workers(allow_in_api: bool = False) -> dict[str, bool]:
     else:
         started["jarvis_learning_loop"] = False
 
+    # The room worker arms itself from the saved room settings rather than the
+    # env flag alone, so "keep meeting 24/7" survives a restart. Reading that
+    # row needs the DB, so it is deferred onto the loop instead of blocking
+    # startup here.
+    try:
+        asyncio.ensure_future(
+            arm_from_settings(
+                settings.ROOM_WORKER_INTERVAL_SECONDS,
+                settings.ROOM_WORKER_COOLDOWN_SECONDS,
+            )
+        )
+        started["room_worker"] = True
+    except RuntimeError:
+        # No running loop (e.g. worker process started outside the API).
+        started["room_worker"] = start_room_worker(
+            settings.ROOM_WORKER_INTERVAL_SECONDS,
+            settings.ROOM_WORKER_COOLDOWN_SECONDS,
+        ) if settings.AUTO_START_ROOM_WORKER else False
+
     return started
 
 
@@ -139,3 +161,4 @@ def stop_background_workers() -> None:
     stop_signal_research_queue()
     stop_vault_sync_loop()
     stop_jarvis_learning_loop()
+    stop_room_worker()

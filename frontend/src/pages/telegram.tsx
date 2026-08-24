@@ -1,5 +1,6 @@
 import Head from 'next/head'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useSmartPoll } from '@/hooks/useSmartPoll'
 import { apiClient } from '@/services/api'
 import {
   AlertTriangle,
@@ -451,6 +452,13 @@ export default function TelegramPage() {
     }
     initialize()
   }, [loadData])
+
+  // Keep the connect banner live: poll auth status so "Connected" appears on its
+  // own after connecting or after a backend restart (no manual refresh needed).
+  useSmartPoll(async () => {
+    const authRes = await apiClient.telegram.getAuthStatus().catch(() => null)
+    if (authRes?.data) setAuthStatus(authRes.data as TelegramAuthStatus)
+  }, { intervalMs: 15000 })
 
   useEffect(() => {
     if (!hasAvailableProvider || autoDiscoveryTriggeredRef.current) {
@@ -1448,6 +1456,8 @@ function BotControlPanel({
   }, [onError])
 
   useEffect(() => { loadBotInfo() }, [loadBotInfo])
+  // Refresh bot identity/config so it updates without a manual reload.
+  useSmartPoll(loadBotInfo, { intervalMs: 20000 })
 
   const handleSetWebhook = async () => {
     if (!webhookUrl.trim()) { onError('Webhook URL is required'); return }

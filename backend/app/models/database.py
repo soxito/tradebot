@@ -3,7 +3,7 @@ Database Models for TradeBot
 """
 from datetime import datetime, timezone, timedelta
 from typing import Optional
-from sqlalchemy import Column, String, Float, Boolean, DateTime, Text, Enum as SQLEnum, Integer, JSON, event
+from sqlalchemy import Column, String, Float, Boolean, DateTime, Text, Enum as SQLEnum, Integer, JSON, ForeignKey, event
 from sqlalchemy.orm import DeclarativeBase, validates
 import enum
 
@@ -783,4 +783,142 @@ class NgrokConfig(Base):
     frontend_addr_override = Column(String, nullable=True)
     enable_on_start = Column(Boolean, nullable=True)  # NULL = honour env NGROK_AUTO_START
     # Metadata
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+# ─── Trading Room ──────────────────────────────────────────────────────────────
+
+
+class RoomAgentProfile(Base):
+    """Who an agent *is* in the trading room: their human name, seat and brief.
+
+    Kept apart from ``agents`` so the room can be re-skinned (renamed, reseated,
+    re-tasked) without touching the prompt/model config the orchestrator runs on.
+    """
+
+    __tablename__ = "room_agent_profiles"
+
+    id = Column(Integer, primary_key=True, index=True)
+    agent_id = Column(Integer, ForeignKey("agents.id", ondelete="CASCADE"), unique=True, nullable=False)
+
+    human_name = Column(String, nullable=False)      # "Sakhile"
+    title = Column(String, nullable=False)           # "Market Analyst"
+    color = Column(String, default="#94a3b8", nullable=False)
+    seat = Column(Integer, default=0, nullable=False)
+    # "male" | "female" — picks the body proportions and hair in the 3D room.
+    gender = Column(String, default="male", nullable=False)
+    # Free-text brief shown in the room and appended to the agent's system prompt.
+    tasks = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+class AgentInstructionRevision(Base):
+    """One rewrite of an agent's standing instructions, with the evidence for it.
+
+    Self-improvement edits the prompt an agent runs on, so every change is
+    recorded rather than applied silently: what it said before, what it says
+    now, and the measured performance that justified the change. That makes a
+    bad revision diagnosable and revertable instead of mysterious.
+    """
+
+    __tablename__ = "agent_instruction_revisions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    agent_id = Column(Integer, ForeignKey("agents.id", ondelete="CASCADE"), nullable=False, index=True)
+    role = Column(String, nullable=False, index=True)
+
+    previous_instructions = Column(Text, nullable=True)
+    new_instructions = Column(Text, nullable=False)
+    rationale = Column(Text, nullable=True)
+
+    # The window that justified the rewrite.
+    decisions_reviewed = Column(Integer, default=0, nullable=False)
+    win_rate = Column(Float, nullable=True)
+    avg_pnl = Column(Float, nullable=True)
+
+    # False once superseded or rolled back, so the active text is unambiguous.
+    applied = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+
+
+class RoomSettings(Base):
+    """Execution policy for the trading room. Only ever one row (id=1).
+
+    Defaults are deliberately inert: execution off, and dry-run on so the first
+    thing that happens after switching it on is a logged intent, not an order.
+    """
+
+    __tablename__ = "room_settings"
+
+    id = Column(Integer, primary_key=True, default=1)
+
+    # ── Master gates ──
+    execution_enabled = Column(Boolean, default=False, nullable=False)
+    #: Routing, not silence. On: the demo/paper account takes every trade for
+    #: real and the live account is neither traded nor managed. Off: demo and
+    #: live take the same trade at the same moment, so the demo stays a running
+    #: mirror to watch. See ``app.agents.execution.mt5_targets``.
+    dry_run = Column(Boolean, default=True, nullable=False)
+
+    # ── Venue routing ──
+    allow_sim = Column(Boolean, default=True, nullable=False)
+    allow_crypto = Column(Boolean, default=False, nullable=False)
+    allow_mt5 = Column(Boolean, default=False, nullable=False)
+    mt5_account_id = Column(Integer, nullable=True)  # the live account
+    #: Superseded by ``dry_run``, which is now the single switch deciding
+    #: whether the live account trades. Kept so old rows and the settings API
+    #: stay valid; room execution no longer reads it.
+    mt5_live_mode = Column(Boolean, default=False, nullable=False)
+    #: The demo account. It trades in both modes — that is what makes the demo
+    #: a mirror you can keep watching rather than a record that stops on the
+    #: day you arm the live account.
+    mt5_demo_account_id = Column(Integer, nullable=True)
+
+    # ── Risk policy ──
+    risk_pct = Column(Float, default=1.0, nullable=False)          # % of equity per trade
+    max_open_positions = Column(Integer, default=3, nullable=False)
+    # 0-1 board agreement / confidence needed before an order clears the gate.
+    # 0.40: the seats rarely align above 0.70 on a ranging pair, and holding out
+    # for that consensus was skipping setups that then ran — a 40% floor still
+    # bars the genuinely split board while letting a real lean through. The two
+    # move together; consensus without the matching confidence just relocates
+    # the block message.
+    min_consensus = Column(Float, default=0.4, nullable=False)     # 0-1 agreement
+    min_confidence = Column(Float, default=0.4, nullable=False)
+    max_trades_per_day = Column(Integer, default=10, nullable=False)
+    max_leverage = Column(Integer, default=10, nullable=False)
+
+    # ── Cadence ──
+    # How often a *pinned* pair is re-analysed. Deliberately separate from the
+    # rotation cooldown: focus means "keep looking at this one", so it must not
+    # be throttled by the gap that stops unpinned pairs being re-run back to
+    # back. 300 | 900 | 3600 | 7200 | 14400.
+    focus_interval_s = Column(Integer, default=300, nullable=False)
+    # The timeframe the board analyses on, and the one the room's chart draws.
+    # One setting for both deliberately: an agent arguing a 4h structure under a
+    # 1h chart is two different analyses presented as one.
+    focus_timeframe = Column(String, default="1h", nullable=False)
+    # Whether the room worker starts itself with the API, so the board keeps
+    # meeting across restarts without anyone re-arming it by hand.
+    worker_enabled = Column(Boolean, default=True, nullable=False)
+    # The pinned pair. Persisted because "never stop analysing this one" has to
+    # outlive a restart — in-process state alone silently drops the focus.
+    focus_symbol = Column(String, nullable=True)
+
+    # ── Bitcoin 1064-day cycle ──
+    # The calendar the whole desk reads. Anchors are the cycle bottoms as ISO
+    # dates in a JSON list; the bull/bear lengths are the pattern's constants.
+    # Defaults live in app.services.market_cycle — an empty column means "use
+    # the verified history", not "no cycle".
+    cycle_anchors = Column(Text, nullable=True)   # JSON ["2015-01-14", ...]
+    cycle_bull_days = Column(Integer, default=1064, nullable=False)
+    cycle_bear_days = Column(Integer, default=365, nullable=False)
+    # Auto risk reduction: when the calendar is inside the projected-bear (or
+    # late-bull caution) window, size new entries at cycle_risk_multiplier of
+    # the configured risk. Off by default — inert until asked for.
+    cycle_auto_risk = Column(Boolean, default=False, nullable=False)
+    cycle_risk_multiplier = Column(Float, default=0.5, nullable=False)
+
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)

@@ -40,6 +40,8 @@ openwa-sdk==1.1.1
 # Data Processing
 pandas==2.2.3
 numpy==2.2.4
+# Drawing analysis overlays onto chart screenshots (services/chart_annotate.py)
+pillow==12.2.0
 
 # Monitoring & Logging
 loguru==0.7.3

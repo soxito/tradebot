@@ -23,6 +23,21 @@ from plugins.AiMarketAnalyst.backend.services import analysis_router
 from plugins.MT5TradingPlugin.backend.services import smc_floor, smc_memory
 
 
+def _structure_window() -> int:
+    """How many recent market-structure events the AI reviews.
+
+    Floored at 28 so the model always weighs the current candle against at least
+    the last ~28 closed candles' structure, honouring AGENT_ANALYSIS_CANDLES
+    when the core app config is importable. No hard upper cap.
+    """
+    try:
+        from app.core.config import settings  # type: ignore
+        return max(28, int(getattr(settings, "AGENT_ANALYSIS_CANDLES", 120) or 120))
+    except Exception:
+        return 28
+
+
+
 _SYSTEM_PROMPT = (
     "You are an institutional Smart Money Concepts (SMC) trading analyst. "
     "You are given pre-computed market structure, order blocks, fair-value-gaps, "
@@ -228,7 +243,7 @@ async def ai_review(
         "equilibrium": analysis.get("equilibrium"),
         "range": analysis.get("range"),
         "liquidity": analysis.get("liquidity"),
-        "structure_events": (analysis.get("structure_events") or [])[-6:],
+        "structure_events": (analysis.get("structure_events") or [])[-_structure_window():],
         "economic_events": eco_events[:6],
         "candidate_signals": [
             {

@@ -15,6 +15,11 @@ try:
 except ImportError:
     AsyncOpenAI = None  # type: ignore
 
+from app.core.ai_key_routing import (
+    build_async_client,
+    is_openai_key,
+    resolve_base_url,
+)
 from app.utils.headroom_compress import compress_messages
 from plugins.AiMarketAnalyst.backend.config import ai_analyst_config
 from plugins.AiMarketAnalyst.backend.services.llm_registry import (
@@ -140,25 +145,16 @@ async def _call_openai_compatible(
 
     api_key = _get_api_key(provider)
 
-    # Route through the headroom proxy ONLY for OpenAI (base_url is None).
-    # Other providers must use their explicit base URLs to avoid auth errors.
-    # The AsyncOpenAI client reads OPENAI_BASE_URL from environment even when
-    # we pass base_url explicitly, so we need to temporarily unset it for
-    # non-OpenAI providers.
-    if provider.base_url is None:
-        # OpenAI: let it use OPENAI_BASE_URL from environment (headroom proxy)
+    # A provider with no explicit base_url is the built-in "OpenAI" entry, but
+    # OPENAI_API_KEY holds whichever provider the user actually connected — an
+    # nvapi-/gsk_/csk- key there is not an OpenAI key and must not be sent to
+    # OpenAI. The key's own prefix decides the endpoint; only a real sk- key
+    # falls through to the environment's OPENAI_BASE_URL (the headroom proxy).
+    if provider.base_url is None and is_openai_key(api_key):
+        # Genuine OpenAI key: keep the environment's base URL (headroom proxy).
         client = AsyncOpenAI(api_key=api_key)
     else:
-        # Other providers: temporarily clear OPENAI_BASE_URL to prevent
-        # the client from using it, then restore it
-        original_base_url = os.environ.get("OPENAI_BASE_URL")
-        try:
-            if original_base_url:
-                del os.environ["OPENAI_BASE_URL"]
-            client = AsyncOpenAI(api_key=api_key, base_url=provider.base_url)
-        finally:
-            if original_base_url:
-                os.environ["OPENAI_BASE_URL"] = original_base_url
+        client = build_async_client(api_key, provider.base_url or resolve_base_url(api_key))
 
     is_reasoning = model.startswith(("o1", "o3", "o4"))
     max_tokens = max_tokens or ai_analyst_config.default_max_tokens

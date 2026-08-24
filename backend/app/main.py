@@ -42,12 +42,43 @@ async def lifespan(app: FastAPI):
     logger.info(f"CORS origins: {settings.cors_origins_list}")
     if settings.ENABLE_AUTO_TRADING:
         logger.warning("⚠️  ENABLE_AUTO_TRADING is ON — live orders will be placed if auto-trade is active")
-    
+
+    # Event-loop lag probe — the decisive freeze metric. Started first so it
+    # captures the whole startup window.
+    try:
+        from app.core.loop_monitor import loop_monitor
+        loop_monitor.start()
+    except Exception as e:
+        logger.warning(f"Loop monitor failed to start: {e}")
+
     # Initialize database
     try:
         await init_db()
     except Exception as e:
         logger.error(f"Failed to initialize database: {e}")
+
+    # Restore the trading room's custom agent names/seats so a restart doesn't
+    # silently revert the board to the built-in personas.
+    try:
+        from app.core.database import AsyncSessionLocal
+        from app.api.agents import refresh_persona_overrides
+        async with AsyncSessionLocal() as db:
+            await refresh_persona_overrides(db)
+    except Exception as e:
+        logger.debug(f"Room persona overrides not loaded: {e}")
+
+    # Bring un-customised agent instructions up to the current defaults. Prompts
+    # move into the DB the first time an install seeds them, so an improvement
+    # to the shipped text would otherwise never reach a running deployment —
+    # which is how a board kept answering "hold" long after the instruction that
+    # told it to had been rewritten. Anything a user edited is left alone.
+    try:
+        from app.agents.specialists import upgrade_stock_prompts
+        from app.core.database import AsyncSessionLocal
+        async with AsyncSessionLocal() as db:
+            await upgrade_stock_prompts(db)
+    except Exception as e:
+        logger.debug(f"Agent prompt upgrade skipped: {e}")
 
     # Initialize plugin database tables
     if settings.PLUGIN_AUTO_MOUNT:
@@ -129,6 +160,71 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Price tick loop failed to start: {e}")
 
+    # Bitcoin 1064-day cycle detector — watches the calendar for a phase turn
+    # and announces it to the room, the signal feed and the alert channels.
+    try:
+        from app.core.scheduler import start_cycle_detector_loop
+        start_cycle_detector_loop(getattr(settings, "CYCLE_RECHECK_INTERVAL_SECONDS", 3600))
+    except Exception as e:
+        logger.warning(f"Cycle detector failed to start: {e}")
+
+    # Whale watch — reads the curated BTC whale registry so the desk sees the
+    # big money accumulate or distribute before it becomes a candle.
+    try:
+        from app.core.scheduler import start_whale_watch_loop
+        start_whale_watch_loop()
+    except Exception as e:
+        logger.warning(f"Whale watch failed to start: {e}")
+
+    # Telegram signal monitor — start it with the app, not 63 s later when a
+    # browser happens to hit a /plugins/telegram/* endpoint. ensure_started is
+    # idempotent and needs only a running loop (no credentials, no DB rows). The
+    # monitor + bot polling are critical: they must be live at boot regardless of
+    # tier so signals never silently stop arriving.
+    try:
+        from plugins.TelegramSignalNewsPlugin.backend.services.monitor_service import (
+            signal_monitor,
+        )
+        from app.core.database import AsyncSessionLocal as _TgSession
+        signal_monitor.ensure_started(_TgSession)
+        logger.info("✅ Telegram signal monitor started (lifespan autostart)")
+    except Exception as e:  # never fatal — plugin may be absent
+        logger.warning(f"Telegram monitor autostart skipped: {e}")
+
+    # Unified task supervisor — register every background loop as a supervised
+    # adapter (observational: does not change what starts) and launch the memory
+    # watchdog so the app throttles itself under pressure instead of swapping.
+    try:
+        from app.core.task_supervisor import supervisor
+        from app.core.task_registry import register_core_tasks
+        register_core_tasks()
+        # Critical plugin loops: Telegram monitor + bot polling.
+        try:
+            from plugins.TelegramSignalNewsPlugin.backend.services.monitor_service import (
+                signal_monitor as _tg,
+            )
+            from app.core.database import AsyncSessionLocal as _TgSession2
+            from app.core.task_supervisor import TaskSpec
+            from app.core import resource_tier as _rt
+            supervisor.register(TaskSpec(
+                id="telegram_monitor", name="Telegram signal monitor", source="plugin",
+                category=_rt.task_category("telegram_monitor"), default_interval_s=60,
+                critical=True, min_tier=_rt.task_min_tier("telegram_monitor"),
+                start=lambda: _tg.ensure_started(_TgSession2), stop=_tg.stop,
+                status=lambda: {"running": _tg.is_running()},
+            ))
+            supervisor.register(TaskSpec(
+                id="telegram_bot_polling", name="Telegram bot polling", source="plugin",
+                category=_rt.task_category("telegram_bot_polling"), default_interval_s=10,
+                critical=True, min_tier=_rt.task_min_tier("telegram_bot_polling"),
+                start=lambda: _tg.start_bot_polling(_TgSession2), stop=_tg.stop_bot_polling,
+            ))
+        except Exception as e:
+            logger.debug(f"Telegram task registration skipped: {e}")
+        supervisor.start_watchdog()
+    except Exception as e:
+        logger.warning(f"Task supervisor init skipped: {e}")
+
     # ngrok hybrid auto-start — only when explicitly enabled via config/DB
     try:
         from app.core.database import AsyncSessionLocal
@@ -172,6 +268,21 @@ async def lifespan(app: FastAPI):
     try:
         from app.core.scheduler import stop_price_tick_loop
         stop_price_tick_loop()
+    except Exception:
+        pass
+    try:
+        from app.core.loop_monitor import loop_monitor
+        await loop_monitor.stop()
+    except Exception:
+        pass
+    try:
+        from app.core.task_supervisor import supervisor
+        await supervisor.stop_watchdog()
+    except Exception:
+        pass
+    try:
+        from app.core.offload import shutdown as _offload_shutdown
+        _offload_shutdown()
     except Exception:
         pass
     logger.info("🛑 TradeBot shutting down...")

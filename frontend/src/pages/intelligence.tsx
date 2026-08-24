@@ -29,6 +29,243 @@ interface SignalOverlayItem {
   timestamp: string
 }
 
+// ─── BrainAiSettings — which model runs each brain role, and does it work ────
+//
+// The brain map shows what the brains produced; this shows whether they can
+// think at all. Each role gets a profile picker and a real test call, because
+// "provider is reachable" and "this role works" are different questions — a
+// role with no key of its own borrows from the shared pool, and that borrowed
+// key is what has to answer.
+
+interface BrainTask {
+  task: string
+  label: string
+  group: string
+  required: boolean
+  dedicated: boolean
+  needs_key: boolean
+  provider_id: number | null
+  provider_label: string | null
+  provider_status: string | null
+}
+
+interface BrainTestResult {
+  ok: boolean
+  provider?: string | null
+  model?: string | null
+  reply?: string | null
+  error?: string | null
+  latency_ms?: number
+  borrowed?: boolean
+}
+
+function BrainAiSettings({ onClose }: { onClose: () => void }) {
+  const [tasks, setTasks] = useState<BrainTask[]>([])
+  const [providers, setProviders] = useState<any[]>([])
+  const [signupUrls, setSignupUrls] = useState<any[]>([])
+  const [keysNeeded, setKeysNeeded] = useState(0)
+  const [results, setResults] = useState<Record<string, BrainTestResult>>({})
+  const [busy, setBusy] = useState<string | null>(null)
+  const [testingAll, setTestingAll] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  const load = useCallback(async () => {
+    try {
+      const [aRes, pRes] = await Promise.all([
+        apiClient.aiAnalyst.getTaskAssignments(),
+        apiClient.aiAnalyst.getProviders(),
+      ])
+      setTasks((aRes.data?.tasks ?? []).filter((t: BrainTask) => t.group === 'brain'))
+      setSignupUrls(aRes.data?.signup_urls ?? [])
+      setKeysNeeded(aRes.data?.keys_needed ?? 0)
+      setProviders(Array.isArray(pRes.data) ? pRes.data : [])
+      setErr(null)
+    } catch (e: any) {
+      setErr(e?.response?.data?.detail ?? 'Could not reach the AI settings API. Is the backend running the latest build?')
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => { void load() }, [load])
+
+  const assign = async (task: string, providerId: number | null) => {
+    setBusy(task); setErr(null)
+    try {
+      await apiClient.aiAnalyst.assignTaskProfile(task, providerId)
+      // A changed profile invalidates the old verdict — showing a stale green
+      // tick against a profile that was just swapped is worse than no tick.
+      setResults(r => { const n = { ...r }; delete n[task]; return n })
+      await load()
+    } catch (e: any) {
+      setErr(e?.response?.data?.detail ?? 'Could not change the assignment')
+    } finally { setBusy(null) }
+  }
+
+  const test = useCallback(async (task: string) => {
+    setBusy(task)
+    try {
+      const res = await apiClient.aiAnalyst.testTaskAssignment(task)
+      setResults(r => ({ ...r, [task]: res.data }))
+    } catch (e: any) {
+      setResults(r => ({
+        ...r,
+        [task]: { ok: false, error: e?.response?.data?.detail ?? e?.message ?? 'Test request failed' },
+      }))
+    } finally { setBusy(null) }
+  }, [])
+
+  const testAll = async () => {
+    setTestingAll(true)
+    // Sequential on purpose: firing five concurrent calls at a shared key is
+    // the exact rate-limit pile-up this settings page exists to diagnose.
+    for (const t of tasks) await test(t.task)
+    setTestingAll(false)
+  }
+
+  const takenBy = new Map<number, string>()
+  for (const t of tasks) if (t.provider_id) takenBy.set(t.provider_id, t.label)
+
+  const working = tasks.filter(t => results[t.task]?.ok).length
+  const tested = tasks.filter(t => results[t.task]).length
+
+  return (
+    <div className="fixed inset-0 z-[200] flex items-start justify-center overflow-y-auto bg-black/70 p-4 backdrop-blur-sm">
+      <div className="my-8 w-full max-w-3xl rounded-xl border border-gray-700 bg-gray-900 shadow-2xl">
+        <div className="flex items-center justify-between gap-3 border-b border-gray-700 px-5 py-3">
+          <div className="flex items-center gap-2">
+            <Brain className="h-5 w-5 text-cyan-400" />
+            <h2 className="text-sm font-semibold text-white">Brain AI — models &amp; connection</h2>
+          </div>
+          <div className="flex items-center gap-2">
+            {tested > 0 && (
+              <span className={`text-[11px] font-semibold ${working === tasks.length ? 'text-emerald-400' : 'text-amber-400'}`}>
+                {working}/{tasks.length} working
+              </span>
+            )}
+            <button
+              onClick={() => void testAll()}
+              disabled={testingAll || !tasks.length}
+              className="flex items-center gap-1.5 rounded-lg bg-cyan-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-cyan-500 disabled:opacity-50"
+            >
+              {testingAll ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Zap className="h-3.5 w-3.5" />}
+              Test all
+            </button>
+            <button onClick={onClose} className="rounded p-1 text-gray-400 transition hover:text-white">
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        </div>
+
+        <div className="space-y-3 p-5">
+          <p className="text-xs leading-relaxed text-gray-400">
+            The five roles run <strong className="text-gray-300">at the same time</strong> and argue with each
+            other, so each wants its own key. A role with none borrows the
+            least-loaded key from the shared pool — that works, but the roles
+            queue behind one rate limit and the critic may end up reviewing the
+            consolidator on the same model that wrote it.
+          </p>
+
+          {err && (
+            <div className="rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-300">{err}</div>
+          )}
+
+          {keysNeeded > 0 && (
+            <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2.5">
+              <div className="text-xs font-semibold text-amber-300">
+                {keysNeeded} more free API {keysNeeded === 1 ? 'key' : 'keys'} would give every role its own
+              </div>
+              <div className="mt-2 flex flex-wrap gap-2">
+                {signupUrls.map((s: any) => (
+                  <a key={s.url} href={s.url} target="_blank" rel="noopener noreferrer" title={s.note}
+                    className="flex items-center gap-1 rounded bg-amber-500/20 px-2 py-1 text-[11px] font-medium text-amber-200 transition hover:bg-amber-500/30">
+                    {s.label} <ExternalLink className="h-3 w-3" />
+                  </a>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {loading ? (
+            <div className="py-8 text-center text-xs text-gray-500">Loading brain settings…</div>
+          ) : !tasks.length ? (
+            <div className="py-8 text-center text-xs text-gray-500">
+              No brain roles reported. The backend may still be running an older build.
+            </div>
+          ) : tasks.map((t) => {
+            const r = results[t.task]
+            const isBusy = busy === t.task
+            return (
+              <div key={t.task} className={`rounded-lg border p-3 ${
+                r?.ok ? 'border-emerald-500/40 bg-emerald-500/5'
+                  : r ? 'border-red-500/40 bg-red-500/5'
+                  : t.needs_key ? 'border-amber-500/40 bg-amber-500/5'
+                  : 'border-gray-700 bg-gray-950/40'
+              }`}>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-sm font-medium text-gray-200">{t.label}</span>
+                  <span className={`flex items-center gap-1 text-[11px] font-semibold ${
+                    r?.ok ? 'text-emerald-400' : r ? 'text-red-400'
+                      : t.dedicated ? 'text-gray-400' : 'text-amber-400'
+                  }`}>
+                    {r?.ok ? <><Check className="h-3.5 w-3.5" /> connected</>
+                      : r ? <><X className="h-3.5 w-3.5" /> not working</>
+                      : t.dedicated ? 'has a key — untested'
+                      : '⚠ borrowing a shared key'}
+                  </span>
+                </div>
+
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  <select
+                    value={t.provider_id ?? ''}
+                    disabled={isBusy}
+                    onChange={(e) => void assign(t.task, e.target.value ? Number(e.target.value) : null)}
+                    className="min-w-[210px] flex-1 rounded border border-gray-700 bg-gray-800 px-2 py-1.5 text-xs text-gray-200 disabled:opacity-50"
+                  >
+                    <option value="">Borrow from shared pool (no dedicated key)</option>
+                    {providers.map((p: any) => {
+                      const heldBy = takenBy.get(p.id)
+                      const elsewhere = heldBy && heldBy !== t.label
+                      return (
+                        <option key={p.id} value={p.id} disabled={!!elsewhere}>
+                          {p.label}{elsewhere ? ` — taken by ${heldBy}` : ''}
+                        </option>
+                      )
+                    })}
+                  </select>
+                  <button
+                    onClick={() => void test(t.task)}
+                    disabled={isBusy || testingAll}
+                    className="flex items-center gap-1.5 rounded border border-gray-600 px-3 py-1.5 text-xs text-gray-300 transition hover:border-gray-400 disabled:opacity-50"
+                  >
+                    {isBusy ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Activity className="h-3.5 w-3.5" />}
+                    Test
+                  </button>
+                </div>
+
+                {r && (
+                  <div className="mt-2 text-[11px] leading-snug">
+                    {r.ok ? (
+                      <span className="text-emerald-300">
+                        Answered in {r.latency_ms}ms via <span className="font-mono">{r.provider}</span>
+                        {r.model ? <> · <span className="font-mono">{r.model}</span></> : null}
+                        {r.borrowed && <span className="text-amber-300"> · borrowed key</span>}
+                      </span>
+                    ) : (
+                      <span className="break-words text-red-300">{r.error || 'No response from the model'}</span>
+                    )}
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ─── SignalsOverlayPanel — live signals in the brain sidebar ─────────────────
 function SignalsOverlayPanel() {
   const [signals, setSignals] = useState<SignalOverlayItem[]>([])
@@ -683,6 +920,7 @@ export default function IntelligencePage() {
   const lastTransformRef = useRef<{ k: number; x: number; y: number } | null>(null)  // latest live d3-zoom transform
   const [viewSaved, setViewSaved] = useState(false)  // shows "Saved ✓" confirmation
   const [isFullscreen, setIsFullscreen] = useState(false)  // brain fills the whole screen
+  const [showBrainAi, setShowBrainAi] = useState(false)    // brain model/connection settings
   const [panelOpen, setPanelOpen] = useState(true)         // right info panel visible
   const [canvasSize, setCanvasSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 })  // measured graph canvas size
   const [brainReady, setBrainReady] = useState(false)  // hide brain until zoom transform is known
@@ -1265,6 +1503,17 @@ export default function IntelligencePage() {
             {nodeCount.toLocaleString()} nodes · {linkCount.toLocaleString()} links
           </div>
 
+          {/* The map shows what the brains produced; this shows whether they
+              can think at all — which model each role runs on, and a real test. */}
+          <button
+            onClick={() => setShowBrainAi(true)}
+            className="flex items-center gap-1.5 rounded bg-gray-800 px-2.5 py-1 text-xs font-semibold text-gray-300 transition hover:bg-gray-700 hover:text-white"
+            title="Set the AI profile for each brain role and test that it is connected"
+          >
+            <Brain className="h-3.5 w-3.5 text-cyan-400" />
+            Brain AI
+          </button>
+
           {/* 2D/3D toggle (3D hidden on weak-GPU / disable-3D profile) */}
           <div className="flex bg-gray-800 rounded p-0.5 gap-0.5">
             {(disable3D ? (['2d'] as const) : (['2d', '3d'] as const)).map(m => (
@@ -1692,6 +1941,8 @@ export default function IntelligencePage() {
           </div>
 
       </div>
+
+      {showBrainAi && <BrainAiSettings onClose={() => setShowBrainAi(false)} />}
     </>
   )
 }

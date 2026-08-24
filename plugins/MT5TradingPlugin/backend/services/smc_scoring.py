@@ -46,33 +46,45 @@ VOLUME_LOOKBACK = 20
 #: historical score therefore moves by roughly 5% — intended, and worth knowing
 #: before comparing a score taken today against one recorded last week.
 DEFAULT_WEIGHTS: Dict[str, float] = {
-    # volume — 0.30
-    "relative_volume": 0.12,
-    "volume_at_price": 0.07,
-    "delta_imbalance": 0.06,
-    "bos_volume_confirmation": 0.05,
-    # structure — 0.40
-    "htf_alignment": 0.10,
-    "structure_aligned": 0.07,
-    "zone_quality": 0.06,
-    "premium_discount_depth": 0.06,
-    "liquidity_sweep": 0.06,
-    "choch_context": 0.05,
-    # movement — 0.19
-    "displacement_magnitude": 0.07,
-    "wick_rejection": 0.05,
-    "atr_momentum": 0.035,
-    "candle_velocity": 0.035,
-    # risk — 0.06
-    "risk_reward": 0.06,
-    # macro — 0.05
+    # volume — 0.285 (0.30 × 0.95)
+    "relative_volume": 0.114,
+    "volume_at_price": 0.0665,
+    "delta_imbalance": 0.057,
+    "bos_volume_confirmation": 0.0475,
+    # structure — 0.38 (0.40 × 0.95)
+    "htf_alignment": 0.095,
+    "structure_aligned": 0.0665,
+    "zone_quality": 0.057,
+    "premium_discount_depth": 0.057,
+    "liquidity_sweep": 0.057,
+    "choch_context": 0.0475,
+    # movement — 0.1805 (0.19 × 0.95)
+    "displacement_magnitude": 0.0665,
+    "wick_rejection": 0.0475,
+    "atr_momentum": 0.03325,
+    "candle_velocity": 0.03325,
+    # risk — 0.057 (0.06 × 0.95)
+    "risk_reward": 0.057,
+    # macro — 0.0475 (0.05 × 0.95)
     #
     # The dollar and the fear gauge. Small on purpose: macro is the weather a
     # setup trades in, not the setup. It is also the one family that routinely
     # does not apply — a pair with no USD leg redistributes this weight rather
     # than scoring a zero, so the instrument's currency composition never costs
     # it confidence. See app.services.macro_context.
-    "macro_context": 0.05,
+    "macro_context": 0.0475,
+    # fibonacci — 0.05
+    #
+    # Added the same way macro was: 0.05 taken proportionally from every other
+    # family (all scaled by 0.95) rather than appended on top, so weights still
+    # sum to exactly 1.00. Credit for price sitting in the auto-detected
+    # ZigZag/fib golden zone (0.5-0.618 retracement). Also routinely
+    # inapplicable — no confirmed swing yet on a young or choppy series —
+    # in which case it redistributes rather than scoring a zero. See
+    # backend/app/signals/technical.py:auto_fib_retracement for the shared
+    # ZigZag deviation/depth algorithm this mirrors (ported locally below
+    # since this plugin does not import from the main backend package).
+    "fib_confluence": 0.05,
 }
 
 FACTOR_FAMILY: Dict[str, str] = {
@@ -92,7 +104,36 @@ FACTOR_FAMILY: Dict[str, str] = {
     "candle_velocity": "movement",
     "risk_reward": "risk",
     "macro_context": "macro",
+    "fib_confluence": "fibonacci",
 }
+
+
+def _fib_confluence_score(price: float, fib: Optional[Dict[str, Any]]) -> Optional[float]:
+    """0..1 credit for `price` sitting inside the fib golden zone (0.5-0.618 band).
+
+    `fib` is the {"golden_zone": {"low", "high"}, "direction": "up"|"down"}
+    shape produced by SMCStrategyEngine's ZigZag/fib pass (see smc_strategy.py).
+    Ported from backend/app/signals/technical.py:fib_confluence_score — same
+    math, kept local because this plugin is isolated from the main backend
+    package. Returns None when inapplicable (no confirmed swing), not 0, so
+    the caller can redistribute the family weight instead of scoring a zero.
+    """
+    if not fib:
+        return None
+    zone = fib.get("golden_zone")
+    if not zone:
+        return None
+    low, high = zone.get("low"), zone.get("high")
+    if low is None or high is None or high <= low:
+        return None
+    if price < low or price > high:
+        return 0.0
+    mid = (low + high) / 2.0
+    half_width = (high - low) / 2.0
+    if half_width <= 0:
+        return 1.0
+    dist = abs(price - mid) / half_width
+    return round(max(0.0, 1.0 - dist), 4)
 
 #: Confidence is capped below 1.0 — a deterministic model should never claim
 #: certainty. Matches the previous engine's ceiling.
@@ -381,6 +422,7 @@ def score_signal(
     htf_bias: Optional[str] = None,
     weights: Optional[Dict[str, float]] = None,
     macro: Optional[Any] = None,
+    fib: Optional[Dict[str, Any]] = None,
 ) -> ScoreBreakdown:
     """Score one candidate setup. Pure function of the inputs — no I/O.
 
@@ -393,6 +435,11 @@ def score_signal(
     once per bar by ``SMCStrategyEngine.backtest``. ``None``, or a bias that
     reports itself inapplicable, redistributes the macro weight instead of
     scoring a zero.
+
+    ``fib`` is ``{"golden_zone": {"low", "high"}, "direction": "up"|"down"}``
+    from the caller's ZigZag/fib pass (SMCStrategyEngine.analyze computes it
+    once per call, not once per candidate, same reasoning as macro). ``None``,
+    or a result with no confirmed swing yet, redistributes the fib weight.
     """
     w = dict(DEFAULT_WEIGHTS)
     if weights:
@@ -431,6 +478,12 @@ def score_signal(
     macro_applicable = bool(macro is not None and getattr(macro, "applicable", False))
     if not macro_applicable:
         _redistribute(w, "macro")
+
+    # A young or choppy series with no confirmed ZigZag swing yet cannot carry
+    # a fib confluence measurement — redistribute rather than score a zero.
+    fib_applicable = bool(fib and fib.get("golden_zone"))
+    if not fib_applicable:
+        _redistribute(w, "fibonacci")
 
     factors: List[Factor] = []
 
@@ -530,6 +583,21 @@ def score_signal(
     else:
         choch_norm = 0.0
     add("choch_context", float(choch_index), choch_norm)
+
+    # Fib confluence: full credit when entry sits in the golden zone AND the
+    # zone's swing direction agrees with the trade side; a partial penalty
+    # (not a full flip) when the zone is there but the swing disagrees, since
+    # a golden zone against the trade is still a real level, just the wrong
+    # one to be leaning on.
+    if fib_applicable:
+        fib_conf = _fib_confluence_score(entry, fib) or 0.0
+        swing_dir = fib.get("direction")
+        if swing_dir in ("up", "down"):
+            dir_aligned = (swing_dir == "up") == want_bull
+            fib_norm = fib_conf if dir_aligned else -fib_conf * 0.5
+        else:
+            fib_norm = fib_conf
+        add("fib_confluence", fib_conf, fib_norm)
 
     # ── Macro ────────────────────────────────────────────────────────────────
     # The bias arrives signed for the long side, so a short reads the same

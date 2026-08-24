@@ -153,6 +153,14 @@ interface Analysis {
   momentum?: string
   equilibrium?: number | null
   range?: { low: number; high: number } | null
+  /** Auto fib retracement of the latest ZigZag swing — the same levels the
+   *  engine scored its fib confluence factor against. */
+  fib?: {
+    direction?: string
+    swing?: { start_time: number; start_price: number; end_time: number; end_price: number }
+    golden_zone?: { low: number; high: number } | null
+    levels?: { ratio: number; price: number; label: string; color: string }[]
+  } | null
   liquidity?: { buyside: number[]; sellside: number[] }
   zones?: SmcZone[]
   signals?: SmcSignal[]
@@ -299,7 +307,7 @@ function supportsPriceBasis(sym: string): boolean {
 }
 
 // ── Chart layer visibility ───────────────────────────────────────────────────
-const LAYER_KEYS = ['zones', 'range', 'liquidity', 'setup', 'structure', 'position', 'kronos'] as const
+const LAYER_KEYS = ['zones', 'range', 'liquidity', 'setup', 'structure', 'position', 'kronos', 'fib'] as const
 type LayerKey = typeof LAYER_KEYS[number]
 const LAYER_LABELS: Record<LayerKey, string> = {
   zones:     'OB/FVG',
@@ -309,6 +317,7 @@ const LAYER_LABELS: Record<LayerKey, string> = {
   structure: 'CHoCH/BOS',
   position:  'Position',
   kronos:    'Kronos',
+  fib:       'Auto Fib',
 }
 const LAYER_COLORS: Record<LayerKey, string> = {
   zones:     '#3b82f6',
@@ -318,6 +327,7 @@ const LAYER_COLORS: Record<LayerKey, string> = {
   structure: '#10b981',
   position:  '#f97316',
   kronos:    '#a78bfa',
+  fib:       '#009688',
 }
 const LAYERS_CFG_KEY = 'mt5_sniper_layers'
 function loadLayerCfg(): Record<LayerKey, boolean> {
@@ -1227,6 +1237,22 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
         add({ price: analysis.range.high, color: 'rgba(239,83,80,0.55)', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'Strong High' })
         add({ price: analysis.range.low, color: 'rgba(96,165,250,0.55)', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'Weak Low' })
       }
+    }
+
+    // Auto fib retracement — golden zone (0.5/0.618) solid, the rest dotted
+    // context, matching how the engine weights them.
+    if (visibleLayers.fib) {
+      ;(analysis.fib?.levels ?? []).forEach(lvl => {
+        const golden = lvl.ratio === 0.5 || lvl.ratio === 0.618
+        add({
+          price: lvl.price,
+          color: lvl.color,
+          lineWidth: golden ? 2 : 1,
+          lineStyle: golden ? LineStyle.Solid : LineStyle.Dotted,
+          axisLabelVisible: true,
+          title: `Fib ${lvl.label}`,
+        })
+      })
     }
 
     // Liquidity pools — equal highs (EQH) / equal lows (EQL)

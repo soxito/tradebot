@@ -5,6 +5,7 @@ from Bitget with sentiment data from 20+ news sources.
 Uses evaluator-style scoring with strict multi-confirmation requirements.
 Designed to run every 3 minutes via the scheduler.
 """
+import asyncio
 import json
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
@@ -13,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.exchanges.manager import exchange_manager, SupportedExchange
 from app.core.config import settings
 from app.core.timezone import now_sast
+from app.signals.candle_source import get_ohlcv as cached_get_ohlcv
 from app.signals.technical import (
     analyze as technical_analyze,
     ohlcv_to_dataframe,
@@ -48,6 +50,18 @@ DEFAULT_PAIRS = [
 # Signal cooldown — don't re-signal same pair within N minutes
 SIGNAL_COOLDOWN_MINUTES = 15
 _last_signal_time: Dict[str, datetime] = {}
+_cooldown_lock = asyncio.Lock()
+
+
+async def _cooldown_ok(symbol: str) -> bool:
+    """Check-and-claim the per-symbol cooldown atomically."""
+    async with _cooldown_lock:
+        now = now_sast()
+        last_sig = _last_signal_time.get(symbol)
+        if last_sig and (now - last_sig) < timedelta(minutes=SIGNAL_COOLDOWN_MINUTES):
+            return False
+        _last_signal_time[symbol] = now
+        return True
 
 
 def _prune_cooldown_cache():
@@ -166,17 +180,19 @@ async def analyze_multi_timeframe(symbol: str, primary_timeframe: str = "1h") ->
     tf_results: Dict[str, Dict] = {}
     errors = []
 
-    for tf in analysis_tfs:
+    async def _one_tf(tf: str) -> None:
         try:
             limit = 200 if tf in ("5m", "15m") else 200
-            ohlcv = await connector.get_ohlcv(symbol=symbol, timeframe=tf, limit=limit)
+            ohlcv = await cached_get_ohlcv(symbol=symbol, timeframe=tf, limit=limit)
             ta = technical_analyze(ohlcv, tf)
             if "error" in ta:
                 errors.append(f"{tf}: {ta['error']}")
-                continue
+                return
             tf_results[tf] = ta
         except Exception as e:
             errors.append(f"{tf}: {e}")
+
+    await asyncio.gather(*(_one_tf(tf) for tf in analysis_tfs))
 
     if not tf_results:
         return {"error": f"No TA data: {errors}", "symbol": symbol}
@@ -328,21 +344,27 @@ def compute_final_signal(
     btc_sentiment: Optional[Dict] = None,
     strategy_scores: Optional[List[Dict]] = None,
     priority_pine_score: Optional[Dict] = None,
+    fib_confluence: Optional[Dict] = None,
 ) -> Dict[str, Any]:
     """
     Combine TA + Sentiment + Strategy scores into final signal decision.
-    
+
     Stricter thresholds — only high-confidence signals pass.
     Requirements:
       - Multi-TF agreement must be met
       - Volume should confirm direction
       - ADX gate should not heavily dampen
       - Score must exceed ±0.35 (raised from ±0.25)
-    
+
     strategy_scores: optional list of {"name": str, "score": float, "confidence": float}
     from active strategies for this symbol.
     priority_pine_score: optional single Pine Script score that gets 50% weight
     (selected by user in settings — overrides the 20% strategy weight).
+    fib_confluence: optional {"score": float (-1..1, direction of the latest
+    ZigZag swing), "confidence": float (0..1), "in_golden_zone": bool} from
+    auto_fib_retracement()/fib_confluence_score() (technical.py). Additive and
+    conditional — omitting it (default None) leaves this function's behavior
+    unchanged for existing callers.
     """
     ta_score = ta_data["ta_score"]
     ta_confidence = ta_data["ta_confidence"]
@@ -408,6 +430,23 @@ def compute_final_signal(
                 reasons.append(f"Strategies conflict ({strat_names}, avg={avg_strat:+.3f}) → {strategy_boost:+.3f}")
             else:
                 reasons.append(f"Strategies neutral ({strat_names}, avg={avg_strat:+.3f})")
+
+    # ── Fibonacci Confluence Integration (conditional, up to ~10% of ta_score) ──
+    if fib_confluence and fib_confluence.get("score") is not None:
+        f_score = fib_confluence["score"]
+        f_conf = fib_confluence.get("confidence", 0.5)
+        in_zone = fib_confluence.get("in_golden_zone", False)
+        aligned = (f_score > 0 and ta_score > 0) or (f_score < 0 and ta_score < 0)
+        if in_zone and aligned:
+            fib_boost = abs(f_score) * f_conf * 0.10
+            ta_score += fib_boost if ta_score > 0 else -fib_boost
+            reasons.append(f"Fib golden-zone confluence aligns → +{fib_boost:.3f}")
+        elif in_zone and not aligned:
+            fib_penalty = abs(f_score) * f_conf * 0.06
+            ta_score -= fib_penalty if ta_score > 0 else -fib_penalty
+            reasons.append(f"Fib golden-zone confluence conflicts → -{fib_penalty:.3f}")
+        else:
+            reasons.append("Price outside fib golden zone — no confluence adjustment")
 
     # ── Priority Pine Script Integration (50% weight — user's selected script) ──
     pine_boost = 0.0
@@ -596,6 +635,28 @@ async def run_signal_pipeline(
     refresh_if_stale = bool(getattr(settings, "SENTIMENT_AUTO_REFRESH_ON_READ", True))
     max_news_age_hours = max(1, int(getattr(settings, "SENTIMENT_MAX_AGE_HOURS", 2) or 2))
 
+    # ── Warm the candle cache for every pair × timeframe, concurrently ──────
+    # The loop below re-reads the same series five-plus times per pair
+    # (multi-TF TA, strategies, Pine evals, JARVIS evals, fib). Fetching them
+    # all here in one bounded burst turns those sequential round-trips into
+    # cache hits — the loop's wall time collapses to roughly the slowest
+    # single fetch instead of the sum of every fetch.
+    prefetch_tfs = set(MULTI_TF) | {"1h", effective_tf}
+    for strat in active_strategies:
+        tf_attr = getattr(strat, "timeframe", None)
+        if tf_attr:
+            prefetch_tfs.add(tf_attr)
+    prefetch_started = now_sast()
+    await asyncio.gather(*(
+        cached_get_ohlcv(symbol=sym, timeframe=tf, limit=200)
+        for sym in pairs
+        for tf in prefetch_tfs
+    ))
+    logger.info(
+        f"⚡ [SIGNAL PIPELINE] Prefetched {len(pairs)} pairs × {len(prefetch_tfs)} TFs "
+        f"in {(now_sast() - prefetch_started).total_seconds():.1f}s"
+    )
+
     for symbol in pairs:
         try:
             # 1. Multi-TF TA (using configured timeframe as primary)
@@ -642,10 +703,7 @@ async def run_signal_pipeline(
                         adx as s_adx, sma as s_sma, buy_sell_volume as s_bsv,
                     )
                     strat_tf = strat.timeframe or "1h"
-                    connector = exchange_manager.get_exchange(EXCHANGE)
-                    if not connector:
-                        continue
-                    strat_ohlcv = await connector.get_ohlcv(symbol=symbol, timeframe=strat_tf, limit=200)
+                    strat_ohlcv = await cached_get_ohlcv(symbol=symbol, timeframe=strat_tf, limit=200)
                     if len(strat_ohlcv) < 60:
                         continue
                     sdf = s_ohlcv_df(strat_ohlcv)
@@ -743,97 +801,95 @@ async def run_signal_pipeline(
                     from app.api.strategies import _parse_pinescript_to_indicators
                     p_indicators = _parse_pinescript_to_indicators(priority_pine_script.code or "")
                     if p_indicators:
-                        connector = exchange_manager.get_exchange(EXCHANGE)
-                        if connector:
-                            p_ohlcv = await connector.get_ohlcv(symbol=symbol, timeframe=effective_tf, limit=200)
-                            if len(p_ohlcv) >= 60:
-                                from app.signals.technical import ohlcv_to_dataframe as p_odf
-                                pdf = p_odf(p_ohlcv)
-                                p_parts = []
-                                p_wtotal = 0.0
-                                for ind in p_indicators:
-                                    if not ind.get("enabled", True):
-                                        continue
-                                    iname = ind["name"]
-                                    params = ind.get("params", {})
-                                    w = ind.get("weight", 1.0)
-                                    try:
-                                        if iname == "rsi":
-                                            rv = s_rsi(pdf, params.get("period", 14)).iloc[-1]
-                                            ob, os_ = params.get("overbought", 70), params.get("oversold", 30)
-                                            if not np.isnan(rv):
-                                                if rv < os_: p_parts.append(1.0 * w)
-                                                elif rv > ob: p_parts.append(-1.0 * w)
-                                                else: p_parts.append(0.0)
-                                                p_wtotal += w
-                                        elif iname == "macd":
-                                            md = s_macd(pdf, params.get("fast", 12), params.get("slow", 26), params.get("signal", 9))
-                                            h = md["histogram"].iloc[-1]
-                                            hp = md["histogram"].iloc[-2] if len(md["histogram"]) > 1 else 0
-                                            if not np.isnan(h):
-                                                if h > 0 and hp <= 0: p_parts.append(1.0 * w)
-                                                elif h < 0 and hp >= 0: p_parts.append(-1.0 * w)
-                                                elif h > 0: p_parts.append(0.5 * w)
-                                                elif h < 0: p_parts.append(-0.5 * w)
-                                                else: p_parts.append(0.0)
-                                                p_wtotal += w
-                                        elif iname == "bollinger":
-                                            bbd = s_bb(pdf, params.get("period", 20), params.get("mult", 2.0))
-                                            pb = bbd["pct_b"].iloc[-1]
-                                            if not np.isnan(pb):
-                                                if pb < 0.2: p_parts.append(1.0 * w)
-                                                elif pb > 0.8: p_parts.append(-1.0 * w)
-                                                else: p_parts.append(0.0)
-                                                p_wtotal += w
-                                        elif iname == "ema_cross":
-                                            ef = s_ema(pdf["close"], params.get("fast", 50)).iloc[-1]
-                                            es = s_ema(pdf["close"], params.get("slow", 200)).iloc[-1]
-                                            if not np.isnan(ef) and not np.isnan(es):
-                                                p_parts.append((1.0 if ef > es else -1.0) * w)
-                                                p_wtotal += w
-                                        elif iname == "stoch_rsi":
-                                            sv = s_stoch_rsi(pdf, params.get("period", 14)).iloc[-1]
-                                            ob, os_ = params.get("overbought", 80), params.get("oversold", 20)
-                                            if not np.isnan(sv):
-                                                if sv < os_: p_parts.append(0.8 * w)
-                                                elif sv > ob: p_parts.append(-0.8 * w)
-                                                else: p_parts.append(0.0)
-                                                p_wtotal += w
-                                        elif iname == "adx":
-                                            ad = s_adx(pdf, params.get("period", 14))
-                                            a = ad["adx"].iloc[-1]
-                                            pdi, mdi = ad["plus_di"].iloc[-1], ad["minus_di"].iloc[-1]
-                                            if not np.isnan(a) and not np.isnan(pdi) and not np.isnan(mdi):
-                                                direction = 1 if pdi > mdi else -1
-                                                th = params.get("threshold", 25)
-                                                p_parts.append((direction * 1.0 if a > th else 0.0) * w)
-                                                p_wtotal += w
-                                        elif iname == "volume":
-                                            vm = s_sma(pdf["volume"], params.get("period", 20)).iloc[-1]
-                                            vr = pdf["volume"].iloc[-1] / vm if vm > 0 else 1
-                                            mult = params.get("mult", 1.5)
-                                            if vr > mult:
-                                                br = s_bsv(pdf)["buy_ratio"].iloc[-1]
-                                                if br > 0.6: p_parts.append(1.0 * w)
-                                                elif br < 0.4: p_parts.append(-1.0 * w)
-                                                else: p_parts.append(0.0)
-                                            else:
-                                                p_parts.append(0.0)
+                        p_ohlcv = await cached_get_ohlcv(symbol=symbol, timeframe=effective_tf, limit=200)
+                        if len(p_ohlcv) >= 60:
+                            from app.signals.technical import ohlcv_to_dataframe as p_odf
+                            pdf = p_odf(p_ohlcv)
+                            p_parts = []
+                            p_wtotal = 0.0
+                            for ind in p_indicators:
+                                if not ind.get("enabled", True):
+                                    continue
+                                iname = ind["name"]
+                                params = ind.get("params", {})
+                                w = ind.get("weight", 1.0)
+                                try:
+                                    if iname == "rsi":
+                                        rv = s_rsi(pdf, params.get("period", 14)).iloc[-1]
+                                        ob, os_ = params.get("overbought", 70), params.get("oversold", 30)
+                                        if not np.isnan(rv):
+                                            if rv < os_: p_parts.append(1.0 * w)
+                                            elif rv > ob: p_parts.append(-1.0 * w)
+                                            else: p_parts.append(0.0)
                                             p_wtotal += w
-                                    except Exception:
-                                        continue
-                                if p_wtotal > 0:
-                                    ps_s = sum(p_parts) / p_wtotal
-                                    ps_s = max(-1.0, min(1.0, ps_s))
-                                    priority_score = {
-                                        "name": f"[Priority Pine] {priority_pine_script.name}",
-                                        "score": ps_s,
-                                        "confidence": min(1.0, abs(ps_s) / 0.5),
-                                    }
-                                    logger.info(
-                                        f"🌲 Priority Pine '{priority_pine_script.name}' → "
-                                        f"{ps_s:+.3f} for {symbol} (tf={effective_tf})"
-                                    )
+                                    elif iname == "macd":
+                                        md = s_macd(pdf, params.get("fast", 12), params.get("slow", 26), params.get("signal", 9))
+                                        h = md["histogram"].iloc[-1]
+                                        hp = md["histogram"].iloc[-2] if len(md["histogram"]) > 1 else 0
+                                        if not np.isnan(h):
+                                            if h > 0 and hp <= 0: p_parts.append(1.0 * w)
+                                            elif h < 0 and hp >= 0: p_parts.append(-1.0 * w)
+                                            elif h > 0: p_parts.append(0.5 * w)
+                                            elif h < 0: p_parts.append(-0.5 * w)
+                                            else: p_parts.append(0.0)
+                                            p_wtotal += w
+                                    elif iname == "bollinger":
+                                        bbd = s_bb(pdf, params.get("period", 20), params.get("mult", 2.0))
+                                        pb = bbd["pct_b"].iloc[-1]
+                                        if not np.isnan(pb):
+                                            if pb < 0.2: p_parts.append(1.0 * w)
+                                            elif pb > 0.8: p_parts.append(-1.0 * w)
+                                            else: p_parts.append(0.0)
+                                            p_wtotal += w
+                                    elif iname == "ema_cross":
+                                        ef = s_ema(pdf["close"], params.get("fast", 50)).iloc[-1]
+                                        es = s_ema(pdf["close"], params.get("slow", 200)).iloc[-1]
+                                        if not np.isnan(ef) and not np.isnan(es):
+                                            p_parts.append((1.0 if ef > es else -1.0) * w)
+                                            p_wtotal += w
+                                    elif iname == "stoch_rsi":
+                                        sv = s_stoch_rsi(pdf, params.get("period", 14)).iloc[-1]
+                                        ob, os_ = params.get("overbought", 80), params.get("oversold", 20)
+                                        if not np.isnan(sv):
+                                            if sv < os_: p_parts.append(0.8 * w)
+                                            elif sv > ob: p_parts.append(-0.8 * w)
+                                            else: p_parts.append(0.0)
+                                            p_wtotal += w
+                                    elif iname == "adx":
+                                        ad = s_adx(pdf, params.get("period", 14))
+                                        a = ad["adx"].iloc[-1]
+                                        pdi, mdi = ad["plus_di"].iloc[-1], ad["minus_di"].iloc[-1]
+                                        if not np.isnan(a) and not np.isnan(pdi) and not np.isnan(mdi):
+                                            direction = 1 if pdi > mdi else -1
+                                            th = params.get("threshold", 25)
+                                            p_parts.append((direction * 1.0 if a > th else 0.0) * w)
+                                            p_wtotal += w
+                                    elif iname == "volume":
+                                        vm = s_sma(pdf["volume"], params.get("period", 20)).iloc[-1]
+                                        vr = pdf["volume"].iloc[-1] / vm if vm > 0 else 1
+                                        mult = params.get("mult", 1.5)
+                                        if vr > mult:
+                                            br = s_bsv(pdf)["buy_ratio"].iloc[-1]
+                                            if br > 0.6: p_parts.append(1.0 * w)
+                                            elif br < 0.4: p_parts.append(-1.0 * w)
+                                            else: p_parts.append(0.0)
+                                        else:
+                                            p_parts.append(0.0)
+                                        p_wtotal += w
+                                except Exception:
+                                    continue
+                            if p_wtotal > 0:
+                                ps_s = sum(p_parts) / p_wtotal
+                                ps_s = max(-1.0, min(1.0, ps_s))
+                                priority_score = {
+                                    "name": f"[Priority Pine] {priority_pine_script.name}",
+                                    "score": ps_s,
+                                    "confidence": min(1.0, abs(ps_s) / 0.5),
+                                }
+                                logger.info(
+                                    f"🌲 Priority Pine '{priority_pine_script.name}' → "
+                                    f"{ps_s:+.3f} for {symbol} (tf={effective_tf})"
+                                )
                 except Exception as e:
                     logger.warning(f"Priority Pine Script eval failed for {symbol}: {e}")
 
@@ -861,11 +917,7 @@ async def run_signal_pipeline(
                     if not ps_indicators:
                         continue
 
-                    connector = exchange_manager.get_exchange(EXCHANGE)
-                    if not connector:
-                        continue
-
-                    ps_ohlcv = await connector.get_ohlcv(symbol=symbol, timeframe=effective_tf, limit=200)
+                    ps_ohlcv = await cached_get_ohlcv(symbol=symbol, timeframe=effective_tf, limit=200)
                     if len(ps_ohlcv) < 60:
                         continue
 
@@ -964,27 +1016,54 @@ async def run_signal_pipeline(
             # Sentiment, Telegram Signals, SMC, Insights, and the Brain Map.
             try:
                 from plugins.AiMarketAnalyst.backend.services.jarvis_intelligence import evaluate_generated_strategies
-                connector = exchange_manager.get_exchange(EXCHANGE)
-                if connector:
-                    jarvis_ohlcv = await connector.get_ohlcv(symbol=symbol, timeframe=effective_tf, limit=200)
-                    jarvis_candles = _ohlcv_rows_to_candles(jarvis_ohlcv)
-                    if len(jarvis_candles) >= 30:
-                        jarvis_scores = await evaluate_generated_strategies(
-                            db,
-                            candles=jarvis_candles,
-                            symbol=symbol,
-                        )
-                        for js in jarvis_scores:
-                            strategy_scores.append({
-                                "name": f"[JARVIS] {js.get('name', 'generated')}",
-                                "score": float(js.get("score") or 0.0),
-                                "confidence": float(js.get("confidence") or 0.0),
-                                "reasoning": js.get("reasoning"),
-                            })
-                        if jarvis_scores:
-                            logger.info(f"🧠 {len(jarvis_scores)} JARVIS generated strategies scored {symbol}")
+                jarvis_ohlcv = await cached_get_ohlcv(symbol=symbol, timeframe=effective_tf, limit=200)
+                jarvis_candles = _ohlcv_rows_to_candles(jarvis_ohlcv)
+                if len(jarvis_candles) >= 30:
+                    jarvis_scores = await evaluate_generated_strategies(
+                        db,
+                        candles=jarvis_candles,
+                        symbol=symbol,
+                    )
+                    for js in jarvis_scores:
+                        strategy_scores.append({
+                            "name": f"[JARVIS] {js.get('name', 'generated')}",
+                            "score": float(js.get("score") or 0.0),
+                            "confidence": float(js.get("confidence") or 0.0),
+                            "reasoning": js.get("reasoning"),
+                        })
+                    if jarvis_scores:
+                        logger.info(f"🧠 {len(jarvis_scores)} JARVIS generated strategies scored {symbol}")
             except Exception as e:
                 logger.warning(f"JARVIS generated strategy eval failed for {symbol}: {e}")
+
+            # 2.8. Auto Fib Retracement confluence — additive, conditional input
+            # to compute_final_signal (only adjusts score when price sits in the
+            # golden zone). Failure here must never break the pipeline.
+            fib_confluence = None
+            try:
+                from app.signals.technical import auto_fib_retracement, fib_confluence_score
+                fib_ohlcv = await cached_get_ohlcv(symbol=symbol, timeframe=effective_tf, limit=200)
+                if fib_ohlcv and len(fib_ohlcv) >= 20:
+                    fib_df = ohlcv_to_dataframe(fib_ohlcv)
+                    # Only the 0.5/0.618 golden zone is read below, and the
+                    # per-bar line series is unused here — pass lean kwargs so
+                    # this stops building ~2000 per-bar dicts every cycle.
+                    fib_result = auto_fib_retracement(
+                        fib_df, levels=(0.5, 0.618), extend_lines=False,
+                    )
+                    if fib_result.get("swing"):
+                        cp = float(fib_df["close"].iloc[-1])
+                        conf = fib_confluence_score(cp, fib_result, fib_result["swing"]["direction"])
+                        if conf is not None:
+                            direction_sign = 1 if fib_result["swing"]["direction"] == "up" else -1
+                            zone = fib_result["golden_zone"]
+                            fib_confluence = {
+                                "score": direction_sign * conf,
+                                "confidence": conf,
+                                "in_golden_zone": bool(zone and zone["low"] <= cp <= zone["high"]),
+                            }
+            except Exception as e:
+                logger.warning(f"Fib confluence eval failed for {symbol}: {e}")
 
             # 3. Combine TA + sentiment + strategies (baseline decision)
             decision = compute_final_signal(
@@ -993,6 +1072,7 @@ async def run_signal_pipeline(
                 btc_sentiment,
                 strategy_scores or None,
                 priority_score,
+                fib_confluence,
             )
 
             # 3.5. AI Agent Signal Generation — when enabled, AI generates
@@ -1094,13 +1174,12 @@ async def run_signal_pipeline(
                 decision["action"] = "hold"
 
             if decision["action"] in ("buy", "sell"):
-                # Cooldown check: don't re-signal same pair too frequently
-                now = now_sast()
-                last_sig = _last_signal_time.get(symbol)
-                if last_sig and (now - last_sig) < timedelta(minutes=SIGNAL_COOLDOWN_MINUTES):
+                # Cooldown check: don't re-signal same pair too frequently.
+                # Check-and-claim is atomic so concurrent cycles can't double-fire.
+                if not await _cooldown_ok(symbol):
                     logger.debug(f"⏳ Cooldown active for {symbol} — skipping ({SIGNAL_COOLDOWN_MINUTES}m)")
                     decision["action"] = "hold"
-                    decision["reasons"].append(f"Cooldown: last signal {(now - last_sig).seconds // 60}m ago")
+                    decision["reasons"].append(f"Cooldown: last signal within {SIGNAL_COOLDOWN_MINUTES}m")
                 else:
                     action_enum = SignalAction.BUY if decision["action"] == "buy" else SignalAction.SELL
                     sig = SignalCreate(
@@ -1135,7 +1214,6 @@ async def run_signal_pipeline(
                     saved = await SignalService.create_signal(db, sig)
                     signal_id = saved.id
                     signals_created += 1
-                    _last_signal_time[symbol] = now
 
                     logger.info(
                         f"🤖 {decision['action'].upper()} {symbol} "

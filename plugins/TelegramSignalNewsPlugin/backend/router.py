@@ -116,9 +116,21 @@ async def _ensure_monitor() -> None:
     endpoint is hit. Safe to call on every request.
     """
     try:
-        signal_monitor.ensure_started(AsyncSessionLocal)
-    except Exception:
-        pass
+        supervisor_ok = True
+        try:
+            from app.core.task_supervisor import supervisor
+            # Telegram is critical: claim() always returns True; it only binds+dedupes.
+            supervisor_ok = supervisor.claim("telegram_monitor")
+        except Exception:
+            supervisor_ok = True
+        if supervisor_ok:
+            signal_monitor.ensure_started(AsyncSessionLocal)
+    except Exception as exc:  # never propagate — this is a per-request dependency
+        logger.warning(f"[telegram] monitor autostart failed: {exc}")
+        try:
+            signal_monitor.last_error = str(exc)[:300]
+        except Exception:
+            pass
 
 
 # Auto-start the monitor on every request to this router (idempotent).
@@ -701,7 +713,7 @@ def _signal_to_response(model: TelegramParsedSignal) -> TelegramParsedSignalResp
 @router.get("/signals", response_model=list[TelegramParsedSignalResponse])
 async def list_signals(
     status: Optional[str] = Query(
-        default=None, pattern=r"^(active|filled|tp_hit|sl_hit|closed)$"
+        default=None, pattern=r"^(active|filled|tp_hit|sl_hit|closed|expired)$"
     ),
     market_type: Optional[str] = Query(default=None, pattern=r"^(crypto|forex)$"),
     channel_source_id: int | None = None,
@@ -771,6 +783,20 @@ def _sniper_settings_to_response(s: TelegramSniperSettings) -> TelegramSniperSet
         execute_immediately=getattr(s, "execute_immediately", True),
         skipped_reanalyze_minutes=getattr(s, "skipped_reanalyze_minutes", 15),
         tp_trail_pct=getattr(s, "tp_trail_pct", 1.5),
+        max_margin_risk_pct=getattr(s, "max_margin_risk_pct", 20.0),
+        mt5_execute=getattr(s, "mt5_execute", False),
+        mt5_account_id=getattr(s, "mt5_account_id", None),
+        mt5_lot_size=getattr(s, "mt5_lot_size", 0.01),
+        mt5_demo_execute=getattr(s, "mt5_demo_execute", False),
+        mt5_demo_account_id=getattr(s, "mt5_demo_account_id", None),
+        multi_tp_execute=getattr(s, "multi_tp_execute", True),
+        force_telegram_signals=getattr(s, "force_telegram_signals", False),
+        never_skip_confidence_pct=getattr(s, "never_skip_confidence_pct", 90.0),
+        mt5_max_risk_pct=getattr(s, "mt5_max_risk_pct", 5.0),
+        mt5_small_account_mode=getattr(s, "mt5_small_account_mode", True),
+        notify_executions=getattr(s, "notify_executions", True),
+        immediate_confidence_pct=getattr(s, "immediate_confidence_pct", 80.0),
+        max_same_direction=getattr(s, "max_same_direction", 2),
         volume_channel_id=getattr(s, "volume_channel_id", None),
         allowed_channel_ids=s.allowed_channel_ids_json,
     )
@@ -809,6 +835,20 @@ async def update_sniper_settings_endpoint(
         "execute_immediately": "execute_immediately",
         "skipped_reanalyze_minutes": "skipped_reanalyze_minutes",
         "tp_trail_pct": "tp_trail_pct",
+        "max_margin_risk_pct": "max_margin_risk_pct",
+        "mt5_execute": "mt5_execute",
+        "mt5_account_id": "mt5_account_id",
+        "mt5_lot_size": "mt5_lot_size",
+        "mt5_demo_execute": "mt5_demo_execute",
+        "mt5_demo_account_id": "mt5_demo_account_id",
+        "multi_tp_execute": "multi_tp_execute",
+        "force_telegram_signals": "force_telegram_signals",
+        "never_skip_confidence_pct": "never_skip_confidence_pct",
+        "mt5_max_risk_pct": "mt5_max_risk_pct",
+        "mt5_small_account_mode": "mt5_small_account_mode",
+        "notify_executions": "notify_executions",
+        "immediate_confidence_pct": "immediate_confidence_pct",
+        "max_same_direction": "max_same_direction",
     }
     for key, attr in field_map.items():
         if key in data:

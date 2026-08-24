@@ -34,12 +34,14 @@ Cascade states (returned in `cascade_state`):
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Dict, Any, List, Optional, Tuple
 
 import numpy as np
 from loguru import logger
 
 from app.exchanges.manager import exchange_manager, SupportedExchange
+from app.signals.candle_source import get_ohlcv as cached_get_ohlcv
 from app.signals.technical import (
     analyze as technical_analyze,
     ohlcv_to_dataframe,
@@ -384,13 +386,15 @@ async def analyze_cascade(
     trend_tf, setup_tf, confirm_tf, entry_tf = tfs
 
     # ── Fetch OHLCV + run TA for all 4 TFs in parallel ──────
+    # The fetches share one cache, so a pair the pipeline already touched
+    # costs zero network calls; the TA runs are CPU-bound and cheap.
     tf_raw: Dict[str, Any] = {}
     errors: List[str] = []
 
-    for tf in tfs:
+    async def _one_tf(tf: str) -> None:
         limit = TF_LIMITS.get(tf, 200)
         try:
-            ohlcv = await connector.get_ohlcv(symbol=symbol, timeframe=tf, limit=limit)
+            ohlcv = await cached_get_ohlcv(symbol=symbol, timeframe=tf, limit=limit)
             ta = technical_analyze(ohlcv, tf)
             if "error" in ta:
                 errors.append(f"{tf}: {ta['error']}")
@@ -399,6 +403,8 @@ async def analyze_cascade(
         except Exception as exc:
             errors.append(f"{tf}: {exc}")
             logger.debug(f"[MTF Cascade] {symbol} {tf} fetch failed: {exc}")
+
+    await asyncio.gather(*(_one_tf(tf) for tf in tfs))
 
     if len(tf_raw) < 2:
         return {

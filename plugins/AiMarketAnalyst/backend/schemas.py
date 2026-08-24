@@ -63,6 +63,10 @@ class AIProviderUpdate(BaseModel):
     priority: Optional[int] = None
     daily_limit: Optional[int] = None
     monthly_limit: Optional[int] = None
+    #: Dedicate this profile to one task, or "" / null to return it to the
+    #: shared pool. Sent as an explicit empty string to clear, which is why this
+    #: field is read with ``exclude_unset`` rather than a None check.
+    assigned_task: Optional[str] = None
 
 
 class AIProviderResponse(BaseModel):
@@ -73,6 +77,9 @@ class AIProviderResponse(BaseModel):
     label: str
     type: str
     api_key_set: bool = False
+    # First five and last four characters only — enough to recognise a key you
+    # already hold, never enough to use it.
+    api_key_preview: Optional[str] = None
     base_url: Optional[str]
     default_model: Optional[str]
     models: List[str] = Field(default_factory=list)
@@ -84,6 +91,8 @@ class AIProviderResponse(BaseModel):
     last_error: Optional[str]
     last_tested_at: Optional[datetime]
     last_model_used: Optional[str]
+    #: Task this profile is dedicated to; null means it serves the shared pool.
+    assigned_task: Optional[str] = None
     total_calls: int
     total_errors: int
     daily_limit: Optional[int] = None

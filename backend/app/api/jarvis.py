@@ -276,13 +276,72 @@ _BRAIN_ROLE_SLOTS: Dict[str, int] = {
 }
 
 
-async def _get_brain_pool(db) -> list:
-    """Return ALL available enabled providers ordered by priority.
+async def _dedicated_brain_provider(db, role: str):
+    """The profile dedicated to this brain role, if one is set.
 
-    Skips circuit-open and usage-capped providers so the brain always
-    uses working, headroom-positive providers.  The list is stable within
-    a request but may change between cycles as caps reset and providers
-    recover from circuit-breaker cooldown.
+    Returns None when the role has no profile, so the caller falls back to the
+    shared slot-spread pool. That keeps the brain running while the roles are
+    still being configured — the requirement is surfaced in the settings UI
+    rather than enforced by refusing to think.
+    """
+    try:
+        from plugins.AiMarketAnalyst.backend.services.ai_router import (
+            dedicated_profile_for, _cb_open, _is_capped, get_router_settings,
+        )
+        p = await dedicated_profile_for(db, role)
+        if p is None or not (p.api_key and p.base_url):
+            return None
+        settings = await get_router_settings(db)
+        if _cb_open(p.id) or _is_capped(p, settings.reserve_pct):
+            return None
+        return p
+    except Exception as e:
+        logger.debug(f"[JARVIS brain-{role}] dedicated lookup failed: {e}")
+        return None
+
+
+def _brain_load(p) -> tuple:
+    """Sort key: healthy first, then least-used.
+
+    Health leads because low usage is not always a good sign — a provider that
+    rejects everything accrues no calls and would otherwise rank as the
+    emptiest key on the shelf, so "least loaded" would send every unkeyed brain
+    role straight at the one thing known to be broken.
+
+    Within a health tier, raw call counts are not comparable across different
+    caps: 200 calls against a 10k/day tier has far more headroom left than 200
+    against a 250/day one. A capped provider is ranked by the *fraction* of its
+    allowance spent, an uncapped one by absolute calls scaled onto the same 0-1
+    axis, so a busy uncapped key cannot always look cheapest.
+    """
+    unhealthy = 1 if (getattr(p, "status", "") or "") == "error" else 0
+    daily, monthly = (p.daily_calls or 0), (p.monthly_calls or 0)
+    if p.daily_limit:
+        primary = daily / max(1, p.daily_limit)
+    elif p.monthly_limit:
+        primary = monthly / max(1, p.monthly_limit)
+    else:
+        # No published cap: treat 1000 calls/day as a full load so the number
+        # lands on the same scale as the ratios above.
+        primary = min(1.0, daily / 1000.0)
+    # Ties broken by absolute recent volume, then id so ordering is stable
+    # within a cycle rather than shuffling between concurrent roles.
+    return (unhealthy, round(primary, 4), daily, monthly, p.id)
+
+
+async def _get_brain_pool(db) -> list:
+    """Available shared-pool providers, least-used first.
+
+    Skips circuit-open and usage-capped providers so the brain always uses
+    working, headroom-positive providers. Dedicated profiles are already
+    excluded by ``get_enabled_providers``, so this is strictly the shared pool.
+
+    Ordered by remaining headroom rather than priority: a brain role with no key
+    of its own has to borrow from the pool, and borrowing from whichever key is
+    already busiest is how the roles that *do* have keys end up waiting behind
+    rate limits they never caused. The slot spread in :func:`_brain_call` still
+    applies on top, so distinct roles keep landing on distinct providers when
+    the pool is large enough.
     """
     try:
         from plugins.AiMarketAnalyst.backend.services.ai_router import (
@@ -290,12 +349,13 @@ async def _get_brain_pool(db) -> list:
         )
         settings = await get_router_settings(db)
         providers = await get_enabled_providers(db)
-        return [
+        usable = [
             p for p in providers
             if p.api_key and p.base_url
             and not _cb_open(p.id)
             and not _is_capped(p, settings.reserve_pct)
-        ]  # already sorted priority asc, id asc
+        ]
+        return sorted(usable, key=_brain_load)
     except Exception as e:
         logger.debug(f"[JARVIS brain-pool] pool build failed: {e}")
         return []
@@ -320,13 +380,27 @@ async def _brain_call(
     slot = _BRAIN_ROLE_SLOTS.get(role, 0)
 
     try:
-        pool = await _get_brain_pool(db)
-        if not pool:
-            # No providers available — brain is idle this cycle
-            return None
+        # A profile dedicated to this brain role wins outright. The roles run
+        # concurrently and adversarially, so sharing one key serialises the
+        # cycle behind a single rate limit and lets the critic review the
+        # consolidator on the very model that wrote it.
+        provider = await _dedicated_brain_provider(db, role)
 
-        # Deterministic slot assignment (wrap-around for small pools)
-        provider = pool[slot % len(pool)]
+        if provider is None:
+            # No key of its own — borrow the least-loaded shared key. The pool
+            # arrives sorted by remaining headroom, and the slot index still
+            # spreads concurrent roles across different providers rather than
+            # sending every unkeyed role at whichever one is currently cheapest.
+            pool = await _get_brain_pool(db)
+            if not pool:
+                # No providers available — brain is idle this cycle
+                return None
+            provider = pool[slot % len(pool)]
+            logger.debug(
+                f"[JARVIS brain-{role}] no dedicated key — borrowing "
+                f"{provider.label!r} (load rank {slot % len(pool) + 1}/{len(pool)}, "
+                f"{provider.daily_calls or 0} calls today)"
+            )
         model = provider.default_model or ""
         if not model:
             try:
@@ -1578,9 +1652,10 @@ def _safe_float(val, default: float = 0.0) -> float:
 # Fallback version only — the real version is ALWAYS read live from
 # jarvis-extension/manifest.json (see _ext_version()). Keep this in sync so a
 # missing manifest never advertises a stale version.
-_EXT_VERSION = "3.6.8"
-_EXT_RELEASED = "2026-07-05"
+_EXT_VERSION = "3.6.9"
+_EXT_RELEASED = "2026-08-08"
 _EXT_CHANGELOG = [
+    "JARVIS no longer stops talking before finishing — only your calibrated voice can interrupt him now",
     "Fix mic hand-off: in-page JARVIS takes over when the extension speech engine stalls (no more stuck 'Starting…')",
     "Stable mic ownership: stop page<->extension flapping that left voice deaf",
     "Chart-page wake watchdog keeps voice listening alive on heavy WebGL pages",
@@ -1969,82 +2044,27 @@ async def get_system_stats():
     """
     Live host resource usage for the JARVIS Room HUD.
 
-    Returns CPU %, per-core load, memory (used/total/percent), swap and the
-    process footprint. Used by the room to show the operator how much of the
-    machine the app is consuming so resources can be shared fairly.
+    Delegates to ``app.services.system_resources`` — the single source of truth
+    shared with the System Monitor page — so the two can never drift.
     Degrades gracefully (``available: False``) when psutil is missing.
     """
-    try:
-        import psutil  # noqa
-    except Exception:
+    from app.services.system_resources import host_snapshot, process_snapshot
+
+    host = host_snapshot()
+    if not host.get("available"):
         return {
             "available": False,
-            "reason": "psutil not installed",
+            "reason": host.get("reason", "unavailable"),
             "cpu_percent": 0.0,
             "cpu_count": 0,
             "mem_percent": 0.0,
             "mem_used": 0,
             "mem_total": 0,
         }
-
-    try:
-        # interval=None → non-blocking, returns usage since the previous call.
-        cpu_percent = psutil.cpu_percent(interval=None)
-        cpu_count = psutil.cpu_count(logical=True) or 0
-        try:
-            per_core = psutil.cpu_percent(interval=None, percpu=True)
-        except Exception:
-            per_core = []
-
-        vm = psutil.virtual_memory()
-        try:
-            sw = psutil.swap_memory()
-            swap_percent = float(sw.percent)
-            swap_used = int(sw.used)
-            swap_total = int(sw.total)
-        except Exception:
-            swap_percent, swap_used, swap_total = 0.0, 0, 0
-
-        # This backend process's own footprint.
-        proc_cpu = 0.0
-        proc_mem = 0
-        try:
-            p = psutil.Process()
-            proc_cpu = float(p.cpu_percent(interval=None))
-            proc_mem = int(p.memory_info().rss)
-        except Exception:
-            pass
-
-        # 1-minute load average (per-core normalised), where supported.
-        load_pct = None
-        try:
-            import os as _os
-            la1 = _os.getloadavg()[0]
-            if cpu_count:
-                load_pct = round(min(100.0, (la1 / cpu_count) * 100.0), 1)
-        except Exception:
-            load_pct = None
-
-        return {
-            "available": True,
-            "cpu_percent": round(float(cpu_percent), 1),
-            "cpu_count": cpu_count,
-            "per_core": [round(float(c), 1) for c in per_core],
-            "load_percent": load_pct,
-            "mem_percent": round(float(vm.percent), 1),
-            "mem_used": int(vm.used),
-            "mem_total": int(vm.total),
-            "mem_available": int(vm.available),
-            "swap_percent": swap_percent,
-            "swap_used": swap_used,
-            "swap_total": swap_total,
-            "proc_cpu_percent": round(proc_cpu, 1),
-            "proc_mem": proc_mem,
-            "fetched_at": datetime.now(timezone.utc).isoformat(),
-        }
-    except Exception as e:  # pragma: no cover - best effort
-        logger.debug(f"[JARVIS] system-stats error: {e}")
-        return {"available": False, "reason": str(e), "cpu_percent": 0.0, "mem_percent": 0.0}
+    proc = process_snapshot()
+    host["proc_cpu_percent"] = proc.get("cpu_percent", 0.0) if proc.get("available") else 0.0
+    host["proc_mem"] = proc.get("rss", 0) if proc.get("available") else 0
+    return host
 
 
 # ── Crypto pair catalog endpoints ──────────────────────────────────────────────
@@ -3438,21 +3458,29 @@ def _build_setup(
     if unit <= 0:
         return None
 
+    # A pullback entry sits away from current price, so a target measured only
+    # from the entry can land on the wrong side of where price is trading right
+    # now — "buy the dip at 4321, take profit at 4369" while price is already
+    # 4376 is not a trade, it is an instruction to sell into a level the market
+    # has passed. Targets are therefore held beyond current price as well as
+    # beyond the entry.
+    clearance = unit * 0.5
+
     if bias == "long":
         # Wait for a pullback toward support, but never below the swing low and
         # never above current price (that would fill instantly at a worse level).
         entry = min(current, swing_low + unit * 0.5)
         sl    = entry - unit * 1.5
-        tp1   = entry + unit * 1.5          # 1R structural first target
-        tp2   = max(swing_high, entry + unit * 3.0)
+        tp1   = max(entry + unit * 1.5, current + clearance)
+        tp2   = max(swing_high, tp1 + unit * 1.5)
         if not (sl < entry < tp1 < tp2):
             return None
         risk, reward1, reward2 = entry - sl, tp1 - entry, tp2 - entry
     else:
         entry = max(current, swing_high - unit * 0.5)
         sl    = entry + unit * 1.5
-        tp1   = entry - unit * 1.5
-        tp2   = min(swing_low, entry - unit * 3.0)
+        tp1   = min(entry - unit * 1.5, current - clearance)
+        tp2   = min(swing_low, tp1 - unit * 1.5)
         if not (sl > entry > tp1 > tp2):
             return None
         risk, reward1, reward2 = sl - entry, entry - tp1, entry - tp2
@@ -3639,73 +3667,74 @@ async def _find_open_position(symbol: str) -> Optional[Dict[str, Any]]:
 #   `github_models_retirement_brownout`), so it has been removed from every
 #   chain below — leaving it in cost each task an attempt that could only fail.
 #
-#   NVIDIA Nemotron 3 Ultra 550B leads every reasoning task — it is the deepest
-#   model NVIDIA serves free. Nemotron Super 120B sits directly behind it in each
-#   chain: a 550B is likelier to hit capacity (HTTP 529), and the 120B is the
-#   same family and verified to return parseable JSON.
+#   Nemotron 3 Ultra 550B used to lead every reasoning task on the grounds that
+#   it is the largest model NVIDIA serves free. In practice it could not answer
+#   inside a normal request deadline at all, so it timed out on every call and
+#   tripped the provider breaker — taking the rest of NVIDIA's catalog down with
+#   it. Size is not useful if nothing ever waits long enough to read the answer.
+#
+#   The chains now pick on the shape of the task instead (mirroring
+#   ai_router.TASK_MODEL_CHAINS): GLM-5.2 where the reasoning genuinely needs to
+#   be deep and someone will wait for it, Nemotron 3.5 Lightning where the task
+#   is context-hungry or latency-sensitive. Both carry a 1M window, so the old
+#   128K context ceiling on this list is gone.
 #
 #   market_analysis – deep technical + SMC bias read (needs frontier reasoning)
-#                     primary:   NVIDIA Nemotron 550B  (deepest free reasoning)
-#                     secondary: NVIDIA Nemotron 120B  (same family, when 550B is busy)
+#                     primary:   GLM-5.2               (753B, long-horizon reasoning)
+#                     secondary: NVIDIA Nemotron 120B  (same provider, verified JSON)
 #                     tertiary:  Cerebras / Groq 120B   (fast free fallbacks)
 #
-#   news_context    – RAG-optimised news summarisation (needs large context + retrieval quality)
-#                     primary:   NVIDIA Nemotron 550B  (deepest free reasoning)
-#                     secondary: Cohere Command A       (256K ctx, RAG-tuned, best for news)
-#                     tertiary:  Gemini 2.5 Flash       (1M ctx, highest quality Gemini fallback)
-#                     then:      Groq 120B MoE          (fast free last resort)
+#   news_context    – RAG-optimised news summarisation (needs large context + speed)
+#                     primary:   Nemotron 3.5 Lightning (1M ctx, fastest 30B MoE)
+#                     secondary: NVIDIA Nemotron 120B  (deeper same-provider fallback)
+#                     tertiary:  Cohere Command A       (256K ctx, RAG-tuned)
+#                     then:      Gemini 2.5 Flash / Groq 120B
 #
 #   volume_analysis – quantitative buy/sell pressure (needs speed + no rate-limit cap)
-#                     primary:   Cerebras gpt-oss-120B  (wafer speed, same quality as Groq 120B)
-#                     secondary: Groq 120B MoE           (same model, high daily quota)
-#                     tertiary:  NVIDIA Nemotron 120B   (frontier reasoning fallback)
+#                     primary:   Nemotron 3.5 Lightning  (NVIDIA NIM, fast 30B MoE, 1M ctx)
+#                     secondary: Groq gpt-oss-120B       (same model, high daily quota)
+#                     tertiary:  Cerebras gpt-oss-120B   (wafer speed, only if configured)
 #
-#   synthesis       – final decisive JARVIS narrative (needs deepest reasoning + confident output)
-#                     primary:   NVIDIA Nemotron 550B  (deepest free reasoning)
-#                     secondary: NVIDIA Nemotron 120B  (same family, when 550B is busy)
-#                     tertiary:  Groq 120B MoE           (fast free fallback)
+#   synthesis       – final decisive JARVIS narrative (needs deepest reasoning)
+#                     primary:   GLM-5.2               (long-horizon, decisive)
+#                     secondary: NVIDIA Nemotron 120B / Groq 120B
 #
 #   news_position   – map many headlines to many open positions (context-hungry)
-#                     primary:   NVIDIA Nemotron 550B  (128K ctx – see the note below)
-#                     secondary: Gemini 2.5 Flash       (1M ctx – catches an over-long prompt)
-#                     tertiary:  Cohere Command A       (256K ctx, RAG-quality fallback)
-#                     then:      Gemini 3.1 Flash-Lite  (1M ctx, 500 req/day – quota fallback)
+#                     primary:   Nemotron 3.5 Lightning (1M ctx holds any book)
+#                     secondary: NVIDIA Nemotron 120B, then the 1M Gemini models
 #
-# NOTE on news_position and context: this task was originally specced as
-# "1M ctx REQUIRED" because it maps every headline onto every open position.
-# Nemotron Super tops out at 128K. That is ample for a normal desk, but a very
-# large book on a heavy news day can exceed it — which is exactly why the 1M
-# Gemini sits immediately behind it: a context-overflow is a 400 from the
-# provider, and the chain below treats that like any other failure and falls
-# through to a model that can hold the prompt.
+# NOTE on news_position and context: this maps every headline onto every open
+# position, so it was specced as "1M ctx REQUIRED". The primary now genuinely
+# has 1M. The Gemini fallbacks stay because a context overflow is a 400 like any
+# other failure, and the chain should still land somewhere that can hold it.
 
 _JARVIS_TASK_MODELS: Dict[str, list] = {
     "market_analysis": [
-        ("nvidia",  "nvidia/nemotron-3-ultra-550b-a55b"),# PRIMARY – NVIDIA's deepest free model
-        ("nvidia",  "nvidia/nemotron-3-super-120b-a12b"),# 120B when the 550B is at capacity
+        ("nvidia",  "z-ai/glm-5.2"),                     # PRIMARY – long-horizon reasoning, 1M ctx
+        ("nvidia",  "nvidia/nemotron-3-super-120b-a12b"),# same-provider fallback, verified JSON
         ("cerebras","gpt-oss-120b"),                     # wafer-speed 120B fallback
         ("groq",    "openai/gpt-oss-120b"),              # fast 120B last-resort fallback
     ],
     "news_context": [
-        ("nvidia",  "nvidia/nemotron-3-ultra-550b-a55b"),# PRIMARY – NVIDIA's deepest free model
-        ("nvidia",  "nvidia/nemotron-3-super-120b-a12b"),# 120B when the 550B is at capacity
+        ("nvidia",  "nvidia/nemotron-3.5-lightning-30b-a3b"),  # PRIMARY – fast, 1M ctx
+        ("nvidia",  "nvidia/nemotron-3-super-120b-a12b"),# deeper same-provider fallback
         ("cohere",  "command-a-03-2025"),                # RAG-tuned, 256K
         ("gemini",  "gemini-2.5-flash"),                 # highest quality Gemini (1M)
         ("groq",    "openai/gpt-oss-120b"),              # fast free last resort
     ],
     "volume_analysis": [
-        ("cerebras","gpt-oss-120b"),                     # wafer speed, no rate-limit cap
-        ("groq",    "openai/gpt-oss-120b"),              # same model, Groq fallback
-        ("nvidia",  "nvidia/nemotron-3-super-120b-a12b"),# frontier reasoning fallback
+        ("nvidia",  "nvidia/nemotron-3.5-lightning-30b-a3b"),  # PRIMARY – fast 30B MoE, 1M ctx
+        ("groq",    "openai/gpt-oss-120b"),              # same model, high daily quota fallback
+        ("cerebras","gpt-oss-120b"),                     # wafer speed, only if configured
     ],
     "synthesis": [
-        ("nvidia",  "nvidia/nemotron-3-ultra-550b-a55b"),# PRIMARY – NVIDIA's deepest free model
-        ("nvidia",  "nvidia/nemotron-3-super-120b-a12b"),# 120B when the 550B is at capacity
+        ("nvidia",  "z-ai/glm-5.2"),                     # PRIMARY – decisive long-horizon narrative
+        ("nvidia",  "nvidia/nemotron-3-super-120b-a12b"),# same-provider fallback
         ("groq",    "openai/gpt-oss-120b"),              # fast free fallback
     ],
     "news_position": [
-        ("nvidia",  "nvidia/nemotron-3-ultra-550b-a55b"),# PRIMARY – NVIDIA's deepest free model
-        ("nvidia",  "nvidia/nemotron-3-super-120b-a12b"),# 120B when the 550B is at capacity
+        ("nvidia",  "nvidia/nemotron-3.5-lightning-30b-a3b"),  # PRIMARY – 1M ctx holds any book
+        ("nvidia",  "nvidia/nemotron-3-super-120b-a12b"),# same-provider fallback
         ("gemini",  "gemini-2.5-flash"),                 # 1M ctx – catches a prompt too big for 128K
         ("cohere",  "command-a-03-2025"),                # 256K RAG-quality fallback
         ("gemini",  "gemini-3.1-flash-lite"),            # 1M lite, 500/day quota fallback
@@ -3832,6 +3861,9 @@ async def _task_chat(
         json_mode=json_mode,
         agent_name=agent,
         source=source,
+        # JARVIS can be given a profile of its own. Unset, this is the same
+        # standard priority routing as before.
+        task="jarvis_chat",
     )
 
 
@@ -3927,7 +3959,8 @@ async def _compose_ai_narrative(brief: str, symbol: str = "") -> Optional[str]:
 
 
 async def _analysis_from_series(
-    symbol: str, ohlcv: List[List], ticker: Dict, *, deep: bool = False
+    symbol: str, ohlcv: List[List], ticker: Dict, *,
+    deep: bool = False, timeframe: str = "4h",
 ) -> CommandResult:
     """Turn a candle series into a trade proposal.
 
@@ -3975,6 +4008,20 @@ async def _analysis_from_series(
 
     rsi_label = "overbought" if rsi > 70 else "oversold" if rsi < 30 else f"neutral ({rsi:.0f})"
 
+    # The spoken read of the same numbers, so every surface that shows an
+    # analysis — Telegram, Paul chat, voice — leads with the same words rather
+    # than each one paraphrasing the raw indicator dump differently.
+    try:
+        from app.signals.narrative import narrative_summary
+
+        narrative = narrative_summary(
+            ohlcv, symbol=symbol, timeframe=timeframe, trend=trend,
+            swing_high=swing_high, swing_low=swing_low,
+        )
+    except Exception as _nexc:  # noqa: BLE001 — prose is never worth losing the analysis
+        logger.debug("[JARVIS] narrative skipped for {}: {}", symbol, _nexc)
+        narrative = ""
+
     bias, confidence, reasons = _directional_bias(
         current, ema50, ema200 if ema200_valid else 0.0, rsi, trend, buy_pct, sell_pct,
     )
@@ -3987,7 +4034,8 @@ async def _analysis_from_series(
         f"SELL {sell_pct:.0f}% ({sell_vol:,.0f})\n"
     )
     header = (
-        f"{symbol} | {trend.upper()} | RSI {rsi:.0f} ({rsi_label})\n"
+        (f"{narrative}\n\n" if narrative else "")
+        + f"{symbol} | {trend.upper()} | RSI {rsi:.0f} ({rsi_label})\n"
         f"EMA50={ema50:.4g}  EMA200={ema200:.4g}{'' if ema200_valid else ' (insufficient history)'}"
         f"  Current={current:.4g}\n"
         f"Swing Hi={swing_high:.4g}  Swing Lo={swing_low:.4g}  ATR14={atr:.4g}\n"

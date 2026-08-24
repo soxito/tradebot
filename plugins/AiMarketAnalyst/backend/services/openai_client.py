@@ -16,6 +16,11 @@ try:
 except ImportError:
     AsyncOpenAI = None  # type: ignore
 
+from app.core.ai_key_routing import (
+    build_async_client,
+    is_openai_key,
+    resolve_base_url,
+)
 from plugins.AiMarketAnalyst.backend.config import ai_analyst_config
 
 
@@ -56,7 +61,12 @@ def _get_client() -> "AsyncOpenAI":
     key = os.getenv("OPENAI_API_KEY", "")
     if not key:
         raise RuntimeError("OPENAI_API_KEY not set")
-    return AsyncOpenAI(api_key=key)
+    # OPENAI_API_KEY usually holds a connected free provider's key, not an
+    # OpenAI one. Pin the endpoint the key belongs to; only a real sk- key is
+    # left to the environment's base URL (the headroom proxy).
+    if is_openai_key(key):
+        return AsyncOpenAI(api_key=key)
+    return build_async_client(key, resolve_base_url(key))
 
 
 async def call_model(

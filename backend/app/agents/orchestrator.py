@@ -14,14 +14,16 @@ import json
 import uuid
 import asyncio
 from copy import deepcopy
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Sequence
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.models.database import Agent, AgentDecision, Signal, SignalAction, SignalSource, SignalStatus, Trade, SimPosition, SimAccount
+from app.core.database import AsyncSessionLocal
 from app.agents.specialists import agent_from_db
 from app.agents.memory import get_past_decisions, build_memory_prompt, try_local_decision
+from app.agents import room
 from app.signals.technical import analyze as technical_analyze
 from app.exchanges.manager import exchange_manager, SupportedExchange
 from app.exchanges.forex_provider import is_forex_symbol, fetch_ohlcv as forex_fetch_ohlcv
@@ -37,6 +39,75 @@ def _is_quota_error_decision(decision: Dict[str, Any]) -> bool:
     return any(phrase in reasoning for phrase in _quota_phrases)
 from app.core.timezone import now_sast
 from app.core.config import settings
+
+
+#: Triggers that came from a person and are being waited on. These runs skip
+#: every AI shortcut — the memory decision and the per-symbol answer cache —
+#: because both exist to keep the background scanner cheap, and neither is what
+#: someone typing /room is asking for.
+LIVE_TRIGGERS = frozenset({"telegram", "manual", "api", "user"})
+
+# Symbols with a room meeting in flight. Stops the worker (or a second trigger
+# such as a fresh signal) convening a duplicate session on the same pair before
+# the first finishes. Discarded in a finally so a crash never wedges a symbol.
+_inflight_symbols: set[str] = set()
+
+
+def _norm_symbol(symbol: str) -> str:
+    return (symbol or "").replace("/", "").upper()
+
+
+def _analysis_window() -> int:
+    """Closed candles agents study for market movement.
+
+    Reads ``AGENT_ANALYSIS_CANDLES`` but never drops below 28 — every agent
+    compares the current candle against at least the last ~28 closed candles so
+    signals reflect real movement, not a 24h snapshot. No hard upper cap.
+    """
+    try:
+        return max(28, int(getattr(settings, "AGENT_ANALYSIS_CANDLES", 120) or 120))
+    except Exception:
+        return 120
+
+
+def reasoning_text(value: Any) -> str:
+    """Coerce an agent's ``reasoning`` into the string the column expects.
+
+    Models do not reliably honour "reasoning is a string": some return a nested
+    object of sub-analyses instead. Handing that straight to a Text column
+    raises DataError on INSERT, which aborts the *whole* session — every other
+    agent's work in the same flush is lost with it. Flattening keeps the
+    content and the meeting.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        parts = []
+        for key, val in value.items():
+            label = str(key).replace("_", " ").strip().capitalize()
+            body = reasoning_text(val) if isinstance(val, (dict, list)) else str(val)
+            parts.append(f"{label}: {body}")
+        return "\n".join(parts)
+    if isinstance(value, (list, tuple)):
+        return "\n".join(reasoning_text(v) for v in value)
+    return str(value)
+
+
+#: One step up the ladder for the multi-horizon Kronos ensemble — the entry
+#: timeframe's read cross-checked against the swing view above it.
+_HIGHER_TF: Dict[str, str] = {
+    "1m": "5m",
+    "3m": "15m",
+    "5m": "15m",
+    "15m": "1h",
+    "30m": "2h",
+    "1h": "4h",
+    "2h": "6h",
+    "4h": "1d",
+    "1d": "1w",
+}
 
 
 class AgentOrchestrator:
@@ -246,6 +317,550 @@ class AgentOrchestrator:
         return enriched
 
     @staticmethod
+    def _add_candles(
+        context: Dict[str, Any],
+        ohlcv: Sequence[Sequence[Any]],
+        timeframe: str,
+        window: int,
+    ) -> None:
+        """Closed candles, the forming one, and the movement they describe.
+
+        The two are kept apart on purpose. An agent asked to weigh the current
+        candle against the ones before it cannot do that if the bar still being
+        printed is sitting in the same list as the completed ones — its high,
+        low and close are provisional, and treating them as settled is how a
+        "breakout" gets called on a candle that closes back inside the range.
+        """
+        from app.signals.candle_window import movement_summary, split_closed
+
+        closed, forming = split_closed(ohlcv, timeframe)
+        studied = closed[-window:] if window > 0 else closed
+
+        context["recent_candles"] = [
+            {"time": c[0], "open": c[1], "high": c[2], "low": c[3],
+             "close": c[4], "volume": c[5] if len(c) > 5 else 0}
+            for c in studied
+        ]
+        context["candles_analysed"] = len(studied)
+        context["candle_movement"] = movement_summary(studied, forming)
+        if forming is not None:
+            context["forming_candle"] = {
+                "time": forming[0], "open": forming[1], "high": forming[2],
+                "low": forming[3], "close": forming[4],
+                "volume": forming[5] if len(forming) > 5 else 0,
+                "note": "still forming — not a closed candle",
+            }
+
+    @staticmethod
+    async def _add_structure(
+        context: Dict[str, Any],
+        symbol: str,
+        ohlcv: Sequence[Sequence[float]],
+        db: Optional[AsyncSession] = None,
+    ) -> None:
+        """Fib, SMC zones, released data and our own open plans, in place.
+
+        The board was reading indicator values with no sense of where price sat
+        in the structure, which is why its levels read as arbitrary numbers.
+        These are the same computations the charts draw, so what an agent
+        argues and what the user sees are the same analysis. Every block is
+        independently guarded: a missing one is silence, never a failed
+        meeting.
+        """
+        from app.signals.technical import auto_fib_retracement, ohlcv_to_dataframe
+
+        try:
+            df = ohlcv_to_dataframe(ohlcv)
+            fib = auto_fib_retracement(df)
+            if fib.get("swing"):
+                context["fib"] = {
+                    "swing": fib["swing"],
+                    "golden_zone": fib["golden_zone"],
+                    "levels": [
+                        {"ratio": lv["ratio"], "price": lv["price"]}
+                        for lv in fib["levels"]
+                        if lv["ratio"] in (0.382, 0.5, 0.618, 0.786)
+                    ],
+                }
+        except Exception as exc:  # noqa: BLE001 — enrichment only
+            logger.debug(f"[Orchestrator] fib context skipped for {symbol}: {exc}")
+
+        # ── Supply/demand + channel read (the same one the charts draw) ────
+        # The seats argue structure; this hands them the bases and rails the
+        # user sees on the dashboard so both describe the same map.
+        try:
+            from app.signals.zones import compact_payload as zones_compact
+            from app.signals.technical import ohlcv_to_dataframe as _zones_df
+
+            zdf = _zones_df(ohlcv)
+            if not zdf.empty:
+                context["sd_channels"] = zones_compact(zdf)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[Orchestrator] sd/channel context skipped for {symbol}: {exc}")
+
+        try:
+            from app.signals.zone_narrative import zones_ahead
+            from plugins.MT5TradingPlugin.backend.services.smc_strategy import (
+                Candle, SMCStrategyEngine, contract_size_for_symbol,
+            )
+
+            candles = [
+                Candle(time=int(c[0]) // 1000, open=float(c[1]), high=float(c[2]),
+                       low=float(c[3]), close=float(c[4]),
+                       volume=float(c[5]) if len(c) > 5 else 0.0)
+                for c in ohlcv
+            ]
+            analysis = SMCStrategyEngine(
+                symbol=symbol, contract_size=contract_size_for_symbol(symbol)
+            ).analyze(candles)
+            if not analysis.get("error"):
+                last = float(analysis.get("last_price") or candles[-1].close)
+                context["smc_zones"] = zones_ahead(analysis.get("zones") or [], last, limit=2)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[Orchestrator] zone context skipped for {symbol}: {exc}")
+
+        try:
+            from app.signals.release_narrative import latest_release_read
+
+            if release := await latest_release_read(symbol):
+                context["economic_release"] = release
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[Orchestrator] release context skipped for {symbol}: {exc}")
+
+        if db is not None:
+            try:
+                from app.services.scenario_tracker import scenario_narrative, track_symbol
+
+                if states := await track_symbol(db, symbol):
+                    context["scenario"] = {
+                        "plans": states, "summary": scenario_narrative(states),
+                    }
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"[Orchestrator] scenario context skipped for {symbol}: {exc}")
+
+    @staticmethod
+    async def _resolve_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[Any]]:
+        """Candles for any instrument, from every source the app has.
+
+        The per-branch fetches above each speak to one provider and return
+        nothing when it declines. That is how an analysis of a pair that was
+        trading normally reached the board with no candles at all — and an
+        agent with no candles has nothing to be bullish or bearish about, so it
+        says neutral. This asks the shared resolver, which exhausts every feed
+        and folds a finer timeframe up before it reports failure.
+        """
+        try:
+            from app.services import candles as candle_source
+
+            return await candle_source.fetch(symbol, timeframe, limit)
+        except Exception as exc:  # noqa: BLE001 — a dead resolver is not fatal
+            logger.warning(f"[Orchestrator] candle resolver failed for {symbol}: {exc}")
+            return []
+
+    @staticmethod
+    async def _add_forecast(
+        context: Dict[str, Any], symbol: str, timeframe: str
+    ) -> None:
+        """The /forecast read — Kronos' path distribution — as board evidence.
+
+        The forecast page has, for every pair, a model-based projection with a
+        volume gate and a macro bias behind it. The room was analysing the same
+        instruments without ever consulting it, so two surfaces of the same app
+        could disagree about which way a market was pointing. This is the same
+        call ``/forecast`` makes (cached, so a shared symbol costs one
+        inference), reduced to what an agent can reason from.
+
+        Never gating: an unavailable forecast is silence, not a hold.
+        """
+        try:
+            from plugins.KronosForecastPlugin.backend.services import forecast_service
+
+            resp = await forecast_service.run_forecast_cached("bitget", symbol, timeframe)
+        except Exception as exc:  # noqa: BLE001 — enrichment only
+            logger.debug(f"[Orchestrator] forecast context skipped for {symbol}: {exc}")
+            return
+        if resp is None:
+            return
+
+        signal = getattr(resp, "signal", None)
+        block: Dict[str, Any] = {
+            "engine": getattr(resp, "engine", None),
+            "model": getattr(resp, "model_name", None),
+            "horizon": f"{getattr(resp, 'pred_len', 0)}×{timeframe}",
+            "decision": getattr(resp, "decision", None),
+            "anchor_price": getattr(resp, "anchor_price", None),
+            "note": getattr(resp, "note", None),
+        }
+        if signal is not None:
+            block.update({
+                "direction": getattr(signal, "direction", None),
+                "pct_change": getattr(signal, "pct_change", None),
+                "confidence": getattr(signal, "confidence", None),
+                "rationale": getattr(signal, "rationale", None) or getattr(signal, "note", None),
+            })
+        forecast = getattr(resp, "forecast", None) or []
+        if forecast:
+            closes = [float(getattr(c, "close", 0) or 0) for c in forecast]
+            block["projected_path"] = {
+                "next_close": closes[0] if closes else None,
+                "final_close": closes[-1] if closes else None,
+                "path_high": max(closes) if closes else None,
+                "path_low": min(closes) if closes else None,
+            }
+        upper = getattr(resp, "upper_band", None) or []
+        lower = getattr(resp, "lower_band", None) or []
+        if upper and lower:
+            block["band"] = {
+                "p90_final": float(getattr(upper[-1], "value", 0) or 0),
+                "p10_final": float(getattr(lower[-1], "value", 0) or 0),
+            }
+        volume = getattr(resp, "volume", None)
+        if volume is not None:
+            block["volume_gate"] = {
+                "status": getattr(volume, "status", None),
+                "detail": getattr(volume, "detail", None),
+            }
+
+        # ── Multi-horizon ensemble: the next timeframe up the ladder ──────
+        # A single-horizon read can be right about the entry window and wrong
+        # about the swing. Fetching the higher TF (cached like the first) and
+        # stating agreement explicitly gives every seat the same cross-check
+        # the /forecast page shows, instead of each seat guessing it.
+        htf = _HIGHER_TF.get(timeframe)
+        if htf:
+            try:
+                htf_resp = await forecast_service.run_forecast_cached(
+                    "bitget", symbol, htf
+                )
+                htf_signal = getattr(htf_resp, "signal", None) if htf_resp else None
+                if htf_signal is not None:
+                    htf_dir = getattr(htf_signal, "direction", None) or "flat"
+                    block["htf"] = {
+                        "timeframe": htf,
+                        "direction": htf_dir,
+                        "pct_change": getattr(htf_signal, "pct_change", None),
+                        "confidence": getattr(htf_signal, "confidence", None),
+                    }
+                    entry_dir = str(block.get("direction") or "flat")
+                    agree = (
+                        entry_dir == htf_dir
+                        or (entry_dir in {"up", "down"} and htf_dir == "flat")
+                    )
+                    block["ensemble"] = {
+                        "agreement": bool(agree),
+                        "entry_tf": timeframe,
+                        "htf": htf,
+                        "detail": (
+                            f"entry {timeframe} says {entry_dir}; "
+                            f"{htf} says {htf_dir}"
+                        ),
+                    }
+            except Exception as exc:  # noqa: BLE001 — enrichment only
+                logger.debug(
+                    f"[Orchestrator] HTF forecast skipped for {symbol} {htf}: {exc}"
+                )
+
+        # ── Band-derived trade level candidates ───────────────────────────
+        # The p10/p90 band and projected path extremes are exactly where a
+        # stop and targets belong; handing them over pre-computed stops every
+        # seat from re-deriving (and disagreeing about) them from scratch.
+        band = block.get("band") or {}
+        path = block.get("projected_path") or {}
+        anchor = block.get("anchor_price")
+        try:
+            anchor_f = float(anchor) if anchor else 0.0
+        except (TypeError, ValueError):
+            anchor_f = 0.0
+        if anchor_f > 0:
+            atr_hint = 0.0
+            tech = context.get("technical") or {}
+            ind = tech.get("indicators") or {}
+            try:
+                atr_hint = float(ind.get("atr") or 0)
+            except (TypeError, ValueError):
+                atr_hint = 0.0
+            if atr_hint <= 0:
+                atr_hint = anchor_f * 0.008  # ~0.8% fallback when no ATR yet
+
+            p90 = band.get("p90_final")
+            p10 = band.get("p10_final")
+            path_high = path.get("path_high")
+            path_low = path.get("path_low")
+
+            def _f(v: Any) -> Optional[float]:
+                try:
+                    out = float(v)
+                    return out if out > 0 else None
+                except (TypeError, ValueError):
+                    return None
+
+            direction = str(block.get("direction") or "")
+            levels: Dict[str, Any] = {
+                "basis": "kronos_band",
+                "note": (
+                    "candidate SL/TPs derived from Kronos' p10/p90 band and "
+                    "projected path — evidence to weigh, not orders"
+                ),
+            }
+            if direction in {"up", "long"}:
+                sl = _f(p10)
+                if sl is not None:
+                    levels["stop_candidate"] = round(sl - 0.5 * atr_hint, 8)
+                tps = [v for v in (_f(path_high), _f(p90)) if v]
+                if tps:
+                    levels["target_candidates"] = [round(t, 8) for t in sorted(set(tps))]
+            elif direction in {"down", "short"}:
+                sl = _f(p90)
+                if sl is not None:
+                    levels["stop_candidate"] = round(sl + 0.5 * atr_hint, 8)
+                tps = [v for v in (_f(path_low), _f(p10)) if v]
+                if tps:
+                    levels["target_candidates"] = [round(t, 8) for t in sorted(set(tps), reverse=True)]
+            if "stop_candidate" in levels or "target_candidates" in levels:
+                block["level_candidates"] = levels
+
+        context["kronos_forecast"] = block
+
+    #: What ``technical.action`` / ``technical.confidence`` actually are.
+    #:
+    #: ``app.signals.technical.analyze`` scores a fixed indicator basket and
+    #: emits its own verdict. The local no-AI fallback needs those fields, so
+    #: they stay — but the seats were reading them as the desk's answer and
+    #: quoting the number back ("technical confidence 0.3176 is below the 0.55
+    #: threshold") instead of forming a view. That scorer has never seen the
+    #: structure, the forecast or the momentum read, and it returns "hold" at
+    #: ~0.3 through most of a healthy trend, so deferring to it is how a
+    #: trending market got declined by every seat in turn.
+    _TECHNICAL_PROVENANCE = (
+        "action/confidence in this block are a MECHANICAL INDICATOR COMPOSITE, "
+        "not the desk's verdict and not yours. The scorer that produced them "
+        "sees only the indicator basket below — never the candle window, the "
+        "structure, the SMC zones, the forecast or the momentum read. It "
+        "returns 'hold' at low confidence through most of a healthy trend. "
+        "Weigh `indicators` yourself; never adopt this action, and never cite "
+        "this confidence as the reason for your own."
+    )
+
+    @staticmethod
+    def _label_technical(context: Dict[str, Any]) -> None:
+        """Mark the pre-baked indicator verdict as what it is."""
+        tech = context.get("technical")
+        if isinstance(tech, dict) and "action" in tech:
+            tech["provenance"] = AgentOrchestrator._TECHNICAL_PROVENANCE
+
+    @staticmethod
+    async def _add_cycle(context: Dict[str, Any], symbol: str) -> None:
+        """The Bitcoin 1064-day calendar as board evidence.
+
+        Every completed BTC cycle has run ~1064 days from bottom to top and
+        ~365 back down, and alts follow BTC — so the season an instrument is
+        trading in is context no seat should argue without. This is the same
+        snapshot the cycle page renders (cached, so one read serves every
+        seat), reduced to the phase, the countdowns and the evidence lines.
+
+        Advisory only: an unavailable calendar is silence, not a hold.
+        """
+        try:
+            from app.services import market_cycle
+
+            if not market_cycle.cycle_applies(symbol):
+                return
+            snap = await market_cycle.resolve_cycle_snapshot()
+            if snap is None or not snap.ok:
+                return
+            bias = market_cycle.cycle_bias(symbol, snap)
+            context["btc_cycle"] = {
+                "phase": snap.phase,
+                "anchor": snap.anchor,
+                "day_of_cycle": snap.day_of_cycle,
+                "phase_pct": round(snap.phase_pct, 3),
+                "projected_top": snap.projected_top,
+                "projected_bottom": snap.projected_bottom,
+                "days_to_top": snap.days_to_top,
+                "days_to_bottom": snap.days_to_bottom,
+                "late_phase": snap.late_phase,
+                "price": snap.price,
+                "cycle_high": snap.cycle_high,
+                "cycle_low": snap.cycle_low,
+                "bias": bias.normalized,
+                "bias_reason": bias.reason,
+                "validation": {
+                    "top_hit_rate": snap.validation.get("top_hit_rate"),
+                    "bottom_hit_rate": snap.validation.get("bottom_hit_rate"),
+                    "tolerance_days": snap.validation.get("tolerance_days"),
+                },
+                "evidence": market_cycle.evidence_lines(snap),
+            }
+        except Exception as exc:  # noqa: BLE001 — enrichment only
+            logger.debug(f"[Orchestrator] cycle context skipped for {symbol}: {exc}")
+
+    @staticmethod
+    async def _add_whales(context: Dict[str, Any], symbol: str) -> None:
+        """The curated BTC whale registry as board evidence.
+
+        Where the big wallets are flowing their coins over 7 days — the
+        accumulation/distribution read that separates a real move from a
+        trap. Advisory only; an unreachable chain is silence.
+        """
+        try:
+            from app.services import market_cycle, whale_watch
+
+            if not market_cycle.cycle_applies(symbol):
+                return
+            snap = await whale_watch.resolve_whale_snapshot()
+            if snap is None:
+                return
+            context["btc_whales"] = {
+                "status": snap.status,
+                "score": snap.score,
+                "net_flow_7d_btc": snap.net_flow_7d_btc,
+                "wallets_read": len(snap.wallets),
+                "detail": snap.detail,
+                "movers": snap.moves[:3],
+                "evidence": whale_watch.evidence_lines(snap),
+            }
+        except Exception as exc:  # noqa: BLE001 — enrichment only
+            logger.debug(f"[Orchestrator] whale context skipped for {symbol}: {exc}")
+
+    @staticmethod
+    def _add_momentum(context: Dict[str, Any], ohlcv: Sequence[Sequence[Any]]) -> None:
+        """A measured directional read, computed here rather than asked for.
+
+        Everything else in the context is a fact an agent may or may not weigh.
+        This is the one that answers the question the board kept ducking on a
+        trending day: *is this market going somewhere right now?* It is
+        arithmetic — EMA stack, range position, ATR expansion, the run of
+        closes — so a strong move cannot be argued away as "unclear", and the
+        prompts require an agent calling neutral into ``strong`` to say what
+        would change its mind.
+        """
+        try:
+            closes = [float(c[4]) for c in ohlcv if c and c[4] is not None]
+            highs = [float(c[2]) for c in ohlcv if c and c[2] is not None]
+            lows = [float(c[3]) for c in ohlcv if c and c[3] is not None]
+        except (TypeError, ValueError, IndexError):
+            return
+        if len(closes) < 25:
+            return
+
+        def _ema(values: List[float], period: int) -> Optional[float]:
+            if len(values) < period:
+                return None
+            k = 2.0 / (period + 1)
+            out = sum(values[:period]) / period
+            for v in values[period:]:
+                out = v * k + out * (1 - k)
+            return out
+
+        last = closes[-1]
+        ema20, ema50, ema200 = _ema(closes, 20), _ema(closes, 50), _ema(closes, 200)
+
+        stack = None
+        if ema20 and ema50:
+            if last > ema20 > ema50 and (ema200 is None or ema50 > ema200):
+                stack = "bullish"
+            elif last < ema20 < ema50 and (ema200 is None or ema50 < ema200):
+                stack = "bearish"
+            else:
+                stack = "mixed"
+
+        window = closes[-60:]
+        hi, lo = max(highs[-60:]), min(lows[-60:])
+        span = hi - lo
+        range_pos = ((last - lo) / span) if span > 0 else 0.5
+
+        # True range now against its own recent average: an expanding range is
+        # the signature of the day a trend actually pays.
+        trs = [
+            max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+            for i in range(max(1, len(closes) - 30), len(closes))
+        ]
+        atr_now = sum(trs[-5:]) / max(1, len(trs[-5:])) if trs else 0.0
+        atr_avg = sum(trs) / max(1, len(trs)) if trs else 0.0
+        expansion = (atr_now / atr_avg) if atr_avg > 0 else 1.0
+
+        change_pct = ((last - window[0]) / window[0] * 100) if window and window[0] else 0.0
+        ups = sum(1 for a, b in zip(window, window[1:]) if b > a)
+        downs = max(0, len(window) - 1 - ups)
+
+        # How much of the window's own range the move actually travelled. This,
+        # not a fixed percentage, is what makes the read work on every
+        # instrument: 1% is a huge day in EURUSD and noise in SOLUSDT, but
+        # "closed near the top of its range having travelled most of it" means
+        # the same thing on both.
+        drive = ((last - window[0]) / span) if span > 0 else 0.0
+
+        # How directly it got there. Net travel alone cannot tell a clean run
+        # from a market bouncing between two prices that happens to close at
+        # the top — both look like "covered the range". Kaufman's efficiency
+        # ratio does: net movement over total movement is near 1 for a trend
+        # and near 0 for an oscillation.
+        path = sum(abs(b - a) for a, b in zip(window, window[1:]))
+        efficiency = (abs(last - window[0]) / path) if path > 0 else 0.0
+
+        # Price leads, the EMA stack corroborates. Requiring the stack to agree
+        # was the bug: on a fast timeframe price whips across the EMA20 all day,
+        # so gold up 3.2% and sitting at 83% of its range was being reported to
+        # the board as "sideways" — and a board told the market is sideways
+        # holds, which is exactly the entry that was missed.
+        # A market that gave back nearly everything it took is chopping,
+        # whatever it happens to close at. Nothing below can call that a trend.
+        choppy = efficiency < 0.12
+
+        if choppy:
+            direction = "sideways"
+        elif drive >= 0.35 and range_pos >= 0.55:
+            direction = "up"
+        elif drive <= -0.35 and range_pos <= 0.45:
+            direction = "down"
+        elif stack == "bullish" and change_pct > 0:
+            direction = "up"
+        elif stack == "bearish" and change_pct < 0:
+            direction = "down"
+        else:
+            direction = "sideways"
+
+        # "strong" is deliberately reachable. A market that has travelled half
+        # its range and is closing at the edge of it IS moving, whether or not
+        # the averages have caught up — and calling that merely "moderate" is
+        # what made HOLD feel like the safe answer every time.
+        aligned = (direction == "up" and stack == "bullish") or (
+            direction == "down" and stack == "bearish"
+        )
+        edge = range_pos >= 0.7 or range_pos <= 0.3
+        if direction != "sideways" and efficiency >= 0.15 and (
+            (abs(drive) >= 0.5 and (expansion >= 1.05 or edge))
+            or (aligned and abs(drive) >= 0.4)
+        ):
+            strength = "strong"
+        elif direction != "sideways" and (abs(drive) >= 0.2 or (aligned and edge)):
+            # Sitting at the edge of the range with the averages agreeing is a
+            # market with a lean, even when the net travel was chopped up
+            # getting there. "Weak" would invite the board to ignore it.
+            strength = "moderate"
+        else:
+            strength = "weak"
+
+        context["momentum"] = {
+            "direction": direction,
+            "strength": strength,
+            "ema_stack": stack,
+            "ema20": ema20, "ema50": ema50, "ema200": ema200,
+            "range_high": hi, "range_low": lo,
+            "range_position_pct": round(range_pos * 100, 1),
+            "change_pct_60_bars": round(change_pct, 3),
+            "range_travelled": round(drive, 3),
+            "path_efficiency": round(efficiency, 3),
+            "atr_expansion": round(expansion, 3),
+            "up_bars": ups, "down_bars": downs,
+            "note": (
+                "Measured, not inferred. A 'strong' reading with a matching EMA "
+                "stack is a market that is moving now — treat standing aside as "
+                "a decision that needs its own justification, not the default."
+            ),
+        }
+
+    @staticmethod
     async def _gather_context(
         symbol: str,
         timeframe: str = "1h",
@@ -264,19 +879,24 @@ class AgentOrchestrator:
         # Two-tier guard via market_data: is_forex_symbol alone knows only a few
         # majors plus gold, so every cross, index and commodity used to fall
         # through to the crypto branch and fail there.
+        window = _analysis_window()
         if market_data.is_universal_symbol(symbol):
             try:
                 ohlcv, forex_ticker = await market_data.fetch_ohlcv_universal(
-                    symbol, timeframe=timeframe, limit=200
+                    symbol, timeframe=timeframe, limit=max(200, window)
                 )
+                if not ohlcv:
+                    # Yahoo rate-limited, or the provider does not know this
+                    # spelling. Every other feed is still worth asking before
+                    # the board is handed an empty chart.
+                    ohlcv = await AgentOrchestrator._resolve_ohlcv(
+                        symbol, timeframe, max(200, window)
+                    )
+                    forex_ticker = forex_ticker or {"source": "candle_resolver"}
                 if ohlcv:
                     ta = technical_analyze(ohlcv, timeframe)
                     context["technical"] = ta
-                    context["recent_candles"] = [
-                        {"time": c[0], "open": c[1], "high": c[2], "low": c[3],
-                         "close": c[4], "volume": c[5]}
-                        for c in ohlcv[-5:]
-                    ]
+                    AgentOrchestrator._add_candles(context, ohlcv, timeframe, window)
                     context["current_price"] = ohlcv[-1][4]
                     context["ticker"] = forex_ticker  # includes buy_volume, sell_volume
                     context["price_source"] = forex_ticker.get("source", "forex_provider")
@@ -284,9 +904,24 @@ class AgentOrchestrator:
                         f"[Orchestrator] {symbol} — live price "
                         f"{context['current_price']:.4g} via {context['price_source']}"
                     )
+                    await AgentOrchestrator._add_structure(context, symbol, ohlcv, db)
+                    AgentOrchestrator._add_momentum(context, ohlcv)
+                    AgentOrchestrator._label_technical(context)
+                else:
+                    logger.warning(
+                        f"[Orchestrator] no candles for {symbol} {timeframe} "
+                        "from any feed — the board is analysing without a chart"
+                    )
+                    context["technical"] = {
+                        "error": "No OHLCV from any feed for this symbol/timeframe"
+                    }
             except Exception as e:
                 logger.warning(f"[Orchestrator] Forex OHLCV failed for {symbol}: {e}")
                 context["technical"] = {"error": str(e)}
+
+            await AgentOrchestrator._add_forecast(context, symbol, timeframe)
+            await AgentOrchestrator._add_cycle(context, symbol)
+            await AgentOrchestrator._add_whales(context, symbol)
 
             # Sentiment stub (no exchange needed)
             try:
@@ -298,6 +933,12 @@ class AgentOrchestrator:
             except Exception:
                 pass
 
+            # Account state and research, exactly as the crypto branch gets
+            # them. This branch used to return here: every FX pair, metal,
+            # index and energy contract reached the board with no balance to
+            # size against and no calendar to check, so their seats could only
+            # describe the chart while a crypto seat could plan a trade.
+            await AgentOrchestrator._add_account_and_research(context, symbol, db)
             return context
 
         # ── Branch: Crypto symbols via Bitget ─────────────────────────────────
@@ -307,19 +948,42 @@ class AgentOrchestrator:
 
         # OHLCV + TA
         try:
-            ohlcv = await connector.get_ohlcv(symbol=symbol, timeframe=timeframe, limit=200)
+            try:
+                ohlcv = await connector.get_ohlcv(
+                    symbol=symbol, timeframe=timeframe, limit=max(200, window)
+                )
+            except Exception as exc:  # noqa: BLE001 — one venue, not the market
+                logger.debug(f"[Orchestrator] {symbol} venue OHLCV failed: {exc}")
+                ohlcv = []
+            if not ohlcv:
+                # The configured venue may not list this spelling. Public
+                # keyless exchanges usually do, and an empty chart is the one
+                # input that guarantees a neutral read.
+                ohlcv = await AgentOrchestrator._resolve_ohlcv(
+                    symbol, timeframe, max(200, window)
+                )
             ta = technical_analyze(ohlcv, timeframe)
             context["technical"] = ta
-            # Last few candles for price context
-            if ohlcv and len(ohlcv) >= 5:
-                context["recent_candles"] = [
-                    {"time": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5]}
-                    for c in ohlcv[-5:]
-                ]
+            # Closed candles for price/movement context — the current bar is
+            # weighed against at least the last ~28 closed candles (configurable).
+            if ohlcv:
+                AgentOrchestrator._add_candles(context, ohlcv, timeframe, window)
                 context["current_price"] = ohlcv[-1][4]
+                await AgentOrchestrator._add_structure(context, symbol, ohlcv, db)
+                AgentOrchestrator._add_momentum(context, ohlcv)
+                AgentOrchestrator._label_technical(context)
+            else:
+                logger.warning(
+                    f"[Orchestrator] no candles for {symbol} {timeframe} from "
+                    "any feed — the board is analysing without a chart"
+                )
         except Exception as e:
             logger.warning(f"[Orchestrator] OHLCV/TA failed for {symbol}: {e}")
             context["technical"] = {"error": str(e)}
+
+        await AgentOrchestrator._add_forecast(context, symbol, timeframe)
+        await AgentOrchestrator._add_cycle(context, symbol)
+        await AgentOrchestrator._add_whales(context, symbol)
 
         # Sentiment (basic — detailed sentiment comes from the pipeline context)
         try:
@@ -333,8 +997,11 @@ class AgentOrchestrator:
         # sent there answers with an ERROR log and no data; the universal
         # resolver serves it from the live MT5 account instead.
         try:
-            from app.services import market_data
-
+            # NB: no local `from app.services import market_data` here. It is
+            # already imported at module scope, and re-importing inside this
+            # function makes the name function-local for the *whole* body —
+            # which made the universal-symbol checks higher up raise
+            # UnboundLocalError and failed every single analysis.
             is_crypto = (
                 market_data.classify(market_data.normalize_symbol(symbol))
                 == market_data.CRYPTO
@@ -368,7 +1035,147 @@ class AgentOrchestrator:
         except Exception:
             pass
 
+        await AgentOrchestrator._add_account_and_research(context, symbol, db)
         return context
+
+    @staticmethod
+    async def _add_account_and_research(
+        context: Dict[str, Any], symbol: str, db: Optional[AsyncSession]
+    ) -> None:
+        """Balance to size against, and the research the desk already did.
+
+        Both asset branches call this. Without the account state the risk
+        manager sizes against an imagined balance, so "1% of equity" has no
+        answer; without the research the board can buy straight into an NFP
+        print the research loop flagged fifteen minutes earlier.
+        """
+        context["accounts"] = await AgentOrchestrator._gather_account_state(db)
+
+        if db is not None:
+            try:
+                from app.agents.research_context import gather_research
+
+                context["research"] = await gather_research(db, symbol)
+            except Exception as exc:  # noqa: BLE001 - enrichment only
+                logger.debug(f"[Orchestrator] research context unavailable for {symbol}: {exc}")
+
+    @staticmethod
+    async def _build_scalp_prompt(symbol: str) -> str:
+        """The Scalp Bot's multi-timeframe bias for this pair, to sharpen entries.
+
+        Best-effort and plugin-guarded: builds a compact candle stack, runs the
+        scalp strategy engine's directional read, and returns a short cue. Any
+        failure (plugin absent, data gap, type mismatch) returns '' and is
+        silently skipped so it can never break the pipeline.
+        """
+        try:
+            from plugins.MT5TradingPlugin.backend.services.scalp_strategy import (
+                ScalpStrategyEngine, Candle,
+            )
+        except Exception:
+            return ""
+
+        # MT5 TF codes the engine keys on → the timeframes our providers speak.
+        tf_map = {"M5": "5m", "M15": "15m", "H1": "1h"}
+        candles_by_tf: Dict[str, Any] = {}
+        for tf_code, tf in tf_map.items():
+            try:
+                ohlcv = None
+                connector = exchange_manager.get_exchange(SupportedExchange.BITGET)
+                if connector and not market_data.is_universal_symbol(symbol):
+                    ohlcv = await connector.get_ohlcv(symbol=symbol, timeframe=tf, limit=200)
+                else:
+                    ohlcv, _ = await market_data.fetch_ohlcv_universal(symbol, timeframe=tf, limit=200)
+                if ohlcv:
+                    candles_by_tf[tf_code] = [
+                        Candle(time=int(c[0]), open=float(c[1]), high=float(c[2]),
+                               low=float(c[3]), close=float(c[4]), volume=float(c[5] or 0))
+                        for c in ohlcv
+                    ]
+            except Exception:
+                continue
+
+        if "M5" not in candles_by_tf:
+            return ""
+        try:
+            bias = ScalpStrategyEngine(symbol, primary_tf="M5").compute_bias(candles_by_tf)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[Orchestrator] scalp bias skipped for {symbol}: {exc}")
+            return ""
+        if not bias or getattr(bias, "direction", "neutral") == "neutral":
+            return ""
+        return (
+            "\n\n## Scalp Bot read (high-frequency)\n"
+            f"Multi-timeframe scalp bias: {bias.direction.upper()} "
+            f"(confidence {bias.confidence:.0%}). Use as a short-horizon entry-timing "
+            "cue — it must still agree with structure and pass risk before acting.\n"
+        )
+
+    @staticmethod
+    async def _gather_account_state(db: AsyncSession) -> Dict[str, Any]:
+        """Live equity, free margin and open exposure across every venue."""
+        state: Dict[str, Any] = {"mt5": [], "crypto": None, "sim": None, "policy": None}
+
+        try:
+            from app.agents.execution import get_settings, trades_today
+            s = await get_settings(db)
+            state["policy"] = {
+                "execution_enabled": s.execution_enabled,
+                # Spelled out for the seats: "dry run" reads to a model like
+                # "nothing you decide will happen", which is no longer true and
+                # was never a useful thing for a risk manager to believe.
+                "dry_run": s.dry_run,
+                "routing": (
+                    "demo account only — the live account is not traded or managed"
+                    if s.dry_run else "demo and live accounts take every trade together"
+                ),
+                "risk_pct": s.risk_pct,
+                "max_open_positions": s.max_open_positions,
+                "max_leverage": s.max_leverage,
+                "trades_today": trades_today(),
+                "max_trades_per_day": s.max_trades_per_day,
+                "venues": [
+                    v for v, on in
+                    (("sim", s.allow_sim), ("crypto", s.allow_crypto), ("mt5", s.allow_mt5)) if on
+                ],
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[Orchestrator] room policy unavailable: {exc}")
+
+        try:
+            from plugins.MT5TradingPlugin.backend.models import MT5Account
+            rows = (await db.execute(select(MT5Account))).scalars().all()
+            state["mt5"] = [
+                {
+                    "account_id": a.id,
+                    "name": a.name,
+                    "balance": a.balance,
+                    "equity": a.equity,
+                    "free_margin": getattr(a, "margin_free", None),
+                    "currency": a.currency,
+                    "leverage": a.leverage,
+                    "open_positions": getattr(a, "position_count", 0),
+                }
+                for a in rows
+            ]
+        except Exception as exc:  # noqa: BLE001 - plugin-optional
+            logger.debug(f"[Orchestrator] MT5 account state unavailable: {exc}")
+
+        try:
+            from app.trading.live import LiveTradeEngine
+            state["crypto"] = await LiveTradeEngine.get_settings_snapshot(db)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[Orchestrator] crypto account state unavailable: {exc}")
+
+        try:
+            from app.models.database import SimAccount
+            sim = (await db.execute(select(SimAccount).limit(1))).scalar_one_or_none()
+            if sim:
+                state["sim"] = {"balance": sim.balance, "equity": getattr(sim, "equity", None)}
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[Orchestrator] sim account state unavailable: {exc}")
+
+        return state
 
     @staticmethod
     async def _build_knowledge_graph_prompt(db: AsyncSession, role: str, symbol: str) -> str:
@@ -456,6 +1263,8 @@ class AgentOrchestrator:
         agent,
         context: Dict[str, Any],
         symbol: str,
+        session_id: str = "live",
+        live: bool = False,
     ) -> Dict[str, Any]:
         """
         Run a single agent with memory awareness:
@@ -463,10 +1272,88 @@ class AgentOrchestrator:
         2. Inject stored knowledge + Graphify map
         3. Try local decision from memory (no LLM call)
         4. If not confident enough, route through connected providers (or OpenAI)
+
+        ``live`` is for runs a person asked for and is waiting on. Both of the
+        shortcuts above exist to keep the background scanner off the token
+        budget, and both are wrong when someone types /room: the memory
+        shortcut answers from past decisions without calling a model at all,
+        and the per-symbol cache replays an answer up to an hour old. Together
+        they produced a board reading "AI calls: 0" under text that had been
+        written by a model — 55 minutes earlier, about a different price.
+
+        Broadcasts start/complete/fail to the trading room so the 3D view and
+        agent panels track the pipeline live.
         """
+        try:
+            await room.agent_started(session_id, agent.role, agent.name, symbol)
+        except Exception as exc:  # noqa: BLE001 - telemetry must never break analysis
+            logger.debug(f"[Orchestrator] room.agent_started failed: {exc}")
+
+        try:
+            # Each agent runs on its OWN session. The provider router writes
+            # usage/commits mid-call, and Phase 1 runs two agents at once — a
+            # shared session there raced its autoflush and rolled the whole
+            # transaction back, which then failed every later agent in the
+            # meeting. Isolated sessions keep one bad agent from poisoning the rest.
+            async with AsyncSessionLocal() as agent_db:
+                decision = await AgentOrchestrator._run_agent_inner(
+                    agent_db, agent, context, symbol, live=live,
+                )
+        except Exception as exc:
+            try:
+                await room.agent_failed(session_id, agent.role, agent.name, str(exc))
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+
+        try:
+            await room.agent_completed(session_id, agent.role, agent.name, symbol, decision)
+            # The seat now presents its verdict to the board — this is the
+            # event that drives the speech bubbles and the live transcript.
+            try:
+                await room.agent_speaking(session_id, agent.role, agent.name, symbol, decision)
+            except Exception as exc:  # noqa: BLE001 - presentation is cosmetic
+                logger.debug(f"[Orchestrator] room.agent_speaking failed: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[Orchestrator] room.agent_completed failed: {exc}")
+        return decision
+
+    @staticmethod
+    async def _run_agent_inner(
+        db: AsyncSession,
+        agent,
+        context: Dict[str, Any],
+        symbol: str,
+        live: bool = False,
+    ) -> Dict[str, Any]:
         past = await get_past_decisions(db, symbol, agent.role)
         memory_prompt = build_memory_prompt(past)
         memory_count = len([d for d in past if d.get("outcome")])
+
+        # ── Room identity + operator brief ─────────────────────────────────────
+        # The name is what JARVIS calls them and what the user sees on the 3D
+        # board; the brief is free text the user writes on the settings page.
+        persona = room.persona_for(agent.role)
+        memory_prompt += (
+            f"\n\n## Your seat at the table\n"
+            f"You are {persona['human_name']}, the {persona['title']}.\n"
+        )
+        if persona.get("tasks"):
+            memory_prompt += (
+                "\n### Standing instructions from the desk\n"
+                f"{persona['tasks']}\n"
+                "Follow these alongside your role's rules. Where they conflict with "
+                "a hard risk limit, the risk limit wins.\n"
+            )
+
+        # Account state so sizing advice is grounded in real equity, not a guess.
+        accounts = context.get("accounts") if isinstance(context, dict) else None
+        if accounts and agent.role in ("risk_manager", "trade_executor", "signal_generator"):
+            memory_prompt += (
+                "\n### Live account state\n"
+                f"{json.dumps(accounts, default=str)[:2000]}\n"
+                "Size every recommendation against this equity and these limits.\n"
+            )
 
         # Inject stored knowledge + Graphify code map (plugin-optional)
         memory_prompt += await AgentOrchestrator._build_knowledge_graph_prompt(db, agent.role, symbol)
@@ -504,14 +1391,22 @@ class AgentOrchestrator:
             except Exception as _ar_exc:
                 logger.debug(f"[Orchestrator] Agent-Reach context skipped: {_ar_exc}")
 
-        # Try local decision first (no LLM call)
-        local = try_local_decision(past, agent.role)
+        # Try local decision first (no LLM call) — never on a run someone is
+        # waiting for: they asked the desk, not its filing cabinet.
+        local = None if live else try_local_decision(past, agent.role)
         if local is not None:
             local["memory_context_used"] = memory_count
             return await agent.analyze(context, local_decision=local)
 
+        # Scalp Bot bias sharpens the seats that time entries.
+        scalp_prompt = context.get("scalp_prompt") if isinstance(context, dict) else None
+        if scalp_prompt and agent.role in ("market_analyst", "signal_generator"):
+            memory_prompt += scalp_prompt
+
         # Route through connected providers (db passed) → falls back to OpenAI
-        decision = await agent.analyze(context, memory_prompt=memory_prompt, db=db)
+        decision = await agent.analyze(
+            context, memory_prompt=memory_prompt, db=db, live=live,
+        )
         decision["memory_context_used"] = memory_count
         return decision
 
@@ -541,15 +1436,47 @@ class AgentOrchestrator:
         timeframe: str = "1h",
         trigger: str = "scanner",
     ) -> Dict[str, Any]:
-        """
-        Run the full agent pipeline for a single symbol.
-        Returns the orchestration result with all agent decisions.
+        """Public entry: dedupe + focus-lock, then run the pipeline once.
 
-        Respects ENABLE_AI_AGENTS — returns early if disabled.
-        ``trigger`` controls token spend: 'scanner' (background) is skipped in
-        the default telegram-only token mode; 'manual' and 'telegram' always run.
-        Falls back gracefully if OpenAI is unavailable.
+        A pair may only be in session once at a time, and while a pair is
+        pinned in the room the automated triggers (worker/scanner/signal) work
+        that pair alone — other pairs are ignored until focus is cleared.
         """
+        norm = _norm_symbol(symbol)
+        live = trigger in LIVE_TRIGGERS
+
+        # One meeting per pair at a time — for the automated triggers, which are
+        # only ever repeating work that will come round again anyway. A person
+        # who typed /room while the worker happened to hold that pair used to
+        # get this stub back: no decisions, no levels, "AI calls: 0". Waiting a
+        # few seconds for the meeting in progress is not what they asked for
+        # either, so their run simply goes ahead alongside it.
+        if norm in _inflight_symbols and not live:
+            logger.info(f"[Orchestrator] {symbol} already in session — skipping duplicate ({trigger})")
+            return {"symbol": symbol, "skipped": True, "reason": "already_in_session",
+                    "final_action": "hold", "ai_calls": 0, "decisions": []}
+
+        # Focus lock: pinned pair(s) only, and only for the automated triggers —
+        # a pair someone asked for by name is never "not the pair we are on".
+        if room.get_focus_symbols() and not live and trigger in ("scanner", "room", "signal") \
+                and not room.is_focused(symbol):
+            logger.debug(f"[Orchestrator] Focus locked — ignoring {symbol} ({trigger})")
+            return {"symbol": symbol, "skipped": True, "reason": "focus_locked",
+                    "final_action": "hold", "ai_calls": 0, "decisions": []}
+
+        _inflight_symbols.add(norm)
+        try:
+            return await AgentOrchestrator._run_full_pipeline(db, symbol, timeframe, trigger)
+        finally:
+            _inflight_symbols.discard(norm)
+
+    @staticmethod
+    async def _run_full_pipeline(
+        db: AsyncSession,
+        symbol: str,
+        timeframe: str = "1h",
+        trigger: str = "scanner",
+    ) -> Dict[str, Any]:
         # ── Guard: AI agents must be enabled ──
         if not settings.ENABLE_AI_AGENTS:
             return {
@@ -613,8 +1540,25 @@ class AgentOrchestrator:
         if "error" in context and "technical" not in context:
             return {"error": context["error"], "symbol": symbol}
 
+        # Scalp Bot read — computed once here (a few candle fetches) and shared
+        # with the analyst + signal seats so entries are timed against the
+        # high-frequency bias. Pinned pairs get it because the room keeps
+        # returning to them; a pair a person asked for by name gets it because
+        # they are waiting on the answer. Only the background scan goes without,
+        # which is what keeps the cost bounded.
+        if room.is_focused(symbol) or trigger in LIVE_TRIGGERS:
+            context["scalp_prompt"] = await AgentOrchestrator._build_scalp_prompt(symbol)
+
         decisions: List[Dict[str, Any]] = []
         all_errors: List[str] = []
+
+        # Opened only once the pipeline is certain to run — an early bail above
+        # would otherwise leave the room showing a meeting that never happened.
+        # A run someone typed and is watching. The automated triggers keep every
+        # token-saving shortcut; this one gets a fresh read from every seat.
+        live = trigger in LIVE_TRIGGERS
+
+        await room.session_started(session_id, symbol, timeframe, trigger)
 
         # ── Phase 1: Market Analyst + Sentiment Analyst (parallel) ──
         phase1_tasks = []
@@ -622,7 +1566,9 @@ class AgentOrchestrator:
         for role in ("market_analyst", "sentiment_analyst"):
             for agent in agents_by_role.get(role, []):
                 phase1_tasks.append(
-                    AgentOrchestrator._run_agent_with_memory(db, agent, context, symbol)
+                    AgentOrchestrator._run_agent_with_memory(
+                        db, agent, context, symbol, session_id, live=live,
+                    )
                 )
                 phase1_agents.append(agent)
 
@@ -640,7 +1586,7 @@ class AgentOrchestrator:
                     symbol=symbol,
                     action=res.get("action", "hold"),
                     confidence=res.get("confidence", 0),
-                    reasoning=res.get("reasoning", ""),
+                    reasoning=reasoning_text(res.get("reasoning")),
                     market_data=json.dumps(res, default=str),
                     session_id=session_id,
                     ai_called=res.get("ai_called", True),
@@ -656,7 +1602,7 @@ class AgentOrchestrator:
         for agent in agents_by_role.get("signal_generator", []):
             try:
                 signal_decision = await AgentOrchestrator._run_agent_with_memory(
-                    db, agent, signal_context, symbol
+                    db, agent, signal_context, symbol, session_id, live=live,
                 )
                 decisions.append(signal_decision)
                 db.add(AgentDecision(
@@ -666,7 +1612,7 @@ class AgentOrchestrator:
                     symbol=symbol,
                     action=signal_decision.get("action", "hold"),
                     confidence=signal_decision.get("confidence", 0),
-                    reasoning=signal_decision.get("reasoning", ""),
+                    reasoning=reasoning_text(signal_decision.get("reasoning")),
                     market_data=json.dumps(signal_decision, default=str),
                     session_id=session_id,
                     ai_called=signal_decision.get("ai_called", True),
@@ -684,7 +1630,7 @@ class AgentOrchestrator:
             for agent in agents_by_role["risk_manager"]:
                 try:
                     risk_decision = await AgentOrchestrator._run_agent_with_memory(
-                        db, agent, risk_context, symbol
+                        db, agent, risk_context, symbol, session_id, live=live,
                     )
                     decisions.append(risk_decision)
                     db.add(AgentDecision(
@@ -694,7 +1640,7 @@ class AgentOrchestrator:
                         symbol=symbol,
                         action=risk_decision.get("action", "reject"),
                         confidence=risk_decision.get("confidence", 0),
-                        reasoning=risk_decision.get("reasoning", ""),
+                        reasoning=reasoning_text(risk_decision.get("reasoning")),
                         market_data=json.dumps(risk_decision, default=str),
                         session_id=session_id,
                         ai_called=risk_decision.get("ai_called", True),
@@ -716,7 +1662,7 @@ class AgentOrchestrator:
             for agent in agents_by_role["trade_executor"]:
                 try:
                     exec_decision = await AgentOrchestrator._run_agent_with_memory(
-                        db, agent, exec_context, symbol
+                        db, agent, exec_context, symbol, session_id, live=live,
                     )
                     decisions.append(exec_decision)
                     db.add(AgentDecision(
@@ -726,7 +1672,7 @@ class AgentOrchestrator:
                         symbol=symbol,
                         action=exec_decision.get("action", "cancel"),
                         confidence=exec_decision.get("confidence", 0),
-                        reasoning=exec_decision.get("reasoning", ""),
+                        reasoning=reasoning_text(exec_decision.get("reasoning")),
                         market_data=json.dumps(exec_decision, default=str),
                         session_id=session_id,
                         ai_called=exec_decision.get("ai_called", True),
@@ -735,6 +1681,31 @@ class AgentOrchestrator:
                 except Exception as e:
                     all_errors.append(f"Trade Executor: {e}")
                 break
+
+        # ── Phase 5: Strategy Optimizer (reviews the historical record) ──
+        for agent in agents_by_role.get("strategy_optimizer", []):
+            try:
+                opt_context = {**signal_context, "pipeline_decisions": decisions}
+                opt_decision = await AgentOrchestrator._run_agent_with_memory(
+                    db, agent, opt_context, symbol, session_id, live=live,
+                )
+                decisions.append(opt_decision)
+                db.add(AgentDecision(
+                    agent_id=agent.agent_id,
+                    agent_name=agent.name,
+                    agent_role=agent.role,
+                    symbol=symbol,
+                    action=opt_decision.get("action", "keep"),
+                    confidence=opt_decision.get("confidence", 0),
+                    reasoning=reasoning_text(opt_decision.get("reasoning")),
+                    market_data=json.dumps(opt_decision, default=str),
+                    session_id=session_id,
+                    ai_called=opt_decision.get("ai_called", True),
+                    memory_context_used=opt_decision.get("memory_context_used", 0),
+                ))
+            except Exception as e:
+                all_errors.append(f"Strategy Optimizer: {e}")
+            break
 
         # ── Save signal to DB if actionable ──
         saved_signal = None
@@ -771,12 +1742,16 @@ class AgentOrchestrator:
             await db.flush()
             saved_signal = {"id": sig.id, "action": final_action, "symbol": symbol}
 
-            # Update agent decisions with signal_id
-            for ad in await db.execute(
+            # Update agent decisions with signal_id.
+            # scalars() belongs on the Result, not on each Row: iterating the
+            # Result yields Rows, and Row.scalars() does not exist — which threw
+            # AttributeError and aborted every signal save that got this far,
+            # leaving the decisions unlinked from the signal they produced.
+            linked = await db.execute(
                 select(AgentDecision).where(AgentDecision.session_id == session_id)
-            ):
-                for row in ad.scalars():
-                    row.signal_id = sig.id
+            )
+            for row in linked.scalars():
+                row.signal_id = sig.id
 
         await db.commit()
 
@@ -792,7 +1767,7 @@ class AgentOrchestrator:
             db, symbol, timeframe, final_action, final_confidence, final_reasoning
         )
 
-        return {
+        result_payload = {
             "session_id": session_id,
             "symbol": symbol,
             "timeframe": timeframe,
@@ -806,7 +1781,44 @@ class AgentOrchestrator:
             "ai_calls": ai_calls,
             "local_decisions": local_calls,
             "ai_enabled": True,
+            # Carried on the result so every downstream surface — the room UI,
+            # the Telegram publisher, the journal — can show the same forecast
+            # the seats argued from, rather than fetching a later one that may
+            # already disagree with the verdict it is printed under.
+            "kronos_forecast": context.get("kronos_forecast"),
+            "momentum": context.get("momentum"),
+            # The season the verdict was made in, and the whale flow behind it.
+            # Same reason as the forecast: the /room card and the web brief must
+            # quote the calendar the seats actually read.
+            "btc_cycle": context.get("btc_cycle"),
+            "btc_whales": context.get("btc_whales"),
+            # Who asked. The publisher needs it: an answer a person typed is
+            # delivered by whoever they typed to, and publishing it again turns
+            # one question into eight messages.
+            "trigger": trigger,
         }
+        # Set before the session is announced: the publisher and the room UI
+        # both draw the plan against this price, and reading it a moment later
+        # meant the Telegram card quoted a level the chart was not drawn at.
+        result_payload["price"] = context.get("current_price", 0)
+        await room.session_completed(session_id, result_payload)
+
+        # The chair reads the verdict aloud — the debate view's closing line.
+        try:
+            await room.chair_speaking(session_id, result_payload)
+        except Exception as exc:  # noqa: BLE001 - presentation is cosmetic
+            logger.debug(f"[Orchestrator] room.chair_speaking failed: {exc}")
+
+        # ── Execution: gated, sized and dry-run by default (see agents/execution.py)
+        try:
+            from app.agents import execution
+            result_payload["execution"] = await execution.execute_decision(
+                db, result_payload, room.consensus_from(decisions)
+            )
+        except Exception as exc:  # noqa: BLE001 - never let execution break analysis
+            logger.warning(f"[Orchestrator:{session_id}] execution step failed: {exc}")
+
+        return result_payload
 
     @staticmethod
     async def analyze_multiple(
@@ -900,7 +1912,7 @@ class AgentOrchestrator:
                     symbol=symbol,
                     action=decision.get("action", "hold"),
                     confidence=decision.get("confidence", 0),
-                    reasoning=decision.get("reasoning", ""),
+                    reasoning=reasoning_text(decision.get("reasoning")),
                     market_data=json.dumps(market_data, default=str),
                     session_id=session_id,
                     ai_called=decision.get("ai_called", True),
@@ -927,7 +1939,7 @@ class AgentOrchestrator:
                         symbol=symbol,
                         action=risk_decision.get("action", "reject"),
                         confidence=risk_decision.get("confidence", 0),
-                        reasoning=risk_decision.get("reasoning", ""),
+                        reasoning=reasoning_text(risk_decision.get("reasoning")),
                         market_data=json.dumps(market_data, default=str),
                         session_id=session_id,
                         ai_called=risk_decision.get("ai_called", True),
@@ -1171,7 +2183,7 @@ class AgentOrchestrator:
                     symbol=symbol,
                     action=decision.get("action", "reject"),
                     confidence=decision.get("confidence", 0),
-                    reasoning=decision.get("reasoning", ""),
+                    reasoning=reasoning_text(decision.get("reasoning")),
                     market_data=json.dumps(market_data, default=str),
                     session_id=session_id,
                     ai_called=decision.get("ai_called", True),
@@ -1197,7 +2209,7 @@ class AgentOrchestrator:
                         symbol=symbol,
                         action=exec_decision.get("action", "cancel"),
                         confidence=exec_decision.get("confidence", 0),
-                        reasoning=exec_decision.get("reasoning", ""),
+                        reasoning=reasoning_text(exec_decision.get("reasoning")),
                         market_data=json.dumps(market_data, default=str),
                         session_id=session_id,
                         ai_called=exec_decision.get("ai_called", True),
@@ -1434,7 +2446,7 @@ class AgentOrchestrator:
                         symbol=symbol,
                         action=market_dec.get("action", "neutral"),
                         confidence=market_dec.get("confidence", 0),
-                        reasoning=market_dec.get("reasoning", ""),
+                        reasoning=reasoning_text(market_dec.get("reasoning")),
                         market_data=json.dumps({"position_review": True, **market_dec}, default=str),
                         session_id=session_id,
                         ai_called=False,
@@ -1455,7 +2467,7 @@ class AgentOrchestrator:
                         symbol=symbol,
                         action=review.get("action", "hold"),
                         confidence=review.get("confidence", 0),
-                        reasoning=review.get("reasoning", ""),
+                        reasoning=reasoning_text(review.get("reasoning")),
                         market_data=json.dumps({"position_review": True, **review}, default=str),
                         session_id=session_id,
                         ai_called=False,
@@ -1479,7 +2491,7 @@ class AgentOrchestrator:
                             symbol=symbol,
                             action=decision.get("action", "neutral"),
                             confidence=decision.get("confidence", 0),
-                            reasoning=decision.get("reasoning", ""),
+                            reasoning=reasoning_text(decision.get("reasoning")),
                             market_data=json.dumps({"position_review": True, **decision}, default=str),
                             session_id=session_id,
                             ai_called=decision.get("ai_called", True),
@@ -1503,7 +2515,7 @@ class AgentOrchestrator:
                             symbol=symbol,
                             action=review.get("action", "hold"),
                             confidence=review.get("confidence", 0),
-                            reasoning=review.get("reasoning", ""),
+                            reasoning=reasoning_text(review.get("reasoning")),
                             market_data=json.dumps({"position_review": True, **review}, default=str),
                             session_id=session_id,
                             ai_called=review.get("ai_called", True),
@@ -1774,7 +2786,7 @@ class AgentOrchestrator:
                         agent_id=agent.agent_id, agent_name=agent.name, agent_role=agent.role,
                         symbol=symbol, action=decision.get("action", "neutral"),
                         confidence=decision.get("confidence", 0),
-                        reasoning=decision.get("reasoning", ""),
+                        reasoning=reasoning_text(decision.get("reasoning")),
                         market_data=json.dumps({"sim_position_review": True, **decision}, default=str),
                         session_id=session_id,
                         ai_called=decision.get("ai_called", True),
@@ -1793,7 +2805,7 @@ class AgentOrchestrator:
                         agent_id=agent.agent_id, agent_name=agent.name, agent_role=agent.role,
                         symbol=symbol, action=review.get("action", "hold"),
                         confidence=review.get("confidence", 0),
-                        reasoning=review.get("reasoning", ""),
+                        reasoning=reasoning_text(review.get("reasoning")),
                         market_data=json.dumps({"sim_position_review": True, **review}, default=str),
                         session_id=session_id,
                         ai_called=review.get("ai_called", True),
@@ -1858,6 +2870,212 @@ class AgentOrchestrator:
             "positions_reviewed": len(reviews),
             "actions_taken": actions_taken, "reviews": reviews,
         }
+
+    # ── MT5 position review ─────────────────────────────────────
+
+    @staticmethod
+    async def analyze_mt5_positions(
+        db: AsyncSession,
+        min_hold_hours: float = 0.5,
+    ) -> Dict[str, Any]:
+        """Put the Position Reviewer on the trades sitting at the broker.
+
+        The reviewers covered crypto and the sim account only. An MT5 position —
+        the venue the room actually places most of its orders on — was managed
+        by nothing but the stop it was opened with, so "the agents manage the
+        linked account" was true of every account except the linked one.
+
+        Only positions this app opened are reviewed: a trade placed by hand in
+        the terminal belongs to the user. The seat's verdict is applied through
+        the broker unless the room is in dry run, in which case it is recorded
+        and reported like any other blocked order.
+        """
+        if not settings.ENABLE_AI_AGENTS:
+            return {"skipped": True, "reason": "AI agents disabled"}
+        from app.agents.base import _circuit_is_open
+
+        if _circuit_is_open():
+            return {"skipped": True, "reason": "AI circuit breaker open"}
+
+        try:
+            from app.trading.order_tags import is_app_order
+            from plugins.MT5TradingPlugin.backend.models import (
+                MT5Account, MT5AccountStatus, MT5Position,
+            )
+            from plugins.MT5TradingPlugin.backend.services.mt5_client import mt5_client
+        except Exception as exc:  # noqa: BLE001 — plugin-optional
+            return {"skipped": True, "reason": f"MT5 plugin unavailable: {exc}"}
+
+        from datetime import timedelta
+
+        from app.agents.execution import get_settings, mt5_targets
+        from app.workers.room_worker import get_focus_timeframe
+
+        room_settings = await get_settings(db)
+        # Reviewing is acting: a verdict here closes positions and moves stops.
+        # So it is scoped to exactly the accounts the room is allowed to trade —
+        # in a dry run the demo alone, which is what "the live account is not
+        # managed by the room" has to mean to be worth anything.
+        routing = await mt5_targets(db, room_settings)
+        accounts = routing["targets"]
+        send = bool(room_settings.execution_enabled)
+        if not accounts:
+            return {"skipped": False, "positions_reviewed": 0,
+                    "reason": f"No account to review ({routing['note']})"}
+
+        agents_rows = (await db.execute(
+            select(Agent).where(
+                Agent.is_active == True,  # noqa: E712 - SQLAlchemy needs the comparison
+                Agent.role == "position_reviewer",
+            )
+        )).scalars().all()
+        if not agents_rows:
+            return {"skipped": True, "reason": "No position reviewer configured"}
+        reviewer = agent_from_db(agents_rows[0])
+
+        session_id = f"mt5-{str(uuid.uuid4())[:8]}"
+        cutoff = now_sast() - timedelta(hours=max(0.0, min_hold_hours))
+        reviews: List[Dict[str, Any]] = []
+
+        for account in accounts:
+            positions = (await db.execute(
+                select(MT5Position).where(MT5Position.account_id == account.id)
+            )).scalars().all()
+            for pos in positions:
+                if not is_app_order(getattr(pos, "comment", "")):
+                    continue
+                opened = getattr(pos, "mt5_time_open", None) or getattr(pos, "created_at", None)
+                if opened is not None and opened.tzinfo is None:
+                    opened = opened.replace(tzinfo=cutoff.tzinfo)
+                if opened is not None and opened > cutoff:
+                    continue
+
+                side = getattr(pos.side, "value", str(pos.side))
+                entry = float(pos.price_open or 0)
+                price = float(pos.price_current or entry or 0)
+                if entry <= 0 or price <= 0:
+                    continue
+
+                context = await AgentOrchestrator._gather_context(
+                    pos.symbol, get_focus_timeframe(), db=db
+                )
+                is_long = str(side).lower() in ("long", "buy")
+                pnl_pct = ((price - entry) / entry * 100) if is_long \
+                    else ((entry - price) / entry * 100)
+                context["position"] = {
+                    "venue": "mt5",
+                    "account": f"{account.login}@{account.server}",
+                    "ticket": pos.mt5_ticket,
+                    "symbol": pos.symbol,
+                    "side": side,
+                    "volume": pos.volume,
+                    "entry": entry,
+                    "current_price": price,
+                    "stop_loss": pos.sl,
+                    "take_profit": pos.tp,
+                    "unrealized_pnl_pct": round(pnl_pct, 3),
+                }
+
+                try:
+                    review = await AgentOrchestrator._run_agent_with_memory(
+                        db, reviewer, context, pos.symbol, session_id, live=False,
+                    )
+                except Exception as exc:  # noqa: BLE001 — one bad review, not the pass
+                    logger.warning(f"[Orchestrator] MT5 review failed for {pos.symbol}: {exc}")
+                    continue
+
+                db.add(AgentDecision(
+                    agent_id=reviewer.agent_id,
+                    agent_name=reviewer.name,
+                    agent_role=reviewer.role,
+                    symbol=pos.symbol,
+                    action=review.get("action", "hold"),
+                    confidence=review.get("confidence", 0),
+                    reasoning=reasoning_text(review.get("reasoning")),
+                    market_data=json.dumps({"mt5_position_review": True, **review}, default=str),
+                    session_id=session_id,
+                    ai_called=review.get("ai_called", True),
+                    memory_context_used=review.get("memory_context_used", 0),
+                ))
+
+                applied = await AgentOrchestrator._apply_mt5_review(
+                    account, pos, review, send=send, client=mt5_client,
+                )
+                reviews.append({
+                    "ticket": pos.mt5_ticket, "symbol": pos.symbol,
+                    "action": review.get("action", "hold"),
+                    "confidence": review.get("confidence", 0),
+                    "reasoning": reasoning_text(review.get("reasoning"))[:400],
+                    "applied": applied,
+                })
+
+        await db.commit()
+        if reviews:
+            logger.info(
+                f"[Orchestrator:{session_id}] reviewed {len(reviews)} MT5 position(s)"
+            )
+        return {"skipped": False, "positions_reviewed": len(reviews), "reviews": reviews}
+
+    @staticmethod
+    async def _apply_mt5_review(
+        account: Any, pos: Any, review: Dict[str, Any], *, send: bool, client: Any,
+    ) -> Dict[str, Any]:
+        """Turn one reviewer verdict into broker calls, or into a dry-run note.
+
+        A stop is only ever moved in the protective direction here. The seat is
+        being asked whether the trade is still good, not for permission to give
+        the position more room — widening belongs to :mod:`app.agents.guardian`,
+        which pairs it with a matching cut in size.
+        """
+        action = str(review.get("action") or "hold").lower()
+        out: Dict[str, Any] = {"action": action, "applied": send, "sent": []}
+        is_long = str(getattr(pos.side, "value", pos.side)).lower() in ("long", "buy")
+
+        def _protective(candidate: Any) -> Optional[float]:
+            try:
+                level = float(candidate)
+            except (TypeError, ValueError):
+                return None
+            if level <= 0 or pos.sl is None:
+                return level if level > 0 else None
+            return level if (level > pos.sl if is_long else level < pos.sl) else None
+
+        try:
+            if action == "close":
+                out["sent"].append("close")
+                if send:
+                    await client.close_position(
+                        login=account.login, server=account.server,
+                        password=account.password_encrypted, ticket=int(pos.mt5_ticket),
+                    )
+            elif action == "adjust":
+                new_sl = _protective(review.get("adjusted_sl"))
+                new_tp = review.get("adjusted_tp")
+                pct = review.get("partial_close_pct")
+                if new_sl or new_tp:
+                    out["sent"].append(f"modify sl={new_sl} tp={new_tp}")
+                    if send:
+                        await client.modify_order(
+                            login=account.login, server=account.server,
+                            password=account.password_encrypted,
+                            ticket=int(pos.mt5_ticket),
+                            sl=round(new_sl, 5) if new_sl else pos.sl,
+                            tp=round(float(new_tp), 5) if new_tp else pos.tp,
+                        )
+                if pct:
+                    volume = max(0.01, round(float(pos.volume or 0) * float(pct) / 100 / 0.01) * 0.01)
+                    if volume >= 0.01 and volume < float(pos.volume or 0):
+                        out["sent"].append(f"partial close {volume}")
+                        if send:
+                            await client.close_position(
+                                login=account.login, server=account.server,
+                                password=account.password_encrypted,
+                                ticket=int(pos.mt5_ticket), volume=volume,
+                            )
+        except Exception as exc:  # noqa: BLE001 — a broker error is reported, not raised
+            out["error"] = str(exc)[:200]
+            logger.warning(f"[Orchestrator] MT5 review action failed for #{pos.mt5_ticket}: {exc}")
+        return out
 
     # ── Limit Order Optimization ────────────────────────────────
 
@@ -2021,7 +3239,7 @@ class AgentOrchestrator:
                     symbol=display_sym,
                     action=decision.get("action", "keep"),
                     confidence=decision.get("confidence", 0),
-                    reasoning=decision.get("reasoning", ""),
+                    reasoning=reasoning_text(decision.get("reasoning")),
                     market_data=json.dumps({"limit_order_review": True, "order_id": order_id, **decision}, default=str),
                     session_id=session_id,
                     ai_called=decision.get("ai_called", True),
@@ -2427,7 +3645,7 @@ class AgentOrchestrator:
                     symbol=display_sym,
                     action=decision.get("action", "keep"),
                     confidence=decision.get("confidence", 0),
-                    reasoning=decision.get("reasoning", ""),
+                    reasoning=reasoning_text(decision.get("reasoning")),
                     market_data=json.dumps({
                         "position_sltp_review": True,
                         "hold_side": hold_side,

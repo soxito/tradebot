@@ -560,6 +560,90 @@ async def resolve_macro_bias(
         )
 
 
+async def dxy_narrative(
+    *, fetcher: Optional[CandleFetcher] = None,
+) -> str:
+    """The dollar's own chart, read as prose. "" when it cannot be read.
+
+    Says only what the pattern and cloud checks actually resolve to: a dollar
+    that is simply ranging gets told as ranging, because inventing a breakout
+    here would propagate into every crypto call the reader makes off the back
+    of it.
+    """
+    import pandas as pd
+
+    from app.signals.technical import detect_triangle, ichimoku
+
+    fetch = fetcher or _default_fetcher
+    try:
+        rows = await fetch(DXY_SYMBOL, TIMEFRAME, LOOKBACK_DAYS)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[Macro] DXY narrative fetch failed: {}", exc)
+        return ""
+    if not rows or len(rows) < 60:
+        return ""
+
+    try:
+        df = pd.DataFrame(rows)
+        for col in ("open", "high", "low", "close"):
+            df[col] = df[col].astype(float)
+        close = float(df["close"].iloc[-1])
+        triangle = detect_triangle(df)
+        cloud = ichimoku(df)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[Macro] DXY narrative read failed: {}", exc)
+        return ""
+
+    lines = ["#US DOLLAR ANALYSIS"]
+
+    if triangle and triangle["broken"]:
+        way = "broken out of" if triangle["kind"] == "ascending" else "broken down from"
+        pressure = "bullish" if triangle["kind"] == "ascending" else "bearish"
+        lines.append(
+            f"The US Dollar has {way} the {triangle['kind']} triangle pattern at "
+            f"{triangle['level']:,.3f}, signalling increasing {pressure} pressure."
+        )
+    elif triangle:
+        lines.append(
+            f"The US Dollar is still coiling inside a {triangle['kind']} triangle, "
+            f"with {triangle['level']:,.3f} the boundary that decides it."
+        )
+    else:
+        lines.append(
+            f"The US Dollar is trading at {close:,.3f} with no clean pattern "
+            "resolved on the daily — direction is still open."
+        )
+
+    if cloud["position"] == "below":
+        lines.append(
+            "The Ichimoku cloud is acting as a resistance barrier above the "
+            "current price action."
+        )
+    elif cloud["position"] == "above":
+        lines.append(
+            "The Ichimoku cloud is sitting beneath price and acting as support."
+        )
+    elif cloud["position"] == "inside":
+        lines.append(
+            "Price is inside the Ichimoku cloud — the trend read here is "
+            "unresolved by definition."
+        )
+
+    if triangle:
+        side = "below" if triangle["kind"] == "descending" else "above"
+        follow = "downside" if triangle["kind"] == "descending" else "upside"
+        lines.append(
+            f"A sustained close {side} {triangle['level']:,.3f} could confirm "
+            f"further {follow} in the US Dollar."
+        )
+
+    lines.append(
+        "Since DXY moves inversely to crypto, this setup could heavily impact "
+        "upcoming market direction."
+    )
+    return "\n\n".join(lines)
+
+
 def reset_cache() -> None:
     """Drop the cached snapshot — for tests and for a forced refresh."""
     global _cache, _cache_at

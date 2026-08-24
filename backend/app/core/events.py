@@ -48,6 +48,19 @@ class Topics:
     PRICE_TICK = "price.tick"
     SYSTEM_ALERT = "system.alert"
 
+    # Trading-room agent lifecycle
+    AGENT_STARTED = "agent.started"
+    AGENT_PROGRESS = "agent.progress"
+    AGENT_SPEAKING = "agent.speaking"
+    AGENT_COMPLETED = "agent.completed"
+    AGENT_STATE = "agent.state"
+    SESSION_STARTED = "session.started"
+    SESSION_COMPLETED = "session.completed"
+    ROOM_FOCUS = "room.focus"
+    ROOM_EXECUTION = "room.execution"
+    CYCLE_TRANSITION = "cycle.transition"
+    WHALE_MOVE = "whale.move"
+
     ALL: Set[str] = {
         SIGNAL_NEW,
         TRADE_UPDATE,
@@ -56,6 +69,17 @@ class Topics:
         MONITOR_STATUS,
         PRICE_TICK,
         SYSTEM_ALERT,
+        AGENT_STARTED,
+        AGENT_PROGRESS,
+        AGENT_SPEAKING,
+        AGENT_COMPLETED,
+        AGENT_STATE,
+        SESSION_STARTED,
+        SESSION_COMPLETED,
+        ROOM_FOCUS,
+        ROOM_EXECUTION,
+        CYCLE_TRANSITION,
+        WHALE_MOVE,
     }
 
 

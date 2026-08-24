@@ -431,6 +431,14 @@ api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       respond({ ok: true })
       break
 
+    // Grab whatever the user is looking at — a chart on any site — and hand it
+    // back as a data: URI for the caller to send into the Paul chat vision path.
+    case 'capture-tab':
+      api.tabs.captureVisibleTab(null, { format: 'png' })
+        .then(dataUrl => respond({ ok: true, image: dataUrl }))
+        .catch(e => respond({ ok: false, error: String(e && e.message || e) }))
+      return true  // keep the channel open for the async respond
+
     case 'set-monitor':
       monitorEnabled = !!msg.enabled
       api.storage.local.set({ monitorEnabled })

@@ -167,6 +167,27 @@ export const apiClient = {
    */
   getMarketPrice: (symbol: string, signal?: AbortSignal, basis: PriceBasis = 'spot') =>
     api.get('/market/price', { params: { symbol, basis }, timeout: 15000, signal }),
+
+  // ── Bitcoin 1064-day cycle ──
+  /** Where the cycle stands today: phase, countdowns, validation hit-rate. */
+  getCycleState: () => api.get('/cycle/state', { timeout: 20000 }),
+  /** Past + projected cycle boxes for chart overlays (green bull / red bear). */
+  getCycleWindows: () => api.get('/cycle/windows', { timeout: 20000 }),
+  /** A month grid: each day's phase, cycle position and historical expectation. */
+  getCycleCalendar: (year?: number, month?: number) =>
+    api.get('/cycle/calendar', { params: { year, month }, timeout: 20000 }),
+  /** The cycle resolved for one symbol — the same read the agents get. */
+  getCycleBias: (symbol: string) => api.get('/cycle/bias', { params: { symbol } }),
+  /** Every cycle's price path (% from bottom), aligned by day-of-cycle. */
+  getCycleAnalogs: () => api.get('/cycle/analogs', { timeout: 30000 }),
+  /** Day-by-day base rates ahead of an offset — the daily prediction table. */
+  getCycleExpectation: (offset?: number, days = 30, horizon = 1) =>
+    api.get('/cycle/expectation', { params: { offset, days, horizon }, timeout: 30000 }),
+  /** The curated BTC whale registry: balances + 7-day flows. */
+  getWhaleHolders: () => api.get('/whale/holders', { timeout: 60000 }),
+  /** The aggregate whale accumulation/distribution read. */
+  getWhaleScore: () => api.get('/whale/score', { timeout: 60000 }),
+
   placeSpotOrder: (data: {
     exchange: string;
     symbol: string;
@@ -655,7 +676,7 @@ export const apiClient = {
     }) => api.get('/plugins/telegram/messages', { params }),
 
     getSignals: (params?: {
-      status?: 'active' | 'filled' | 'tp_hit' | 'sl_hit' | 'closed';
+      status?: 'active' | 'filled' | 'tp_hit' | 'sl_hit' | 'closed' | 'expired';
       market_type?: 'crypto' | 'forex';
       channel_source_id?: number;
       limit?: number;
@@ -781,6 +802,8 @@ export const apiClient = {
       api.get('/plugins/mt5/candles', { params: { account_id: accountId, symbol, timeframe, count } }),
     getPrice: (accountId: number, symbol: string) =>
       api.get('/plugins/mt5/price', { params: { account_id: accountId, symbol } }),
+    getFibOverlay: (accountId: number, symbol: string, timeframe = 'H1', exchange?: string) =>
+      api.get('/plugins/mt5/fib-overlay', { params: { account_id: accountId, symbol, timeframe, exchange } }),
     getSymbols: (accountId: number) =>
       api.get('/plugins/mt5/symbols', { params: { account_id: accountId } }),
     // Groups
@@ -881,6 +904,14 @@ export const apiClient = {
     testProvider: (id: number) => api.post(`/plugins/ai-analyst/ai/providers/${id}/test`),
     testAllProviders: () => api.post('/plugins/ai-analyst/ai/providers/test-all'),
     getProviderPresets: () => api.get('/plugins/ai-analyst/ai/providers/presets'),
+    // Dedicated profiles: which provider profile serves which task category.
+    getTaskAssignments: () => api.get('/plugins/ai-analyst/ai/task-assignments'),
+    assignTaskProfile: (task: string, providerId: number | null) =>
+      api.put(`/plugins/ai-analyst/ai/task-assignments/${task}`, { provider_id: providerId }),
+    // Sends one real call down whatever the task would actually use, so a pass
+    // means that task works — not just that some provider is reachable.
+    testTaskAssignment: (task: string) =>
+      api.post(`/plugins/ai-analyst/ai/task-assignments/${task}/test`, {}, { timeout: 90000 }),
     // Knowledge & graph
     getKnowledge: () => api.get('/plugins/ai-analyst/ai/knowledge'),
     addKnowledge: (data: { content: string; title?: string; kind?: string; symbol?: string; agent_role?: string; weight?: number; source?: string }) =>
@@ -1102,6 +1133,18 @@ export const apiClient = {
   },
 
   // ── Kronos Forecast Plugin (K-line foundation model) ─────────────────────
+  technical: {
+    /** Auto fib retracement levels as chart overlay series. */
+    fibOverlay: (exchange: string, symbol: string, params?: { timeframe?: string; limit?: number }) =>
+      api.get(`/market/fib-overlay/${exchange}/${symbol.replace('/', '')}`, { params }),
+    /** Trend + momentum indicators (EMA 20/50/200, RSI, MACD) as overlay series. */
+    indicatorOverlay: (
+      exchange: string,
+      symbol: string,
+      params?: { timeframe?: string; limit?: number; indicators?: string },
+    ) => api.get(`/market/indicator-overlay/${exchange}/${symbol.replace('/', '')}`, { params }),
+  },
+
   kronos: {
     /** Model status: real Kronos loaded vs heuristic fallback, device, etc. */
     status: () => api.get('/plugins/kronos/status'),
@@ -1220,6 +1263,26 @@ export const apiClient = {
       frontend_addr_override?: string;
       enable_on_start?: boolean;
     }) => api.patch('/ngrok/config', data),
+  },
+
+  // ─── System Monitor (host resources, event-loop lag, offload, tasks) ───
+  system: {
+    resources: () => api.get('/system/resources'),
+    loopLag: () => api.get('/system/loop-lag'),
+    offload: () => api.get('/system/offload'),
+  },
+  tasks: {
+    list: () => api.get('/tasks'),
+    get: (id: string) => api.get(`/tasks/${id}`),
+    pause: (id: string, force = false) => api.post(`/tasks/${id}/pause`, null, { params: { force } }),
+    resume: (id: string) => api.post(`/tasks/${id}/resume`),
+    start: (id: string) => api.post(`/tasks/${id}/start`),
+    stop: (id: string) => api.post(`/tasks/${id}/stop`),
+    runNow: (id: string) => api.post(`/tasks/${id}/run-now`),
+    setInterval: (id: string, interval_seconds: number | null) =>
+      api.patch(`/tasks/${id}`, { interval_seconds }),
+    pauseAll: (category?: string) => api.post('/tasks/pause-all', null, { params: category ? { category } : {} }),
+    preset: (name: 'battery_saver' | 'balanced' | 'full_power') => api.post(`/tasks/preset/${name}`),
   },
 
   // ── Vibe Trading Plugin (HKUDS/Vibe-Trading sidecar) ──────────────────────

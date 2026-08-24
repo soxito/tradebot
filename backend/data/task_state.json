@@ -1,0 +1,8 @@
+{
+  "paused": {
+    "pair_catalog_sync": "watchdog",
+    "research_loop": "watchdog",
+    "signal_research_queue": "watchdog"
+  },
+  "intervals": {}
+}

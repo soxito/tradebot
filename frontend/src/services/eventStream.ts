@@ -21,6 +21,17 @@ export const STREAM_TOPICS = [
   'monitor.status',
   'price.tick',
   'system.alert',
+  'agent.started',
+  'agent.progress',
+  'agent.speaking',
+  'agent.completed',
+  'agent.state',
+  'session.started',
+  'session.completed',
+  'room.focus',
+  'room.execution',
+  'cycle.transition',
+  'whale.move',
 ] as const;
 
 export type StreamTopic = (typeof STREAM_TOPICS)[number];

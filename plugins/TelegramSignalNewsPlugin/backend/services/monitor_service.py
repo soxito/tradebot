@@ -63,7 +63,32 @@ def _emit_event(topic: str, data: dict) -> None:
 
 MONITOR_INTERVAL_SECONDS = 60          # base loop cadence (sniper trigger checks)
 POLL_INTERVAL_SECONDS = 300            # poll Telegram for new messages every 5 min
+
+#: In-flight update handlers. asyncio only holds weak references to tasks, so
+#: without this a long-running reply can be garbage-collected mid-await.
+_UPDATE_TASKS: set[asyncio.Task] = set()
+
+
+def _spawn_update(update: dict, token: str, allowed: list, session_factory) -> None:
+    """Handle one update concurrently so a slow reply cannot stall the loop."""
+    async def _guarded() -> None:
+        try:
+            await TelegramSignalMonitor._process_update(update, token, allowed, session_factory)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[BotPolling] Update processing error: {}", exc)
+
+    task = asyncio.create_task(_guarded())
+    _UPDATE_TASKS.add(task)
+    task.add_done_callback(_UPDATE_TASKS.discard)
 POLL_LIMIT_PER_CHANNEL = 50
+
+# Zero-based ladder index the trailing stop locks onto and never moves past:
+# 2 == TP3. Everything above it (TP4, TP5, …) is ridden with the stop parked at
+# TP3 so the position can reach the channel's final target instead of being
+# stopped out in profit halfway through the move.
+TRAIL_LOCK_TP_INDEX = 2
 
 _last_skipped_reanalyze: datetime | None = None
 
@@ -224,6 +249,39 @@ async def create_signals_from_messages(
                         outcome.symbol,
                     )
 
+                # ── SL-hit / channel-closed: flatten any still-open position ──
+                # The channel says this trade is done. Cancel pending sniper
+                # trades and close any sandbox/live/MT5 positions that the broker
+                # hasn't already closed, so the signal truly leaves "active".
+                elif outcome.kind in ("sl_hit", "closed"):
+                    sniper_q = await db.execute(
+                        select(TelegramSniperTrade)
+                        .where(
+                            TelegramSniperTrade.signal_id == sig.id,
+                            TelegramSniperTrade.status == SniperTradeStatus.PENDING,
+                        )
+                    )
+                    for st in sniper_q.scalars().all():
+                        st.status = SniperTradeStatus.SKIPPED
+                        st.reason = f"Cancelled \u2014 channel {outcome.kind}: {outcome.detail or ''}".strip()
+                        st.updated_at = now_utc_naive()
+                    await db.commit()
+                    try:
+                        summary = await auto_close_positions_for_signal(
+                            db, sig.id,
+                            reason=f"Channel {outcome.kind} auto-close (monitor loop)",
+                        )
+                        if any(summary.get(k) for k in ("mt5_closed", "live_closed", "sandbox_closed")):
+                            logger.info(
+                                "[Monitor] {} close for {} \u2014 flattened sandbox={} live={} mt5={}",
+                                outcome.kind, outcome.symbol,
+                                len(summary.get("sandbox_closed", [])),
+                                len(summary.get("live_closed", [])),
+                                len(summary.get("mt5_closed", [])),
+                            )
+                    except Exception as ac_exc:  # noqa: BLE001
+                        logger.warning("Auto-close failed for signal {}: {}", sig.id, ac_exc)
+
     await db.commit()
     return {"created": created, "outcomes_applied": outcomes_applied}
 
@@ -240,15 +298,14 @@ async def reconcile_active_signals_from_live_price(
     1. Sort the signal's TP list in trade direction (ascending for LONG,
        descending for SHORT) so we process them in the order price hits them.
     2. Count how many TPs the current live price has already crossed.
-    3. If that count has increased since the last check → advance the trailing
-       SL to the new highest TP crossed (locks in profit at each level).
-    4. When the FINAL TP is crossed the trailing SL is set to that TP value and
-       we also enable a live percentage trail so further profit is protected:
-           trailing_sl = max(trailing_sl, live * (1 - trail_pct))   [LONG]
-           trailing_sl = min(trailing_sl, live * (1 + trail_pct))   [SHORT]
-    5. A signal closes as TP_HIT when price falls back to the trailing SL
-       (which means we closed in profit).
-    6. A signal closes as SL_HIT when price hits the original stop-loss before
+    3. The stop moves once, at the ``TRAIL_LOCK_TP_INDEX`` (TP3) milestone,
+       and then holds: the original stop stands below TP3, jumps to BREAK-EVEN
+       when TP3 prints so the trade can no longer lose, and is frozen there
+       while price works through TP4, TP5, … Ladders with fewer than 3 TPs use
+       their final TP as the milestone.
+    4. The trade closes as TP_HIT only when the FINAL TP is crossed, or when
+       price retraces through the break-even stop.
+    5. A signal closes as SL_HIT when price hits the original stop-loss before
        any TP has been reached (clean loss, no profit was locked).
     """
     # Fetch sniper settings once for the trailing percentage.
@@ -265,6 +322,18 @@ async def reconcile_active_signals_from_live_price(
 
     # Cache prices to avoid double-fetching the same symbol in one pass.
     price_cache: dict[str, float | None] = {}
+
+    # Signals that actually produced a live/sandbox order — only these get
+    # lifecycle notifications (so untraded signals never spam the bot).
+    notify_enabled = bool(getattr(sniper_cfg, "notify_executions", True))
+    executed_ids: set[int] = set()
+    if notify_enabled:
+        ex = await db.execute(
+            select(TelegramSniperTrade.signal_id).where(
+                TelegramSniperTrade.status == SniperTradeStatus.PLACED
+            )
+        )
+        executed_ids = {r[0] for r in ex.all()}
 
     checked = 0
     moved_tp = 0
@@ -358,81 +427,184 @@ async def reconcile_active_signals_from_live_price(
         prev_reached = int(getattr(sig, "tp_reached_count", 0) or 0)
 
         # ── Advance trailing SL when new TP levels are hit ───────────────────
+        # The stop moves exactly ONCE, at the TP3 milestone, and then holds:
+        #
+        #   before TP3 : the signal's original stop stands
+        #   at TP3     : the stop jumps to BREAK-EVEN (the entry price), so the
+        #                trade can no longer lose
+        #   after TP3  : frozen — TP4, TP5, … do not move it
+        #
+        # Ratcheting the stop onto every TP crossed meant a routine pullback
+        # after TP4/TP5 closed a position that was still heading for the
+        # channel's last target. Break-even removes the downside while leaving
+        # far more room to run than parking the stop on TP3 itself would.
+        # Ladders shorter than 3 TPs use their final TP as the milestone.
         changed = False
+        trail_before = getattr(sig, "trailing_sl", None)
         if crossed > prev_reached and tps:
-            # The highest TP crossed in the sorted ladder.
-            new_trail_anchor = tps[crossed - 1]
+            lock_idx = min(TRAIL_LOCK_TP_INDEX, len(tps) - 1)
             setattr(sig, "tp_reached_count", crossed)
-            # Ensure trailing SL only ever moves in the profit direction.
-            current_trail = getattr(sig, "trailing_sl", None)
-            if current_trail is None:
-                setattr(sig, "trailing_sl", new_trail_anchor)
-            else:
-                if is_long:
-                    setattr(sig, "trailing_sl", max(current_trail, new_trail_anchor))
-                else:
-                    setattr(sig, "trailing_sl", min(current_trail, new_trail_anchor))
-            sig.updated_at = now_utc_naive()
-            changed = True
-            trailing_updated += 1
-            logger.info(
-                "[Trailing SL] {} {} — TP {}/{} hit @ {} | new trailing SL = {}",
-                direction.upper(), sym, crossed, len(tps),
-                new_trail_anchor, getattr(sig, "trailing_sl", None),
+            reached_lock = (crossed - 1) >= lock_idx
+            # Break-even needs a known entry; without one fall back to the
+            # milestone TP so the trade is still protected.
+            break_even = (
+                float(entry_price) if (entry_price and entry_price > 0) else tps[lock_idx]
             )
+            if reached_lock:
+                current_trail = getattr(sig, "trailing_sl", None)
+                if current_trail is None:
+                    setattr(sig, "trailing_sl", break_even)
+                else:
+                    # Never give back a stop that is already safer than break-even.
+                    setattr(sig, "trailing_sl", (
+                        max(current_trail, break_even) if is_long
+                        else min(current_trail, break_even)
+                    ))
+                sig.updated_at = now_utc_naive()
+                changed = True
+                trailing_updated += 1
+            logger.info(
+                "[Trailing SL] {} {} — TP {}/{} hit @ {} | stop = {}{}",
+                direction.upper(), sym, crossed, len(tps), tps[crossed - 1],
+                getattr(sig, "trailing_sl", None) or orig_sl,
+                (
+                    f" (BREAK-EVEN from TP{lock_idx + 1}, held until TP{len(tps)})"
+                    if reached_lock else f" (original stop until TP{lock_idx + 1})"
+                ),
+            )
+            if notify_enabled and sig.id in executed_ids:
+                try:
+                    from plugins.TelegramSignalNewsPlugin.backend.services import notifications as _notif
+                    await _notif.notify(_notif.format_tp_hit(
+                        symbol=sym, direction=direction, tp_index=crossed, tp_total=len(tps),
+                        tp_price=tps[crossed - 1], trailing_sl=getattr(sig, "trailing_sl", None),
+                        channel=getattr(sig, "channel_title", None),
+                    ), db)
+                except Exception:  # noqa: BLE001
+                    pass
 
-        # ── Sync trailing SL to any linked open sim position ─────────────
-        # When trailing_sl has just changed, push it to the sim account
-        # position so /trading reflects the correct stop-loss level.
-        new_trail_now = getattr(sig, "trailing_sl", None)
-        if changed and new_trail_now is not None:
+        # ── Sync trailing SL to the linked sim AND live positions ────────
+        # When trailing_sl changes it must reach every place the position
+        # actually lives: the sim book (so /trading shows the stop) and, for a
+        # real telegram order, the live exchange — otherwise the locked profit
+        # only exists on the signal row, not on the money at risk.
+        async def _apply_trailing_sl(new_sl: float) -> None:
             try:
                 trade_row = await db.execute(
                     select(TelegramSniperTrade).where(
                         TelegramSniperTrade.signal_id == sig.id,
                         TelegramSniperTrade.status == SniperTradeStatus.PLACED,
-                        TelegramSniperTrade.sim_order_id.isnot(None),
                     )
                 )
-                for sniper_trade in trade_row.scalars().all():
-                    from app.models.database import SimPosition
-                    pos_row = await db.execute(
-                        select(SimPosition).where(
-                            SimPosition.order_id == sniper_trade.sim_order_id,
-                            SimPosition.status == "open",
+                sniper_trades = list(trade_row.scalars().all())
+            except Exception:
+                sniper_trades = []
+            for sniper_trade in sniper_trades:
+                if sniper_trade.sim_order_id is not None:
+                    try:
+                        from app.models.database import SimPosition
+                        pos_row = await db.execute(
+                            select(SimPosition).where(
+                                SimPosition.order_id == sniper_trade.sim_order_id,
+                                SimPosition.status == "open",
+                            )
                         )
-                    )
-                    sim_pos = pos_row.scalar_one_or_none()
-                    if sim_pos is not None:
-                        sim_pos.stop_loss = new_trail_now
-                        # Tag the position as having a trailing stop-loss so the
-                        # /trading page can show the 🔒 indicator.
+                        sim_pos = pos_row.scalar_one_or_none()
+                        if sim_pos is not None:
+                            sim_pos.stop_loss = new_sl
+                            try:
+                                sim_pos.sl_type = "trailing"
+                            except Exception:
+                                pass
+                            logger.info(
+                                "[Trailing SL→Sim] {} {} position id={} stop_loss→{}",
+                                direction.upper(), sym, sim_pos.id, new_sl,
+                            )
+                    except Exception as sync_exc:  # noqa: BLE001
+                        logger.warning("[Trailing SL→Sim] sync failed for {}: {}", sym, sync_exc)
+                # Live money: push the trail to the exchange so the stop actually moves.
+                if getattr(sniper_trade, "executed_mode", None) == "live":
+                    try:
+                        from app.exchanges.manager import exchange_manager, SupportedExchange
+                        connector = exchange_manager.get_exchange(SupportedExchange.BITGET)
+                        if connector is not None:
+                            await connector.replace_tpsl_orders(
+                                symbol=sniper_trade.symbol,
+                                hold_side="long" if is_long else "short",
+                                new_sl=new_sl,
+                            )
+                            logger.info(
+                                "[Trailing SL→Live] {} {} SL→{} on Bitget",
+                                direction.upper(), sniper_trade.symbol, new_sl,
+                            )
+                    except Exception as live_exc:  # noqa: BLE001
+                        logger.warning(
+                            "[Trailing SL→Live] {} push failed: {}", sniper_trade.symbol, live_exc,
+                        )
+                # Forex on MT5: the locked stop has to reach the broker too, or
+                # it only exists on the signal row while the money still sits
+                # behind the signal's original stop.
+                if str(getattr(sniper_trade, "executed_mode", "") or "").startswith("mt5"):
+                    tickets = [
+                        t.strip() for t in str(sniper_trade.live_order_id or "").split(",")
+                        if t.strip().isdigit()
+                    ]
+                    if tickets:
                         try:
-                            sim_pos.sl_type = "trailing"
-                        except Exception:
-                            pass
-                        logger.info(
-                            "[Trailing SL→Sim] {} {} position id={} stop_loss→{}",
-                            direction.upper(), sym, sim_pos.id, new_trail_now,
-                        )
-            except Exception as sync_exc:  # noqa: BLE001
-                logger.warning("[Trailing SL→Sim] sync failed for {}: {}", sym, sync_exc)
+                            from plugins.MT5TradingPlugin.backend.services.mt5_client import mt5_client
+                            from plugins.MT5TradingPlugin.backend.models import MT5Account
+                            acct_q = await db.execute(
+                                select(MT5Account).where(MT5Account.api_reachable.is_(True))
+                            )
+                            for acct in acct_q.scalars().all():
+                                for ticket in tickets:
+                                    try:
+                                        await mt5_client.modify_order(
+                                            login=acct.login, server=acct.server,
+                                            password=acct.password_encrypted,
+                                            ticket=int(ticket), sl=new_sl,
+                                        )
+                                    except Exception:  # noqa: BLE001
+                                        continue  # ticket belongs to another account
+                            logger.info(
+                                "[Trailing SL→MT5] {} {} SL→{} on ticket(s) {}",
+                                direction.upper(), sniper_trade.symbol, new_sl, ",".join(tickets),
+                            )
+                        except Exception as mt5_exc:  # noqa: BLE001
+                            logger.warning(
+                                "[Trailing SL→MT5] {} push failed: {}",
+                                sniper_trade.symbol, mt5_exc,
+                            )
 
-        # ── Live percentage trail after all TPs are exhausted ────────────────
-        current_trail = getattr(sig, "trailing_sl", None)
-        if crossed >= len(tps) and len(tps) > 0 and current_trail is not None and trail_pct > 0:
-            if is_long:
-                candidate = live * (1.0 - trail_pct)
-                if candidate > current_trail:
-                    setattr(sig, "trailing_sl", candidate)
-                    sig.updated_at = now_utc_naive()
-                    changed = True
-            else:
-                candidate = live * (1.0 + trail_pct)
-                if candidate < current_trail:
-                    setattr(sig, "trailing_sl", candidate)
-                    sig.updated_at = now_utc_naive()
-                    changed = True
+        new_trail_now = getattr(sig, "trailing_sl", None)
+        # Only push when the stop actually moved — once locked at TP3, later TP
+        # crossings re-derive the same value and must not re-hit the exchange.
+        if changed and new_trail_now is not None and new_trail_now != trail_before:
+            await _apply_trailing_sl(new_trail_now)
+
+        # ── Full TP reached → CLOSE as TP_HIT (do NOT keep trailing) ─────────
+        # Once every take-profit is crossed the trade is complete: lock it in as
+        # a win and stop tracking it. (Previously a live percentage trail kept
+        # the signal ACTIVE until price retraced to the trailing SL, which left
+        # fully-completed signals showing as active on /telegram-signals.)
+        if tps and crossed >= len(tps):
+            sig.status = SignalStatus.TP_HIT
+            sig.updated_at = now_utc_naive()
+            moved_tp += 1
+            logger.info(
+                "[Reconcile] {} {} closed as TP_HIT — all {} TPs reached (live={})",
+                direction.upper(), sym, len(tps), live,
+            )
+            if notify_enabled and sig.id in executed_ids:
+                try:
+                    from plugins.TelegramSignalNewsPlugin.backend.services import notifications as _notif
+                    await _notif.notify(_notif.format_close(
+                        symbol=sym, direction=direction, kind="tp", price=live,
+                        channel=getattr(sig, "channel_title", None),
+                    ), db)
+                except Exception:  # noqa: BLE001
+                    pass
+            continue
 
         # ── Resolve effective stop-loss ───────────────────────────────────────
         effective_sl = getattr(sig, "trailing_sl", None) or sig.stop_loss
@@ -451,11 +623,18 @@ async def reconcile_active_signals_from_live_price(
         )
 
         # ── Check if effective SL has been breached ───────────────────────────
+        # The trailing stop sits exactly ON the TP level price just reached, so
+        # it must be breached STRICTLY: price has to trade back THROUGH the
+        # locked level, not merely touch it. With `<=` the trade closed on the
+        # same tick the TP was hit (live == trailing_sl), banking TP1 the
+        # instant it printed and killing every run before it started. The
+        # original hard stop keeps `<=` — touching it is a stop-out.
+        trail_sl = getattr(sig, "trailing_sl", None)
         sl_breached = orig_sl_breached or bool(
             effective_sl is not None
             and (
-                (is_long and live <= effective_sl)
-                or (not is_long and live >= effective_sl)
+                (is_long and (live < effective_sl if trail_sl is not None else live <= effective_sl))
+                or (not is_long and (live > effective_sl if trail_sl is not None else live >= effective_sl))
             )
         )
 
@@ -477,6 +656,16 @@ async def reconcile_active_signals_from_live_price(
                 "[Reconcile] {} {} closed as {} (live={}, eff_sl={}, orig_sl={})",
                 direction.upper(), sym, sig.status.value, live, effective_sl, orig_sl,
             )
+            if notify_enabled and sig.id in executed_ids:
+                try:
+                    from plugins.TelegramSignalNewsPlugin.backend.services import notifications as _notif
+                    _kind = "tp" if sig.status == SignalStatus.TP_HIT else "sl"
+                    await _notif.notify(_notif.format_close(
+                        symbol=sym, direction=direction, kind=_kind, price=live,
+                        channel=getattr(sig, "channel_title", None),
+                    ), db)
+                except Exception:  # noqa: BLE001
+                    pass
 
     if moved_tp or moved_sl or trailing_updated:
         await db.commit()
@@ -489,6 +678,48 @@ async def reconcile_active_signals_from_live_price(
         "updated": moved_tp + moved_sl,
     }
 
+async def expire_stale_forex_signals(db: AsyncSession, *, hours: int = 3) -> int:
+    """Move stale, never-executed FOREX signals out of ACTIVE → EXPIRED.
+
+    A forex signal still ACTIVE more than `hours` after it was posted, with no
+    PLACED sniper trade, is a dead/missed trade. Marking it EXPIRED keeps the
+    Active tab showing only live trades; the UI surfaces these under "Not
+    Traded". Crypto signals are left untouched (this is forex-only).
+    """
+    from plugins.TelegramSignalNewsPlugin.backend.services.forex_price_service import is_forex_pair
+
+    executed = {
+        r[0]
+        for r in (
+            await db.execute(
+                select(TelegramSniperTrade.signal_id).where(
+                    TelegramSniperTrade.status == SniperTradeStatus.PLACED
+                )
+            )
+        ).all()
+    }
+
+    rows = await db.execute(
+        select(TelegramParsedSignal).where(TelegramParsedSignal.status == SignalStatus.ACTIVE)
+    )
+    now = now_utc_naive()
+    expired = 0
+    for sig in rows.scalars().all():
+        is_fx = (getattr(sig, "market_type", "") == "forex") or is_forex_pair(sig.symbol)
+        if not is_fx or sig.id in executed:
+            continue
+        ref = sig.posted_at or sig.created_at
+        if ref is None:
+            continue
+        if (now - ref).total_seconds() / 3600.0 < hours:
+            continue
+        sig.status = SignalStatus.EXPIRED
+        sig.updated_at = now
+        expired += 1
+    if expired:
+        await db.commit()
+        logger.info("[Expire] moved {} stale forex signals (>{}h) to EXPIRED", expired, hours)
+    return expired
 
 async def run_monitor_cycle(db: AsyncSession, *, do_poll: bool = True) -> dict[str, Any]:
     """One monitor tick.
@@ -535,6 +766,14 @@ async def run_monitor_cycle(db: AsyncSession, *, do_poll: bool = True) -> dict[s
     except Exception as exc:  # noqa: BLE001
         logger.warning("Live outcome reconciliation failed: {}", exc)
         live_outcome_stats = {"error": str(exc)}
+
+    # Keep the Active tab clean: expire never-executed forex signals older than 3h.
+    try:
+        expired_forex = await expire_stale_forex_signals(db, hours=3)
+        if expired_forex:
+            live_outcome_stats["forex_expired"] = expired_forex
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Forex signal expiry failed: {}", exc)
 
     # Run the sniper auto-trade engine over fresh signals (no-op if disabled)
     try:
@@ -684,6 +923,46 @@ class TelegramSignalMonitor:
         self._bot_polling_task = None
         logger.info("🤖 Telegram bot polling loop stopped")
 
+    @staticmethod
+    async def _process_update(update: dict, token: str, allowed: list, session_factory) -> None:
+        """Handle one Telegram update and send whatever reply it produces."""
+        from plugins.TelegramSignalNewsPlugin.backend.services.bot_service import (
+            answer_callback_query,
+            send_message,
+        )
+        from plugins.TelegramSignalNewsPlugin.backend.services.command_service import (
+            parse_and_execute,
+        )
+
+        # Resolve chat_id — works for both message and callback_query
+        if "callback_query" in update:
+            cq = update["callback_query"]
+            chat_id = (cq.get("message") or {}).get("chat", {}).get("id")
+            cq_id = cq.get("id")
+        else:
+            chat_id = (
+                (update.get("message") or update.get("edited_message") or {})
+                .get("chat", {}).get("id")
+            )
+            cq_id = None
+
+        async with session_factory() as db2:
+            result = await parse_and_execute(update, token, allowed, db2)
+
+        # Normalise to 3-tuple (text, parse_mode, reply_markup)
+        if len(result) == 2:
+            reply_text, parse_mode, reply_markup = result[0], result[1], None
+        else:
+            reply_text, parse_mode, reply_markup = result
+
+        # Acknowledge button press first so Telegram removes the spinner
+        if cq_id:
+            ack_text = "⏳ Processing…" if reply_text else "✅"
+            await answer_callback_query(token, cq_id, text=ack_text)
+
+        if reply_text and chat_id:
+            await send_message(token, chat_id, reply_text, parse_mode, reply_markup)
+
     def _maybe_start_bot_polling(self, loop: asyncio.AbstractEventLoop, session_factory) -> None:
         """Start bot polling if configured — best-effort, never raises."""
         try:
@@ -759,39 +1038,11 @@ class TelegramSignalMonitor:
                     if update_id is not None:
                         offset = update_id + 1
 
-                    try:
-                        # Resolve chat_id — works for both message and callback_query
-                        if "callback_query" in update:
-                            cq = update["callback_query"]
-                            chat_id = (cq.get("message") or {}).get("chat", {}).get("id")
-                            cq_id = cq.get("id")
-                        else:
-                            chat_id = (
-                                (update.get("message") or update.get("edited_message") or {})
-                                .get("chat", {}).get("id")
-                            )
-                            cq_id = None
-
-                        async with session_factory() as db2:
-                            result = await parse_and_execute(
-                                update, token, allowed, db2
-                            )
-
-                        # Normalise to 3-tuple (text, parse_mode, reply_markup)
-                        if len(result) == 2:
-                            reply_text, parse_mode, reply_markup = result[0], result[1], None
-                        else:
-                            reply_text, parse_mode, reply_markup = result
-
-                        # Acknowledge button press first so Telegram removes the spinner
-                        if cq_id:
-                            ack_text = "⏳ Processing…" if reply_text else "✅"
-                            await answer_callback_query(token, cq_id, text=ack_text)
-
-                        if reply_text and chat_id:
-                            await send_message(token, chat_id, reply_text, parse_mode, reply_markup)
-                    except Exception as update_exc:  # noqa: BLE001
-                        logger.warning("[BotPolling] Update processing error: {}", update_exc)
+                    # Each update is handled on its own task. Awaiting them here
+                    # meant one slow command — an image read is ~60s, a room
+                    # session minutes — stalled every other chat behind it, and
+                    # stopped this loop collecting new updates at all.
+                    _spawn_update(update, token, list(allowed), session_factory)
 
                 # Persist last update_id
                 if updates and offset is not None:

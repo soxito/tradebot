@@ -415,6 +415,43 @@ def _synthesize(base: List[Dict[str, Any]], quote: List[Dict[str, Any]]) -> List
     return out
 
 
+#: Yahoo tickers whose bars get re-based onto the broker's quote — FX spot
+#: (``EURUSD=X``) and the metal futures that stand in for spot metal.
+#:
+#: Indices, energy and softs are excluded: Yahoo already charts them off the
+#: same front-month future the broker's CFD is quoted from, so there is no basis
+#: to remove. Crypto is excluded deliberately — Swissquote lists BTC/USD as a
+#: CFD and would happily answer for it, but crypto is priced on the exchange the
+#: user trades (Bitget), and re-basing it here would silently overrule that.
+_SQ_METAL_TICKERS = frozenset(_METAL_BASES.values())
+
+
+async def _to_swissquote_scale(
+    symbol: str, ticker: Optional[str], bars: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Put FX / metals bars on Swissquote's price scale — the broker the user
+    actually trades — leaving every other instrument as Yahoo served it.
+
+    This is the choke point every Yahoo-sourced chart in the app passes through,
+    so correcting here is what makes "FX and metals quote Swissquote" true of the
+    Kronos forecast, the MT5 fallback charts and the market-candles API alike,
+    rather than of whichever one was patched. Any failure yields *bars*
+    untouched: a chart on the wrong scale still beats no chart.
+    """
+    if not bars:
+        return bars
+    # A synthesised cross (ticker is None) is two USD legs divided — XAUEUR and
+    # friends — and Swissquote quotes those directly, so it is anchored too.
+    if ticker is not None and not (ticker.endswith("=X") or ticker in _SQ_METAL_TICKERS):
+        return bars
+    try:
+        from app.exchanges.forex_provider import anchor_bars_to_swissquote
+        return await anchor_bars_to_swissquote(symbol, bars)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[Yahoo] Swissquote anchor failed for {symbol}: {e}")
+        return bars
+
+
 async def fetch_candles(symbol: str, timeframe: str = "H1", limit: int = 400) -> List[Dict[str, Any]]:
     """
     OHLCV for *symbol* on *timeframe*, newest last.  Returns [] when the symbol
@@ -472,6 +509,7 @@ async def fetch_candles(symbol: str, timeframe: str = "H1", limit: int = 400) ->
         return []
 
     bars = bars[-limit:] if limit and limit > 0 else bars
+    bars = await _to_swissquote_scale(symbol, ticker, bars)
     _cache[cache_key] = {"data": bars, "ts": time.monotonic()}
     return bars
 

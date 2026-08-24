@@ -863,6 +863,10 @@ export default function KronosForecastPage() {
                 strategyAction={sig?.direction}
                 strategyScore={sig ? sig.confidence : undefined}
                 initialCandles={data?.candles?.length ? data.candles : undefined}
+                // Backend only returns `candles` for FX / metals, and those bars
+                // are anchored to Swissquote — naming the crypto exchange there
+                // would credit the wrong feed.
+                sourceLabel={data?.candles?.length ? 'Swissquote' : undefined}
               />
             </div>
 

@@ -263,6 +263,124 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "candles",
+            "description": (
+                "Fetch CLOSED candles for any instrument and study the move "
+                "across them — the current bar measured against the ones "
+                "before it. YOU choose the depth: pass `count` for as many "
+                "closed candles as the read needs (28 is the floor, use more "
+                "for a structural view). Returns each candle plus a movement "
+                "summary (window high/low, net change, up/down counts, the run "
+                "in progress, swing structure, average body and volume). Use "
+                "this whenever a judgement depends on how price actually moved "
+                "rather than on a single snapshot."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "e.g. 'XAUUSD', 'BTCUSDT'."},
+                    "timeframe": {
+                        "type": "string",
+                        "description": "1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w (default 1h).",
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": (
+                            "How many closed candles to analyse. Minimum 28; "
+                            "ask for several hundred for a structural read."
+                        ),
+                    },
+                },
+                "required": ["symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "economic_release",
+            "description": (
+                "Get today's ALREADY-RELEASED economic data (CPI, PPI, NFP, "
+                "retail sales, claims…) with actual vs forecast vs previous, "
+                "and what each print means for the currency and for gold. Use "
+                "whenever the user asks about CPI, PPI, NFP, inflation data, "
+                "'the news', or why a market moved on a release. Returns only "
+                "numbers that have actually printed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Instrument whose currencies matter, e.g. 'XAUUSD'.",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scenario_check",
+            "description": (
+                "Check how the trade plans we already published for an "
+                "instrument are tracking: whether price reached our entry, how "
+                "much of the mapped move has completed, and whether the "
+                "invalidation was hit. Use when the user asks about a previous "
+                "call, 'how is our plan doing', or a follow-up on a level we "
+                "gave earlier."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "e.g. 'XAUUSD'."},
+                },
+                "required": ["symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "dollar_read",
+            "description": (
+                "Read the US Dollar Index (DXY) chart: its triangle pattern "
+                "state, where price sits against the Ichimoku cloud, and what "
+                "that implies for crypto, which moves inversely to it. Use "
+                "when the user asks about the dollar, DXY, or the macro "
+                "backdrop for the market. Takes no arguments."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "zone_levels",
+            "description": (
+                "Get the Smart Money Concepts zones price is heading into — "
+                "order blocks and fair-value gaps above and below the current "
+                "price, nearest first, with the reaction to watch for at each. "
+                "Use this when the user asks which levels to watch, where price "
+                "might react, or about supply/demand zones. This NEVER places "
+                "an order."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "e.g. 'XAUUSD'."},
+                    "timeframe": {
+                        "type": "string",
+                        "description": "1m–1w candle size (default 1h).",
+                    },
+                },
+                "required": ["symbol"],
+            },
+        },
+    },
 ]
 
 TOOL_NAMES = {t["function"]["name"] for t in TOOL_SCHEMAS}
@@ -329,6 +447,97 @@ def parse_text_directives(content: str) -> List[Dict[str, Any]]:
 def strip_directives(content: str) -> str:
     """Reply text with the directives removed, for display."""
     return _DIRECTIVE_RE.sub("", content or "").strip()
+
+
+# ── ChatML inline tool-call parsing (Nemotron / Qwen / Hermes) ────────────────
+# Some strong open models emit a tool call as *text* in the content even when
+# native ``tools`` were offered — they were trained on the ChatML ``<tool_call>``
+# convention and fall back to it. Left unparsed, that raw markup leaks straight
+# to the user as the reply (e.g. the bare
+# ``<tool_call>analyze_symbol<arg_key>symbol</arg_key>…</tool_call>`` a user saw
+# instead of an analysis). We recognise both bodies the models use:
+#
+#   <tool_call>{"name": "analyze_symbol", "arguments": {"symbol": "GBPUSD"}}</tool_call>
+#   <tool_call>analyze_symbol<arg_key>symbol</arg_key><arg_value>GBPUSD</arg_value></tool_call>
+#
+# and turn them into the same {name, arguments} dicts the directive path uses.
+# A missing closing tag (truncated generation) still parses.
+
+_TOOLCALL_BLOCK_RE = re.compile(
+    r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", re.DOTALL | re.IGNORECASE
+)
+_ARG_PAIR_RE = re.compile(
+    r"<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>\s*(.*?)\s*</arg_value>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _coerce_arg(value: str) -> Any:
+    """JSON-coerce a ``<arg_value>`` so ints and arrays keep their real type."""
+    v = value.strip()
+    try:
+        return json.loads(v)
+    except (json.JSONDecodeError, ValueError):
+        return v
+
+
+def parse_inline_tool_calls(content: str) -> List[Dict[str, Any]]:
+    """Pull ChatML ``<tool_call>…</tool_call>`` calls out of a model reply.
+
+    Handles both the JSON body and the ``<arg_key>/<arg_value>`` key–value body.
+    Unknown tools and unparseable blocks are skipped, never raised.
+    """
+    if not content or "<tool_call>" not in content.lower():
+        return []
+    out: List[Dict[str, Any]] = []
+    for block in _TOOLCALL_BLOCK_RE.findall(content):
+        body = block.strip()
+        if not body:
+            continue
+        name = ""
+        arguments: Dict[str, Any] = {}
+        # Shape 1: JSON object body — {"name": …, "arguments": {…}}.
+        brace = body.find("{")
+        if brace != -1:
+            try:
+                obj = json.loads(body[brace : body.rfind("}") + 1])
+            except json.JSONDecodeError:
+                obj = None
+            if isinstance(obj, dict):
+                name = str(obj.get("name") or obj.get("tool") or "").strip()
+                raw_args = obj.get("arguments")
+                if raw_args is None:
+                    raw_args = obj.get("parameters")
+                if isinstance(raw_args, str):
+                    try:
+                        raw_args = json.loads(raw_args)
+                    except json.JSONDecodeError:
+                        raw_args = {}
+                if isinstance(raw_args, dict):
+                    arguments = raw_args
+        # Shape 2: <arg_key>/<arg_value> body — the name is the text that
+        # precedes the first pair.
+        if not name:
+            name = re.split(r"<arg_key>", body, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+            for key, val in _ARG_PAIR_RE.findall(body):
+                arguments[key.strip()] = _coerce_arg(val)
+        if name and name in TOOL_NAMES:
+            out.append({"name": name, "arguments": arguments})
+    return out
+
+
+def strip_inline_tool_calls(content: str) -> str:
+    """Reply text with any ``<tool_call>…</tool_call>`` markup removed, for display.
+
+    A safety net: if a malformed or unknown inline call survives the tool loop,
+    the user should still see clean prose, never the raw ChatML markup.
+    """
+    if not content or "<tool_call>" not in content.lower():
+        return content
+    cleaned = re.sub(
+        r"<tool_call>.*?(?:</tool_call>|$)", "", content, flags=re.DOTALL | re.IGNORECASE
+    )
+    return cleaned.strip()
 
 
 # ── URL safety ───────────────────────────────────────────────────────────────
@@ -600,8 +809,171 @@ async def _run_analyze_symbol(args: Dict[str, Any]) -> str:
             f"ERROR: not enough candle history for {symbol} on {timeframe}. "
             "Try a different timeframe, or use the /analyze command for crypto."
         )
-    result = await _analysis_from_series(symbol, ohlcv, ticker)
+    result = await _analysis_from_series(symbol, ohlcv, ticker, timeframe=timeframe)
     return _truncate(result.detail or result.speech or "", _MAX_ANALYSIS_CHARS)
+
+
+#: Rows printed verbatim. The *analysis* covers every candle asked for — this
+#: only bounds how many are spelled out, so a 500-candle request still returns
+#: a 500-candle read instead of a wall of numbers that crowds out the answer.
+_MAX_CANDLE_ROWS = 60
+
+
+async def _run_candles(args: Dict[str, Any]) -> str:
+    """Closed candles and the move across them, at whatever depth was asked."""
+    from app.signals.candle_window import movement_summary, split_closed
+    from app.services import market_data
+
+    symbol = market_data.normalize_symbol(str(args.get("symbol") or ""))
+    if not symbol:
+        return "ERROR: candles needs a symbol."
+    timeframe = str(args.get("timeframe") or "1h").lower()
+
+    try:
+        count = int(args.get("count") or 60)
+    except (TypeError, ValueError):
+        count = 60
+    # The floor is the point of the tool; there is no ceiling beyond what the
+    # feed will serve, so a structural request is never quietly downgraded.
+    count = max(28, count)
+
+    ohlcv, _ticker = await market_data.fetch_ohlcv_universal(
+        symbol, timeframe=timeframe, limit=count + 5
+    )
+    if not ohlcv:
+        return (
+            f"ERROR: no candle history returned for {symbol} on {timeframe}. "
+            "Try another timeframe before concluding anything about the move."
+        )
+
+    closed, forming = split_closed(ohlcv, timeframe)
+    studied = closed[-count:]
+    if not studied:
+        return f"ERROR: {symbol} returned no closed candles on {timeframe}."
+
+    move = movement_summary(studied, forming)
+    lines = [
+        f"{symbol} {timeframe} — {move['candles']} closed candles analysed"
+        + ("" if move["enough_history"] else "  (shallow window — qualify the read)"),
+        f"window {move['window_low']:g} to {move['window_high']:g}"
+        f"  ·  net {move['net_change']:+g} ({move['net_change_pct']:+.2f}%)",
+        f"{move['up_candles']} up / {move['down_candles']} down"
+        f"  ·  {move['streak']} in a row {move['streak_direction']}"
+        f"  ·  {move['structure']}",
+        f"avg body {move['avg_body']:g}  ·  avg range {move['avg_range']:g}",
+    ]
+    if cur := move.get("current_vs_window"):
+        c = move["current_candle"]
+        lines += [
+            "",
+            f"CURRENT (still forming): O{c['open']:g} H{c['high']:g} "
+            f"L{c['low']:g} C{c['close']:g}",
+            f"  {cur['position_in_range_pct']}% up the window range"
+            + (f"  ·  body {cur['body_vs_avg']}x avg" if cur["body_vs_avg"] else "")
+            + (f"  ·  volume {cur['volume_vs_avg']}x avg" if cur["volume_vs_avg"] else "")
+            + ("  ·  BREAKS window high" if cur["breaks_window_high"] else "")
+            + ("  ·  BREAKS window low" if cur["breaks_window_low"] else ""),
+        ]
+
+    shown = studied[-_MAX_CANDLE_ROWS:]
+    if len(studied) > len(shown):
+        lines.append(f"\nlast {len(shown)} of {len(studied)} closed candles:")
+    else:
+        lines.append("\nclosed candles:")
+    for row in shown:
+        lines.append(
+            f"  O{float(row[1]):g} H{float(row[2]):g} L{float(row[3]):g} "
+            f"C{float(row[4]):g}"
+        )
+    return _truncate("\n".join(lines), _MAX_ANALYSIS_CHARS)
+
+
+async def _run_economic_release(args: Dict[str, Any]) -> str:
+    """Today's printed economic data, read for the currency and for gold."""
+    from app.signals.release_narrative import latest_release_read
+
+    symbol = str(args.get("symbol") or "XAUUSD").upper().replace("/", "")
+    text = await latest_release_read(symbol)
+    return text or (
+        "No economic releases with published figures in the last 24 hours for "
+        f"{symbol}. Say that plainly — do not describe an event that has not printed."
+    )
+
+
+async def _run_scenario_check(args: Dict[str, Any]) -> str:
+    """How the plans we already published are tracking."""
+    from app.core.database import AsyncSessionLocal
+    from app.services import market_data
+    from app.services.scenario_tracker import scenario_narrative, track_symbol
+
+    symbol = market_data.normalize_symbol(str(args.get("symbol") or ""))
+    if not symbol:
+        return "ERROR: scenario_check needs a symbol."
+
+    async with AsyncSessionLocal() as db:
+        states = await track_symbol(db, symbol)
+    if not states:
+        return (
+            f"No plan has been published for {symbol} in the last few days, so "
+            "there is nothing to follow up on. Do not imply an earlier call was made."
+        )
+    return _truncate(scenario_narrative(states), _MAX_ANALYSIS_CHARS)
+
+
+async def _run_dollar_read(_args: Dict[str, Any]) -> str:
+    """The DXY chart read, for the macro backdrop behind a crypto call."""
+    from app.services.macro_context import dxy_narrative
+
+    text = await dxy_narrative()
+    return text or "ERROR: the dollar index could not be read right now."
+
+
+async def _run_zone_levels(args: Dict[str, Any]) -> str:
+    """SMC zones ahead of price, described nearest-first."""
+    from app.services import market_data
+    from app.signals.zone_narrative import zone_narrative
+
+    symbol = market_data.normalize_symbol(str(args.get("symbol") or ""))
+    if not symbol:
+        return "ERROR: zone_levels needs a symbol."
+    timeframe = str(args.get("timeframe") or "1h").lower()
+
+    ohlcv, _ticker = await market_data.fetch_ohlcv_universal(
+        symbol, timeframe=timeframe, limit=300
+    )
+    if len(ohlcv) < 40:
+        return f"ERROR: not enough candle history for {symbol} on {timeframe}."
+
+    from plugins.MT5TradingPlugin.backend.services.smc_strategy import (
+        Candle, SMCStrategyEngine, contract_size_for_symbol,
+    )
+
+    # The engine reads timestamps as seconds (it calls utcfromtimestamp on
+    # them); OHLCV rows arrive in milliseconds.
+    candles = [
+        Candle(time=int(c[0]) // 1000, open=float(c[1]), high=float(c[2]),
+               low=float(c[3]), close=float(c[4]),
+               volume=float(c[5]) if len(c) > 5 else 0.0)
+        for c in ohlcv
+    ]
+    engine = SMCStrategyEngine(
+        symbol=symbol, contract_size=contract_size_for_symbol(symbol)
+    )
+    analysis = engine.analyze(candles)
+    if error := analysis.get("error"):
+        return f"ERROR: {error}"
+
+    last_price = float(analysis.get("last_price") or candles[-1].close)
+    text = zone_narrative(
+        analysis.get("zones") or [], last_price, timeframe=timeframe
+    )
+    if not text:
+        return (
+            f"{symbol} {timeframe}: price is at {last_price:.6g} and no order "
+            "blocks or fair-value gaps are sitting ahead of it right now."
+        )
+    return _truncate(f"{symbol} {timeframe} — price {last_price:.6g}\n\n{text}",
+                     _MAX_ANALYSIS_CHARS)
 
 
 async def _run_forecast_symbol(args: Dict[str, Any]) -> str:
@@ -668,6 +1040,11 @@ _HANDLERS = {
     "github_activity": _run_github_activity,
     "analyze_symbol": _run_analyze_symbol,
     "forecast_symbol": _run_forecast_symbol,
+    "zone_levels": _run_zone_levels,
+    "dollar_read": _run_dollar_read,
+    "candles": _run_candles,
+    "economic_release": _run_economic_release,
+    "scenario_check": _run_scenario_check,
 }
 
 

@@ -1,5 +1,8 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { createChart, IChartApi, ISeriesApi, SeriesMarker, Time } from 'lightweight-charts';
+import { attachZonesOverlay, type ZonesOverlay } from '@/utils/zonesOverlay';
+import { useZonesData } from '@/hooks/useZonesData';
+import type { CycleWindowBox, ZonesData } from '@/utils/zonesOverlay';
 import { apiClient } from '@/services/api';
 import { calcMinMove, calcChartPrecision } from '@/utils/price';
 import { formatTimeZA } from '@/utils/datetime';
@@ -76,6 +79,31 @@ interface TradingViewChartProps {
   /** Pre-fetched candles (lightweight-charts format) to use instead of the exchange fetch.
    *  Used for forex/metals where the crypto exchange has no OHLCV data. */
   initialCandles?: { time: number; open: number; high: number; low: number; close: number; volume?: number }[];
+  /** Venue to name in the header. Defaults to `exchange`, which is only the real
+   *  source when the chart fetched its own candles — pre-fetched FX/metals bars
+   *  come from Swissquote, not from the crypto exchange in the dropdown. */
+  sourceLabel?: string;
+  /** Draw the desk's zone read (supply/demand, fib bands, channels) on the pane. */
+  showZones?: boolean;
+  /** Bitcoin 1064-day cycle boxes (green bull / red bear) behind the candles. */
+  cycleWindows?: CycleWindowBox[];
+}
+
+/**
+ * Compose what the overlay primitive draws: the zone read when enabled, the
+ * cycle boxes whenever present. Either alone is enough to render — cycle
+ * boxes do not depend on the zone toggle.
+ */
+function composeOverlayData(
+  zones: ZonesData | null,
+  cycle: CycleWindowBox[] | undefined,
+  includeZones: boolean,
+): ZonesData | null {
+  if (cycle?.length) {
+    const base: ZonesData = includeZones && zones ? zones : { supply_zones: [], demand_zones: [] };
+    return { ...base, cycle_windows: cycle };
+  }
+  return includeZones ? zones : null;
 }
 
 export default function TradingViewChart({ 
@@ -93,10 +121,24 @@ export default function TradingViewChart({
   onToggleMaximize,
   onSlTpChange,
   initialCandles,
+  sourceLabel,
+  showZones = false,
+  cycleWindows,
 }: TradingViewChartProps) {
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candlestickSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
+  const zonesOverlayRef = useRef<ZonesOverlay | null>(null);
+  // The hook always runs (rules of hooks) but only fetches when enabled; the
+  // ref lets the primitive hydrate from the latest data at attach time.
+  const zonesData = useZonesData(symbol, timeframe, showZones);
+  const zonesDataRef = useRef(zonesData);
+  zonesDataRef.current = zonesData;
+  const [zonesVisible, setZonesVisible] = useState(true);
+  // Cycle boxes live in a ref so the compose helper always reads the latest
+  // without re-attaching the primitive.
+  const cycleWindowsRef = useRef<CycleWindowBox[] | undefined>(cycleWindows);
+  cycleWindowsRef.current = cycleWindows;
   const overlaySeriesRef = useRef<ISeriesApi<any>[]>([]);
   const priceLinesRef = useRef<any[]>([]);
   const orderLinesRef = useRef<any[]>([]);
@@ -270,6 +312,14 @@ export default function TradingViewChart({
     candlestickSeriesRef.current = candlestickSeries;
     didFitRef.current = false;
 
+    // Zone overlays (supply/demand, fib bands, channels) ride the price pane
+    // as a series primitive so they pan/zoom with the candles. Attached
+    // unconditionally — visibility is controlled by what setData receives.
+    zonesOverlayRef.current = attachZonesOverlay(candlestickSeries, chart);
+    zonesOverlayRef.current.setData(
+      composeOverlayData(zonesDataRef.current, cycleWindowsRef.current, showZones && zonesVisible),
+    );
+
     // Initial data fetch
     fetchChartData();
 
@@ -308,9 +358,21 @@ export default function TradingViewChart({
       window.removeEventListener('resize', handleResize);
       resizeObserver.disconnect();
       clearInterval(refreshInterval);
+      zonesOverlayRef.current = null;
       chart.remove();
     };
   }, [symbol, exchange, timeframe, maximized, initialCandles]);
+
+  // Push fresh zone data into the primitive; also re-run when the user
+  // toggles visibility or new cycle boxes arrive so a re-attach picks up
+  // whatever is current.
+  useEffect(() => {
+    const overlay = zonesOverlayRef.current;
+    if (!overlay) return;
+    overlay.setData(composeOverlayData(zonesData, cycleWindows, zonesVisible));
+    // The chart repaints primitives on view changes; nudge it after data swap.
+    chartRef.current?.timeScale().applyOptions({});
+  }, [zonesData, zonesVisible, cycleWindows]);
 
   // Draw indicator overlays on the chart.
   // Custom mode does not support true multi-pane rendering, so non-main panes
@@ -668,13 +730,27 @@ export default function TradingViewChart({
         <div>
           <h3 className="text-lg font-semibold">{symbol}</h3>
           <div className="text-xs text-gray-500">
-            {exchange.toUpperCase()} • {timeframe}
+            {(sourceLabel ?? exchange).toUpperCase()} • {timeframe}
             {strategyName && (
               <span className="ml-2 text-cyan-400">• {strategyName}</span>
             )}
           </div>
         </div>
         <div className="text-right flex items-center gap-3">
+          {showZones && (
+            <button
+              type="button"
+              onClick={() => setZonesVisible((v) => !v)}
+              className={`text-xs px-2 py-1 rounded border transition-colors ${
+                zonesVisible
+                  ? 'border-cyan-500/60 bg-cyan-500/10 text-cyan-300'
+                  : 'border-gray-600 text-gray-400 hover:text-gray-200'
+              }`}
+              title="Toggle supply/demand zones, fib bands and channels"
+            >
+              Zones
+            </button>
+          )}
           {strategyScore !== undefined && (
             <div className="flex items-center gap-2">
               <span className={`text-sm font-bold px-2 py-0.5 rounded ${

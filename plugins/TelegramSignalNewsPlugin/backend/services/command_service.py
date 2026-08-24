@@ -78,13 +78,22 @@ async def parse_and_execute(
 
     chat_id = str(message.get("chat", {}).get("id", ""))
     text = (message.get("text") or "").strip()
-    if not text:
+    image = _extract_image(message)
+    if not text and not image:
         return None, "HTML", None
 
     # ── Security gate ─────────────────────────────────────────────────────────
+    # Ahead of every branch below, images included: an unauthorized chat must
+    # not be able to spend a vision call any more than it can place a trade.
     if allowed_chat_ids and chat_id not in allowed_chat_ids:
         logger.warning("[BotCommand] Rejected update from unauthorized chat_id={}", chat_id)
         return None, "HTML", None
+
+    # ── Photo / image document ────────────────────────────────────────────────
+    if image:
+        file_id, mime = image
+        caption = (message.get("caption") or "").strip()
+        return await _handle_photo(file_id, mime, caption, token, chat_id, db)
 
     # ── Command dispatch ──────────────────────────────────────────────────────
     if text.startswith("/"):
@@ -92,6 +101,21 @@ async def parse_and_execute(
         cmd_raw, _, args = text.partition(" ")
         # Strip any @BotName suffix from the command
         cmd = cmd_raw.split("@")[0].lstrip("/").lower()
+        # /room is handled here rather than in _dispatch because it needs the
+        # token and chat_id to deliver its own result later — the room runs for
+        # minutes, long after this reply has been sent.
+        if cmd == "room":
+            sub = args.strip().split(maxsplit=1)
+            head = (sub[0] or "").lower() if sub else ""
+            if head in {"agents", "seats"}:
+                return await _room_seats_reply()
+            if head == "status":
+                return await _room_status_reply(chat_id)
+            if head == "focus":
+                return await _room_focus_reply(
+                    sub[1].strip() if len(sub) > 1 else "", chat_id
+                )
+            return _start_room(args.strip(), token, chat_id)
         return await _dispatch(cmd, args.strip(), db)
 
     # ── "Yes" to a command the last reply offered ─────────────────────────────
@@ -222,6 +246,16 @@ async def _handle_start(_args: str, _db: AsyncSession) -> tuple[str, str]:
         "/sniper — Sniper auto-trade status",
         "/sniper XAUUSD 1h — MT5 SMC sniper analysis (1m|5m|15m|30m|1h|4h|1d)",
         "/monitor start|stop — Signal monitor control",
+        "",
+        "🏛 <b>Trading Room</b> — the full agent desk, results sent when done",
+        "/room BTCUSDT 4h — agents review the pair, then a plan chart with",
+        "<i>order blocks, entry, SL and TP plus the projected move</i>",
+        "/room why is gold selling off? — put a question to the agents",
+        "/room agents — who's on the board and what each seat last decided",
+        "/room status — is a meeting running, which pairs are pinned",
+        "/room focus BTCUSDT,XAUUSD — pin pairs (or <code>off</code> to unpin)",
+        "<i>Send a chart image with caption /room and they'll read it, mark it up</i>",
+        "<i>and review whatever pair it shows. A plain image gets a quick read.</i>",
         "",
         "🔮 <b>Kronos Forecast &amp; Order Execution</b>",
         "/forecast BTCUSDT [exchange] [1h] — Kronos ML forecast + sniper entries",
@@ -784,6 +818,59 @@ async def _news_context(text: str, symbols: list[str]) -> str | None:
     return "## Live News & Web Results\n" + "\n\n".join(blocks)
 
 
+async def _fib_context(symbols: list[str]) -> str | None:
+    """Auto fib retracement golden-zone confluence for the instruments named.
+
+    Mirrors _news_context's additive pattern: computes the same ZigZag-based
+    auto fib retracement used on the web charts (app.signals.technical) and
+    the /sniper SMC engine, formatted as a small markdown block, or None on
+    any failure — /analyze and general chat must degrade to their pre-existing
+    behavior, not error, when fib data is unavailable.
+    """
+    if not symbols:
+        return None
+    try:
+        from app.signals.technical import auto_fib_retracement, ohlcv_to_dataframe
+        from app.services import market_data
+    except Exception:  # noqa: BLE001
+        return None
+
+    blocks: list[str] = []
+    for sym in symbols[:2]:
+        try:
+            ohlcv, _ = await market_data.fetch_ohlcv_universal(sym, timeframe="1h", limit=200)
+            if not ohlcv or len(ohlcv) < 20:
+                try:
+                    from app.exchanges.manager import exchange_manager, SupportedExchange
+                    connector = exchange_manager.get_exchange(SupportedExchange.BITGET)
+                    if connector:
+                        ohlcv = await connector.get_ohlcv(symbol=sym, timeframe="1h", limit=200)
+                except Exception:  # noqa: BLE001
+                    ohlcv = []
+            if not ohlcv or len(ohlcv) < 20:
+                continue
+            df = ohlcv_to_dataframe(ohlcv)
+            fib = auto_fib_retracement(df)
+            swing = fib.get("swing")
+            zone = fib.get("golden_zone")
+            if not swing or not zone:
+                continue
+            cp = float(df["close"].iloc[-1])
+            in_zone = zone["low"] <= cp <= zone["high"]
+            blocks.append(
+                f"### Fibonacci confluence — {sym}\n"
+                f"  Auto-detected swing: {swing['start_price']:.4f} → {swing['end_price']:.4f} ({swing['direction']})\n"
+                f"  Golden zone: {zone['low']:.4f}–{zone['high']:.4f} — price is currently "
+                f"{'inside' if in_zone else 'outside'} this zone (last: {cp:.4f})"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[AI] fib context skipped for {}: {}", sym, exc)
+
+    if not blocks:
+        return None
+    return "## Fibonacci Confluence\n" + "\n\n".join(blocks)
+
+
 async def _learned_context(db: AsyncSession, symbols: list[str]) -> str | None:
     """What past calls on these instruments actually did — win rate, realised R.
 
@@ -821,6 +908,7 @@ def _jarvis_system_prompt(
     price_block: str | None = None,
     news_block: str | None = None,
     learned: str | None = None,
+    fib_block: str | None = None,
 ) -> str:
     """System prompt giving the LLM the Jarvis persona and its real capabilities.
 
@@ -912,7 +1000,45 @@ def _jarvis_system_prompt(
         "- Maintain the conversation thread — reference prior messages when relevant.\n"
         "- IMPORTANT: When live portfolio data is included, ALWAYS analyse it directly.\n"
         "  Give clear hold/close/adjust recommendations for each position with reasoning.\n"
-        "  Never tell the user to 'run a command' if data is already shown."
+        "  Never tell the user to 'run a command' if data is already shown.\n\n"
+        "HOW TO DELIVER A MARKET READ (same voice on every instrument — crypto,\n"
+        "FX, metals, indices):\n"
+        "1. 👁‍🗨 Structure — the timeframe and whether price is trending (higher\n"
+        "   lows / lower highs) or consolidating and waiting for a break.\n"
+        "2. ⚖️ Momentum — MACD against the zero line and the RSI value.\n"
+        "3. Volatility — position against the Bollinger Bands, whether volume is\n"
+        "   drying up or expanding versus average, and the Stochastic.\n"
+        "4. 🔔 Key Levels — the level that ignites upside and the one whose loss\n"
+        "   opens a correction; entry, stop and targets when a plan exists.\n"
+        "5. A one-line bias with the tally, e.g. 🟡 Bias: Neutral (Buy 3/6 | Sell 3/6).\n"
+        "Skip any part you have no data for. QUOTE the numbers you were given —\n"
+        "never invent an RSI, a level, a volume ratio or a vote tally.\n\n"
+        "ECONOMIC DATA (CPI, PPI, NFP, claims): call the `economic_release` tool\n"
+        "and report only what it returns — each line as actual vs forecast vs\n"
+        "previous, a one-line read of each, then the overall insight: hawkish or\n"
+        "dovish, the currency direction, and gold's (gold moves inversely to the\n"
+        "dollar). Never state a figure that has not printed. If nothing has been\n"
+        "released, say exactly that.\n\n"
+        "FOLLOW-UP ON AN EARLIER CALL: use the `scenario_check` tool and report\n"
+        "what it returns — whether price reached our entry, how much of the mapped\n"
+        "move is complete, and whether the invalidation was hit. NEVER claim a\n"
+        "previous call worked, or that a level was called at all, unless the tool\n"
+        "returned it; a congratulatory update on a losing or imaginary call is the\n"
+        "most damaging thing you can send, because the user will size the next\n"
+        "trade on it. When a plan is genuinely running, say so and give the "
+        "percentage completed.\n\n"
+        "ZONES: for 'which levels should I watch', call `zone_levels`. For the\n"
+        "dollar or the macro backdrop, call `dollar_read`.\n\n"
+        "CANDLES — STUDY THE MOVE, DON'T GUESS IT: judgements about direction,\n"
+        "trend or where a move can run come from the CLOSED candles behind the\n"
+        "current one. Call the `candles` tool and choose the depth yourself: 28\n"
+        "closed candles is the floor, and you should ask for far more (100, 200,\n"
+        "500) for anything structural. There is no cap. It separates closed\n"
+        "candles from the bar still forming and returns the measured movement\n"
+        "across the window — window high/low, net change, up/down counts, the\n"
+        "run in progress and the swing structure. Never treat the forming bar as\n"
+        "closed, and never say you cannot judge a move for lack of data: fetch\n"
+        "more candles."
     )
     if price_block:
         base += f"\n\n{price_block}"
@@ -920,6 +1046,8 @@ def _jarvis_system_prompt(
         base += f"\n\n{news_block}"
     if learned:
         base += f"\n\n{learned}"
+    if fib_block:
+        base += f"\n\n{fib_block}"
     if live_data:
         base += f"\n\n## Live Portfolio Snapshot (fetched moments ago)\n{live_data}"
     return base
@@ -940,6 +1068,20 @@ def _wants_position_analysis(text: str) -> bool:
     """Return True when the message seems to be about live positions / portfolio."""
     lower = text.lower()
     return any(kw in lower for kw in _POSITION_KEYWORDS)
+
+
+#: Asking for real analysis earns the slow, strong model. Everything else — the
+#: bulk of bot traffic — gets the fast one, because on Telegram there is no
+#: streaming or progress indicator and a long silence reads as a broken bot.
+#:
+#: The rule lives in the router now (``ai_router.wants_deep_thinking``) so the
+#: bot and the web chat cannot drift apart on what counts as a big task. The
+#: local keyword set it replaced matched "why", "plan", "strategy" and "explain"
+#: as bare substrings, which sent nearly every message down the slow path.
+def _wants_deep_reasoning(text: str) -> bool:
+    from plugins.AiMarketAnalyst.backend.services.ai_router import wants_deep_thinking
+
+    return wants_deep_thinking(text)
 
 
 async def _fetch_live_position_context(db: AsyncSession) -> str | None:
@@ -1170,8 +1312,16 @@ def _timeframe_in(text: str, default: str = "1h") -> str:
 async def _method_note(text: str, db: AsyncSession) -> str | None:
     """Two or three sentences on the method, to sit above the live forecast."""
     try:
-        from plugins.AiMarketAnalyst.backend.services.ai_router import chat_with_tools
+        from plugins.AiMarketAnalyst.backend.services.ai_router import (
+            chat_with_tools, resolve_chat_route,
+        )
 
+        # Ninety words above a forecast card is never deep work, whatever the
+        # question sounded like — and a thinking model here would spend the
+        # whole 10s budget reasoning and return nothing.
+        route = await resolve_chat_route(
+            db, task="telegram_chat", text=text, force_deep=False, surface="telegram"
+        )
         system = (
             "You are JARVIS, addressing the user as 'Sir'. Answer the question "
             "about forecasting method in at most 90 words, in plain Unicode "
@@ -1186,10 +1336,13 @@ async def _method_note(text: str, db: AsyncSession) -> str | None:
             max_iterations=1,
             total_budget_s=10.0,
             temperature=0.4,
-            max_tokens=320,
+            max_tokens=480,
             json_mode=False,
+            model_override=route.model,
+            max_retries=route.max_retries,
             agent_name="jarvis-telegram-method",
             source="telegram",
+            task=route.task,
         )
         if resp.get("ok") and resp.get("content"):
             return str(resp["content"]).strip()
@@ -1303,6 +1456,412 @@ async def _forecast_reply(
     return body[:4096], mode, markup
 
 
+# ── Images ────────────────────────────────────────────────────────────────────
+
+def _extract_image(message: dict[str, Any]) -> tuple[str, str] | None:
+    """Return ``(file_id, mime)`` for an image message, else None.
+
+    Handles both ways an image reaches a bot:
+
+    * ``photo`` — Telegram's recompressed sizes, ascending, so the last entry is
+      the highest resolution available.
+    * ``document`` with an image mime — what you get by sending a chart as a
+      *file*, which skips recompression and keeps the candles legible. Worth
+      supporting precisely because that is the better way to send a chart.
+    """
+    photos = message.get("photo")
+    if isinstance(photos, list) and photos:
+        largest = photos[-1]
+        if isinstance(largest, dict) and largest.get("file_id"):
+            return str(largest["file_id"]), "image/jpeg"
+
+    doc = message.get("document")
+    if isinstance(doc, dict):
+        mime = str(doc.get("mime_type") or "")
+        if mime.startswith("image/") and doc.get("file_id"):
+            return str(doc["file_id"]), mime
+
+    return None
+
+
+def _symbol_from_chart_title(raw: str) -> str | None:
+    """Turn whatever is printed on a chart into a symbol we can price.
+
+    Charts are titled for humans — "Gold Spot / U.S. Dollar", "Bitcoin / TetherUS"
+    — and none of that resolves to an instrument. Reduce the title to its words
+    and take the first one the market-data aliases recognise, so the plan is
+    still built for the right market.
+    """
+    from app.services import market_data
+
+    text = (raw or "").strip()
+    if not text:
+        return None
+
+    # "XAU/USD" is one instrument, not two tokens — join the slash spellings
+    # before extraction so the pair survives as a pair.
+    joined = re.sub(r"\b([A-Za-z]{3})\s*/\s*([A-Za-z]{3})\b", r"\1\2", text)
+
+    # extract_symbols is deliberately conservative: a token has to be a known
+    # alias or a real instrument, so "a photo of a cat" yields nothing rather
+    # than sending "PHOTO" off to the analysis route.
+    for token in market_data.extract_symbols(joined, limit=4):
+        symbol, cls = market_data.canonicalize_for_analysis(token)
+        if symbol and cls != market_data.UNKNOWN:
+            return symbol
+    return None
+
+
+async def _live_plan(instrument: str) -> dict | None:
+    """Live trade proposal for the instrument a chart shows, or None.
+
+    The picture supplies the *market*; every number comes from live data for it.
+    Reading levels off a screenshot would inherit whatever the screenshot was —
+    a stale chart, a different broker's scale — and quote them as current.
+    """
+    symbol = _symbol_from_chart_title(instrument) or instrument
+    try:
+        from app.api.jarvis import _analyze_symbol
+
+        result = await _analyze_symbol(symbol, f"analyze {symbol}", None)
+    except Exception as exc:  # noqa: BLE001 — no plan is fine, a crash is not
+        logger.debug("[Vision] live plan failed for {}: {}", instrument, exc)
+        return None
+
+    if not (result and result.ok and isinstance(result.order, dict)):
+        return None
+    order = result.order
+    return order if order.get("proposed_entry") is not None else None
+
+
+def _format_plan(instrument: str, plan: dict, vision) -> str:
+    """Render the proposal as a Telegram card that explains itself.
+
+    The old output was a wall of raw indicator readings with the setup buried at
+    the bottom, and nothing tying the two together — so a plan could read as if
+    it contradicted the chart it came with. This leads with the decision, then
+    says in one line why, then shows the levels.
+    """
+    import html as _html
+
+    def num(key: str):
+        try:
+            return float(plan.get(key))
+        except (TypeError, ValueError):
+            return None
+
+    side = str(plan.get("side") or "").lower()
+    arrow = "🟢 BUY" if side == "long" else "🔴 SELL" if side == "short" else "⚪ WAIT"
+    entry, sl = num("proposed_entry"), num("sl")
+    tp1, tp2 = num("tp1"), num("tp2")
+    current = num("current_price")
+    conf = num("confidence") or 0
+    rsi = num("rsi")
+
+    def px(v):
+        return f"{v:g}" if v is not None else "—"
+
+    lines = [
+        f"{arrow} <b>{_html.escape(instrument)}</b>  ·  confidence {conf:.0%}",
+        f"Live {px(current)} · {_html.escape(str(plan.get('trend') or '')).lower()}"
+        + (f" · RSI {rsi:.0f}" if rsi is not None else ""),
+        "",
+        "<b>The setup</b>",
+    ]
+
+    # One plain sentence explaining what the plan actually asks the trader to do.
+    if entry is not None and current is not None:
+        if side == "long":
+            move = "a pullback to" if entry < current else "a break above"
+        else:
+            move = "a rally to" if entry > current else "a break below"
+        risk = abs(entry - sl) if sl is not None else None
+        lines.append(
+            f"Wait for {move} <b>{px(entry)}</b>, then risk "
+            f"{px(risk) if risk else '—'} to <b>{px(tp1)}</b>."
+        )
+    if reasons := plan.get("bias_reasons"):
+        text = reasons if isinstance(reasons, str) else "; ".join(str(r) for r in reasons)
+        lines.append(f"<i>{_html.escape(text)[:300]}</i>")
+
+    lines += [
+        "",
+        "<b>Levels</b>",
+        f"Entry <code>{px(entry)}</code>",
+        f"Stop  <code>{px(sl)}</code>",
+        f"TP1   <code>{px(tp1)}</code>  (R:R {plan.get('rr1', '—')}x)",
+        f"TP2   <code>{px(tp2)}</code>  (R:R {plan.get('rr2', '—')}x)",
+    ]
+
+    if buy_pct := plan.get("buy_volume_pct"):
+        lines.append(f"\nFlow: buy {buy_pct:.0f}% / sell {plan.get('sell_volume_pct', 0):.0f}%")
+    if plan.get("macro_applied") and (macro := plan.get("macro_reason")):
+        lines.append(f"Macro: {_html.escape(str(macro))[:140]}")
+
+    # What the chart itself showed, so the plan and the picture are read together
+    # rather than as two unrelated opinions.
+    if vision is not None and (bias := str(vision.findings.get("bias") or "").strip()):
+        agree = (bias.startswith("bull") and side == "long") or (
+            bias.startswith("bear") and side == "short"
+        )
+        lines.append(
+            f"Chart read: {_html.escape(bias)} — "
+            + ("agrees with this plan." if agree else "differs from the live read; size down.")
+        )
+
+    lines += [
+        f"\nSource: {_html.escape(str(plan.get('price_source') or 'live'))} · not executed.",
+        f"To place it: <code>{_html.escape(str(plan.get('confirm_command') or ''))}</code>",
+    ]
+    return "\n".join(lines)[:3900]
+
+
+async def _room_seats_reply() -> tuple[str, str, dict | None]:
+    """/room agents — who sits on the board and what each seat last decided."""
+    from app.agents import room as trading_room
+
+    snap = trading_room.snapshot()
+    ceo = snap.get("ceo") or {}
+    lines = [f"🏛 <b>Trading room seats</b>{' — pinned: ' + ', '.join(snap.get('focus_symbols') or []) if snap.get('focus_symbols') else ''}", ""]
+
+    def _seat(role_info: dict) -> str:
+        state = role_info.get("state", "idle")
+        icon = {"analyzing": "🔄", "presenting": "🗣", "resting": "✅", "error": "⚠️"}.get(state, "💤")
+        name = html.escape(str(role_info.get("human_name") or role_info.get("role")))
+        title = html.escape(str(role_info.get("title") or ""))
+        line = f"{icon} <b>{name}</b> — {title} ({state})"
+        last = role_info.get("last_decision") or {}
+        if last:
+            action = html.escape(str(last.get("action", "-")).upper())
+            conf = last.get("confidence")
+            try:
+                conf_txt = f" · {float(conf)*100:.0f}%" if conf is not None else ""
+            except (TypeError, ValueError):
+                conf_txt = ""
+            line += f"\n   └ {action}{conf_txt}: {html.escape(str(last.get('reasoning', ''))[:160])}"
+        return line
+
+    for agent in snap.get("agents", []):
+        lines.append(_seat(agent))
+    if ceo:
+        lines.append("")
+        lines.append(f"🏛 <b>{html.escape(str(ceo.get('human_name', 'CEO')))}</b> chairs.")
+    if not snap.get("agents"):
+        lines.append("No seats have convened yet — run <code>/room PAIR 1h</code> to wake the board.")
+    return "\n".join(lines), "HTML", None
+
+
+async def _room_status_reply(chat_id: str) -> tuple[str, str, dict | None]:
+    """/room status — is a meeting running, what's pinned."""
+    from plugins.TelegramSignalNewsPlugin.backend.services import room_bridge
+    from app.agents import room as trading_room
+
+    busy = room_bridge.is_busy(chat_id)
+    focus = trading_room.get_focus_symbols()
+    lines = [
+        "🏛 <b>Trading room status</b>",
+        f"Meeting in progress here: {'yes — verdict coming' if busy else 'no'}",
+        f"Pinned pairs: {', '.join(focus) if focus else 'none (free roaming)'}",
+    ]
+    running = [s for s in reversed(trading_room.snapshot().get("sessions", [])) if s.get("status") == "running"]
+    if running:
+        s0 = running[0]
+        lines.append(
+            f"Current session: <b>{html.escape(str(s0.get('symbol')))}</b> "
+            f"{html.escape(str(s0.get('timeframe')))} — {len(s0.get('decisions') or [])} seat(s) reported"
+        )
+    return "\n".join(lines), "HTML", None
+
+
+async def _room_focus_reply(args: str, chat_id: str) -> tuple[str, str, dict | None]:
+    """/room focus BTCUSDT,XAUUSD — pin pairs; /room focus off resumes free roam."""
+    from app.agents import room as trading_room
+
+    if not args or args.lower() in {"off", "none", "clear"}:
+        await trading_room.set_focus(None)
+        return "🏛 Room unpinned — back to free roaming.", "HTML", None
+
+    symbols = [s.strip().upper() for s in args.replace(",", " ").split() if s.strip()]
+    if not symbols:
+        return "Give me at least one pair, e.g. <code>/room focus BTCUSDT,XAUUSD</code>.", "HTML", None
+    await trading_room.set_focus(symbols)
+    shown = ", ".join(trading_room.get_focus_symbols())
+    return f"📌 Pinned: <b>{shown}</b> — the board will keep returning to these.", "HTML", None
+
+
+def _start_room(
+    args: str,
+    token: str,
+    chat_id: str,
+    *,
+    image: tuple[bytes, str] | None = None,
+) -> tuple[str, str, dict | None]:
+    """Kick off a trading-room job and acknowledge immediately.
+
+    The room is a seven-agent pipeline; the answer arrives as its own message
+    when it is done. Returning right away is what keeps the bot responsive to
+    everyone else in the meantime.
+    """
+    from plugins.TelegramSignalNewsPlugin.backend.services import room_bridge
+
+    if not chat_id:
+        return "❌ /room needs a chat to reply to.", "HTML", None
+    if room_bridge.is_busy(chat_id):
+        return (
+            "🏛 The room is still sitting on your last request — "
+            "I'll report back as soon as it finishes.",
+            "HTML", None,
+        )
+
+    symbol, timeframe, question = room_bridge.parse_args(args)
+
+    if image is None and symbol:
+        room_bridge.spawn(
+            room_bridge.run_pair(token, chat_id, symbol, timeframe), chat_id, token
+        )
+        return (
+            f"🏛 Convening the trading room on <b>{symbol}</b> {timeframe}. "
+            "I'll send the verdict and the chart when the agents are done.",
+            "HTML", None,
+        )
+
+    if image is None and not question:
+        return (
+            "🏛 <b>/room</b> — put the trading room on something.\n\n"
+            "• <code>/room BTCUSDT 4h</code> — full agent review + plan chart\n"
+            "• <code>/room why is gold selling off?</code> — ask the agents\n"
+            "• send a chart image with caption <code>/room</code> — read it, "
+            "then review that pair",
+            "HTML", None,
+        )
+
+    room_bridge.spawn(
+        room_bridge.run_context(token, chat_id, question, image=image), chat_id, token
+    )
+    return (
+        "🏛 Taking that to the trading room — I'll reply when the agents are done.",
+        "HTML", None,
+    )
+
+
+async def _handle_photo(
+    file_id: str,
+    mime: str,
+    caption: str,
+    token: str,
+    chat_id: str,
+    db: AsyncSession,
+) -> tuple[str | None, str, dict | None]:
+    """Read an image the user sent, then answer about it with live context.
+
+    The vision model's read is fed back through :func:`_ai_fallback` rather than
+    returned directly, so a chart screenshot picks up the same live prices,
+    news, learned history and Kronos forecast a typed question would — the
+    instrument the model read off the chart is what drives that lookup.
+    """
+    from plugins.TelegramSignalNewsPlugin.backend.config import telegram_plugin_config as cfg
+    from plugins.TelegramSignalNewsPlugin.backend.services import bot_service, vision_service
+
+    if not cfg.vision_enabled:
+        return "🖼 Image analysis is turned off.", "HTML", None
+
+    # Downloading, reading and then enriching runs well past the point where
+    # silence reads as a dead bot, and the transports only send what we return.
+    # "/room" on a photo hands the whole thing to the agents instead: read the
+    # chart, work out the pair, then convene the room on it.
+    wants_room = caption.lstrip("/").strip().lower().startswith("room")
+
+    if token and chat_id and not wants_room:
+        await bot_service.send_message(token, chat_id, "🔍 Reading your image…")
+
+    file_path = await bot_service.get_file(token, file_id)
+    if not file_path:
+        return "❌ Couldn't fetch that image from Telegram.", "HTML", None
+
+    data = await bot_service.download_file(
+        token, file_path, max_bytes=cfg.vision_max_image_bytes
+    )
+    if not data:
+        return (
+            "❌ Couldn't download that image — it may be too large. "
+            "Try a smaller screenshot.",
+            "HTML",
+            None,
+        )
+
+    if wants_room:
+        # Strip the command word; whatever follows is the question for the room.
+        room_args = caption.lstrip("/").strip()[len("room"):].strip()
+        return _start_room(room_args, token, chat_id, image=(data, mime))
+
+    # Chart-first, caption overrides: a bare photo gets the chart prompt, a
+    # caption becomes the question instead. A leading slash is stripped so
+    # "/analyze this" reads as a question rather than a failed command.
+    question = caption.lstrip("/").strip() or vision_service.DEFAULT_CHART_PROMPT
+
+    vision = await vision_service.read_chart(data, mime, question, db)
+    if not vision:
+        return (
+            "❌ I couldn't read that image — the vision model didn't respond. "
+            "Try again in a moment.",
+            "HTML",
+            None,
+        )
+    read = vision.narrative
+
+    # A chart is only worth marking up if we know which market it is: the plan
+    # levels come from live data for that instrument, not from the picture.
+    instrument = str(vision.findings.get("instrument") or "").strip()
+    plan = await _live_plan(instrument) if instrument else None
+
+    # Send the marked-up chart straight back, before the slower enrichment runs.
+    # The overlay is drawn on the user's own screenshot, so the levels sit on the
+    # real chart rather than on a regenerated lookalike.
+    if token and chat_id and (vision.findings or plan):
+        from plugins.AiMarketAnalyst.backend.services import chart_annotate
+
+        if overlay := chart_annotate.annotate(data, vision.findings, plan=plan):
+            bias = str(vision.findings.get("bias") or "").strip()
+            overlay_caption = " ".join(
+                p for p in (instrument, f"({bias} bias)" if bias else "") if p
+            )
+            await bot_service.send_photo(token, chat_id, overlay, caption=overlay_caption)
+
+    # A live plan is a better answer than a paragraph — send it formatted, with
+    # the reasoning behind it, instead of the raw analysis dump.
+    if plan:
+        card = _format_plan(instrument, plan, vision)
+        if chat_id:
+            _record_history(chat_id, "user", f"[image] {caption.strip() or 'sent a chart'}")
+            _record_history(chat_id, "assistant", card)
+        return card, "HTML", None
+
+    # Hand the read to the normal chain. The prompt names it as a chart the user
+    # sent so the model treats the description as observed fact, not as its own
+    # speculation, and answers the caption rather than restating the image.
+    asked = caption.lstrip("/").strip()
+    prompt = (
+        "I sent you an image. A vision model read it as follows:\n\n"
+        f"{read}\n\n"
+        + (
+            f"My question about it: {asked}"
+            if asked
+            else "Analyse it as a trading chart: confirm the levels against live "
+                 "price where you can, and give me the bias and any entry worth taking."
+        )
+    )
+
+    reply, mode, markup = await _ai_fallback(prompt, db, chat_id=chat_id)
+    if reply:
+        return reply, mode, markup
+
+    # The enrichment failed but the read is still worth having.
+    if chat_id:
+        _record_history(chat_id, "user", f"[image] {asked or 'sent a chart'}")
+        _record_history(chat_id, "assistant", read)
+    return format_for_telegram(read, limit=4000), "HTML", None
+
+
 # ── AI fallback ───────────────────────────────────────────────────────────────
 
 async def _ai_fallback(
@@ -1361,7 +1920,9 @@ async def _ai_fallback(
 
     # ── Step 2: Full AI chat with live prices, news, memory and fetch tools ───
     try:
-        from plugins.AiMarketAnalyst.backend.services.ai_router import chat_with_tools
+        from plugins.AiMarketAnalyst.backend.services.ai_router import (
+            chat_turn, resolve_chat_route,
+        )
 
         # Auto-fetch live portfolio data when the message is about positions
         live_data: str | None = None
@@ -1376,14 +1937,16 @@ async def _ai_fallback(
         price_blk: str | None = None
         news_blk: str | None = None
         learned: str | None = None
+        fib_blk: str | None = None
         try:
             from app.services import market_data
 
             symbols = market_data.extract_symbols(text)
-            price_blk, news_blk, learned = await asyncio.gather(
+            price_blk, news_blk, learned, fib_blk = await asyncio.gather(
                 market_data.price_block(symbols, db=db, max_lines=25),
                 _news_context(text, symbols),
                 _learned_context(db, symbols),
+                _fib_context(symbols),
                 return_exceptions=False,
             )
         except Exception as exc:  # noqa: BLE001 — context is a bonus, not a gate
@@ -1391,7 +1954,8 @@ async def _ai_fallback(
 
         history = _get_history(chat_id) if chat_id else []
         system = _jarvis_system_prompt(
-            live_data, price_block=price_blk, news_block=news_blk, learned=learned
+            live_data, price_block=price_blk, news_block=news_blk, learned=learned,
+            fib_block=fib_blk,
         )
         if hint:
             system += (
@@ -1406,15 +1970,31 @@ async def _ai_fallback(
             {"role": "user", "content": text},
         ]
 
-        resp = await chat_with_tools(
+        # Match the model to what was asked: a real analysis request is worth
+        # waiting longer for, a one-line question is not. The route is resolved
+        # against the providers this surface can actually reach — pinning the
+        # deep chain blind used to name a model that lives on a profile
+        # dedicated to another task, so every provider in the pool 400'd on it
+        # in turn before anything answered.
+        route = await resolve_chat_route(
+            db, task="telegram_chat", text=text, surface="telegram"
+        )
+        logger.info(
+            "[AI] telegram turn routed {} (model={})",
+            route.label, route.model or "provider default",
+        )
+
+        # Budgets come from the route: Telegram shows no streaming or progress,
+        # so its ceiling is tighter than the web chat's — a silent 25s wait
+        # reads as a broken bot. The Telegram surface can be given a profile of
+        # its own; unset, it falls through to any available provider (or, on a
+        # deep turn, to the profile reserved for reasoning), so nothing has to
+        # be configured for the bot to keep answering.
+        resp = await chat_turn(
             db,
             messages,
-            # Telegram shows no streaming or progress, so the ceiling is tighter
-            # than the web chat's: a silent 25s wait reads as a broken bot.
-            max_iterations=2,
-            total_budget_s=15.0,
-            temperature=0.5,
-            max_tokens=1200,  # more room for position analysis
+            route=route,
+            surface_task="telegram_chat",
             json_mode=False,
             agent_name="jarvis-telegram-chat",
             source="telegram",
@@ -1549,16 +2129,39 @@ async def _handle_forecast(args: str, db: AsyncSession) -> tuple[str, str, dict 
     conf_pct = int((sig.confidence if sig else 0) * 100)
     pct_chg = sig.pct_change if sig else 0.0
     direction = (sig.direction if sig else "flat").upper()
-    target = _fmt_p(sig.target_price) if sig else "—"
+
+    # For forex/metals: replace the stale candle-close anchor with the live
+    # Swissquote BBO mid price so "Now:" always reflects the tradeable market.
+    _model_anchor = forecast_resp.anchor_price
+    _live_now: float = _model_anchor
+    try:
+        from plugins.TelegramSignalNewsPlugin.backend.services.forex_price_service import (
+            get_forex_price as _get_sq_price,
+            is_forex_pair as _is_fx_pair,
+        )
+        if _is_fx_pair(symbol):
+            _sq = await _get_sq_price(symbol)
+            if _sq and _sq > 0:
+                _live_now = float(_sq)
+    except Exception:  # noqa: BLE001 — fall back to candle anchor silently
+        pass
+
+    # Scale all model price levels by (live / model_anchor) so percentages and
+    # R:R ratios stay consistent with where price actually is right now.
+    _scale = (_live_now / _model_anchor) if _model_anchor > 0 else 1.0
+    _display_target = ((sig.target_price * _scale) if sig and sig.target_price else None)
+    target = _fmt_p(_display_target) if _display_target else "—"
 
     lines: list[str] = [
         f"🔮 <b>Kronos Forecast — {symbol} ({timeframe})</b>",
         f"Engine: <code>{forecast_resp.engine}</code>",
         "",
         f"{dir_emoji} <b>{direction}  |  {pct_chg:+.2f}%  |  {conf_pct}% confidence</b>",
-        f"Now: <code>{_fmt_p(forecast_resp.anchor_price)}</code>  →  "
+        f"Now: <code>{_fmt_p(_live_now)}</code>  →  "
         f"Target: <code>{target}</code>",
     ]
+    if abs(_scale - 1.0) > 0.001:  # note when Swissquote price was used
+        lines.append(f"<i>(model anchor: {_fmt_p(_model_anchor)} → Swissquote live: {_fmt_p(_live_now)})</i>")
     if forecast_resp.note:
         lines.append(f"⚠️ <i>{forecast_resp.note}</i>")
 
@@ -1658,9 +2261,9 @@ async def _handle_forecast(args: str, db: AsyncSession) -> tuple[str, str, dict 
         for i, s in enumerate(signals[:4], 1):
             side_emoji = "🟢 LONG" if s.side == "long" else "🔴 SHORT"
             kind_label = "Market" if s.order_kind == "market" else "Limit"
-            entry_str = _fmt_p(s.entry)
-            sl_str = _fmt_p(s.stop_loss)
-            tp_str = _fmt_p(s.take_profit_1)
+            entry_str = _fmt_p(s.entry * _scale)
+            sl_str = _fmt_p(s.stop_loss * _scale)
+            tp_str = _fmt_p(s.take_profit_1 * _scale)
             lines.append(
                 f"[{i}] {side_emoji} {kind_label} @ <code>{entry_str}</code>"
                 f"  SL <code>{sl_str}</code>  TP1 <code>{tp_str}</code>"
@@ -1942,6 +2545,13 @@ async def _handle_analyze(args: str, db: AsyncSession) -> tuple[str, str]:
 
 # ── MT5 commands ──────────────────────────────────────────────────────────────
 
+def _enum_val(v) -> str:
+    """Render an enum/str consistently (MT5AccountType.LIVE -> 'live')."""
+    if v is None:
+        return ""
+    return str(getattr(v, "value", v))
+
+
 async def _handle_mt5(args: str, db: AsyncSession) -> tuple[str, str]:
     """MT5 account, position, and ScalpBot control.
 
@@ -2001,7 +2611,9 @@ async def _mt5_status(db: AsyncSession) -> tuple[str, str]:
     try:
         from sqlalchemy import select as _sel
         from plugins.MT5TradingPlugin.backend.models import MT5Account
-        from plugins.MT5TradingPlugin.backend.services.mt5_client import mt5_client
+        from plugins.MT5TradingPlugin.backend.services.mt5_client import (
+            mt5_client, normalize_order_type,
+        )
 
         rows = (await db.execute(_sel(MT5Account))).scalars().all()
         if not rows:
@@ -2009,19 +2621,76 @@ async def _mt5_status(db: AsyncSession) -> tuple[str, str]:
 
         lines = ["🖥 <b>MT5 Accounts</b>", ""]
         for a in rows:
-            badge = "🟢" if str(getattr(a, "status", "")).lower() == "active" else "⚪"
+            status_val = _enum_val(getattr(a, "status", "")).lower()
+            badge = "🟢" if status_val in ("active", "connected") else "⚪"
+            acct_type = _enum_val(getattr(a, "account_type", "")) or "demo"
+            reach = "" if getattr(a, "api_reachable", False) else " · unreachable"
             lines.append(
-                f"{badge} [{a.id}] <b>{a.label or a.login}</b> — {getattr(a, 'account_type', '')}"
+                f"{badge} [{a.id}] <b>{a.name or a.login}</b> — {acct_type}{reach}"
             )
+            creds = (a.login, a.server, a.password_encrypted)
             try:
-                info = await mt5_client.get_account_info(a)
+                info = await mt5_client.get_account_info(*creds)
                 if info:
-                    eq = info.get("equity") or info.get("balance") or 0
-                    bal = info.get("balance") or 0
-                    lines.append(f"     Equity: {eq:.2f}  Balance: {bal:.2f}")
+                    eq = float(info.get("equity") or info.get("balance") or 0)
+                    bal = float(info.get("balance") or 0)
+                    lines.append(
+                        f"     Equity: {eq:.2f}  Balance: {bal:.2f}  "
+                        f"{info.get('currency', '')}".rstrip()
+                    )
             except Exception:  # noqa: BLE001
-                pass
-        return "\n".join(lines), "HTML"
+                lines.append("     ⚠️ live equity unavailable")
+
+            # ── Active trades (open positions) ──
+            try:
+                positions = await mt5_client.get_positions(*creds)
+            except Exception:  # noqa: BLE001
+                positions = None
+            if positions is None:
+                lines.append("     📈 positions unavailable")
+            elif not positions:
+                lines.append("     📈 No open positions")
+            else:
+                tot = sum(float(p.get("profit", 0) or 0) for p in positions)
+                tot_e = "🟢" if tot >= 0 else "🔴"
+                lines.append(f"     📈 <b>{len(positions)} open</b>  {tot_e} PnL {tot:+.2f}")
+                for p in positions[:5]:
+                    pnl = float(p.get("profit", 0) or 0)
+                    side = (normalize_order_type(p) or str(p.get("type", ""))).upper()
+                    vol = p.get("lots", p.get("volume", "?"))
+                    open_px = p.get("openPrice", p.get("price_open", "?"))
+                    cur_px = p.get("currentPrice", p.get("price_current", "?"))
+                    lines.append(
+                        f"        {'🟢' if pnl >= 0 else '🔴'} {p.get('symbol', '?')} "
+                        f"{side} {vol} @ {open_px} → {cur_px}  {pnl:+.2f}  #{p.get('ticket', '?')}"
+                    )
+                if len(positions) > 5:
+                    lines.append(f"        …+{len(positions) - 5} more")
+
+            # ── Pending orders ──
+            try:
+                pend = await mt5_client.get_pending_orders(*creds)
+            except Exception:  # noqa: BLE001
+                pend = None
+            if pend is None:
+                lines.append("     📋 pending unavailable")
+            elif not pend:
+                lines.append("     📋 No pending orders")
+            else:
+                lines.append(f"     📋 <b>{len(pend)} pending</b>")
+                for o in pend[:5]:
+                    otype = (normalize_order_type(o) or str(o.get("orderType", "?"))).upper()
+                    vol = o.get("lots", o.get("volume", "?"))
+                    px = o.get("openPrice", o.get("price", "?"))
+                    lines.append(
+                        f"        • {o.get('symbol', '?')} {otype} {vol} @ {px}  "
+                        f"SL {o.get('stopLoss', 0)}  TP {o.get('takeProfit', 0)}  "
+                        f"#{o.get('ticket', '?')}"
+                    )
+                if len(pend) > 5:
+                    lines.append(f"        …+{len(pend) - 5} more")
+            lines.append("")
+        return "\n".join(lines).rstrip(), "HTML"
     except Exception as exc:  # noqa: BLE001
         return f"❌ MT5 status failed: {exc}", "HTML"
 
@@ -2039,7 +2708,11 @@ async def _mt5_positions(account_id, db: AsyncSession) -> tuple[str, str]:
         if not account:
             return "❌ No MT5 account found.", "HTML"
 
-        positions = await mt5_client.get_positions(account)
+        from plugins.MT5TradingPlugin.backend.services.mt5_client import normalize_order_type
+
+        positions = await mt5_client.get_positions(
+            account.login, account.server, account.password_encrypted
+        )
         if not positions:
             return f"📭 No open positions on account {account.id}.", "HTML"
 
@@ -2047,10 +2720,14 @@ async def _mt5_positions(account_id, db: AsyncSession) -> tuple[str, str]:
         for p in positions[:10]:
             pnl = float(p.get("profit", 0) or 0)
             pnl_e = "🟢" if pnl >= 0 else "🔴"
+            side = (normalize_order_type(p) or str(p.get("type", ""))).upper()
+            vol = p.get("lots", p.get("volume", "?"))
+            open_px = p.get("openPrice", p.get("price_open", "?"))
+            cur_px = p.get("currentPrice", p.get("price_current", "?"))
             lines.append(
-                f"{pnl_e} <b>{p.get('symbol', '?')}</b> "
-                f"{p.get('type', '').upper()} {p.get('volume', '?')}\n"
-                f"   Open: {p.get('price_open', '?')}  Cur: {p.get('price_current', '?')}\n"
+                f"{pnl_e} <b>{p.get('symbol', '?')}</b> {side} {vol}\n"
+                f"   Open: {open_px}  Cur: {cur_px}\n"
+                f"   SL: {p.get('stopLoss', 0)}  TP: {p.get('takeProfit', 0)}\n"
                 f"   PnL: {pnl:+.2f}  Ticket: {p.get('ticket', '?')}"
             )
         return "\n".join(lines), "HTML"
@@ -2071,16 +2748,24 @@ async def _mt5_orders(account_id, db: AsyncSession) -> tuple[str, str]:
         if not account:
             return "❌ No MT5 account found.", "HTML"
 
-        orders = await mt5_client.get_orders(account)
+        from plugins.MT5TradingPlugin.backend.services.mt5_client import normalize_order_type
+
+        orders = await mt5_client.get_pending_orders(
+            account.login, account.server, account.password_encrypted
+        )
         if not orders:
             return f"📋 No pending orders on account {account.id}.", "HTML"
 
         lines = [f"📋 <b>MT5 Pending Orders — Account {account.id}</b>", ""]
         for o in orders[:10]:
+            otype = (normalize_order_type(o) or str(o.get("orderType", "?"))).upper()
+            vol = o.get("lots", o.get("volume", "?"))
+            px = o.get("openPrice", o.get("price", "?"))
             lines.append(
-                f"• <b>{o.get('symbol', '?')}</b> {o.get('type', '?').upper()} "
-                f"vol {o.get('volume_initial', '?')} @ {o.get('price_open', '?')}\n"
-                f"  SL: {o.get('sl', 0)}  TP: {o.get('tp', 0)}  Ticket: {o.get('ticket', '?')}"
+                f"• <b>{o.get('symbol', '?')}</b> {otype} "
+                f"vol {vol} @ {px}\n"
+                f"  SL: {o.get('stopLoss', 0)}  TP: {o.get('takeProfit', 0)}  "
+                f"Ticket: {o.get('ticket', '?')}"
             )
         return "\n".join(lines), "HTML"
     except Exception as exc:  # noqa: BLE001
@@ -2198,12 +2883,20 @@ async def _mt5_close(ticket_raw: str, account_id: int, db: AsyncSession) -> tupl
         if not account:
             return f"❌ MT5 account {account_id} not found.", "HTML"
 
-        result = await mt5_client.close_position(account, ticket_raw)
-        if result and result.get("retcode") == 10009:
-            return f"✅ Position {ticket_raw} closed.", "HTML"
+        try:
+            ticket_int = int(str(ticket_raw).strip())
+        except (TypeError, ValueError):
+            return f"❌ Invalid ticket '{ticket_raw}'.", "HTML"
+
+        result = await mt5_client.close_position(
+            account.login, account.server, account.password_encrypted, ticket_int
+        )
+        retcode = str(result.get("retcode")) if isinstance(result, dict) else None
+        if retcode in ("10009", "0"):
+            return f"✅ Position {ticket_int} closed.", "HTML"
         elif result:
-            return f"✅ Close sent. Result: {result}", "HTML"
+            return f"✅ Close sent for {ticket_int}. Result: {result}", "HTML"
         else:
-            return f"⚠️ Close returned no result for ticket {ticket_raw}.", "HTML"
+            return f"⚠️ Close returned no result for ticket {ticket_int}.", "HTML"
     except Exception as exc:  # noqa: BLE001
         return f"❌ MT5 close failed: {exc}", "HTML"

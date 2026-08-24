@@ -65,6 +65,7 @@ import pandas as pd
 from loguru import logger
 
 from app.exchanges.manager import exchange_manager, SupportedExchange
+from app.signals.candle_source import get_ohlcv as cached_get_ohlcv
 
 
 def _to_py(obj):
@@ -506,7 +507,7 @@ async def analyze_ar_atr(
 
     # ── Fetch OHLCV ───────────────────────────────────────────────────────
     try:
-        ohlcv = await connector.get_ohlcv(symbol=symbol, timeframe=timeframe, limit=TF_LIMIT)
+        ohlcv = await cached_get_ohlcv(symbol=symbol, timeframe=timeframe, limit=TF_LIMIT, exchange=exch)
     except Exception as exc:
         logger.debug(f"[AR-ATR] {symbol} {timeframe} fetch error: {exc}")
         return {

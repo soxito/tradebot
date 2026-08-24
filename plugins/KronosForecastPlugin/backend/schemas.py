@@ -50,7 +50,7 @@ class OverlayMarker(BaseModel):
 # Volume is a hard precondition for every forecast / analysis / sniper entry.
 # See services/volume_context.py for how each field is derived.
 
-VolumeStatusT = Literal["OK", "UNAVAILABLE", "STALE", "INSUFFICIENT"]
+VolumeStatusT = Literal["OK", "UNAVAILABLE", "STALE", "INSUFFICIENT", "NOT_APPLICABLE"]
 VolumeRegimeT = Literal["DEAD", "NORMAL", "ELEVATED", "CLIMACTIC", "UNKNOWN"]
 VolumeDivergenceT = Literal[
     "CONFIRMED_UP", "EXHAUSTION_UP", "CONFIRMED_DOWN", "EXHAUSTION_DOWN",

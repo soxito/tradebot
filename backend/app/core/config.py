@@ -96,6 +96,10 @@ class Settings(BaseSettings):
     # for a single debugging session, and turn it back off.
     SQL_ECHO: bool = False
     SECRET_KEY: str = "change-me-in-production-to-a-secure-random-string"
+    # System Monitor task-control API key. Off-localhost mutations require this
+    # in the X-API-Key header; loopback callers are allowed without it (GETs are
+    # always open). Empty in dev; must be set in production.
+    TASKS_API_KEY: str = ""
     
     # API
     API_V1_PREFIX: str = "/api/v1"
@@ -106,6 +110,12 @@ class Settings(BaseSettings):
     # "localhost" to ::1 (IPv6) while PostgreSQL only listens on 127.0.0.1,
     # producing [Errno 11001] getaddrinfo failed.
     DATABASE_URL: str = "postgresql+asyncpg://tradebot:tradebot_password@127.0.0.1:5434/tradebot"
+
+    # Connection pooling. Off by default: NullPool has masked sessions held
+    # across slow awaits, so enabling a pool needs those audited first. Enable
+    # with TRADEBOT_DB_POOL_ENABLED=1. SQLite always uses NullPool regardless.
+    TRADEBOT_DB_POOL_ENABLED: bool = False
+    TRADEBOT_DB_POOL_SIZE: int = 10
     
     # Redis
     REDIS_URL: str = "redis://127.0.0.1:6379/0"
@@ -193,6 +203,12 @@ class Settings(BaseSettings):
     DEEPGRAM_STT_MODEL: str = "nova-3"          # pre-recorded model
     DEEPGRAM_TOTAL_CREDIT_USD: float = 200.0    # total credit, for runway projection
 
+    # Bitcoin 1064-day market cycle (editable at runtime via room settings)
+    CYCLE_BULL_DAYS: int = 1064                 # bottom → projected top
+    CYCLE_BEAR_DAYS: int = 365                  # projected top → next bottom
+    CYCLE_RECHECK_INTERVAL_SECONDS: int = 3600  # detector loop tick
+    CYCLE_CACHE_TTL_SECONDS: int = 900          # snapshot resolver cache
+
     # Monitoring & Alerts
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
@@ -224,6 +240,10 @@ class Settings(BaseSettings):
     # AI Agent Configuration
     ENABLE_AI_AGENTS: bool = False  # Must be explicitly enabled
     AI_MEMORY_LOOKBACK: int = 50  # Past decisions to consider for learning
+    # Closed candles agents analyse for market movement. Floored at 28 everywhere
+    # (never less than the user's minimum) and has no hard upper cap — raise
+    # AGENT_ANALYSIS_CANDLES via env for deeper reads across every agent.
+    AGENT_ANALYSIS_CANDLES: int = 120
     AI_MIN_MEMORY_FOR_LOCAL: int = 15  # Min decisions before agents can decide locally without OpenAI
     AI_LOCAL_CONFIDENCE_THRESHOLD: float = 0.70  # Min confidence from memory to skip OpenAI
 
@@ -261,6 +281,26 @@ class Settings(BaseSettings):
     JARVIS_JOURNAL_EXPIRY_HOURS: int = 72     # unresolved after this → closed out
     JARVIS_LEARNING_MIN_SAMPLES: int = 8      # below this a win rate is noise
     JARVIS_LEARNING_MAX_SETTLE_PER_CYCLE: int = 40  # caps upstream candle fetches
+    # Trading room: keeps the agent board in session on the focused pair, the
+    # newest signal, or a rotation — so the room has fresh decisions even when
+    # nobody has the page open. Off by default; it spends AI tokens per cycle.
+    AUTO_START_ROOM_WORKER: bool = False
+    ROOM_WORKER_INTERVAL_SECONDS: int = 300
+    ROOM_WORKER_COOLDOWN_SECONDS: int = 1800  # min gap before re-analysing a pair
+    # Seed only. Once the room has settings the timeframe is chosen there
+    # (room_settings.focus_timeframe) so the board and the room's chart agree.
+    ROOM_WORKER_TIMEFRAME: str = "1h"
+
+    # ── Resource tiering (env contract from start.py; .env still wins) ─────────
+    # start.py derives these from the machine and injects them via setdefault, so
+    # explicit .env values always take precedence. PERF_TIER is the resolved
+    # value, exposed for the config snapshot and the System Monitor page.
+    TRADEBOT_TIER: str = ""
+    TRADEBOT_PROFILE: str = ""
+    TRADEBOT_RAM_GB: float = 0.0
+    TRADEBOT_PHYSICAL_CORES: int = 0
+    TRADEBOT_SIDECARS: str = ""
+    PERF_TIER: str = "high"
 
     # Loop intervals (seconds)
     SIM_AUTO_TRADE_LOOP_INTERVAL_SECONDS: int = 60
@@ -391,6 +431,85 @@ class Settings(BaseSettings):
         # Probe 6379 (Homebrew/native), 6380 (docker-exposed) in order.
         v = _reroute_unresolvable_host(v, "redis", "127.0.0.1", ["6379", "6380"])
         return v
+
+    @model_validator(mode='after')
+    def apply_resource_tier(self) -> "Settings":
+        """Scale loop intervals, autostart flags and concurrency caps to the
+        machine's resource tier.
+
+        Only touches fields the user did **not** pin explicitly (absent from
+        ``model_fields_set``), so anything set in ``.env`` survives untouched.
+        Falls back *up* to ``high`` when no tier is provided — never guess low
+        and silently disable features.
+        """
+        from app.core.resource_tier import (
+            resolve_tier, interval_multiplier, should_autostart, tier_index,
+        )
+
+        tier = resolve_tier(self.TRADEBOT_PROFILE, self.TRADEBOT_TIER)
+        self.PERF_TIER = tier
+        mult = interval_multiplier(tier)
+        pinned = self.model_fields_set
+
+        def _set(name: str, value) -> None:
+            if name not in pinned:
+                setattr(self, name, value)
+
+        if mult != 1.0:
+            _interval_fields = [
+                "SENTIMENT_PIPELINE_INTERVAL_SECONDS",
+                "SIGNALS_PIPELINE_INTERVAL_SECONDS",
+                "POSITION_MONITOR_INTERVAL_SECONDS",
+                "SNIPER_LOOP_INTERVAL_SECONDS",
+                "PUMP_MONITOR_LOOP_INTERVAL_SECONDS",
+                "RESEARCH_LOOP_INTERVAL_SECONDS",
+                "JARVIS_LEARNING_INTERVAL_SECONDS",
+                "VAULT_SYNC_INTERVAL_SECONDS",
+                "SIGNAL_RESEARCH_SCAN_SECONDS",
+                "PRICE_TICK_INTERVAL_SECONDS",
+                "SIM_AUTO_TRADE_LOOP_INTERVAL_SECONDS",
+                "LIVE_AUTO_TRADE_LOOP_INTERVAL_SECONDS",
+            ]
+            for name in _interval_fields:
+                if name in pinned:
+                    continue
+                current = getattr(self, name, None)
+                if isinstance(current, int) and current > 0:
+                    setattr(self, name, int(round(current * mult)))
+
+        # Autostart gating — disable non-critical loops below their min tier.
+        # Critical tasks (position_monitor, live_auto_trade, sniper) always
+        # autostart regardless of tier.
+        _autostart_map = {
+            "AUTO_START_RESEARCH_LOOP": "research_loop",
+            "AUTO_START_SIGNAL_RESEARCH_QUEUE": "signal_research_queue",
+            "AUTO_START_VAULT_SYNC_LOOP": "vault_sync",
+            "AUTO_START_JARVIS_LEARNING_LOOP": "jarvis_learning",
+            "AUTO_START_PRICE_TICK_LOOP": "price_tick",
+            "AUTO_START_PUMP_MONITOR_LOOP": "pump_monitor",
+            "AUTO_START_SIM_AUTO_TRADE_LOOP": "sim_auto_trade",
+        }
+        for flag, task_id in _autostart_map.items():
+            if flag in pinned:
+                continue
+            if getattr(self, flag, False) and not should_autostart(task_id, tier):
+                setattr(self, flag, False)
+
+        # Concurrency / volume caps — lower on weak machines, never raise.
+        idx = tier_index(tier)  # minimal=0 … ultra=4
+        _research_conc_cap = {0: 1, 1: 1, 2: 2, 3: 5, 4: 5}.get(idx, 5)
+        if "SIGNAL_RESEARCH_CONCURRENCY" not in pinned:
+            self.SIGNAL_RESEARCH_CONCURRENCY = min(self.SIGNAL_RESEARCH_CONCURRENCY, _research_conc_cap)
+        _settle_cap = {0: 8, 1: 12, 2: 20, 3: 40, 4: 40}.get(idx, 40)
+        if "JARVIS_LEARNING_MAX_SETTLE_PER_CYCLE" not in pinned:
+            self.JARVIS_LEARNING_MAX_SETTLE_PER_CYCLE = min(
+                self.JARVIS_LEARNING_MAX_SETTLE_PER_CYCLE, _settle_cap
+            )
+        _tick_symbol_cap = {0: 8, 1: 12, 2: 20, 3: 30, 4: 30}.get(idx, 30)
+        if "PRICE_TICK_MAX_SYMBOLS" not in pinned:
+            self.PRICE_TICK_MAX_SYMBOLS = min(self.PRICE_TICK_MAX_SYMBOLS, _tick_symbol_cap)
+
+        return self
 
     @model_validator(mode='after')
     def apply_desktop_mode(self) -> "Settings":
