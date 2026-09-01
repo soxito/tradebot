@@ -159,8 +159,10 @@ async def test_auto_risk_off_or_non_crypto_leaves_risk_alone(monkeypatch):
         return mc.build_cycle_snapshot(mc.DEFAULT_ANCHORS, today=date(2026, 2, 1))
 
     monkeypatch.setattr(mc, "resolve_cycle_snapshot", _bear)
+    # auto=False: risk unchanged
     assert await effective_risk_pct(_FakeSettings(auto=False), "BTCUSD") == pytest.approx(2.0)
-    assert await effective_risk_pct(_FakeSettings(), "XAUUSD") == pytest.approx(2.0)
+    # XAUUSD is a metal: metals dampener (0.45×) is always on, not gated by cycle_auto_risk
+    assert await effective_risk_pct(_FakeSettings(), "XAUUSD") == pytest.approx(0.9)  # 2.0 * 0.45
 
 
 @pytest.mark.asyncio

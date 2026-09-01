@@ -273,13 +273,18 @@ _TF_MAP: Dict[str, Tuple[str, str]] = {
     "H4":  ("60m", "730d"),
     "H6":  ("60m", "730d"),
     "H12": ("60m", "730d"),
-    "D1":  ("1d",  "10y"),
-    "W1":  ("1wk", "10y"),
+    "D1":  ("1d",  "max"),
+    "W1":  ("1wk", "max"),
+    # Monthly — the cycle screen's timeframe. "max" reaches Bitcoin's full
+    # Yahoo history (2014-09 for BTCUSD); callers trim to the years they need.
+    # D1/W1 now also use "max" so the Bitcoin cycle page can show genesis
+    # (2010) via Yahoo + CoinMetrics backfill instead of being capped at 10y.
+    "MN1": ("1mo", "max"),
 }
 _TF_SECONDS = {
     "M1": 60, "M5": 300, "M15": 900, "M30": 1800,
     "H1": 3600, "H2": 7200, "H4": 14400, "H6": 21600, "H12": 43200,
-    "D1": 86400, "W1": 604800,
+    "D1": 86400, "W1": 604800, "MN1": 2592000,
 }
 
 #: Yahoo intervals that sit on a clean UTC grid, so _bucket() may fold them.

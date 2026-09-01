@@ -62,6 +62,11 @@ export interface ExecutionPolicy {
   /** Auto risk reduction inside the projected-bear / late-bull window. */
   cycle_auto_risk: boolean
   cycle_risk_multiplier: number
+  /** Years of monthly candles the cycle chart reaches back for. */
+  cycle_history_years: number
+  /** When on, the room supervisor reviews and manages all copy profiles. */
+  manage_copy_profiles?: boolean
+  copy_max_drawdown_pct?: number
   trades_today?: number
   mt5_accounts?: Mt5AccountOption[]
   global_auto_trading_enabled?: boolean

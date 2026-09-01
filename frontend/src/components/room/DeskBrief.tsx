@@ -9,7 +9,7 @@
  */
 import { useCallback, useState } from 'react'
 import Link from 'next/link'
-import { Loader2, RefreshCw } from 'lucide-react'
+import { ChevronDown, ChevronUp, Loader2, RefreshCw } from 'lucide-react'
 
 import { api } from '@/services/api'
 import { useBtcCycleState } from '@/hooks/useBtcCycle'
@@ -68,6 +68,7 @@ export default function DeskBrief({ symbol }: { symbol: string | null }) {
   const [brief, setBrief] = useState<Brief | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [collapsed, setCollapsed] = useState(false)
   // The season the pair is trading in — same snapshot the seats receive.
   // Called before the early return below: hooks run on every render.
   const { state: cycle } = useBtcCycleState()
@@ -94,10 +95,17 @@ export default function DeskBrief({ symbol }: { symbol: string | null }) {
   const forecast = brief?.forecast
 
   return (
-    <div className="max-h-[38vh] shrink-0 overflow-y-auto rounded-xl border border-slate-700/70 bg-slate-900/50 p-3">
-      <div className="mb-2 flex items-center gap-2">
-        <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-400">Desk brief</h2>
-        <span className="font-mono text-[11px] text-slate-500">{symbol}</span>
+    <div className="shrink-0 overflow-hidden rounded-xl border border-slate-700/70 bg-slate-900/50">
+      <div className="flex items-center gap-2 px-3 py-2">
+        <button
+          type="button"
+          onClick={() => setCollapsed((v) => !v)}
+          className="flex items-center gap-2 text-left"
+        >
+          <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-400">Desk brief</h2>
+          <span className="font-mono text-[11px] text-slate-500">{symbol}</span>
+          {collapsed ? <ChevronDown className="h-3.5 w-3.5 text-slate-500" /> : <ChevronUp className="h-3.5 w-3.5 text-slate-500" />}
+        </button>
         <button
           type="button"
           disabled={busy}
@@ -117,7 +125,18 @@ export default function DeskBrief({ symbol }: { symbol: string | null }) {
           {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
           Convene
         </button>
+        <button
+          type="button"
+          onClick={() => setCollapsed((v) => !v)}
+          className="rounded p-1 text-slate-500 hover:bg-slate-800 hover:text-slate-300"
+          title={collapsed ? 'Expand' : 'Collapse'}
+          aria-label={collapsed ? 'Expand desk brief' : 'Collapse desk brief'}
+        >
+          {collapsed ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronUp className="h-3.5 w-3.5" />}
+        </button>
       </div>
+      {collapsed ? null : (
+        <div className="max-h-[38vh] overflow-y-auto border-t border-slate-800 px-3 pb-3 pt-2">
 
       {error && <p className="text-[11px] text-red-400">{error}</p>}
       {cycle?.ok && (
@@ -205,6 +224,8 @@ export default function DeskBrief({ symbol }: { symbol: string | null }) {
           {brief.scenario_follow_up && (
             <p className="text-[11px] leading-snug text-amber-300/80">{plain(brief.scenario_follow_up)}</p>
           )}
+        </div>
+      )}
         </div>
       )}
     </div>

@@ -42,7 +42,7 @@ _FALLBACK_SOURCE_TF: dict[str, tuple[str, ...]] = {
 _TF_SECONDS: dict[str, int] = {
     "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
     "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600, "12h": 43200,
-    "1d": 86400, "3d": 259200, "1w": 604800,
+    "1d": 86400, "3d": 259200, "1w": 604800, "1M": 2592000, "MN1": 2592000,
 }
 
 #: Short-lived cache so the four consumers of a single analysis (agent context,
@@ -52,7 +52,11 @@ _cache: dict[str, tuple[float, List[list]]] = {}
 
 
 def timeframe_seconds(timeframe: str) -> int:
-    return _TF_SECONDS.get((timeframe or "").strip().lower(), 3600)
+    tf = (timeframe or "").strip()
+    # Monthly is case-sensitive: "1m" is one minute, "1M"/"MN1" one month.
+    if tf in ("1M", "MN1"):
+        return _TF_SECONDS["MN1"]
+    return _TF_SECONDS.get(tf.lower(), 3600)
 
 
 def _valid(rows: Any, minimum: int = 5) -> bool:
@@ -172,7 +176,13 @@ async def fetch(
     only when every source and every fallback timeframe has been exhausted.
     """
     sym = (symbol or "").strip().upper()
-    tf = (timeframe or "1h").strip().lower()
+    tf = (timeframe or "1h").strip()
+    # Monthly is case-sensitive ("1m" minute vs "1M"/"MN1" month); the sources
+    # know it as MN1.
+    if tf.lower() in ("1m", "mn1") and tf != "1m":
+        tf = "MN1"
+    else:
+        tf = tf.lower()
     if not sym:
         return []
 

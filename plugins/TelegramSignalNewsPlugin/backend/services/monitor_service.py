@@ -98,6 +98,171 @@ def _signal_dedupe_hash(channel_source_id: int, message_id: str, symbol: str) ->
     return hashlib.sha256(raw).hexdigest()
 
 
+def _ratchet_trailing_stop(
+    *,
+    is_long: bool,
+    live: float,
+    peak: float | None,
+    entry_price: float | None,
+    milestone_tp: float,
+    current_trail: float | None,
+    trail_pct: float,
+) -> tuple[float, float]:
+    """One step of the profit trail that activates at the TP3 milestone.
+
+    Tracks the best price seen so far (``peak``) and derives the stop from it:
+    ``peak ∓ trail_pct`` — but never behind break-even (entry when known, the
+    milestone TP otherwise), never loosening an already-tighter stop, and kept
+    just on the tradable side of the live price so brokers accept the modify.
+
+    Returns ``(new_peak, new_stop)``.
+    """
+    if peak is None or peak <= 0:
+        peak = live
+    elif is_long:
+        peak = max(peak, live)
+    else:
+        peak = min(peak, live)
+
+    break_even = (
+        float(entry_price) if (entry_price is not None and entry_price > 0) else float(milestone_tp)
+    )
+    if is_long:
+        candidate = max(break_even, peak * (1.0 - trail_pct))
+        # A stop at/above the live price would be rejected by the broker.
+        candidate = min(candidate, live * 0.999)
+        stop = candidate if current_trail is None else max(current_trail, candidate)
+    else:
+        candidate = min(break_even, peak * (1.0 + trail_pct))
+        candidate = max(candidate, live * 1.001)
+        stop = candidate if current_trail is None else min(current_trail, candidate)
+    return peak, stop
+
+
+# ── LLM fallback parsing ─────────────────────────────────────────────────────
+# The regex parser misses channel posts written in freeform prose ("buy zone
+# 114.20-40, stops under 113.8, targets 116/118/121"). Those are real signals
+# that used to silently vanish. When the regex finds nothing in a message that
+# LOOKS signal-ish, one structured LLM extraction is attempted (budget-capped
+# per cycle so a chatty channel cannot burn the token tier).
+_LLM_FALLBACK_ENV = "TELEGRAM_PLUGIN_SIGNAL_LLM_FALLBACK"
+_LLM_FALLBACK_PER_CYCLE = 8
+
+_SIGNAL_HINT_RE = None  # compiled lazily
+
+
+def _looks_like_signal(text: str) -> bool:
+    """Cheap prefilter so only plausible signal posts cost an LLM call."""
+    import re as _re
+
+    global _SIGNAL_HINT_RE
+    if _SIGNAL_HINT_RE is None:
+        _SIGNAL_HINT_RE = _re.compile(
+            r"\b(long|short|buy|sell|entry|sl|stop\s*loss|tp\s*\d|target)",
+            _re.IGNORECASE,
+        )
+    return bool(_SIGNAL_HINT_RE.search(text or ""))
+
+
+async def _llm_parse_signal(text: str) -> dict[str, Any] | None:
+    """One structured extraction attempt for a message the regex parser missed.
+
+    Returns {direction, symbol, entry, stop_loss, take_profits, leverage,
+    confidence} or None when the model does not consider this an actionable
+    entry signal. Routed through the shared provider pool like every other
+    plugin AI call.
+    """
+    import json as _json
+
+    prompt = (
+        "You extract forex/crypto trade signals from Telegram channel posts.\n"
+        "Return STRICT JSON only, no prose:\n"
+        '{"is_signal": true|false, "direction": "long"|"short", "symbol": "XAUUSD"|'
+        '"BTCUSDT"|..., "entry": number|null, "stop_loss": number|null, '
+        '"take_profits": [numbers ordered by distance from entry], "leverage": string|null, '
+        '"confidence": 0.0-1.0}\n'
+        "Rules: is_signal=false unless there is a direction AND at least an entry or "
+        "TP level. Symbols use the exchange format with no separators "
+        "(GOLD→XAUUSD, bitcoin→BTCUSDT). Numbers must be bare numbers."
+    )
+    try:
+        from plugins.AiMarketAnalyst.backend.services.ai_router import db_chat
+        content = await db_chat(
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": text[:2000]},
+            ],
+            temperature=0,
+        )
+    except Exception as exc:  # noqa: BLE001 — provider pool down → skip quietly
+        logger.debug("[LLM-parse] provider call failed: {}", exc)
+        return None
+    if not content:
+        return None
+    try:
+        parsed = _json.loads(content)
+    except Exception:
+        try:
+            from plugins.AiMarketAnalyst.backend.services.ai_router import parse_json_content
+            parsed = parse_json_content(content)
+        except Exception:
+            parsed = None
+    if not isinstance(parsed, dict) or not parsed.get("is_signal"):
+        return None
+    direction = str(parsed.get("direction") or "").lower()
+    symbol = str(parsed.get("symbol") or "").upper().replace("/", "").replace("-", "")
+    entry = parsed.get("entry")
+    sl = parsed.get("stop_loss")
+    tps = [
+        float(tp)
+        for tp in (parsed.get("take_profits") or [])
+        if isinstance(tp, (int, float)) and float(tp) > 0
+    ]
+    if direction not in {"long", "short"} or not symbol:
+        return None
+    if not (entry or sl or tps):
+        return None
+    try:
+        confidence = float(parsed.get("confidence") or 0.7)
+    except (TypeError, ValueError):
+        confidence = 0.7
+    # LLM-parsed signals carry slightly capped confidence vs regex parses so
+    # downstream gates treat them a touch more conservatively.
+    leverage = parsed.get("leverage")
+    return {
+        "direction": direction,
+        "symbol": symbol[:40],
+        "entry": float(entry) if isinstance(entry, (int, float)) and entry else None,
+        "stop_loss": float(sl) if isinstance(sl, (int, float)) and sl else None,
+        "take_profits": tps,
+        "leverage": str(leverage)[:20] if leverage else None,
+        "confidence": max(0.3, min(confidence, 0.9)),
+    }
+
+
+async def _maybe_llm_parse(db: AsyncSession, msg: TelegramIngestMessage, budget: list[int]) -> dict[str, Any] | None:
+    """LLM fallback gate: env-enabled, hint-matched, cycle-budgeted."""
+    import os as _os
+
+    enabled = _os.getenv(_LLM_FALLBACK_ENV, "true").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    if not enabled or budget[0] <= 0:
+        return None
+    text = msg.raw_text or ""
+    if len(text) < 15 or not _looks_like_signal(text):
+        return None
+    budget[0] -= 1
+    parsed = await _llm_parse_signal(text)
+    if parsed is None:
+        return None
+    logger.info(
+        "[LLM-parse] recovered a signal the regex missed: {} {} (msg {})",
+        parsed["direction"].upper(), parsed["symbol"], msg.telegram_message_id,
+    )
+    return parsed
+
+
 async def create_signals_from_messages(
     db: AsyncSession, limit: int = 500, since_hours: int | None = 24
 ) -> dict[str, int]:
@@ -111,6 +276,9 @@ async def create_signals_from_messages(
     """
     created = 0
     outcomes_applied = 0
+    llm_created = 0
+    # Mutable budget box so the LLM fallback can spend across the loop.
+    llm_budget = [_LLM_FALLBACK_PER_CYCLE]
 
     # Pull the most recent SIGNALS-kind messages only — volume/news channels
     # are filtered out so they don't eat up the scan budget.
@@ -175,6 +343,46 @@ async def create_signals_from_messages(
             inserted_id = (await db.execute(insert_stmt)).scalar_one_or_none()
             if inserted_id is not None:
                 created += 1
+            continue
+
+        # 1b) Regex found nothing actionable — one LLM extraction attempt so
+        # freeform channel posts still become executable signals. Outcomes are
+        # still tried first below, since a "TP2 hit" reply must never spawn a
+        # fresh entry.
+        llm_parsed = await _maybe_llm_parse(db, msg, llm_budget)
+        if llm_parsed is not None:
+            market_type = classify_market_type(llm_parsed["symbol"]) or channel_market_types.get(
+                msg.channel_source_id, "crypto"
+            )
+            dedupe = _signal_dedupe_hash(msg.channel_source_id, msg.telegram_message_id, llm_parsed["symbol"])
+            insert_stmt = (
+                pg_insert(TelegramParsedSignal)
+                .values(
+                        channel_source_id=msg.channel_source_id,
+                        channel_title=channel_titles.get(msg.channel_source_id),
+                        telegram_message_id=msg.telegram_message_id,
+                        symbol=llm_parsed["symbol"],
+                        direction=llm_parsed["direction"],
+                        leverage=llm_parsed["leverage"],
+                        entry=llm_parsed["entry"],
+                        entry_raw="llm" if llm_parsed["entry"] is not None else None,
+                        stop_loss=llm_parsed["stop_loss"],
+                        stop_loss_raw="llm" if llm_parsed["stop_loss"] is not None else None,
+                        take_profits_json=llm_parsed["take_profits"] or None,
+                        status=SignalStatus.ACTIVE,
+                        confidence=llm_parsed["confidence"],
+                        raw_text=text,
+                        posted_at=msg.posted_at,
+                        dedupe_hash=dedupe,
+                        market_type=market_type,
+                )
+                .on_conflict_do_nothing()
+                .returning(TelegramParsedSignal.id)
+                )
+            inserted_id = (await db.execute(insert_stmt)).scalar_one_or_none()
+            if inserted_id is not None:
+                created += 1
+                llm_created += 1
             continue
 
         # 2) Outcome update for the latest active signal of this symbol/channel?
@@ -283,7 +491,11 @@ async def create_signals_from_messages(
                         logger.warning("Auto-close failed for signal {}: {}", sig.id, ac_exc)
 
     await db.commit()
-    return {"created": created, "outcomes_applied": outcomes_applied}
+    return {
+        "created": created,
+        "outcomes_applied": outcomes_applied,
+        "llm_created": llm_created,
+    }
 
 
 async def reconcile_active_signals_from_live_price(
@@ -298,13 +510,16 @@ async def reconcile_active_signals_from_live_price(
     1. Sort the signal's TP list in trade direction (ascending for LONG,
        descending for SHORT) so we process them in the order price hits them.
     2. Count how many TPs the current live price has already crossed.
-    3. The stop moves once, at the ``TRAIL_LOCK_TP_INDEX`` (TP3) milestone,
-       and then holds: the original stop stands below TP3, jumps to BREAK-EVEN
-       when TP3 prints so the trade can no longer lose, and is frozen there
-       while price works through TP4, TP5, … Ladders with fewer than 3 TPs use
-       their final TP as the milestone.
+    3. The original stop stands below the ``TRAIL_LOCK_TP_INDEX`` (TP3)
+       milestone. When TP3 prints, the stop jumps to BREAK-EVEN — from that
+       moment the position can no longer lose — and the ratcheting trail
+       ACTIVATES: every tick afterwards tracks the best price seen since
+       activation into ``trail_peak_price`` and moves the stop to
+       peak ∓ ``tp_trail_pct`` (default 1.5 %), forward-only, never behind
+       break-even. Ladders with fewer than 3 TPs use their final TP as the
+       milestone.
     4. The trade closes as TP_HIT only when the FINAL TP is crossed, or when
-       price retraces through the break-even stop.
+       price retraces through the trailing stop (banking locked profit).
     5. A signal closes as SL_HIT when price hits the original stop-loss before
        any TP has been reached (clean loss, no profit was locked).
     """
@@ -394,6 +609,7 @@ async def reconcile_active_signals_from_live_price(
             )
             setattr(sig, "trailing_sl", None)
             setattr(sig, "tp_reached_count", 0)
+            setattr(sig, "trail_peak_price", None)
             sig.updated_at = now_utc_naive()
             trailing_updated += 1
 
@@ -427,48 +643,30 @@ async def reconcile_active_signals_from_live_price(
         prev_reached = int(getattr(sig, "tp_reached_count", 0) or 0)
 
         # ── Advance trailing SL when new TP levels are hit ───────────────────
-        # The stop moves exactly ONCE, at the TP3 milestone, and then holds:
         #
         #   before TP3 : the signal's original stop stands
         #   at TP3     : the stop jumps to BREAK-EVEN (the entry price), so the
-        #                trade can no longer lose
-        #   after TP3  : frozen — TP4, TP5, … do not move it
+        #                trade can no longer lose — and the trail ACTIVATES
+        #   after TP3  : the stop RATCHETS every tick to
+        #                (peak price since activation) ∓ tp_trail_pct,
+        #                never loosening and never giving back past break-even
         #
-        # Ratcheting the stop onto every TP crossed meant a routine pullback
-        # after TP4/TP5 closed a position that was still heading for the
-        # channel's last target. Break-even removes the downside while leaving
-        # far more room to run than parking the stop on TP3 itself would.
         # Ladders shorter than 3 TPs use their final TP as the milestone.
+        # ``trail_pct`` comes from the sniper settings row (default 1.5 %).
         changed = False
         trail_before = getattr(sig, "trailing_sl", None)
+        lock_idx = min(TRAIL_LOCK_TP_INDEX, len(tps) - 1) if tps else 0
         if crossed > prev_reached and tps:
-            lock_idx = min(TRAIL_LOCK_TP_INDEX, len(tps) - 1)
             setattr(sig, "tp_reached_count", crossed)
+            sig.updated_at = now_utc_naive()
+            changed = True
             reached_lock = (crossed - 1) >= lock_idx
-            # Break-even needs a known entry; without one fall back to the
-            # milestone TP so the trade is still protected.
-            break_even = (
-                float(entry_price) if (entry_price and entry_price > 0) else tps[lock_idx]
-            )
-            if reached_lock:
-                current_trail = getattr(sig, "trailing_sl", None)
-                if current_trail is None:
-                    setattr(sig, "trailing_sl", break_even)
-                else:
-                    # Never give back a stop that is already safer than break-even.
-                    setattr(sig, "trailing_sl", (
-                        max(current_trail, break_even) if is_long
-                        else min(current_trail, break_even)
-                    ))
-                sig.updated_at = now_utc_naive()
-                changed = True
-                trailing_updated += 1
             logger.info(
                 "[Trailing SL] {} {} — TP {}/{} hit @ {} | stop = {}{}",
                 direction.upper(), sym, crossed, len(tps), tps[crossed - 1],
                 getattr(sig, "trailing_sl", None) or orig_sl,
                 (
-                    f" (BREAK-EVEN from TP{lock_idx + 1}, held until TP{len(tps)})"
+                    f" (BREAK-EVEN + trail from TP{lock_idx + 1})"
                     if reached_lock else f" (original stop until TP{lock_idx + 1})"
                 ),
             )
@@ -482,6 +680,36 @@ async def reconcile_active_signals_from_live_price(
                     ), db)
                 except Exception:  # noqa: BLE001
                     pass
+
+        # ── Ratcheting profit trail (runs EVERY tick once activated) ─────────
+        # Activated = the milestone TP has been crossed. Each pass tracks the
+        # best price seen since activation into ``trail_peak_price`` and moves
+        # the stop to peak ∓ trail_pct — but only ever FORWARD (tighter), and
+        # never behind break-even, so the position can no longer lose while
+        # still riding toward the channel's final target.
+        trail_active = bool(tps) and int(getattr(sig, "tp_reached_count", 0) or 0) > lock_idx
+        if trail_active:
+            current_trail = getattr(sig, "trailing_sl", None)
+            peak, new_trail = _ratchet_trailing_stop(
+                is_long=is_long,
+                live=live,
+                peak=getattr(sig, "trail_peak_price", None),
+                entry_price=entry_price,
+                milestone_tp=tps[lock_idx],
+                current_trail=current_trail,
+                trail_pct=trail_pct,
+            )
+            setattr(sig, "trail_peak_price", peak)
+            if new_trail is not None and abs(new_trail - (current_trail or 0.0)) > 1e-9:
+                setattr(sig, "trailing_sl", new_trail)
+                sig.updated_at = now_utc_naive()
+                changed = True
+                trailing_updated += 1
+                logger.info(
+                    "[Trailing SL→ratchet] {} {} peak={} stop→{} (BE={}, trail={:.2f}%)",
+                    direction.upper(), sym, peak, new_trail,
+                    entry_price or tps[lock_idx], trail_pct * 100,
+                )
 
         # ── Sync trailing SL to the linked sim AND live positions ────────
         # When trailing_sl changes it must reach every place the position

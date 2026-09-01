@@ -225,7 +225,7 @@ async def market_overview():
 async def market_candles(
     symbol: str = Query(..., min_length=2, max_length=24),
     timeframe: str = Query(default="H1"),
-    limit: int = Query(default=400, ge=10, le=1000),
+    limit: int = Query(default=400, ge=10, le=150000),
     basis: str = Query(
         default="spot",
         pattern="^(spot|futures)$",
@@ -596,4 +596,107 @@ async def indicator_overlay(
         }
     except Exception as e:  # noqa: BLE001 - an overlay must never break the chart
         logger.warning(f"[Market] indicator overlay {exchange}/{symbol}: {e}")
+        return empty
+
+
+@router.get("/pattern-overlay/{exchange}/{symbol}")
+async def pattern_overlay(
+    exchange: str,
+    symbol: str,
+    timeframe: str = Query(default="1d"),
+    limit: int = Query(default=400, ge=30, le=3000),
+    patterns: str = Query(
+        default="morning_star,evening_star,inverted_hammer,hammer,shooting_star,engulfing",
+        description="Comma set of candlestick patterns to flag",
+    ),
+    fisher: bool = Query(default=True, description="Include the Fisher transform pane"),
+):
+    """Candlestick pattern markers + Fisher transform as chart overlays.
+
+    The cycle screen's read for any symbol and timeframe: named reversals
+    (Morning Star, Inverted Hammer, …) as markers on the price pane, and the
+    Fisher/trigger pair as a lower-pane series. Shaped like
+    ``indicator-overlay`` so it drops straight into TradingViewChart.
+    """
+    empty = {"symbol": symbol, "timeframe": timeframe, "overlays": [], "markers": [], "signal": None}
+
+    try:
+        from app.services import candles as candle_resolver
+        from app.signals.candle_patterns import detect_patterns
+        from app.signals.technical import fisher, ohlcv_to_dataframe
+
+        rows = await candle_resolver.fetch(symbol, timeframe, limit)
+        tf_up = (timeframe or "").upper()
+        if not rows and tf_up in {"MN1", "1M"}:
+            # Monthly is the cycle screen's timeframe; only the Yahoo provider
+            # carries it, so ask there directly before giving up.
+            from app.exchanges import yahoo_provider
+
+            ybars = await yahoo_provider.fetch_candles(symbol, "MN1", limit=limit)
+            rows = [
+                [int(b["time"]) * 1000, b.get("open"), b.get("high"),
+                 b.get("low"), b.get("close"), b.get("volume") or 0]
+                for b in (ybars or []) if b.get("time") and b.get("close")
+            ]
+        if not rows or len(rows) < 30:
+            return empty
+
+        wanted = [p.strip().lower() for p in (patterns or "").split(",") if p.strip()]
+        events = detect_patterns(rows, patterns=wanted or None)
+        markers = [
+            {
+                "time": int(ev["time"]) if int(ev["time"]) > 10**12 else int(ev["time"]),
+                "position": "belowBar" if ev["direction"] == "bull" else "aboveBar",
+                "color": "#22c55e" if ev["direction"] == "bull" else "#ef4444",
+                "shape": "arrowUp" if ev["direction"] == "bull" else "arrowDown",
+                "text": ev["name"],
+            }
+            for ev in events
+        ]
+
+        overlays = []
+        if fisher:
+            df = ohlcv_to_dataframe(rows)
+            if len(df) >= 10:
+                f, trigger = fisher(df)
+                times = [int(ts.timestamp()) for ts in df["timestamp"]]
+                overlays.append({
+                    "name": "Fisher",
+                    "type": "line",
+                    "pane": "main",
+                    "color": "#38bdf8",
+                    "lineWidth": 2,
+                    "levels": [
+                        {"value": 2.0, "color": "rgba(239,68,68,0.4)", "label": "+2"},
+                        {"value": -2.0, "color": "rgba(34,197,94,0.4)", "label": "-2"},
+                    ],
+                    "data": [
+                        {"time": t, "value": round(float(v), 4)}
+                        for t, v in zip(times, f) if v == v
+                    ],
+                })
+                overlays.append({
+                    "name": "Fisher Trigger",
+                    "type": "line",
+                    "pane": "main",
+                    "color": "#f59e0b",
+                    "lineWidth": 1,
+                    "data": [
+                        {"time": t, "value": round(float(v), 4)}
+                        for t, v in zip(times, trigger) if v == v
+                    ],
+                })
+
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "overlays": overlays,
+            "markers": markers,
+            "signal": {
+                "patterns_found": len(events),
+                "last_pattern": events[-1]["name"] if events else None,
+            },
+        }
+    except Exception as e:  # noqa: BLE001 - an overlay must never break the chart
+        logger.warning(f"[Market] pattern overlay {exchange}/{symbol}: {e}")
         return empty

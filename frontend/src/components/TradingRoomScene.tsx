@@ -13,7 +13,7 @@ import {
   type SeatInput,
   type TradingRoomHandle,
 } from '@/three/tradingRoom'
-import type { BoardQuote, ChartCandle, NewsItem, ScreenInfo, CycleScreenInfo } from '@/three/roomFurniture'
+import type { BoardQuote, ChartCandle, ChartOverlays, NewsItem, ScreenInfo, CycleScreenInfo } from '@/three/roomFurniture'
 import type { SpeechTurn } from '@/three/tradingRoom'
 
 interface Props {
@@ -26,6 +26,8 @@ interface Props {
   quotes?: BoardQuote[]
   /** Real OHLC bars for the back-wall chart of the focused pair. */
   chartCandles?: ChartCandle[]
+  /** Pattern flags + cycle season bands behind the wall chart's candles. */
+  chartOverlays?: ChartOverlays | null
   /** Recent headlines for the news screen. */
   news?: NewsItem[]
   /** The line currently being spoken at the board (drives the speech bubbles). */
@@ -47,6 +49,7 @@ export default function TradingRoomScene({
   screenInfo,
   quotes,
   chartCandles,
+  chartOverlays,
   news,
   speech,
   cycleInfo,
@@ -62,6 +65,7 @@ export default function TradingRoomScene({
   const screenRef = useRef<ScreenInfo>(screenInfo ?? EMPTY_SCREEN)
   const quotesRef = useRef<BoardQuote[]>(quotes ?? [])
   const candlesRef = useRef<ChartCandle[]>(chartCandles ?? [])
+  const overlaysRef = useRef<ChartOverlays | null>(chartOverlays ?? null)
   const newsRef = useRef<NewsItem[]>(news ?? [])
   const speechRef = useRef<SpeechTurn | null>(speech ?? null)
   const cycleInfoRef = useRef<CycleScreenInfo | null>(cycleInfo ?? null)
@@ -83,6 +87,7 @@ export default function TradingRoomScene({
   useEffect(() => { screenRef.current = screenInfo ?? EMPTY_SCREEN }, [screenInfo])
   useEffect(() => { quotesRef.current = quotes ?? [] }, [quotes])
   useEffect(() => { candlesRef.current = chartCandles ?? [] }, [chartCandles])
+  useEffect(() => { overlaysRef.current = chartOverlays ?? null }, [chartOverlays])
   useEffect(() => { newsRef.current = news ?? [] }, [news])
   useEffect(() => { speechRef.current = speech ?? null }, [speech])
   useEffect(() => { cycleInfoRef.current = cycleInfo ?? null }, [cycleInfo])
@@ -109,6 +114,7 @@ export default function TradingRoomScene({
       getScreenInfo: () => screenRef.current,
       getQuotes: () => quotesRef.current,
       getChartCandles: () => candlesRef.current,
+      getChartOverlays: () => overlaysRef.current,
       getNews: () => newsRef.current,
       getSpeech: () => speechRef.current,
       getCycleInfo: () => cycleInfoRef.current,

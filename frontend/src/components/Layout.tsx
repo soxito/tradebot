@@ -84,6 +84,7 @@ const navItems: NavItem[] = [
   ],
   },
   { href: '/bitcoin-cycle', label: 'Bitcoin Cycle', icon: Repeat },
+  { href: '/hermes', label: 'Hermes', icon: Sparkles },
   { href: '/agents', label: 'AI Agents', icon: Bot },
   { href: '/ai-providers', label: 'AI Providers', icon: Plug },
   { href: '/custom-agents', label: 'Custom Agents', icon: Cpu },

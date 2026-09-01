@@ -145,6 +145,9 @@ async def track_symbol(
         rows = await recent_plans(db, symbol, hours=hours, limit=limit)
     except Exception as exc:  # noqa: BLE001 — history is context, never a gate
         logger.debug("[Scenario] could not read plans for {}: {}", symbol, exc)
+        from app.core.database import safe_rollback
+
+        await safe_rollback(db)
         return []
     if not rows:
         return []

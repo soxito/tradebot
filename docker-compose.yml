@@ -157,7 +157,49 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  # TradingAgents multi-agent LLM framework — isolated sidecar. The backend
+  # proxies it at /api/v1/tradingagents/*; set TRADINGAGENTS_SERVICE_URL to
+  # http://tradingagents:8010 on the backend when this profile is active.
+  tradingagents:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.tradingagents
+    container_name: tradebot-tradingagents
+    env_file:
+      - .env
+    environment:
+      TZ: Africa/Johannesburg
+    ports:
+      - "8010:8010"
+    volumes:
+      - ta_results:/data/results
+    restart: unless-stopped
+
+  # Hermes Agent (NousResearch/hermes-agent) — self-aware sidecar.
+  # Isolated like TradingAgents on 8011. Backend proxies at /api/v1/hermes/*;
+  # set HERMES_GATEWAY_URL to http://hermes-gateway:8011 when this profile is active.
+  # Start with: docker compose --profile hermes up
+  hermes-gateway:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.hermes
+    container_name: tradebot-hermes
+    profiles: ["hermes"]
+    env_file:
+      - .env
+    environment:
+      TZ: Africa/Johannesburg
+      HERMES_PORT: 8011
+    ports:
+      - "8011:8011"
+    volumes:
+      - hermes_data:/data/hermes
+      - ./SOUL.md:/app/SOUL.md:ro
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   redis_data:
   openwa_data:
+  ta_results:
+  hermes_data:

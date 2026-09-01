@@ -52,6 +52,9 @@ class _FakeDB:
     async def execute(self, _stmt):
         return _FakeResult(self.obj)
 
+    async def commit(self):
+        pass
+
 
 @pytest.fixture
 def smc_calls(monkeypatch):
@@ -127,8 +130,11 @@ def test_no_args_uses_legacy_status_path(monkeypatch):
 
     monkeypatch.setattr(cs, "_sniper_smc", _boom)
     # A settings row with enabled=True drives the unchanged rug-pull status reply.
+    # exec_bootstrap_v1=True marks the one-time executor bootstrap as done so
+    # get_or_create_settings leaves the row (and this fake) untouched.
     db = _FakeDB(SimpleNamespace(
         enabled=True, symbol="PEPE/USDT", direction="long", entry_price=0.0000012,
+        exec_bootstrap_v1=True,
     ))
     text, mode = asyncio.run(cs._handle_sniper("", db))
     assert mode == "HTML"

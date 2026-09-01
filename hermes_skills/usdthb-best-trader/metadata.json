@@ -1,0 +1,30 @@
+{
+  "symbol": "USDTHB",
+  "asset_class": "forex-exotic",
+  "group": "FX Exotics",
+  "slug": "usdthb-best-trader",
+  "linked_agents": [
+    "market_analyst",
+    "sentiment_analyst",
+    "signal_generator",
+    "risk_manager",
+    "trade_executor",
+    "position_reviewer",
+    "strategy_optimizer"
+  ],
+  "jarvis": {
+    "role": "ceo",
+    "human_name": "JARVIS",
+    "seat": -1,
+    "model": "via AiMarketAnalyst pool"
+  },
+  "version": 1,
+  "source": "best-trader-bootstrap",
+  "created_at": 1788159433.235137,
+  "updated_at": 1788159433.235137,
+  "evolved_at": null,
+  "decisions_reviewed": 0,
+  "win_rate": null,
+  "avg_pnl": null,
+  "path": "/Users/sakhilematsimela/Sites/tradebot/hermes_skills/usdthb-best-trader"
+}

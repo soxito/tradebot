@@ -496,6 +496,20 @@ export default function TelegramSignalsPage() {
     }
   }, [loadSniper])
 
+  // signal_id → latest sniper-trade verdict, so every card can say exactly
+  // why it has not been executed yet (gate rejection, pending fill, …).
+  const tradeReasons = useMemo(() => {
+    const map = new Map<number, { status: string; reason: string | null; at: string }>()
+    for (const t of sniperTrades) {
+      const at = t.updated_at || t.created_at
+      const prev = map.get(t.signal_id)
+      if (!prev || new Date(at).getTime() >= new Date(prev.at).getTime()) {
+        map.set(t.signal_id, { status: String(t.status), reason: t.reason, at })
+      }
+    }
+    return map
+  }, [sniperTrades])
+
   const loadAI = useCallback(async () => {
     try {
       const [presetsRes, providersRes] = await Promise.all([
@@ -921,6 +935,7 @@ export default function TelegramSignalsPage() {
             onExecute={executeSignal}
             busySignalId={busySignalId}
             onClose={closeSignal}
+            tradeReasons={tradeReasons}
           />
         ) : activeTab === 'forex' ? (
           <ForexSignalsView
@@ -930,6 +945,7 @@ export default function TelegramSignalsPage() {
             onStatusFilter={setForexStatusFilter}
             onRefresh={loadForexSignals}
             prices={forexPrices}
+            tradeReasons={tradeReasons}
           />
         ) : activeTab === 'trailing' ? (
           <TrailingSlView
@@ -1137,8 +1153,9 @@ function ActiveSignalsView(props: {
   onExecute: (signalId: number, symbol: string, direction: string, mode: 'sandbox' | 'live') => Promise<void>
   busySignalId: number | null
   onClose: (signalId: number, symbol: string, kind: 'close' | 'opposite') => Promise<void>
+  tradeReasons: Map<number, { status: string; reason: string | null; at: string }>
 }) {
-  const { signals, channels, loading, statusFilter, onStatusFilter, selectedChannelId, onChannelFilter, onRefresh, prices, settings, onExecute, busySignalId, onClose } = props
+  const { signals, channels, loading, statusFilter, onStatusFilter, selectedChannelId, onChannelFilter, onRefresh, prices, settings, onExecute, busySignalId, onClose, tradeReasons } = props
 
   return (
     <div className="space-y-4">
@@ -1249,6 +1266,18 @@ function ActiveSignalsView(props: {
                     {statusKey.replace('_', ' ')}
                   </span>
                 </div>
+
+                {/* Why hasn't this signal been executed? — latest sniper verdict */}
+                {(() => {
+                  const tr = tradeReasons.get(s.id)
+                  if (!tr || tr.status === 'placed') return null
+                  return (
+                    <div className="mt-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-200">
+                      <span className="font-semibold uppercase">{tr.status.replace('_', ' ')}</span>
+                      {tr.reason ? <span className="text-amber-200/80"> · {tr.reason}</span> : null}
+                    </div>
+                  )
+                })()}
 
                 <div className="mt-3 grid grid-cols-3 gap-2 text-xs">
                   <div className="rounded bg-gray-900/60 border border-gray-700/50 p-2">
@@ -3983,8 +4012,9 @@ function ForexSignalsView(props: {
   onStatusFilter: (s: SignalStatus | '') => void
   onRefresh: () => void
   prices: Record<string, number | null>
+  tradeReasons: Map<number, { status: string; reason: string | null; at: string }>
 }) {
-  const { signals, loading, statusFilter, onStatusFilter, onRefresh, prices } = props
+  const { signals, loading, statusFilter, onStatusFilter, onRefresh, prices, tradeReasons } = props
 
   return (
     <div className="space-y-4">
@@ -4067,6 +4097,18 @@ function ForexSignalsView(props: {
                     {statusKey.replace('_', ' ')}
                   </span>
                 </div>
+
+                {/* Why hasn't this forex signal been executed yet? */}
+                {(() => {
+                  const tr = tradeReasons.get(s.id)
+                  if (!tr || tr.status === 'placed') return null
+                  return (
+                    <div className="mt-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-200">
+                      <span className="font-semibold uppercase">{tr.status.replace('_', ' ')}</span>
+                      {tr.reason ? <span className="text-amber-200/80"> · {tr.reason}</span> : null}
+                    </div>
+                  )
+                })()}
 
                 {/* Entry / SL / Targets */}
                 <div className="mt-3 grid grid-cols-3 gap-2 text-xs">

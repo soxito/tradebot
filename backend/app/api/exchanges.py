@@ -178,7 +178,7 @@ async def get_ohlcv(
     exchange: SupportedExchange,
     symbol: str,
     timeframe: str = Query("1h", description="Timeframe (1m, 5m, 15m, 1h, 4h, 1d)"),
-    limit: int = Query(100, description="Number of candles", ge=1, le=1500),
+    limit: int = Query(100, description="Number of candles", ge=1, le=150000),
 ):
     """Get OHLCV (candlestick) data for a trading pair"""
     # Crypto exchanges trade USDT pairs, not plain USD

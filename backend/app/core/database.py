@@ -246,9 +246,18 @@ async def init_db():
             ("room_settings", "cycle_anchors", "TEXT"),
             ("room_settings", "cycle_bull_days", "INTEGER DEFAULT 1064"),
             ("room_settings", "cycle_bear_days", "INTEGER DEFAULT 365"),
+            ("room_settings", "cycle_history_years", "INTEGER DEFAULT 15"),
             ("room_settings", "cycle_auto_risk", "BOOLEAN DEFAULT FALSE"),
             ("room_settings", "cycle_risk_multiplier", "FLOAT DEFAULT 0.5"),
+            # Copy-trading supervision by the trading room
+            ("room_settings", "manage_copy_profiles", "BOOLEAN DEFAULT FALSE"),
+            ("room_settings", "copy_max_drawdown_pct", "FLOAT DEFAULT 20.0"),
             ("room_agent_profiles", "gender", "VARCHAR DEFAULT 'male'"),
+            # One-time execution bootstrap flags: the first boot after deploy
+            # flips live/room execution fully ON (user opted in), then the flag
+            # makes the flip never happen again — later manual toggles win.
+            ("live_trade_settings", "tg_exec_bootstrap_v1", "BOOLEAN DEFAULT FALSE"),
+            ("room_settings", "room_exec_bootstrap_v1", "BOOLEAN DEFAULT FALSE"),
             # Dedicates an AI provider profile to a single task category.
             ("ai_llm_providers", "assigned_task", "VARCHAR"),
         ]
@@ -379,6 +388,24 @@ async def init_db():
                 await conn.execute(text(
                     "UPDATE sim_accounts SET tradingagents_max_risk_discuss_rounds = 2 WHERE tradingagents_max_risk_discuss_rounds IS NULL"
                 ))
+                # ── One-time execution bootstraps (user opted into live) ──────
+                # Guarded by *_bootstrap_v1 flags added above: they run exactly
+                # once, then never again — so a later manual toggle in any UI
+                # survives restarts.
+                await conn.execute(text(
+                    "UPDATE live_trade_settings SET dry_run = FALSE, "
+                    "tg_exec_bootstrap_v1 = TRUE WHERE tg_exec_bootstrap_v1 IS NOT TRUE"
+                ))
+                await conn.execute(text(
+                    "UPDATE room_settings SET execution_enabled = TRUE, dry_run = FALSE, "
+                    "allow_sim = TRUE, allow_crypto = TRUE, allow_mt5 = TRUE, "
+                    "room_exec_bootstrap_v1 = TRUE WHERE room_exec_bootstrap_v1 IS NOT TRUE"
+                ))
+                # Agent token budgets: 2000 truncated published reasoning
+                # mid-sentence; 6000 lets a verbose model finish its paragraph.
+                await conn.execute(text(
+                    "UPDATE agents SET max_tokens = 6000 WHERE max_tokens = 2000"
+                ))
             except Exception:
                 pass
 
@@ -424,3 +451,20 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
             yield session
         finally:
             await session.close()
+
+
+async def safe_rollback(db: AsyncSession) -> None:
+    """Clear a failed transaction so the same session can be reused.
+
+    PostgreSQL aborts the whole transaction on any statement error, and every
+    later statement on that session then fails with
+    ``InFailedSQLTransactionError: current transaction is aborted`` — which is
+    how one optional, swallowed read (a settings lookup, a scenario check)
+    used to cost an entire room meeting its final commit. Call this in the
+    ``except`` block of anything that catches a database error and intends to
+    keep going.
+    """
+    try:
+        await db.rollback()
+    except Exception:  # noqa: BLE001 - rollback is best-effort by design
+        pass

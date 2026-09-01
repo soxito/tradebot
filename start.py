@@ -21,6 +21,7 @@ Services started:
 
 import argparse
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -145,6 +146,20 @@ SPEECH_ENGINE_UVICORN_BIN = SPEECH_ENGINE_VENV_BIN / f"uvicorn{_EXE}"
 SPEECH_ENGINE_PORT     = int(os.environ.get("SPEECH_ENGINE_PORT", "8790"))
 SPEECH_ENGINE_SETUP_ENABLED = os.environ.get("TRADEBOT_SKIP_SPEECH_ENGINE_SETUP", "").strip().lower() not in ("1", "true", "yes", "on")
 
+# ── Hermes (NousResearch/hermes-agent self-aware sidecar) ─────────────────────
+# Isolated on :8011 like TradingAgents :8010. Unlike heavy ML sidecars it is
+# stdlib-only (SQLite FTS5 + http.server) so it auto-starts by default and does
+# NOT gate on RAM. Opt-out: TRADEBOT_SKIP_HERMES_SETUP=1 or HERMES_ENABLED=false.
+# Full repo is auto-cloned to integrations/hermes-agent and auto-pulled on every
+# start so the integrated version stays current; `docker/hermes_sidecar.py` is
+# the runtime shim that actually binds :8011 (repo provides SOUL/skills/soul).
+HERMES_PORT        = int(os.environ.get("HERMES_PORT", os.environ.get("HERMES_GATEWAY_PORT", "8011")))
+HERMES_SETUP_ENABLED = os.environ.get("TRADEBOT_SKIP_HERMES_SETUP", "").strip().lower() not in ("1", "true", "yes", "on")
+HERMES_SIDECAR_PY  = (ROOT / "docker" / "hermes_sidecar.py").resolve()
+HERMES_REPO_URL    = os.environ.get("HERMES_REPO_URL", "https://github.com/NousResearch/hermes-agent.git")
+HERMES_REPO_DIR    = (ROOT / "integrations" / "hermes-agent").resolve()
+HERMES_REPO_VERSION_FILE = (ROOT / "integrations" / "hermes-agent.version.json")
+
 # ── Ports ─────────────────────────────────────────────────────────────────────
 BACKEND_PORT       = int(os.environ.get("BACKEND_PORT", "1448"))
 FRONTEND_PORT      = int(os.environ.get("FRONTEND_PORT", "3000"))
@@ -169,6 +184,7 @@ RUN_DIR = (ROOT / ".tradebot" / "run")
 SIDECARS: List[Dict[str, object]] = [
     {"key": "headroom",      "label": "Headroom proxy",     "port": HEADROOM_PORT,           "kind": "process", "tool": True,  "markers": ["headroom"]},
     {"key": "obsidian",      "label": "Obsidian app",       "port": None,                    "kind": "app",     "tool": True,  "markers": ["obsidian"]},
+    {"key": "hermes",        "label": "Hermes gateway",     "port": HERMES_PORT,             "kind": "process", "tool": False, "markers": ["hermes_sidecar", "hermes-gateway"]},
     {"key": "speech_engine", "label": "Speech engine",      "port": SPEECH_ENGINE_PORT,      "kind": "process", "tool": False, "markers": ["speech_engine"]},
     {"key": "vibe_trading",  "label": "Vibe-Trading sidecar","port": VIBE_TRADING_SERVE_PORT, "kind": "process", "tool": False, "markers": ["vibe-trading", "vibe_trading"]},
     {"key": "agentmemory",   "label": "agentmemory server", "port": AGENTMEMORY_PORT,        "kind": "process", "tool": False, "markers": ["agentmemory"]},
@@ -873,6 +889,162 @@ def _sweep_ports(ports: List[int]) -> None:
         for pid in _port_pids(port):
             if _kill_pid_tree(pid):
                 info(f"  swept :{port} (pid {pid})")
+
+
+# ── Startup port-freeing ──────────────────────────────────────────────────────
+# Every run of start.py is a FRESH START: whatever still holds a port the app
+# needs is killed first. The "already running → skip" behaviour used to let
+# stale/zombie backends accumulate — an orphaned uvicorn holds no port but
+# keeps its DB connection pool open, which is how PostgreSQL once ran out of
+# connections entirely. DB services (postgres/redis) are deliberately NOT
+# touched: they are shared services managed by brew/docker and reused, not
+# respawned.
+
+#: Process patterns killed on EVERY start, even when they hold no port.
+#: Kept narrow so unrelated projects are never matched: the frontend pattern
+#: includes our specific port, and start.py supervisors must also have
+#: ``python`` in their cmdline (an editor with this file open never matches).
+_STARTUP_KILL_PATTERNS = ["uvicorn app.main:app"]
+
+
+def _pid_gone(pid: int) -> bool:
+    """True when `pid` no longer runs any code.
+
+    Treats zombies as gone: a dead-but-unreaped child holds no sockets, no
+    threads and no DB pools — waiting on it would only add delay. POSIX-only
+    refinement; Windows taskkill is synchronous already.
+    """
+    if IS_WINDOWS:
+        return not _pid_alive(pid)
+    try:
+        r = subprocess.run(["ps", "-p", str(pid), "-o", "stat="],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return True                    # no such process
+        return r.stdout.strip().startswith("Z")
+    except (OSError, subprocess.SubprocessError):
+        return not _pid_alive(pid)
+
+
+def _term_then_kill(pid: int, grace: float = 5.0) -> bool:
+    """SIGTERM, wait `grace` seconds for a clean exit, then SIGKILL.
+
+    Returns True when the pid is gone (or was never ours to kill because it
+    had already exited).
+    """
+    if IS_WINDOWS:
+        try:
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                           capture_output=True, text=True)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return not _pid_alive(pid)
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return True  # already gone
+    deadline = time.time() + grace
+    while time.time() < deadline:
+        if _pid_gone(pid):
+            return True
+        time.sleep(0.2)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+    time.sleep(0.5)
+    return _pid_gone(pid)
+
+
+def _kill_other_supervisors() -> None:
+    """Stop other `python start.py` watcher instances (never this one).
+
+    Two concurrent supervisors double-spawn every service — each sees the
+    other's freshly-freed ports, starts its own copy, and they fight until one
+    crashes. Killing older watchers first keeps exactly one supervisor.
+    """
+    me = os.getpid()
+    for pid in pgrep("start.py"):
+        if pid == me:
+            continue
+        cmd = _proc_cmdline(pid)
+        # Verify it really is a python launcher of THIS script, not an editor
+        # or grep with "start.py" in its arguments.
+        if "start.py" in cmd and "python" in cmd:
+            if _term_then_kill(pid):
+                info(f"Stopped previous supervisor (pid {pid})")
+
+
+def free_ports_for_startup(
+    ports: Optional[List[int]] = None,
+    extra_kill_patterns: Optional[List[str]] = None,
+) -> None:
+    """Free every port the app needs before starting anything.
+
+    Pass 1 kills known app process patterns — including orphans that hold no
+    port but keep pools/threads alive. Pass 2 unconditionally frees each
+    required port by owner (SIGTERM → SIGKILL). Ports still occupied after
+    both passes are reported loudly: something root-owned or protected has
+    them and the corresponding service will fail to bind.
+    """
+    header("0/6  Freeing ports")
+    _kill_other_supervisors()
+
+    # ── Pass 1: pattern kill (orphans without ports matter too) ──────────────
+    patterns = list(_STARTUP_KILL_PATTERNS)
+    # Match OUR frontend only: the exact command start_backend spawns.
+    patterns.append(f"next dev --port {FRONTEND_PORT}")
+    patterns.extend(extra_kill_patterns or [])
+    for pattern in patterns:
+        pids = [p for p in pgrep(pattern) if p != os.getpid()]
+        for pid in pids:
+            label = _proc_cmdline(pid)[:70]
+            if _term_then_kill(pid):
+                info(f"Killed stale process (pid {pid}): {label}")
+            else:
+                warn(f"Could not kill pid {pid}: {label}")
+
+    # ── Pass 2: free every required port by owner ────────────────────────────
+    if ports is None:
+        ports = [
+            HEADROOM_PORT, HERMES_PORT, SPEECH_ENGINE_PORT, VIBE_TRADING_SERVE_PORT,
+            AGENTMEMORY_PORT, OPENMANUS_MCP_PORT, OPENWA_API_PORT,
+            OPENWA_DASHBOARD_PORT, BACKEND_PORT, FRONTEND_PORT,
+        ]
+    still_busy: List[int] = []
+    for port in ports:
+        pids = [p for p in _port_pids(port) if p != os.getpid()]
+        for pid in pids:
+            cmd = _proc_cmdline(pid)[:60]
+            if _term_then_kill(pid):
+                info(f"Freed :{port} (was pid {pid}: {cmd})")
+            else:
+                warn(f"Port :{port} held by pid {pid} ({cmd}) — kill failed")
+        if _port_pids(port):
+            still_busy.append(port)
+
+    if still_busy:
+        warn(f"Ports still occupied after sweep: "
+             f"{', '.join(':' + str(p) for p in still_busy)}")
+        warn("Those services may fail to bind — check what owns them with: "
+             f"lsof -iTCP:{still_busy[0]} -sTCP:LISTEN")
+    else:
+        ok("All required ports are free")
+
+    # macOS: a KeepAlive LaunchAgent re-launches the backend every few seconds
+    # and will steal :1448 right back mid-startup. Warn rather than disable —
+    # the agent was installed deliberately.
+    if platform.system() == "Darwin":
+        try:
+            r = subprocess.run(["launchctl", "list", "com.tradebot.backend"],
+                               capture_output=True, text=True)
+            if r.returncode == 0:
+                warn("LaunchAgent 'com.tradebot.backend' is loaded and will "
+                     "respawn its own backend on :" + str(BACKEND_PORT))
+                info("If you want start.py to own the backend, run:  "
+                     "launchctl bootout gui/$(id -u)/com.tradebot.backend")
+        except (OSError, subprocess.SubprocessError):
+            pass
 
 
 def _npm_cmd() -> str:
@@ -2020,13 +2192,9 @@ def preflight_check(mode: str) -> bool:
                     _check("Python packages (fastapi, uvicorn, sqlalchemy …)", True,
                            "installed by auto-setup")
                     fixed_items.append("pip packages")
-                    # tradingagents is optional; install without deps so its
-                    # broken chainlit/Python-3.12 requirements don't block us.
-                    _spinner_run(
-                        [str(pip), "install", "--quiet", "--no-deps",
-                         "--upgrade", "tradingagents==0.6.0"],
-                        "tradingagents (no-deps)", timeout=60
-                    )
+                    # TradingAgents sidecar venv — isolated from the backend,
+                    # created on demand if the desk is missing.
+                    setup_tradingagents_sidecar()
             else:
                 _check("Python packages", False, "",
                        f"pip install failed: {err_p[:200]}")
@@ -3240,6 +3408,59 @@ def ensure_venv() -> bool:
     return True
 
 
+TA_DIR     = ROOT / "integrations" / "TradingAgents"
+TA_VENV_PY = TA_DIR / ".venv" / _VENV_BIN / f"python{_EXE}"
+
+
+def setup_tradingagents_sidecar() -> bool:
+    """Ensure the isolated TradingAgents sidecar venv exists with full deps.
+
+    The sidecar runs the multi-agent LLM framework in its own interpreter so
+    its langchain/langgraph/pandas stack never conflicts with the backend's
+    pinned requirements. The clone under integrations/ keeps the upstream
+    source available for reading; runtime uses the PyPI release.
+    """
+    if TA_VENV_PY.exists():
+        return True
+
+    if not TA_DIR.exists():
+        info("Cloning TauricResearch/TradingAgents …")
+        r = run(["git", "clone", "--depth", "1",
+                 "https://github.com/TauricResearch/TradingAgents.git", str(TA_DIR)])
+        if r.returncode != 0:
+            warn(f"TradingAgents clone failed: {r.stderr.strip()[:200]}")
+            return False
+
+    # Needs Python >= 3.12; prefer the backend venv's interpreter.
+    host_py = None
+    for candidate in (str(PY_BIN), sys.executable, "python3.13", "python3.12", "python3"):
+        if not candidate:
+            continue
+        probe = run([candidate, "-c",
+                     "import sys; raise SystemExit(0 if sys.version_info >= (3,12) else 1)"])
+        if probe.returncode == 0 and (candidate == sys.executable or Path(candidate).exists()):
+            host_py = candidate
+            break
+    if host_py is None:
+        warn("No Python >= 3.12 found for the TradingAgents sidecar — desk disabled")
+        return False
+
+    info("Creating TradingAgents sidecar venv (isolated, full deps — one-off) …")
+    ok_inst = run([host_py, "-m", "venv", str(TA_DIR / ".venv")])
+    if ok_inst.returncode != 0:
+        warn(f"TradingAgents venv creation failed: {ok_inst.stderr.strip()[:200]}")
+        return False
+    r = run([str(TA_VENV_PY), "-m", "pip", "install", "--quiet", "--upgrade",
+             "tradingagents==0.7.0",
+             "fastapi", "uvicorn[standard]", "sse-starlette", "loguru",
+             "python-dotenv", "httpx"])
+    if r.returncode != 0:
+        warn(f"TradingAgents sidecar deps failed: {(r.stderr or '').strip()[:300]}")
+        return False
+    ok("TradingAgents sidecar ready")
+    return True
+
+
 def ensure_pip_deps() -> bool:
     reqs = BACKEND_DIR / "requirements.txt"
     if not reqs.exists():
@@ -3298,13 +3519,11 @@ def ensure_pip_deps() -> bool:
 
     ok("Python dependencies installed")
 
-    # tradingagents has an unpublished dep (chainlit>=2.11.1) and requires
-    # Python>=3.12, so it can't be in requirements.txt.  Install the wheel
-    # alone (--no-deps) — the conditional import in orchestrator.py works fine
-    # without chainlit/langgraph being present.
-    pip = PIP_BIN
-    run([str(pip), "install", "--quiet", "--no-deps", "--upgrade",
-         "tradingagents==0.6.0"], cwd=BACKEND_DIR)
+    # TradingAgents runs as an isolated sidecar service (its own venv under
+    # integrations/TradingAgents); the backend talks to it over HTTP. The old
+    # --no-deps wheel install into the backend venv is gone — nothing imports
+    # the package in-process anymore.
+    setup_tradingagents_sidecar()
 
     # headroom-ai (context compression) is OPTIONAL — imported conditionally and
     # falls back silently if absent (backend/app/utils/headroom_compress.py). It
@@ -4186,6 +4405,238 @@ daytona_api_key = "disabled"
     return True  # always best-effort
 
 
+def _hermes_repo_version() -> Dict[str, object]:
+    """Best-effort repo version from integrations/hermes-agent git metadata."""
+    if not HERMES_REPO_DIR.exists():
+        return {"cloned": False, "commit": None, "branch": None, "remote": HERMES_REPO_URL, "last_pull": None, "version_file": str(HERMES_REPO_VERSION_FILE)}
+    try:
+        r = subprocess.run(["git", "-C", str(HERMES_REPO_DIR), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5)
+        commit = r.stdout.strip()[:12] if r.returncode == 0 else None
+        r2 = subprocess.run(["git", "-C", str(HERMES_REPO_DIR), "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, timeout=5)
+        branch = r2.stdout.strip() if r2.returncode == 0 else None
+        last_pull: Optional[str] = None
+        if HERMES_REPO_VERSION_FILE.exists():
+            try:
+                last_pull = json.loads(HERMES_REPO_VERSION_FILE.read_text()).get("last_pull")
+            except Exception:
+                pass
+        # Try to get package version if installed
+        pkg_version: Optional[str] = None
+        for cand in [HERMES_REPO_DIR / "pyproject.toml", HERMES_REPO_DIR / "package.json"]:
+            if cand.exists():
+                try:
+                    txt = cand.read_text()
+                    # crude: look for version = "x.y.z"
+                    import re
+                    m = re.search(r'version\s*=\s*["\']([^"\']+)["\']', txt)
+                    if m:
+                        pkg_version = m.group(1)
+                        break
+                except Exception:
+                    pass
+        return {"cloned": True, "commit": commit, "branch": branch, "remote": HERMES_REPO_URL, "last_pull": last_pull, "pkg_version": pkg_version, "path": str(HERMES_REPO_DIR)}
+    except Exception:
+        return {"cloned": True, "commit": None, "branch": None, "remote": HERMES_REPO_URL, "last_pull": None, "path": str(HERMES_REPO_DIR)}
+
+
+def _hermes_ensure_repo() -> bool:
+    """Ensure integrations/hermes-agent exists and is up-to-date. Always best-effort."""
+    # Check git availability
+    if not shutil.which("git"):
+        warn("Hermes: git not found — cannot clone/update hermes-agent repo (manual: git clone https://github.com/NousResearch/hermes-agent.git integrations/hermes-agent)")
+        return False
+    # Clone if missing
+    if not HERMES_REPO_DIR.exists():
+        HERMES_REPO_DIR.parent.mkdir(parents=True, exist_ok=True)
+        info(f"Cloning Hermes repo → {HERMES_REPO_DIR} …")
+        clone_cmd = ["git", "clone", "--depth=1", HERMES_REPO_URL, str(HERMES_REPO_DIR)]
+        ok_run, err = _spinner_run(clone_cmd, "Hermes clone", cwd=str(ROOT), timeout=120)
+        if not ok_run or not (HERMES_REPO_DIR / ".git").exists():
+            warn(f"Hermes clone failed ({(err or '')[:160]}). Using local sidecar shim only.")
+            return False
+        # Record version after clone
+        try:
+            v = _hermes_repo_version()
+            HERMES_REPO_VERSION_FILE.write_text(json.dumps({**v, "last_pull": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, indent=2))
+        except Exception:
+            pass
+        ok(f"Hermes repo cloned ✓  ({HERMES_REPO_URL})")
+        return True
+    # Already cloned → pull updates (best-effort, never blocks startup long)
+    try:
+        # Fetch latest
+        info("Checking Hermes repo for updates …")
+        fetch = subprocess.run(["git", "-C", str(HERMES_REPO_DIR), "fetch", "--depth=1", "origin"], capture_output=True, text=True, timeout=30)
+        if fetch.returncode == 0:
+            # Check if behind
+            behind = subprocess.run(["git", "-C", str(HERMES_REPO_DIR), "rev-list", "HEAD..FETCH_HEAD", "--count"], capture_output=True, text=True, timeout=10)
+            count = int(behind.stdout.strip()) if behind.returncode == 0 and behind.stdout.strip().isdigit() else 0
+            if count > 0:
+                info(f"Hermes repo has {count} new commit(s) — pulling …")
+                pull = subprocess.run(["git", "-C", str(HERMES_REPO_DIR), "pull", "--ff-only"], capture_output=True, text=True, timeout=60)
+                if pull.returncode == 0:
+                    ok(f"Hermes repo updated ✓  ({count} commit(s) pulled)")
+                else:
+                    warn(f"Hermes pull failed ({(pull.stderr or '')[:120]}). Using existing checkout.")
+            else:
+                ok("Hermes repo up-to-date ✓")
+        else:
+            # Offline or no remote — keep existing checkout
+            info("Hermes repo: offline or fetch skipped — using existing checkout")
+    except Exception as ex:
+        warn(f"Hermes repo update check skipped ({ex}) — using existing checkout")
+    # Always update last_pull timestamp even when no new commits (so page shows freshness)
+    try:
+        v = _hermes_repo_version()
+        HERMES_REPO_VERSION_FILE.write_text(json.dumps({**v, "last_pull": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, indent=2))
+    except Exception:
+        pass
+    return True
+
+
+def _hermes_ensure_best_trader_skills() -> None:
+    """Ensure 78 crypto+FX best-trader skills exist (A+A). Idempotent, best-effort."""
+    try:
+        # Use the standalone bootstrap script's logic without subprocess.
+        # Counting btcusd as canary — if it's missing, rebuild missing only.
+        canary = ROOT / "hermes_skills" / "btcusd-best-trader" / "SKILL.md"
+        if canary.exists():
+            # verify count quickly; skip heavy work if all present
+            try:
+                existing = [p for p in (ROOT / "hermes_skills").iterdir() if p.is_dir() and p.name.endswith("-best-trader")]
+                if len(existing) >= 78:
+                    return
+            except Exception:
+                pass
+        bs = ROOT / "scripts" / "bootstrap_hermes_best_trader_skills.py"
+        if not bs.exists():
+            return
+        # Run via the venv python so imports resolve; best-effort, never block >30s
+        info("Hermes best-trader skills: bootstrapping 78 pairs …")
+        res = subprocess.run([str(PY_BIN), str(bs)], capture_output=True, text=True, timeout=30, cwd=str(ROOT))
+        if res.returncode == 0:
+            # parse per-dir counts from output (last line has unique count)
+            last = (res.stdout or "").strip().splitlines()[-1] if res.stdout else ""
+            ok(f"Hermes best-trader skills ready ✓  ({last or '78 pairs'})")
+        else:
+            warn(f"Hermes best-trader bootstrap deferred ({(res.stderr or res.stdout or '')[:160]})")
+    except Exception as ex:
+        warn(f"Hermes best-trader skills check skipped ({ex})")
+
+
+def _hermes_ensure_configured() -> None:
+    """Ensure Hermes runtime config exists so the sidecar is fully usable."""
+    # Ensure data dirs exist
+    for d in [ROOT / "data" / "hermes", ROOT / "hermes_skills"]:
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+    # Ensure SOUL.md exists (merged JARVIS/Paul/SOX) — already at ROOT/SOUL.md
+    soul_path = ROOT / "SOUL.md"
+    if not soul_path.exists():
+        # Try to copy from repo's SOUL.md if available, else keep our managed one
+        repo_soul = HERMES_REPO_DIR / "SOUL.md"
+        if repo_soul.exists():
+            try:
+                soul_path.write_text(repo_soul.read_text(encoding="utf-8"), encoding="utf-8")
+                ok("Hermes SOUL.md configured from repo template ✓")
+            except Exception:
+                pass
+    # Ensure .env has Hermes defaults (non-destructive — only add missing keys)
+    env_path = ROOT / ".env"
+    if env_path.exists():
+        try:
+            txt = env_path.read_text(encoding="utf-8")
+            missing: List[str] = []
+            if "HERMES_ENABLED" not in txt:
+                missing.append("HERMES_ENABLED=true")
+            if "HERMES_GATEWAY_URL" not in txt:
+                missing.append(f"HERMES_GATEWAY_URL=http://127.0.0.1:{HERMES_PORT}")
+            if "HERMES_RETENTION_DAYS" not in txt:
+                missing.append("HERMES_RETENTION_DAYS=90")
+            if "HERMES_AUTO_INGEST" not in txt:
+                missing.append("HERMES_AUTO_INGEST=true")
+            if missing:
+                with open(env_path, "a", encoding="utf-8") as f:
+                    f.write("\n# Hermes auto-configured by start.py\n" + "\n".join(missing) + "\n")
+                ok(f"Hermes .env configured ✓  (added {', '.join(k.split('=')[0] for k in missing)})")
+        except Exception:
+            pass
+
+
+def ensure_hermes() -> bool:
+    """Ensure Hermes repo is cloned/updated, configured, and the gateway is running.
+
+    Steps (all best-effort, never blocks startup):
+      1. Respect TRADEBOT_SKIP_HERMES_SETUP=1 and HERMES_ENABLED=false (opt-out).
+      2. Ensure repo at integrations/hermes-agent (clone if missing, pull if behind).
+      3. Ensure config: data dirs, SOUL.md, .env defaults.
+      4. Start sidecar on :8011 if not already listening (docker/hermes_sidecar.py
+         which fully uses SOUL.md + FTS5 + skills; repo at integrations/hermes-agent
+         is the source of truth for version/docs and future gateway wiring).
+    """
+    if not HERMES_SETUP_ENABLED:
+        warn("Hermes setup skipped (TRADEBOT_SKIP_HERMES_SETUP set)")
+        return True
+    # Honour explicit HERMES_ENABLED=false in .env (user opted out)
+    if (_DOTENV.get("HERMES_ENABLED", "").strip().lower() in ("0", "false", "no", "off")):
+        info("Hermes disabled via HERMES_ENABLED=false in .env — skipping sidecar")
+        return True
+    # 1) Repo: clone if missing, auto-pull updates every start
+    _hermes_ensure_repo()
+    # 2) Config: ensure data dirs, SOUL, .env
+    _hermes_ensure_configured()
+    # 2b) Best-trader skills (A+A+B): ensure 78 crypto+FX playbooks linked to ALL agents + JARVIS
+    _hermes_ensure_best_trader_skills()
+    # 3) Report repo version (so user sees what's integrated)
+    ver = _hermes_repo_version()
+    if ver.get("cloned"):
+        commit = ver.get("commit") or "unknown"
+        branch = ver.get("branch") or "main"
+        ok(f"Hermes repo ✓  {commit} on {branch}  ({HERMES_REPO_DIR.name}) — auto-updates on each start")
+    else:
+        info("Hermes repo not cloned — sidecar shim only (run: git clone https://github.com/NousResearch/hermes-agent.git integrations/hermes-agent)")
+    # 4) Gateway sidecar (idempotent)
+    if port_open("127.0.0.1", HERMES_PORT, 0.5):
+        ok(f"Hermes gateway already running on :{HERMES_PORT} ✓  (http://localhost:{HERMES_PORT}/health)")
+        return True
+    if not HERMES_SIDECAR_PY.exists():
+        warn(f"Hermes sidecar not found at {HERMES_SIDECAR_PY} — skipping (pull latest?)")
+        return True
+    if not PY_BIN.exists():
+        warn("Hermes: backend venv python not found — skipping sidecar start")
+        return True
+    info(f"Starting Hermes gateway on :{HERMES_PORT} …")
+    hermes_log = ROOT / "hermes.log"
+    # Use local data dir for sidecar DB (writable) — docker uses /data/hermes via volume.
+    hermes_data_dir = str((ROOT / "data" / "hermes").resolve())
+    env = {**os.environ, "HERMES_PORT": str(HERMES_PORT), "HERMES_DATA_DIR": hermes_data_dir, "PYTHONPATH": f"{BACKEND_DIR}{os.pathsep}{ROOT}"}
+    # Honour DATA_DIR override if set
+    if _DOTENV.get("HERMES_STATE_PATH"):
+        env["HERMES_STATE_PATH"] = _DOTENV["HERMES_STATE_PATH"]
+    # Expose repo path to sidecar so it can read SOUL/skills directly from repo
+    env["HERMES_REPO_DIR"] = str(HERMES_REPO_DIR)
+    _win_flags = 0
+    if IS_WINDOWS:
+        _win_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    try:
+        with open(hermes_log, "ab") as lf:
+            if IS_WINDOWS:
+                subprocess.Popen([str(PY_BIN), str(HERMES_SIDECAR_PY)], env=env, stdout=lf, stderr=subprocess.STDOUT, creationflags=_win_flags)
+            else:
+                subprocess.Popen([str(PY_BIN), str(HERMES_SIDECAR_PY)], env=env, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True, cwd=str(ROOT))
+    except Exception as ex:
+        warn(f"Could not launch Hermes sidecar: {ex}")
+        return True
+    for _ in range(10):
+        time.sleep(1)
+        if port_open("127.0.0.1", HERMES_PORT, 0.5):
+            ok(f"Hermes gateway ready on :{HERMES_PORT} ✓  (SOUL: JARVIS/Paul/SOX merged)")
+            return True
+    warn(f"Hermes gateway didn't bind to :{HERMES_PORT} within 10s — check {hermes_log.name}. Backend will use local FTS5 fallback.")
+    return True
+
 
 def _start_agentmemory_server() -> bool:
     """Launch 'agentmemory serve' as a detached background daemon on :8900.
@@ -4442,6 +4893,15 @@ def start_backend(pg_port: int, redis_port: int, mode: str) -> bool:
     env.setdefault("PAUL_HEARTBEAT_ENABLED", PAUL_HEARTBEAT_ENABLED)
     env.setdefault("PAUL_HEARTBEAT_GOAL_CONTINUATION", PAUL_HEARTBEAT_GOAL_CONTINUATION)
     env.setdefault("PAUL_HEARTBEAT_TICK_SECONDS", PAUL_HEARTBEAT_TICK_SECONDS)
+
+    # Hermes self-aware gateway — auto-enable on :8011 so the /hermes page
+    # and Trading Room ingest work without the user editing .env. Explicit
+    # HERMES_ENABLED=false in .env still wins (checked in ensure_hermes).
+    env.setdefault("HERMES_ENABLED", "true")
+    env.setdefault("HERMES_GATEWAY_URL", f"http://127.0.0.1:{HERMES_PORT}")
+    env.setdefault("HERMES_RETENTION_DAYS", "90")
+    env.setdefault("HERMES_AUTO_INGEST", "true")
+    env.setdefault("SOUL_PATH", "SOUL.md")
 
     # Resource-aware ML/BLAS thread caps so torch/numpy (Kronos, sentiment) can't
     # saturate the CPU and stall the API on smaller machines (e.g. 8-core M2).
@@ -4704,7 +5164,7 @@ def stop_all(keep_tools: bool = False, hard: bool = False) -> None:
     if hard:
         warn("--hard: sweeping all known ports")
         _sweep_ports([
-            HEADROOM_PORT, SPEECH_ENGINE_PORT, VIBE_TRADING_SERVE_PORT,
+            HEADROOM_PORT, HERMES_PORT, SPEECH_ENGINE_PORT, VIBE_TRADING_SERVE_PORT,
             AGENTMEMORY_PORT, OPENMANUS_MCP_PORT, OPENWA_API_PORT,
             OPENWA_DASHBOARD_PORT, BACKEND_PORT, FRONTEND_PORT,
         ])
@@ -4719,6 +5179,7 @@ def status() -> None:
     header("TradeBot Service Status")
     checks = [
         ("Headroom proxy", "127.0.0.1", HEADROOM_PORT),
+        ("Hermes gateway", "127.0.0.1", HERMES_PORT),
         ("PostgreSQL (brew)", "localhost", 5434),
         ("PostgreSQL (docker)", "localhost", 5433),
         ("Redis (brew)", "localhost", 6379),
@@ -4748,6 +5209,19 @@ def status() -> None:
         running = bool(tg.get("running"))
         sym = f"{C.GREEN}●{C.RESET}" if running else f"{C.YELLOW}○{C.RESET}"
         print(f"  {sym}  {'Telegram monitor':<26}  {'-':>5}  {'running' if running else 'stopped'}")
+
+    # Hermes API health (best-effort; backend must be up) — extra detail beyond port.
+    hg = http_json(f"http://127.0.0.1:{BACKEND_PORT}/api/v1/hermes/health", timeout=3)
+    if hg is not None:
+        en = bool(hg.get("enabled"))
+        gw = (hg.get("gateway") or {})
+        reachable = bool(gw.get("reachable"))
+        sym = f"{C.GREEN}●{C.RESET}" if (en and reachable) else f"{C.YELLOW}○{C.RESET}" if en else f"{C.RED}○{C.RESET}"
+        state = "reachable (SOUL merged)" if reachable else ("enabled (local FTS5 fallback)" if en else "disabled (HERMES_ENABLED=false)")
+        print(f"  {sym}  {'Hermes API':<26}  {'-':>5}  {state}")
+    else:
+        # Fallback when backend not yet up — already shown via port check above, skip duplicate.
+        pass
 
 
 
@@ -4864,9 +5338,16 @@ def print_sox_banner(mode: str, pg_port: int, redis_port: int) -> None:
     print(row("API DOCS", f"http://localhost:{BACKEND_PORT}/docs", CY))
     print(row("MT5 REST", MT5_API_URL, CY))
     print(row("HEADROOM", f"{HEADROOM_URL}/dashboard", CY))
+    print(row("HERMES", f"http://localhost:{HERMES_PORT}  ·  /hermes  ·  SOUL merged", CY))
     print(row("OPENAWA", f"{OPENWA_DASHBOARD_URL}/dashboard", CY))
     print(line("╚", "═", "╝"))
-    print(f"\n  {DIM}Logs:{RS} {ROOT}/backend.log  |  {ROOT}/frontend.log\n")
+    # ── Hermes explicit started line (requested) ───────────────────────────
+    hermes_running = port_open("127.0.0.1", HERMES_PORT, 0.5)
+    if hermes_running:
+        print(f"  {C.GREEN}✓{C.RESET}  {C.BOLD}Hermes has started{C.RESET} — gateway on {C.CYAN}http://localhost:{HERMES_PORT}/health{C.RESET}  ·  page {C.CYAN}http://localhost:{FRONTEND_PORT}/hermes{C.RESET}  ·  SOUL {C.CYAN}SOUL.md{C.RESET} (JARVIS/Paul/SOX merged)")
+    else:
+        print(f"  {C.YELLOW}!{C.RESET}  Hermes gateway not running on :{HERMES_PORT} — backend will use local FTS5 fallback (check {ROOT}/hermes.log)")
+    print(f"\n  {DIM}Logs:{RS} {ROOT}/backend.log  |  {ROOT}/frontend.log  |  {ROOT}/hermes.log\n")
 
 
 def print_summary(results: Dict[str, bool], mode: str, pg_port: int, redis_port: int) -> None:
@@ -4921,6 +5402,9 @@ def main() -> None:
     parser.add_argument("--hard",     action="store_true",
                         help="With --stop: also sweep every known port (incl. DB services)")
     parser.add_argument("--status",   action="store_true", help="Show service status")
+    parser.add_argument("--no-free-ports", action="store_true",
+                        help="Do NOT kill processes holding required ports "
+                             "(default: every start frees all app ports first)")
     parser.add_argument("--simulate", action="store_true",
                         help="Show resource settings for all PC model classes and exit")
     args = parser.parse_args()
@@ -4940,6 +5424,14 @@ def main() -> None:
     forced = "brew" if args.brew else ("docker" if args.docker else None)
     mode = detect_mode(forced)
     save_mode(mode)
+
+    # ── Fresh-start guarantee: kill stale instances and free our ports ────────
+    # Skippable for CI/embedded use via --no-free-ports or
+    # TRADEBOT_NO_FREE_PORTS=1.
+    _opt_out = os.environ.get("TRADEBOT_NO_FREE_PORTS", "").strip().lower() in (
+        "1", "true", "yes", "on")
+    if not (args.no_free_ports or _opt_out):
+        free_ports_for_startup()
 
     # ── Pre-flight ────────────────────────────────────────────────────────────
     if not preflight_check(mode):
@@ -5063,6 +5555,14 @@ def main() -> None:
     else:
         info(f"OpenManus skipped (host RAM < {_SIDECAR_MIN_RAM_GB}GB; "
              "set TRADEBOT_ENABLE_OPENMANUS=1 to force)")
+
+    # Hermes gateway — self-aware sidecar (episodic+skill+user-model, :8011).
+    # Stdlib-only (no heavy ML) so it auto-starts by default and always shows
+    # in the startup summary below. Opt-out: TRADEBOT_SKIP_HERMES_SETUP=1 or
+    # HERMES_ENABLED=false in .env.
+    header("3b/6  Hermes gateway")
+    hermes_ok = ensure_hermes()
+    results["Hermes gateway"] = hermes_ok
 
     # ── 4. Backend ────────────────────────────────────────────────────────────
     header("4/6  FastAPI backend")

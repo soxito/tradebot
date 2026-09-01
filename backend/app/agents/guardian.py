@@ -27,8 +27,9 @@ to lose, and any single position can be widened only once.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from loguru import logger
 from sqlalchemy import select
@@ -100,13 +101,79 @@ def reset_state() -> None:
     _announced.clear()
 
 
+# ── Market-hours guard ────────────────────────────────────────────────────────
+# Forex and metals pairs have no price feed during the weekend.  Stale Friday
+# candles fed into the structural analysis produce false "structure broken"
+# verdicts, which fire "Position closed early" notifications (and broker calls
+# when execution is on) even though nothing has actually happened.
+
+#: Friday 21:00 UTC — markets close.
+_FX_WEEK_CLOSE = (4, 21)
+#: Sunday 22:00 UTC — markets re-open.
+_FX_WEEK_OPEN  = (6, 22)
+#: If the newest candle is older than this the feed is considered stale.
+_CANDLE_STALE_S = 8 * 3600  # 8 hours
+
+
+def _forex_market_open() -> bool:
+    """False during the standard forex weekend break (Fri 21:00–Sun 22:00 UTC)."""
+    t = _dt.datetime.now(_dt.timezone.utc)
+    wd, hour = t.weekday(), t.hour
+    if wd == 5:                                               # all of Saturday
+        return False
+    if wd == _FX_WEEK_CLOSE[0] and hour >= _FX_WEEK_CLOSE[1]:
+        return False
+    if wd == _FX_WEEK_OPEN[0] and hour < _FX_WEEK_OPEN[1]:
+        return False
+    return True
+
+
+def _candles_fresh(candles: Sequence[Any]) -> bool:
+    """True when the most recent candle timestamp is within the staleness window."""
+    if not candles:
+        return True
+    try:
+        last_ms = float(candles[-1][0])
+        return (time.time() - last_ms / 1000.0) <= _CANDLE_STALE_S
+    except (IndexError, TypeError, ValueError):
+        return True
+
+
+def _is_forex_pair(symbol: str) -> bool:
+    """Gracefully delegates to the plugin's classifier; returns False on import error."""
+    try:
+        from plugins.TelegramSignalNewsPlugin.backend.services.forex_price_service import (
+            is_forex_pair,
+        )
+        return is_forex_pair(symbol)
+    except Exception:  # noqa: BLE001 — plugin may not be loaded
+        return False
+
+
 async def _read(symbol: str) -> tuple[list, list]:
-    """The two candle series the verdict is formed from, or two empty lists."""
+    """The two candle series the verdict is formed from, or two empty lists.
+
+    Returns ``([], [])`` without fetching when:
+    - the symbol is a forex/metals pair AND the weekend break is in progress, OR
+    - the most recent candle is too old for the feed to be considered live.
+    Either condition means the guardian would be deciding on stale data, which
+    produces false "structure broken" verdicts and spurious close notifications.
+    """
     from app.services import candles as candle_source
 
     until = _no_bars.get(symbol)
     if until and time.time() < until:
         return [], []
+
+    # Forex/metals markets close Friday evening and re-open Sunday evening (UTC).
+    # Skip the entire guard pass for those pairs while the market is shut so that
+    # stale Friday candles cannot trigger false "break, not a sweep" verdicts.
+    if _is_forex_pair(symbol):
+        if not _forex_market_open():
+            logger.debug(
+                "[Guardian] {} — forex market closed (weekend), skipping", symbol
+            )
+            return [], []
 
     ltf = await candle_source.fetch(symbol, MANAGE_TF)
     htf = await candle_source.fetch(symbol, STRUCTURE_TF)
@@ -114,6 +181,17 @@ async def _read(symbol: str) -> tuple[list, list]:
         _no_bars[symbol] = time.time() + _NO_BARS_BACKOFF_S
         return [], []
     _no_bars.pop(symbol, None)
+
+    # Belt-and-suspenders: even within normal trading hours, refuse candles
+    # whose most recent bar is older than the staleness threshold.  This catches
+    # broker maintenance windows, feed outages, and the very first minutes after
+    # market re-open before the first new bar has arrived.
+    if _is_forex_pair(symbol) and not _candles_fresh(htf):
+        logger.debug(
+            "[Guardian] {} — HTF candles are stale, skipping guard pass", symbol
+        )
+        return [], []
+
     return ltf, htf
 
 

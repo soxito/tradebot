@@ -9,6 +9,8 @@ if _sys.platform == "win32":
     import asyncio as _asyncio
     _asyncio.set_event_loop_policy(_asyncio.WindowsSelectorEventLoopPolicy())
 
+import asyncio
+import os
 import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
@@ -151,6 +153,20 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"JARVIS learning loop failed to start: {e}")
 
+    # Agent-decision learning loop — settles agent_decisions.outcome against
+    # closed trades and auto-runs the self-improve pass, so the trading room's
+    # seats actually evolve from realised results instead of only from a
+    # manual API call. Started unconditionally like the loop above: it is one
+    # indexed query per cycle when there is nothing pending.
+    if getattr(settings, "AUTO_START_DECISION_LEARNING_LOOP", True) and not started_workers.get(
+        "decision_learning_loop"
+    ):
+        try:
+            from app.core.scheduler import start_decision_learning_loop
+            start_decision_learning_loop()
+        except Exception as e:
+            logger.warning(f"Decision learning loop failed to start: {e}")
+
     # Realtime price-tick fan-out for SSE subscribers (idempotent; self-throttles
     # to zero work when no client is connected).
     if settings.AUTO_START_PRICE_TICK_LOOP:
@@ -253,9 +269,74 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"ngrok startup check error (non-fatal): {e}")
 
+    # TradingAgents sidecar — spawn the isolated multi-agent service as a child
+    # process so its heavy langchain/pandas stack never loads into this app.
+    ta_proc = None
+    if settings.TRADINGAGENTS_SERVICE_AUTOSTART:
+        try:
+            import httpx as _ta_httpx
+
+            async with _ta_httpx.AsyncClient() as _c:
+                _health = await _c.get(
+                    f"{settings.TRADINGAGENTS_SERVICE_URL.rstrip('/')}/health", timeout=2
+                )
+            already = _health.status_code == 200
+        except Exception:
+            already = False
+        if already:
+            logger.info("✅ TradingAgents sidecar already running")
+        else:
+            import shutil as _shutil
+            from pathlib import Path as _Path
+
+            _ws_root = _Path(__file__).resolve().parents[2]
+            _venv_py = _ws_root / "integrations" / "TradingAgents" / ".venv" / "bin" / "python"
+            if not _venv_py.exists():
+                _venv_py = _ws_root / "integrations" / "TradingAgents" / ".venv" / "Scripts" / "python.exe"
+            if _venv_py.exists():
+                try:
+                    ta_proc = await asyncio.create_subprocess_exec(
+                        str(_venv_py),
+                        "-m",
+                        "tradingagents_service.main",
+                        cwd=str(_ws_root / "backend"),
+                        env={
+                            **os.environ,
+                            "PYTHONPATH": str(_ws_root / "backend"),
+                            "TRADINGAGENTS_SERVICE_PORT": settings.TRADINGAGENTS_SERVICE_URL.rsplit(":", 1)[-1],
+                        },
+                        stdout=asyncio.subprocess.Discard,
+                    )
+                    for _ in range(20):  # up to ~10s for the sidecar to bind
+                        await asyncio.sleep(0.5)
+                        try:
+                            async with _ta_httpx.AsyncClient() as _c:
+                                r = await _c.get(
+                                    f"{settings.TRADINGAGENTS_SERVICE_URL.rstrip('/')}/health", timeout=1
+                                )
+                            if r.status_code == 200:
+                                break
+                        except Exception:
+                            continue
+                    logger.info(f"✅ TradingAgents sidecar started (pid {ta_proc.pid})")
+                except Exception as _ta_err:
+                    logger.warning(f"TradingAgents sidecar failed to start (non-fatal): {_ta_err}")
+            else:
+                logger.info("TradingAgents sidecar venv not found — run integrations/TradingAgents setup")
+
     yield
 
     # Shutdown logic here
+    if ta_proc is not None and ta_proc.returncode is None:
+        try:
+            ta_proc.terminate()
+            await asyncio.wait_for(ta_proc.wait(), timeout=5)
+            logger.info("TradingAgents sidecar stopped")
+        except Exception:  # noqa: BLE001
+            try:
+                ta_proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
     # Stop ngrok tunnels gracefully
     try:
         from app.services.ngrok_service import ngrok_service as _ngrok

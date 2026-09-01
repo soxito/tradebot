@@ -373,6 +373,7 @@ class TelegramSniperSettingsResponse(BaseModel):
     execute_sandbox: bool = True
     execute_live: bool = False
     require_ai_confirmation: bool = True
+    ai_confirmation_fail_open: bool = True
     execute_immediately: bool = True
     skipped_reanalyze_minutes: int = 15
     tp_trail_pct: float = 1.5
@@ -411,6 +412,7 @@ class TelegramSniperSettingsUpdate(BaseModel):
     execute_sandbox: bool | None = None
     execute_live: bool | None = None
     require_ai_confirmation: bool | None = None
+    ai_confirmation_fail_open: bool | None = None
     execute_immediately: bool | None = None
     skipped_reanalyze_minutes: int | None = Field(default=None, ge=0, le=1440)
     tp_trail_pct: float | None = Field(default=None, ge=0.1, le=20.0)

@@ -364,6 +364,9 @@ function CycleSettingsCard({
           <NumberField label="Bear days" value={policy.cycle_bear_days ?? 365} min={60} max={1200} step={1}
             hint="Projected top → next bottom."
             onChange={(v) => { void setPolicy({ cycle_bear_days: v }) }} />
+          <NumberField label="History years" value={policy.cycle_history_years ?? 15} min={1} max={20} step={1}
+            hint="How many years of monthly candles the cycle chart loads — as far back as the calendar read reaches."
+            onChange={(v) => { void setPolicy({ cycle_history_years: v }) }} />
           <div className="col-span-2 space-y-3">
             <Toggle
               label="Auto risk reduction in the projected-bear window"
@@ -648,6 +651,26 @@ export default function TradingRoomSettingsPage() {
                 </div>
               </div>
             )}
+
+            <div>
+              <h3 className="mb-2 text-[11px] font-medium uppercase tracking-wide text-slate-400">Copy-trading supervision</h3>
+              <div className="space-y-3">
+                <Toggle
+                  label="Agents manage all copy accounts"
+                  hint="The room reviews every copy profile each cycle. It can disable profiles breaching drawdown or win-rate limits, disable followers stuck in errors, and log every decision to its supervision log. Re-enabling is always manual."
+                  checked={policy.manage_copy_profiles ?? false}
+                  onChange={(v) => setPolicy({ manage_copy_profiles: v })}
+                />
+                {(policy.manage_copy_profiles ?? false) && (
+                  <NumberField
+                    label="Copy max drawdown" suffix="%" value={policy.copy_max_drawdown_pct ?? 20}
+                    min={1} max={100} step={1}
+                    hint="A copy profile whose paper drawdown exceeds this gets paused by the agents."
+                    onChange={(v) => setPolicy({ copy_max_drawdown_pct: v })}
+                  />
+                )}
+              </div>
+            </div>
 
             <div>
               <h3 className="mb-2 text-[11px] font-medium uppercase tracking-wide text-slate-400">Risk limits</h3>

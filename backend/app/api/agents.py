@@ -516,12 +516,15 @@ class RoomSettingsUpdate(BaseModel):
     focus_interval_s: Optional[int] = None
     focus_timeframe: Optional[str] = None
     worker_enabled: Optional[bool] = None
+    manage_copy_profiles: Optional[bool] = None
+    copy_max_drawdown_pct: Optional[float] = None
     # Bitcoin 1064-day cycle — anchors are cycle-bottom ISO dates.
     cycle_anchors: Optional[List[str]] = None
     cycle_bull_days: Optional[int] = None
     cycle_bear_days: Optional[int] = None
     cycle_auto_risk: Optional[bool] = None
     cycle_risk_multiplier: Optional[float] = None
+    cycle_history_years: Optional[int] = None
 
 
 def _settings_payload(s, db_extra: dict | None = None) -> dict:
@@ -543,6 +546,8 @@ def _settings_payload(s, db_extra: dict | None = None) -> dict:
         "focus_interval_s": getattr(s, "focus_interval_s", 300),
         "focus_timeframe": getattr(s, "focus_timeframe", "1h") or "1h",
         "worker_enabled": getattr(s, "worker_enabled", True),
+        "manage_copy_profiles": getattr(s, "manage_copy_profiles", False),
+        "copy_max_drawdown_pct": getattr(s, "copy_max_drawdown_pct", 20.0),
         "focus_symbol": getattr(s, "focus_symbol", None),
         # Cycle settings — anchors come back as a list regardless of storage.
         "cycle_anchors": _cycle_anchors_out(getattr(s, "cycle_anchors", None)),
@@ -550,6 +555,7 @@ def _settings_payload(s, db_extra: dict | None = None) -> dict:
         "cycle_bear_days": getattr(s, "cycle_bear_days", 365) or 365,
         "cycle_auto_risk": getattr(s, "cycle_auto_risk", False),
         "cycle_risk_multiplier": getattr(s, "cycle_risk_multiplier", 0.5),
+        "cycle_history_years": getattr(s, "cycle_history_years", 15) or 15,
         **(db_extra or {}),
     }
 
@@ -569,6 +575,41 @@ def _cycle_anchors_out(raw) -> list[str]:
     except (ValueError, TypeError):
         pass
     return list(DEFAULT_ANCHORS)
+
+
+@router.get("/room/copy-overview")
+async def get_room_copy_overview(db: AsyncSession = Depends(get_db)):
+    """Copy-trading supervision state: gate, latest supervisor decisions, profiles."""
+    from app.models.database import AgentDecision
+    from app.agents.copy_supervisor import SUPERVISOR_AGENT_ROLE
+
+    gate_on = False
+    try:
+        from app.agents.execution import get_settings
+
+        s = await get_settings(db)
+        gate_on = bool(getattr(s, "manage_copy_profiles", False))
+    except Exception:  # noqa: BLE001 - plugin/room optional
+        pass
+
+    decisions = []
+    try:
+        result = await db.execute(
+            select(AgentDecision)
+            .where(AgentDecision.agent_role == SUPERVISOR_AGENT_ROLE)
+            .order_by(AgentDecision.id.desc())
+            .limit(20)
+        )
+        for d in result.scalars().all():
+            decisions.append({
+                "id": d.id, "symbol": d.symbol, "action": d.action,
+                "reasoning": d.reasoning, "confidence": d.confidence,
+                "created_at": str(d.created_at) if hasattr(d, "created_at") else None,
+            })
+    except Exception:  # noqa: BLE001
+        pass
+
+    return {"manage_copy_profiles": gate_on, "decisions": decisions}
 
 
 @router.get("/room/settings")
@@ -665,15 +706,26 @@ async def update_room_settings(data: RoomSettingsUpdate, db: AsyncSession = Depe
         raise HTTPException(status_code=400, detail="cycle_bull_days must be 200–2000")
     if data.cycle_bear_days is not None and not (60 <= data.cycle_bear_days <= 1200):
         raise HTTPException(status_code=400, detail="cycle_bear_days must be 60–1200")
+    if data.cycle_history_years is not None and not (1 <= data.cycle_history_years <= 20):
+        raise HTTPException(status_code=400, detail="cycle_history_years must be 1–20")
     if data.cycle_risk_multiplier is not None and not (0 < data.cycle_risk_multiplier <= 1):
         raise HTTPException(
-            status_code=400, detail="cycle_risk_multiplier must be between 0 and 1"
+            status_code=400,
+            detail="cycle_risk_multiplier must be between 0 and 1"
+        )
+    if data.copy_max_drawdown_pct is not None and not (
+        0 < data.copy_max_drawdown_pct <= 100
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="copy_max_drawdown_pct must be between 0 and 100",
         )
 
     # Boolean fields must be settable to False, not just truthy values.
     _bool_fields = {
         "execution_enabled", "dry_run", "allow_sim", "allow_crypto",
         "allow_mt5", "worker_enabled", "mt5_live_mode", "cycle_auto_risk",
+        "manage_copy_profiles",
     }
     updates = data.model_dump(exclude_unset=True)
     # The anchors column is TEXT; the API contract is a list.

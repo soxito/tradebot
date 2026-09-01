@@ -9,7 +9,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import Head from 'next/head'
 import Link from 'next/link'
 import dynamic from 'next/dynamic'
-import { Activity, Radio, Settings, Volume2, VolumeX } from 'lucide-react'
+import { Activity, Bot, ChevronDown, ChevronUp, Radio, Search, Settings, Volume2, VolumeX } from 'lucide-react'
 
 import { useTradingRoom, type RoomSeat } from '@/hooks/useTradingRoom'
 import { useBtcCycleState } from '@/hooks/useBtcCycle'
@@ -25,8 +25,9 @@ import LiveDebate from '@/components/room/LiveDebate'
 import AccountTabs from '@/components/room/AccountTabs'
 import PairFocusSelector from '@/components/room/PairFocusSelector'
 import DeskBrief from '@/components/room/DeskBrief'
+import TradingAgentsDesk from '@/components/tradingagents/TradingAgentsDesk'
 import type { SeatInput } from '@/three/tradingRoom'
-import type { ChartCandle, NewsItem } from '@/three/roomFurniture'
+import type { ChartCandle, ChartOverlays, CycleBand, ChartPatternMarker, NewsItem } from '@/three/roomFurniture'
 
 // The candles endpoint speaks MT5 timeframe labels; the room settings speak
 // ccxt ones. One mapping, so both surfaces name the same bar.
@@ -60,6 +61,13 @@ export default function TradingRoomPage() {
   const visible = usePageVisibility()
   const [focusedRole, setFocusedRole] = useState<string | null>(null)
   const [voiceOn, setVoiceOn] = useState(true)
+  // The multi-agent desk (TradingAgents framework) slides over the room when
+  // summoned; it keeps streaming server-side even while collapsed.
+  const [taDeskOpen, setTaDeskOpen] = useState(false)
+  // Right-rail collapsible state — each card remembers its open/closed state.
+  const [pairsOpen, setPairsOpen] = useState(true)
+  const [orderDeskOpen, setOrderDeskOpen] = useState(true)
+  const [logOpen, setLogOpen] = useState(true)
 
   // Research feed — calendar events appear on the news screen when no verdict is pending.
   const { data: resData } = useResearchFeed({ days: 7, fomo_only: true })
@@ -164,14 +172,57 @@ export default function TradingRoomPage() {
         const res = await apiClient.getMarketCandles(chartSymbol, TF_TO_MT5[roomTimeframe] ?? 'H1', 60, controller.signal)
         const raw = res.data?.candles ?? []
         if (!alive) return
-        setChartCandles(raw.map((c: { open: number; high: number; low: number; close: number }) =>
-          ({ open: c.open, high: c.high, low: c.low, close: c.close })))
+        setChartCandles(raw.map((c: { time?: number; open: number; high: number; low: number; close: number }) =>
+          ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close })))
       } catch {
         /* leave the last bars up; the live price still tracks the header */
       }
     }
     void load()
     const timer = window.setInterval(load, 30_000)
+    return () => { alive = false; controller.abort(); window.clearInterval(timer) }
+  }, [chartSymbol, roomTimeframe, visible])
+
+  // Wall-chart overlays: named candlestick patterns at the room's own
+  // timeframe, plus the cycle's green/red season bands behind the candles.
+  // The chart always shows the room timeframe; the bands only say what season
+  // the bars were printed in.
+  const [chartOverlays, setChartOverlays] = useState<ChartOverlays | null>(null)
+  useEffect(() => {
+    if (!chartSymbol || !visible) return
+    let alive = true
+    const controller = new AbortController()
+    const load = async () => {
+      try {
+        const [pat, win] = await Promise.all([
+          apiClient.getPatternOverlay('yahoo', chartSymbol.replace('/', ''), {
+            timeframe: TF_TO_MT5[roomTimeframe] ?? 'H1',
+            limit: 120,
+            fisher: false,
+          }),
+          apiClient.getCycleWindows(),
+        ])
+        if (!alive) return
+        const markers: ChartPatternMarker[] = (pat.data?.markers ?? [])
+          .filter((m: { text?: string }) => Boolean(m.text))
+          .map((m: { time: number; text?: string; color?: string }) => ({
+            time: m.time > 10 ** 12 ? m.time : m.time * 1000,
+            name: String(m.text ?? ''),
+            direction: (m.color ?? '').includes('22c55e') ? 'bull' : 'bear',
+          }))
+        const bands: CycleBand[] = (win.data?.windows ?? []).map((w: { start: string; end: string; phase: string; projected?: boolean }) => ({
+          start: new Date(`${w.start}T00:00:00Z`).getTime(),
+          end: new Date(`${w.end}T00:00:00Z`).getTime(),
+          phase: w.phase === 'bull' ? 'bull' : 'bear',
+          projected: w.projected,
+        }))
+        setChartOverlays({ markers, bands })
+      } catch {
+        /* the wall chart stands without flags */
+      }
+    }
+    void load()
+    const timer = window.setInterval(load, 300_000)
     return () => { alive = false; controller.abort(); window.clearInterval(timer) }
   }, [chartSymbol, roomTimeframe, visible])
 
@@ -307,6 +358,7 @@ export default function TradingRoomPage() {
             screenInfo={screenInfo}
             quotes={boardQuotes}
             chartCandles={chartCandles}
+            chartOverlays={chartOverlays}
             news={allNewsItems}
             speech={currentSpeech}
             cycleInfo={cycleInfo}
@@ -335,11 +387,51 @@ export default function TradingRoomPage() {
           </div>
         </main>
 
-        {/* ── Right: focus + meeting log ── */}
-        <aside className="flex w-full shrink-0 flex-col gap-3 overflow-hidden xl:w-96">
-          <div className="shrink-0 rounded-xl border border-slate-700/70 bg-slate-900/50 p-3">
-            <PairFocusSelector focusSymbols={focusSymbols} onToggle={toggleFocus} onClear={clearFocus} />
+        {/* ── Right: focus + meeting log — scrollable, every card collapsible ── */}
+        <aside className="flex w-full shrink-0 flex-col gap-3 overflow-y-auto overflow-x-hidden xl:w-96 min-h-0 pr-1 scrollbar-thin">
+          <div className="shrink-0 overflow-hidden rounded-xl border border-slate-700/70 bg-slate-900/50">
+            <button
+              type="button"
+              onClick={() => setPairsOpen((v) => !v)}
+              className="flex w-full items-center gap-2 px-3 py-2.5 text-left transition hover:bg-slate-800/50"
+            >
+              <Search className="h-3.5 w-3.5 shrink-0 text-cyan-400" />
+              <span className="text-xs font-semibold uppercase tracking-wide text-slate-300">Pair focus</span>
+              <span className="ml-auto text-[10px] text-slate-500">
+                {focusSymbols.length ? `${focusSymbols.length} pinned` : 'free roaming'}
+              </span>
+              {pairsOpen ? <ChevronUp className="h-3.5 w-3.5 shrink-0 text-slate-500" /> : <ChevronDown className="h-3.5 w-3.5 shrink-0 text-slate-500" />}
+            </button>
+            {pairsOpen && (
+              <div className="border-t border-slate-800 p-3">
+                <PairFocusSelector focusSymbols={focusSymbols} onToggle={toggleFocus} onClear={clearFocus} />
+              </div>
+            )}
           </div>
+
+          <button
+            type="button"
+            onClick={() => setTaDeskOpen((v) => !v)}
+            className={`flex shrink-0 items-center gap-2 rounded-xl border px-3 py-2.5 text-xs font-semibold transition ${
+              taDeskOpen
+                ? 'border-violet-400/60 bg-violet-500/20 text-violet-100'
+                : 'border-violet-500/30 bg-violet-500/10 text-violet-300 hover:bg-violet-500/20'
+            }`}
+            title="TradingAgents multi-agent analysis desk — full pipeline on demand"
+          >
+            <Bot className="h-4 w-4" />
+            TradingAgents desk
+            <span className="ml-auto flex items-center gap-2 text-[10px] font-normal opacity-75">
+              {taDeskOpen ? 'close' : 'open'}
+              {taDeskOpen ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+            </span>
+          </button>
+
+          {taDeskOpen && (
+            <div className="flex max-h-[60vh] min-h-[420px] shrink-0 flex-col overflow-hidden">
+              <TradingAgentsDesk />
+            </div>
+          )}
 
           <DeskBrief symbol={chartSymbol} />
 
@@ -349,49 +441,69 @@ export default function TradingRoomPage() {
             <AccountTabs />
           </div>
           {executions.length > 0 && (
-            <div className="shrink-0 rounded-xl border border-slate-700/70 bg-slate-900/50 p-3">
-              <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
-                Order desk
-              </h2>
-              <div className="space-y-1.5">
-                {executions.slice(0, 5).map((e) => {
-                  // Where it actually went. One decision can fill on several
-                  // accounts at once — demo and live, or the exchange and the
-                  // paper book — and which ones is the whole question a trader
-                  // has when they see an order go out.
-                  const legs = (e.order?.orders ?? [])
-                    .filter((o) => o.status === 'placed')
-                    .map((o) => o.role || o.venue)
-                    .filter(Boolean)
-                  return (
-                    <div key={`${e.symbol}-${e.at}`} className="flex items-baseline gap-2 text-[11px]">
-                      <span className={`rounded px-1.5 py-0.5 font-medium ${
-                        e.status === 'placed' ? 'bg-emerald-500/20 text-emerald-300'
-                        : e.status === 'skipped' ? 'bg-slate-600/40 text-slate-300'
-                        : 'bg-red-500/20 text-red-300'
-                      }`}>
-                        {e.status === 'dry_run' ? 'DRY' : e.status.toUpperCase()}
-                      </span>
-                      <span className="font-mono text-slate-200">{e.symbol}</span>
-                      <span className="uppercase text-slate-400">{e.action}</span>
-                      {legs.length > 0 && (
-                        <span className="rounded bg-cyan-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-cyan-300">
-                          {legs.join(' · ')}
-                        </span>
-                      )}
-                      <span className="truncate text-slate-500">{e.reason}</span>
-                    </div>
-                  )
-                })}
-              </div>
+            <div className="shrink-0 overflow-hidden rounded-xl border border-slate-700/70 bg-slate-900/50">
+              <button
+                type="button"
+                onClick={() => setOrderDeskOpen((v) => !v)}
+                className="flex w-full items-center gap-2 px-3 py-2 text-left transition hover:bg-slate-800/40"
+              >
+                <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">Order desk</span>
+                <span className="ml-auto text-[10px] text-slate-500">{executions.length}</span>
+                {orderDeskOpen ? <ChevronUp className="h-3.5 w-3.5 shrink-0 text-slate-500" /> : <ChevronDown className="h-3.5 w-3.5 shrink-0 text-slate-500" />}
+              </button>
+              {orderDeskOpen && (
+                <div className="border-t border-slate-800 p-3">
+                  <div className="max-h-[28vh] space-y-1.5 overflow-y-auto pr-0.5">
+                    {executions.slice(0, 5).map((e) => {
+                      // Where it actually went. One decision can fill on several
+                      // accounts at once — demo and live, or the exchange and the
+                      // paper book — and which ones is the whole question a trader
+                      // has when they see an order go out.
+                      const legs = (e.order?.orders ?? [])
+                        .filter((o) => o.status === 'placed')
+                        .map((o) => o.role || o.venue)
+                        .filter(Boolean)
+                      return (
+                        <div key={`${e.symbol}-${e.at}`} className="flex items-baseline gap-2 text-[11px]">
+                          <span className={`rounded px-1.5 py-0.5 font-medium ${
+                            e.status === 'placed' ? 'bg-emerald-500/20 text-emerald-300'
+                            : e.status === 'skipped' ? 'bg-slate-600/40 text-slate-300'
+                            : 'bg-red-500/20 text-red-300'
+                          }`}>
+                            {e.status === 'dry_run' ? 'DRY' : e.status.toUpperCase()}
+                          </span>
+                          <span className="font-mono text-slate-200">{e.symbol}</span>
+                          <span className="uppercase text-slate-400">{e.action}</span>
+                          {legs.length > 0 && (
+                            <span className="rounded bg-cyan-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-cyan-300">
+                              {legs.join(' · ')}
+                            </span>
+                          )}
+                          <span className="truncate text-slate-500">{e.reason}</span>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
-          <div className="min-h-0 flex-1 overflow-y-auto">
-            <h2 className="mb-2 px-1 text-xs font-semibold uppercase tracking-wide text-slate-400">
-              Meeting log
-            </h2>
-            <SessionStream sessions={sessions} seats={seats} />
+          <div className="shrink-0 overflow-hidden rounded-xl border border-slate-700/70 bg-slate-900/50">
+            <button
+              type="button"
+              onClick={() => setLogOpen((v) => !v)}
+              className="flex w-full items-center gap-2 px-3 py-2 text-left transition hover:bg-slate-800/40"
+            >
+              <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">Meeting log</span>
+              <span className="ml-auto text-[10px] text-slate-500">{sessions.length} sessions</span>
+              {logOpen ? <ChevronUp className="h-3.5 w-3.5 shrink-0 text-slate-500" /> : <ChevronDown className="h-3.5 w-3.5 shrink-0 text-slate-500" />}
+            </button>
+            {logOpen && (
+              <div className="max-h-[38vh] overflow-y-auto border-t border-slate-800 p-2">
+                <SessionStream sessions={sessions} seats={seats} />
+              </div>
+            )}
           </div>
         </aside>
       </div>

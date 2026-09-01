@@ -44,12 +44,100 @@ import {
   type WhalePayload,
 } from '@/hooks/useBtcCycle'
 import { apiClient } from '@/services/api'
-import type { IndicatorOverlaySeries } from '@/components/TradingViewChart'
+import type { IndicatorMarker, IndicatorOverlaySeries } from '@/components/TradingViewChart'
 import { toCycleBoxes, phaseColor } from '@/utils/cycleOverlay'
 import type { CycleWindowBox } from '@/utils/zonesOverlay'
 import { toReasoningText } from '@/utils/reasoning'
 
 const TradingViewChart = dynamic(() => import('@/components/TradingViewChart'), { ssr: false })
+
+/** How many candles to ask for per TF to reach genesis (2010-07-17). */
+export const TF_GENESIS_LIMIT: Record<string, number> = {
+  MN1: 300,   // ~195 months + buffer
+  W1: 1200,   // 842 weeks + buffer
+  D1: 7000,   // 5.9k days
+  H4: 40000,  // 35k 4h
+  H1: 150000, // 141k hours
+}
+function tfToCycleApi(tf: string): string {
+  const u = (tf || 'D1').toUpperCase()
+  if (u === 'MN1' || u === '1M') return 'MN1'
+  if (['W1', 'D1', 'H4', 'H1'].includes(u)) return u
+  return 'D1'
+}
+function tfToPatternApi(tf: string): string {
+  // Bitget pattern endpoint expects 1d rather than D1 for daily etc.
+  const map: Record<string, string> = { MN1: 'MN1', W1: '1w', D1: '1d', H4: '4h', H1: '1h' }
+  return map[tfToCycleApi(tf)] ?? '1d'
+}
+/** One candle shape shared by /cycle/candles and /cycle/chart. */
+interface CycleChartCandle {
+  time: number
+  open: number
+  high: number
+  low: number
+  close: number
+  volume?: number
+  synthetic?: boolean
+}
+/** Genesis-aware candle feed for every TF: MN1/W1/D1 via Yahoo+CoinMetrics, H1/H4 via Bitget+synthetic. */
+function useCycleCandles(timeframe: string) {
+  const tf = tfToCycleApi(timeframe)
+  const [candles, setCandles] = useState<CycleChartCandle[]>([])
+  const [markers, setMarkers] = useState<IndicatorMarker[]>([])
+  const [fisherOverlays, setFisherOverlays] = useState<IndicatorOverlaySeries[]>([])
+  const [count, setCount] = useState<number>(0)
+  const [earliest, setEarliest] = useState<number | null>(null)
+  const [earliestIso, setEarliestIso] = useState<string | null>(null)
+  const [synthetic, setSynthetic] = useState<number>(0)
+  const [loaded, setLoaded] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    let alive = true
+    const ctrl = new AbortController()
+    setLoaded(false)
+    setError(null)
+    void (async () => {
+      try {
+        const limit = TF_GENESIS_LIMIT[tf] ?? 7000
+        const { data } = await apiClient.getCycleCandles(tf, limit, ctrl.signal)
+        if (!alive) return
+        setCandles(data?.candles ?? [])
+        setCount(data?.count ?? 0)
+        setEarliest(data?.earliest ?? null)
+        setEarliestIso(data?.earliest_iso ?? null)
+        setSynthetic(data?.synthetic_count ?? 0)
+        // Pattern + Fisher for the same TF so markers align with the visible TF
+        const reach = Math.max((data?.candles?.length ?? 0), limit)
+        try {
+          const pat = await apiClient.getPatternOverlay('bitget', 'BTCUSDT', {
+            timeframe: tfToPatternApi(tf),
+            limit: Math.min(reach, 3000),
+          })
+          if (!alive) return
+          setMarkers(pat.data?.markers ?? [])
+          setFisherOverlays(pat.data?.overlays ?? [])
+        } catch {
+          /* chart stands without pattern flags */
+        }
+      } catch (e: any) {
+        if (e?.code === 'ERR_CANCELED' || e?.name === 'CanceledError') return
+        if (!alive) return
+        setError(e?.response?.data?.detail || e?.message || 'Failed to load candles')
+      } finally {
+        if (alive) setLoaded(true)
+      }
+    })()
+    return () => { alive = false; ctrl.abort() }
+  }, [tf])
+
+  return { candles, markers, fisherOverlays, count, earliest, earliestIso, synthetic, loaded, error }
+}
+// Backward compat alias — old page code used useCycleMonthly for MN1 only.
+function useCycleMonthly() {
+  return useCycleCandles('MN1')
+}
 
 const WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
 const MONTHS = [
@@ -68,11 +156,12 @@ function fmtPrice(v?: number | null): string {
   return typeof v === 'number' ? v.toLocaleString(undefined, { maximumFractionDigits: 0 }) : '—'
 }
 
-/** Trend + momentum overlays for the chart, with per-group toggles. */
+/** Trend + momentum overlays for the chart, with per-group toggles — TF-aware. */
 const INDICATOR_GROUPS = ['ema', 'rsi', 'macd'] as const
 type IndicatorGroup = (typeof INDICATOR_GROUPS)[number]
 
-function useIndicatorOverlays() {
+function useIndicatorOverlays(chartTf?: string) {
+  const tf = tfToCycleApi(chartTf ?? 'D1')
   const [overlays, setOverlays] = useState<IndicatorOverlaySeries[]>([])
   const [trend, setTrend] = useState<string | null>(null)
   const [enabled, setEnabled] = useState<Record<IndicatorGroup, boolean>>({
@@ -81,10 +170,15 @@ function useIndicatorOverlays() {
 
   useEffect(() => {
     let alive = true
+    const ctrl = new AbortController()
     void (async () => {
       try {
+        const patTf = tfToPatternApi(tf)
+        // Ask enough history for EMA200 warm-up: need >200 bars regardless of TF
+        const want = Math.max(TF_GENESIS_LIMIT[tf] ?? 500, 500)
+        const lim = Math.min(want, 1500) // indicator endpoint caps at 1500 for performance, EMA200 still covered
         const { data } = await apiClient.technical.indicatorOverlay('bitget', 'BTCUSDT', {
-          timeframe: '1d', limit: 500, indicators: 'ema,rsi,macd',
+          timeframe: patTf, limit: lim, indicators: 'ema,rsi,macd',
         })
         if (alive) {
           setOverlays(data?.overlays ?? [])
@@ -94,8 +188,8 @@ function useIndicatorOverlays() {
         /* the chart stands without indicators */
       }
     })()
-    return () => { alive = false }
-  }, [])
+    return () => { alive = false; ctrl.abort() }
+  }, [tf])
 
   const visible = useMemo(
     () => overlays.filter((o) => {
@@ -381,7 +475,7 @@ function ExpectationCard({ state, expectation }: {
         <div className="rounded-lg bg-slate-800/50 px-2.5 py-1.5">
           <span className="text-slate-500">best</span>
           <span className="float-right font-mono text-emerald-400">
-            {expectation.best_return_pct != null ? `+${expectation.best_return_pct}%` : '—'}
+            {expectation.best_return_pct != null ? `${expectation.best_return_pct >= 0 ? '+' : ''}${expectation.best_return_pct}%` : '—'}
           </span>
         </div>
         <div className="rounded-lg bg-slate-800/50 px-2.5 py-1.5">
@@ -522,7 +616,7 @@ function ExpectationTable({ rows, dayOfCycle }: {
                   <td className={`py-1 pr-2 ${avg == null ? 'text-slate-500' : avg >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
                     {avg == null ? '—' : `${avg > 0 ? '+' : ''}${avg}%`}
                   </td>
-                  <td className="py-1 pr-2 text-emerald-500/80">{r.best_return_pct != null ? `+${r.best_return_pct}%` : '—'}</td>
+                  <td className="py-1 pr-2 text-emerald-500/80">{r.best_return_pct != null ? `${r.best_return_pct >= 0 ? '+' : ''}${r.best_return_pct}%` : '—'}</td>
                   <td className="py-1 pr-2 text-red-500/80">{r.worst_return_pct != null ? `${r.worst_return_pct}%` : '—'}</td>
                   <td className="py-1 text-slate-500">{r.samples}</td>
                 </tr>
@@ -536,18 +630,21 @@ function ExpectationTable({ rows, dayOfCycle }: {
 }
 
 /** The big money: monitored whale wallets, flows, and the aggregate read. */
-function WhalePanel({ whale }: { whale: WhalePayload | null }) {
+function WhalePanel({ whale, loaded }: { whale: WhalePayload | null; loaded: boolean }) {
   if (!whale) {
     return (
       <div className="rounded-xl border border-slate-700/70 bg-slate-900/50 p-3">
         <h2 className="flex items-center gap-2 text-sm font-semibold text-slate-200">
           <WhaleIcon className="h-4 w-4 text-cyan-300" /> Whale watch
+          {!loaded && <Loader2 className="h-3.5 w-3.5 animate-spin text-slate-500" />}
         </h2>
-        <p className="mt-1 text-[11px] text-slate-500">The whale feed has not answered yet.</p>
+        <p className="mt-1 text-[11px] text-slate-500">
+          {loaded ? 'Whale feed unavailable — external blockchain APIs unreachable.' : 'Loading whale data…'}
+        </p>
       </div>
     )
   }
-  const score = whale.score.toUpperCase()
+  const score = String(whale.score ?? 'UNKNOWN').toUpperCase()
   const tone = score === 'ACCUMULATING' ? 'text-emerald-300 border-emerald-500/40 bg-emerald-500/10'
     : score === 'DISTRIBUTING' ? 'text-red-300 border-red-500/40 bg-red-500/10'
     : 'text-slate-300 border-slate-600/50 bg-slate-700/20'
@@ -664,13 +761,76 @@ function AgentContextStrip({ state }: { state: CycleState }) {
   )
 }
 
+const CHART_TFS = [
+  { label: '1H', value: 'H1' },
+  { label: '4H', value: 'H4' },
+  { label: 'D1', value: 'D1' },
+  { label: 'W1', value: 'W1' },
+  { label: '1M', value: 'MN1' },
+] as const
+
+function CandleMetaStrip({ tf, count, earliestIso, synthetic, loaded, error }: { tf: string; count: number; earliestIso: string | null; synthetic: number; loaded: boolean; error: string | null }) {
+  const label = tf === 'MN1' ? '1M' : tf
+  if (!loaded) {
+    return <div className="flex items-center gap-2 text-[11px] text-slate-500"><Loader2 className="h-3 w-3 animate-spin" /> Loading {label} full history…</div>
+  }
+  if (error) {
+    return <div className="text-[11px] text-amber-300">{label}: {error}</div>
+  }
+  const start = earliestIso ? earliestIso.slice(0, 10) : '2010-07-17'
+  const genesisOk = start <= '2010-08-01'
+  return (
+    <div className="flex flex-wrap items-center gap-2 text-[11px]">
+      <span className={`rounded-full border px-2 py-0.5 text-[10px] ${genesisOk ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300' : 'border-amber-500/40 bg-amber-500/10 text-amber-300'}`}>
+        {genesisOk ? '✓ Genesis' : '◐ Limited history'}
+      </span>
+      <span className="font-mono text-slate-300">{count.toLocaleString()} {label} candles</span>
+      <span className="text-slate-500">· from {start}</span>
+      <span className="text-slate-500">· to now</span>
+      {synthetic > 0 && <span className="rounded-full border border-violet-500/30 bg-violet-500/10 px-2 py-0.5 text-[10px] text-violet-300" title="Pre-Bitget H1/H4 (2010→exchange start) synthesized from daily closes; flat OHLC, volume 0">{synthetic.toLocaleString()} synthetic</span>}
+      {genesisOk && <span className="text-emerald-400/70">· day 1 ✓</span>}
+    </div>
+  )
+}
+
 export default function BitcoinCyclePage() {
   const { state, loaded, windows, calendar, calLoading, analogs, expectation, month, shiftMonth } = useBtcCyclePage()
-  const { visible: indicatorOverlays, enabled: indicatorsOn, setEnabled: setIndicatorEnabled } = useIndicatorOverlays()
-  const { whale: whales } = useWhaleWatch()
+  // TF from ?tf= query so links/deep-links keep the selection and tests can drive each TF
+  const initialTf = (() => {
+    if (typeof window !== 'undefined') {
+      const q = new URLSearchParams(window.location.search).get('tf')
+      if (q) {
+        const u = q.toUpperCase()
+        if (u === '1M' || u === 'MN1') return 'MN1'
+        if (['W1','D1','H4','H1'].includes(u)) return u
+      }
+    }
+    return 'MN1'
+  })()
+  const [chartTf, setChartTf] = useState<string>(initialTf)
+  const candleFeed = useCycleCandles(chartTf)
+  const { visible: indicatorOverlays, enabled: indicatorsOn, setEnabled: setIndicatorEnabled } = useIndicatorOverlays(chartTf)
+  const { whale: whales, loaded: whaleLoaded } = useWhaleWatch()
   const [selected, setSelected] = useState<CycleCalendarDay | null>(null)
+  const [fitMode, setFitMode] = useState<'genesis' | 'recent'>('genesis')
+
+  // Keep URL in sync when TF changes (without full reload)
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const url = new URL(window.location.href)
+    url.searchParams.set('tf', chartTf === 'MN1' ? '1M' : chartTf)
+    window.history.replaceState({}, '', url.toString())
+  }, [chartTf])
 
   const boxes = useMemo<CycleWindowBox[]>(() => toCycleBoxes(windows), [windows])
+  const chartLabel = chartTf === 'MN1' ? '1M' : chartTf
+  // The cycle overlay boxes are TF-agnostic; fisher/pattern overlays now come TF-aware from useCycleCandles
+  const candleSourceLabel = (() => {
+    if (!candleFeed.loaded) return `BTC/USD · ${chartLabel} · loading…`
+    if (candleFeed.synthetic > 0) return `BTC/USD · ${chartLabel} · CRYPTO (Bitget+Yahoo/CoinMetrics, ${candleFeed.synthetic} synth)`
+    if (chartTf === 'H1' || chartTf === 'H4') return `BTC/USD · ${chartLabel} · CRYPTO (Bitget)`
+    return `BTC/USD · ${chartLabel} · CRYPTO (Yahoo/CoinMetrics)`
+  })()
 
   return (
     <>
@@ -683,7 +843,7 @@ export default function BitcoinCyclePage() {
             <h1 className="text-xl font-bold text-slate-100">Bitcoin 1064-Day Cycle</h1>
             <p className="text-[11px] text-slate-500">
               Every cycle since launch: ≈1064 days up from the bottom, ≈365 back down.
-              The agents and the signal engine read this same calendar.
+              The agents and the signal engine read this same calendar. Every TF now loads from genesis.
             </p>
           </div>
         </div>
@@ -703,7 +863,7 @@ export default function BitcoinCyclePage() {
               {/* Chart + alignment + daily prediction + validation history */}
               <div className="space-y-4">
                 <div className="rounded-xl border border-slate-700/70 bg-slate-900/50 p-2">
-                  <div className="flex items-center gap-1.5 px-1 pb-1.5">
+                  <div className="flex items-center gap-1.5 px-1 pb-1.5 flex-wrap">
                     <span className="text-[10px] uppercase tracking-wide text-slate-500">Indicators</span>
                     {INDICATOR_GROUPS.map((g) => (
                       <button
@@ -719,15 +879,50 @@ export default function BitcoinCyclePage() {
                         {g}
                       </button>
                     ))}
+                    <div className="ml-auto flex items-center gap-1">
+                      <span className="text-[10px] uppercase tracking-wide text-slate-500 mr-1">Timeframe</span>
+                      <div className="flex gap-0.5 bg-slate-800/70 rounded-lg p-0.5">
+                        {CHART_TFS.map((tf) => (
+                          <button
+                            key={tf.value}
+                            type="button"
+                            onClick={() => setChartTf(tf.value)}
+                            className={`px-2 py-1 rounded text-xs font-medium transition-colors ${
+                              chartTf === tf.value
+                                ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30'
+                                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-700/50'
+                            }`}
+                          >
+                            {tf.label}
+                          </button>
+                        ))}
+                      </div>
+                      <div className="ml-2 flex gap-0.5 bg-slate-800/70 rounded-lg p-0.5">
+                        <button type="button" onClick={() => setFitMode('genesis')} className={`px-2 py-1 rounded text-[10px] ${fitMode==='genesis' ? 'bg-slate-700 text-slate-200' : 'text-slate-500 hover:text-slate-300'}`}>Genesis</button>
+                        <button type="button" onClick={() => setFitMode('recent')} className={`px-2 py-1 rounded text-[10px] ${fitMode==='recent' ? 'bg-slate-700 text-slate-200' : 'text-slate-500 hover:text-slate-300'}`}>2 cycles</button>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="px-1 pb-1.5">
+                    <CandleMetaStrip tf={chartTf} count={candleFeed.count} earliestIso={candleFeed.earliestIso} synthetic={candleFeed.synthetic} loaded={candleFeed.loaded} error={candleFeed.error} />
                   </div>
                   <TradingViewChart
+                    key={`${chartTf}-${fitMode}`}
                     symbol="BTC/USDT"
                     exchange="bitget"
-                    timeframe="1d"
+                    timeframe={chartTf}
+                    initialCandles={candleFeed.candles.length ? candleFeed.candles : undefined}
+                    sourceLabel={candleSourceLabel}
                     cycleWindows={boxes}
-                    overlays={indicatorOverlays}
+                    overlays={[...candleFeed.fisherOverlays, ...indicatorOverlays]}
+                    markers={candleFeed.markers}
                     showZones={false}
                   />
+                  {candleFeed.synthetic > 0 && (
+                    <p className="px-1 pt-1 text-[10px] leading-snug text-violet-300/70">
+                      H1/H4 before {candleFeed.earliestIso ? new Date(candleFeed.earliestIso).getFullYear() : 2018}: Bitget had no data — shown as daily-close interpolated bars (flat, volume 0) to keep the line continuous from genesis. Real Bitget candles begin where the flat segment ends.
+                    </p>
+                  )}
                 </div>
                 <CyclesAlignedChart analogs={analogs} bullDays={analogs?.bull_days} />
                 <ExpectationTable rows={expectation} dayOfCycle={state.day_of_cycle} />
@@ -770,7 +965,7 @@ export default function BitcoinCyclePage() {
                   />
                 )}
 
-                <WhalePanel whale={whales} />
+                <WhalePanel whale={whales} loaded={whaleLoaded} />
 
                 <AgentContextStrip state={state} />
               </div>

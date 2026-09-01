@@ -57,6 +57,30 @@ export interface ChartCandle {
   high: number
   low: number
   close: number
+  /** Bar timestamp (ms). Carried so pattern flags can land on the right bar. */
+  time?: number
+}
+
+/** A named candlestick pattern flagged on the wall chart. */
+export interface ChartPatternMarker {
+  /** Bar timestamp (ms) — matched to the nearest candle. */
+  time: number
+  name: string
+  direction: 'bull' | 'bear'
+}
+
+/** One green/red cycle band painted behind the candles. */
+export interface CycleBand {
+  start: number  // ms
+  end: number    // ms
+  phase: 'bull' | 'bear'
+  projected?: boolean
+}
+
+/** Optional overlays for the wall chart — patterns + cycle season bands. */
+export interface ChartOverlays {
+  markers?: ChartPatternMarker[]
+  bands?: CycleBand[]
 }
 
 /** Handle to the big back-wall chart screen. */
@@ -80,6 +104,7 @@ export interface ChartScreenHandle {
     prev: number | null,
     candles?: ChartCandle[] | null,
     cycle?: CycleScreenInfo | null,
+    overlays?: ChartOverlays | null,
   ): void
 }
 
@@ -452,6 +477,9 @@ function makeChartScreen(
   let livePrice: number | null = null
   let lastKey = ''
   let cycle: CycleScreenInfo | null = null
+  let markers: ChartPatternMarker[] = []
+  let bands: CycleBand[] = []
+  let lastOverlayKey = ''
 
   // Turn the price stream into synthetic OHLC bars so the fallback still reads
   // as a bar chart, not a lonely line.
@@ -540,6 +568,36 @@ function makeChartScreen(
     const min = lo - pad, max = hi + pad
     const yOf = (v: number) => y1 - ((v - min) / (max - min)) * (y1 - y0)
 
+    // Time → x helpers: bands and pattern flags land on the bar whose
+    // timestamp they match, so they track the candles they belong to.
+    const times = view.map((b) => b.time ?? 0)
+    const timed = times.some((t) => t > 0)
+    const xAt = (ms: number) => {
+      if (!timed) return null
+      if (ms <= times[0]) return x0
+      if (ms >= times[times.length - 1]) return x1
+      let lo = 0, hi = times.length - 1
+      while (hi - lo > 1) {
+        const mid = (lo + hi) >> 1
+        if (times[mid] < ms) lo = mid; else hi = mid
+      }
+      const frac = (ms - times[lo]) / Math.max(1, times[hi] - times[lo])
+      return x0 + (lo + frac) * cw0
+    }
+    const cw0 = (x1 - x0) / view.length
+
+    // Cycle season bands — the green/red boxes behind the price, dimmed when
+    // the segment is still a projection.
+    if (timed) for (const band of bands) {
+      const bx0 = xAt(band.start)
+      const bx1 = xAt(band.end)
+      if (bx0 == null || bx1 == null || bx1 <= bx0) continue
+      ctx.fillStyle = band.phase === 'bull'
+        ? (band.projected ? 'rgba(34,197,94,0.05)' : 'rgba(34,197,94,0.10)')
+        : (band.projected ? 'rgba(239,68,68,0.05)' : 'rgba(239,68,68,0.10)')
+      ctx.fillRect(bx0, y0, Math.min(bx1, x1) - bx0, y1 - y0)
+    }
+
     // Grid + price axis.
     ctx.strokeStyle = 'rgba(148,163,184,0.12)'
     ctx.fillStyle = '#64748b'
@@ -556,7 +614,7 @@ function makeChartScreen(
     // OHLC bars: a high→low stick with an open tick on the left and a close tick
     // on the right — the classic bar chart the user asked for, drawn from the
     // real candles so it matches the app's other charts tick-for-tick.
-    const cw = (x1 - x0) / view.length
+    const cw = cw0
     const tick = Math.min(Math.max(3, cw * 0.34), 14)
     const barW = Math.max(1.5, Math.min(3, cw * 0.16))
     view.forEach((b, i) => {
@@ -572,6 +630,30 @@ function makeChartScreen(
       ctx.beginPath(); ctx.moveTo(cx - tick, yO); ctx.lineTo(cx, yO); ctx.stroke()
       ctx.beginPath(); ctx.moveTo(cx, yC); ctx.lineTo(cx + tick, yC); ctx.stroke()
     })
+
+    // Pattern flags: a small triangle above (bear) or below (bull) the bar the
+    // pattern printed on, so the wall chart reads like the reference screen.
+    if (timed) for (const m of markers) {
+      const mx = xAt(m.time)
+      if (mx == null || mx < x0 || mx > x1) continue
+      // Nearest bar for the flag's vertical anchor.
+      let best = 0, bestDist = Infinity
+      for (let i = 0; i < times.length; i++) {
+        const d = Math.abs(times[i] - m.time)
+        if (d < bestDist) { bestDist = d; best = i }
+      }
+      const b = view[best]
+      const cx = x0 + best * cw + cw / 2
+      const bull = m.direction === 'bull'
+      const ay = bull ? yOf(b.low) + 14 : yOf(b.high) - 14
+      const dir = bull ? 1 : -1
+      ctx.fillStyle = bull ? '#22c55e' : '#ef4444'
+      ctx.beginPath()
+      ctx.moveTo(cx, ay + dir * 7)
+      ctx.lineTo(cx - 5, ay - dir * 3)
+      ctx.lineTo(cx + 5, ay - dir * 3)
+      ctx.closePath(); ctx.fill()
+    }
 
     // Last-price marker line.
     const ly = yOf(lastClose)
@@ -593,7 +675,7 @@ function makeChartScreen(
   paint()
 
   return {
-    update(sym, price, prev, candles, cycleInfo) {
+    update(sym, price, prev, candles, cycleInfo, overlays) {
       let changed = false
 
       if (cycleInfo && JSON.stringify(cycleInfo) !== JSON.stringify(cycle)) {
@@ -608,6 +690,8 @@ function makeChartScreen(
         bars = []
         ticks.length = 0
         livePrice = null
+        markers = []
+        bands = []
         if (prev != null) ticks.push(prev)
         if (price != null) ticks.push(price)
         changed = true
@@ -621,6 +705,15 @@ function makeChartScreen(
           bars = candles
           changed = true
         }
+      }
+
+      // Overlays: pattern flags + season bands, repainted only on change.
+      const overlayKey = JSON.stringify(overlays ?? null)
+      if (overlayKey !== lastOverlayKey) {
+        lastOverlayKey = overlayKey
+        markers = overlays?.markers ?? []
+        bands = overlays?.bands ?? []
+        changed = true
       }
 
       // Live price feeds the header/marker and, when no candles exist, the line.

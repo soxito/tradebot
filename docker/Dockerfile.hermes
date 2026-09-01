@@ -1,0 +1,21 @@
+# Hermes Agent sidecar — NousResearch/hermes-agent
+# Isolated like TradingAgents; backend talks via HERMES_GATEWAY_URL.
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends git curl ripgrep sqlite3 && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir uv
+
+WORKDIR /app
+# Shallow clone to keep image small; hermes runs via `hermes gateway` or python -m
+RUN git clone --depth 1 https://github.com/NousResearch/hermes-agent.git /app/hermes-agent
+WORKDIR /app/hermes-agent
+RUN uv pip install --system -e ".[all]" || pip install -e "."
+
+# Our thin shim that exposes /v1/hermes/* for TradeBot backend proxy
+COPY hermes_sidecar.py /app/hermes_sidecar.py
+
+ENV HERMES_PORT=8011
+EXPOSE 8011
+CMD ["python", "/app/hermes_sidecar.py"]

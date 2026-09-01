@@ -6,7 +6,7 @@
  * open positions). Polls on an interval so the desk always shows real money.
  */
 import { useCallback, useEffect, useState } from 'react'
-import { Landmark, Bitcoin, RefreshCw } from 'lucide-react'
+import { Bitcoin, ChevronDown, ChevronUp, Landmark, RefreshCw } from 'lucide-react'
 import { apiClient } from '@/services/api'
 
 interface Position {
@@ -53,6 +53,7 @@ export default function AccountTabs() {
   const [data, setData] = useState<Monitor | null>(null)
   const [tab, setTab] = useState<'mt5' | 'crypto'>('mt5')
   const [loading, setLoading] = useState(false)
+  const [collapsed, setCollapsed] = useState(false)
 
   const load = useCallback(async (sync = false) => {
     setLoading(true)
@@ -83,9 +84,16 @@ export default function AccountTabs() {
   const cryptoPos = data?.crypto_positions ?? []
 
   return (
-    <div className="rounded-xl border border-amber-500/20 bg-gradient-to-br from-slate-900/80 to-slate-950/60 p-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
-      <div className="mb-2 flex items-center gap-2">
-        <h2 className="text-xs font-semibold uppercase tracking-wide text-amber-200/80">Linked accounts</h2>
+    <div className="overflow-hidden rounded-xl border border-amber-500/20 bg-gradient-to-br from-slate-900/80 to-slate-950/60 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
+      <div className="flex items-center gap-2 px-3 py-2">
+        <button
+          type="button"
+          onClick={() => setCollapsed((v) => !v)}
+          className="flex items-center gap-2 text-left"
+        >
+          <h2 className="text-xs font-semibold uppercase tracking-wide text-amber-200/80">Linked accounts</h2>
+          {collapsed ? <ChevronDown className="h-3.5 w-3.5 text-amber-200/60" /> : <ChevronUp className="h-3.5 w-3.5 text-amber-200/60" />}
+        </button>
         <span className={`ml-auto font-mono text-[11px] ${pnlColor(data?.total_pnl)}`}>
           {money(data?.total_pnl)} P&L
         </span>
@@ -97,7 +105,18 @@ export default function AccountTabs() {
         >
           <RefreshCw className={`h-3 w-3 ${loading ? 'animate-spin' : ''}`} />
         </button>
+        <button
+          type="button"
+          onClick={() => setCollapsed((v) => !v)}
+          className="rounded p-1 text-slate-500 hover:bg-slate-800 hover:text-slate-300"
+          title={collapsed ? 'Expand' : 'Collapse'}
+          aria-label={collapsed ? 'Expand linked accounts' : 'Collapse linked accounts'}
+        >
+          {collapsed ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronUp className="h-3.5 w-3.5" />}
+        </button>
       </div>
+      {collapsed ? null : (
+        <div className="px-3 pb-3">
 
       <div className="mb-2 grid grid-cols-2 gap-1 rounded-lg bg-slate-800/40 p-0.5">
         <button
@@ -185,6 +204,8 @@ export default function AccountTabs() {
               ))}
             </div>
           )}
+        </div>
+      )}
         </div>
       )}
     </div>

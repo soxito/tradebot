@@ -26,6 +26,8 @@ from app.api.system import router as system_router
 from app.api.tasks import router as tasks_router
 from app.api.market_cycle import router as market_cycle_router
 from app.api.whale import router as whale_router
+from app.api.tradingagents import router as tradingagents_router
+from app.api.hermes import router as hermes_router
 
 # WhatsApp Plugin - loaded via plugin system
 # Fallback import if plugin system doesn't load it
@@ -67,6 +69,8 @@ api_router.include_router(system_router)
 api_router.include_router(tasks_router)
 api_router.include_router(market_cycle_router)
 api_router.include_router(whale_router)
+api_router.include_router(tradingagents_router)
+api_router.include_router(hermes_router)
 
 if HAS_WHATSAPP:
     api_router.include_router(whatsapp_router)

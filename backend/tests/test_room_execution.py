@@ -484,8 +484,9 @@ async def test_the_paper_venue_can_actually_place_an_order(async_session, monkey
     )
     assert out["status"] == "placed"
     assert seen["side"] == "buy" and seen["stop_loss"] == 4450.0
-    # 1% of 10,000 risked over a 50-point stop is 2 units, not "whatever fits".
-    assert seen["amount"] == pytest.approx(2.0, rel=0.01)
+    # Metals are sized at 0.45× risk (post-mortem 2026-08-28: 1% on a large demo caps at $4.5k on gold).
+    # 0.45% of 10,000 = 45 risked over a 50-point stop is 0.9 units, not "whatever fits".
+    assert seen["amount"] == pytest.approx(0.9, rel=0.01)
 
 
 @pytest.mark.asyncio

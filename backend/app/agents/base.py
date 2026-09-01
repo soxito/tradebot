@@ -181,12 +181,20 @@ def _repair_truncated_json(text: str) -> "Optional[Dict[str, Any]]":
     candidate = text
     stack, in_string = _scan(candidate)
 
-    # Dangling partial string: cut back to its opening quote and rescan.
+    # Dangling partial string: trim back to its last COMPLETE sentence so the
+    # salvaged reasoning is published whole — "…momentum is sideways." not
+    # "…momentum is side" — then close the quote and rescan.
     if in_string:
-        last_quote = candidate.rfind('"')
-        if last_quote <= 0:
+        cut = max(
+            candidate.rfind(". "),
+            candidate.rfind(".\n"),
+            candidate.rfind("! "),
+            candidate.rfind("? "),
+        )
+        opening = candidate.rfind('"')
+        if opening <= 0:
             return None
-        candidate = candidate[:last_quote]
+        candidate = candidate[: cut + 1] if cut > opening else candidate[:opening]
         stack, in_string = _scan(candidate)
 
     # Drop any trailing comma left before the cut.

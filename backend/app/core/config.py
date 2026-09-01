@@ -168,6 +168,19 @@ class Settings(BaseSettings):
     # OpenAI (used for Whisper STT / TTS fallback, and OpenAI-backed AI agents)
     OPENAI_API_KEY: str = ""
 
+    # TradingAgents sidecar service. The multi-agent LLM framework runs in its
+    # own process (integrations/TradingAgents/.venv) so its heavy dependency
+    # stack (langchain, langgraph, pandas 3.x) never loads into this backend.
+    TRADINGAGENTS_SERVICE_URL: str = "http://127.0.0.1:8010"
+    # When True the backend spawns the sidecar as a child process at startup
+    # (and stops it on shutdown). Set False if you run it via docker-compose
+    # or manually — then only the URL above matters.
+    TRADINGAGENTS_SERVICE_AUTOSTART: bool = True
+    # Proxy timeout for starting/reading runs through to the sidecar. A full
+    # analysis takes minutes; these bound only the HTTP hop.
+    TRADINGAGENTS_PROXY_TIMEOUT_START: int = 30
+    TRADINGAGENTS_PROXY_TIMEOUT_READ: int = 60
+
     # NVIDIA NIM hosted speech (fast, cloud) — tried first for /voice/stt and
     # /voice/tts, ahead of the slow local MLX engine below. Uses the same
     # nvapi- key already configured for other NVIDIA-backed AI providers.
@@ -206,6 +219,7 @@ class Settings(BaseSettings):
     # Bitcoin 1064-day market cycle (editable at runtime via room settings)
     CYCLE_BULL_DAYS: int = 1064                 # bottom → projected top
     CYCLE_BEAR_DAYS: int = 365                  # projected top → next bottom
+    CYCLE_HISTORY_YEARS: int = 15               # years of monthly candles the cycle screen loads
     CYCLE_RECHECK_INTERVAL_SECONDS: int = 3600  # detector loop tick
     CYCLE_CACHE_TTL_SECONDS: int = 900          # snapshot resolver cache
 
@@ -281,6 +295,11 @@ class Settings(BaseSettings):
     JARVIS_JOURNAL_EXPIRY_HOURS: int = 72     # unresolved after this → closed out
     JARVIS_LEARNING_MIN_SAMPLES: int = 8      # below this a win rate is noise
     JARVIS_LEARNING_MAX_SETTLE_PER_CYCLE: int = 40  # caps upstream candle fetches
+    # Agent-decision learning: settles agent_decisions.outcome from closed
+    # trades in both order books and auto-runs the revision-tracked
+    # self-improve pass for seats with enough resolved samples.
+    AUTO_START_DECISION_LEARNING_LOOP: bool = True
+    DECISION_LEARNING_INTERVAL_SECONDS: int = 900
     # Trading room: keeps the agent board in session on the focused pair, the
     # newest signal, or a rotation — so the room has fresh decisions even when
     # nobody has the page open. Off by default; it spends AI tokens per cycle.
@@ -290,6 +309,9 @@ class Settings(BaseSettings):
     # Seed only. Once the room has settings the timeframe is chosen there
     # (room_settings.focus_timeframe) so the board and the room's chart agree.
     ROOM_WORKER_TIMEFRAME: str = "1h"
+    # Copy-trading worker: mirrors enabled copy profiles (sim + live followers)
+    # on a fast clock. Individual profiles are gated by their own enabled flag.
+    COPY_WORKER_INTERVAL_SECONDS: int = 30
 
     # ── Resource tiering (env contract from start.py; .env still wins) ─────────
     # start.py derives these from the machine and injects them via setdefault, so
@@ -311,6 +333,7 @@ class Settings(BaseSettings):
     PUMP_MONITOR_PUMPED_RETENTION_HOURS: int = 24
     RESEARCH_LOOP_INTERVAL_SECONDS: int = 900  # 15 min — free news feeds
     JARVIS_LEARNING_INTERVAL_SECONDS: int = 900  # 15 min — settle proposals
+    DECISION_LEARNING_INTERVAL_SECONDS: int = 900  # 15 min — settle agent decisions
 
     # Realtime price-tick fan-out (SSE). Broadcasts live prices for symbols with
     # open positions / active signals to all stream subscribers, replacing
@@ -359,6 +382,21 @@ class Settings(BaseSettings):
     AGENT_REACH_TIMEOUT_S: float = 15.0
     AGENT_REACH_CONTEXT_TOKEN_BUDGET: int = 800
     AGENT_REACH_INJECT_CONTEXT: bool = False
+
+    # ── Hermes Agent (NousResearch/hermes-agent) ─────────────────────
+    # Self-aware upgrade: episodic + skill + user-model (locked scope per plan).
+    # Runs as isolated sidecar on 8011 (like TradingAgents on 8010). Vault stays
+    # as async exporter only; hermes_state.db is recall source (90d retention,
+    # recall-only — scoring stays on Postgres AgentDecision).
+    HERMES_ENABLED: bool = False
+    HERMES_GATEWAY_URL: str = "http://127.0.0.1:8011"
+    HERMES_STATE_PATH: str = ""              # default: DATA_DIR/hermes_state.db or ./data/hermes_state.db
+    HERMES_SKILLS_PATH: str = ""             # default: DATA_DIR/hermes_skills or ./hermes_skills
+    HERMES_RETENTION_DAYS: int = 90
+    HERMES_CRON_ENABLED: bool = False        # episodic+skill+user-model only — no Honcho/nudge by default
+    HERMES_AUTO_INGEST: bool = True          # ingest every Trading Room session + JARVIS turn
+    HERMES_GATEWAY_AUTOSTART: bool = False   # start sidecar as child process (like TradingAgents)
+    SOUL_PATH: str = "SOUL.md"               # merged JARVIS/Paul/SOX directive
 
     # ── Desktop (packaged Electron app) ───────────────────────
     # Both are populated from TRADEBOT_DATA_DIR / TRADEBOT_STATIC_DIR by the
@@ -508,6 +546,12 @@ class Settings(BaseSettings):
         _tick_symbol_cap = {0: 8, 1: 12, 2: 20, 3: 30, 4: 30}.get(idx, 30)
         if "PRICE_TICK_MAX_SYMBOLS" not in pinned:
             self.PRICE_TICK_MAX_SYMBOLS = min(self.PRICE_TICK_MAX_SYMBOLS, _tick_symbol_cap)
+
+        # Hermes: disable entirely on minimal/low, gate cron on medium+
+        if tier_index(tier) <= 1 and "HERMES_ENABLED" not in pinned:
+            self.HERMES_ENABLED = False
+        if tier_index(tier) <= 2 and "HERMES_CRON_ENABLED" not in pinned:
+            self.HERMES_CRON_ENABLED = False
 
         return self
 

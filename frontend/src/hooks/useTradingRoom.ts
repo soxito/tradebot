@@ -71,10 +71,12 @@ export interface RoomSession {
   started_at: number
   finished_at?: number
   status: 'running' | 'complete'
-  decisions: Array<{ role: string; agent_name: string } & AgentDecisionSummary>
+  decisions: Array<{ role: string; agent_name: string; skill_used?: string; skill_asset_class?: string } & AgentDecisionSummary>
   final_action?: string
   final_confidence?: number
   final_reasoning?: string
+  hermes_skill?: { symbol: string; asset_class: string; group?: string; linked_agents?: string[]; jarvis?: { role: string; human_name: string }; is_best_trader?: boolean; win_rate?: number | null; decisions_reviewed?: number; playbook_preview?: string } | null
+  hermes_best_trader?: { symbol: string; asset_class: string } | null
   consensus?: {
     tally: { buy: number; sell: number; hold: number }
     leader: string

@@ -420,7 +420,7 @@ class Agent(Base):
     temperature = Column(Float, default=0.3, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
     pairs = Column(Text, nullable=True)  # comma-separated, null = all
-    max_tokens = Column(Integer, default=2000, nullable=False)
+    max_tokens = Column(Integer, default=6000, nullable=False)
     created_at = Column(DateTime, default=_utcnow, nullable=False)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
@@ -903,6 +903,14 @@ class RoomSettings(Base):
     # Whether the room worker starts itself with the API, so the board keeps
     # meeting across restarts without anyone re-arming it by hand.
     worker_enabled = Column(Boolean, default=True, nullable=False)
+    # ── Copy-trading supervision ──
+    # When on, the room supervisor reviews every copy profile each cycle and
+    # may enable/disable profiles & followers and tune allocation (full
+    # control). Off = the room leaves copy accounts alone.
+    manage_copy_profiles = Column(Boolean, default=False, nullable=False)
+    #: A profile whose closed-trade PnL drawdown from its paper-balance peak
+    #: exceeds this % gets disabled by the supervisor.
+    copy_max_drawdown_pct = Column(Float, default=20.0, nullable=False)
     # The pinned pair. Persisted because "never stop analysing this one" has to
     # outlive a restart — in-process state alone silently drops the focus.
     focus_symbol = Column(String, nullable=True)
@@ -915,6 +923,10 @@ class RoomSettings(Base):
     cycle_anchors = Column(Text, nullable=True)   # JSON ["2015-01-14", ...]
     cycle_bull_days = Column(Integer, default=1064, nullable=False)
     cycle_bear_days = Column(Integer, default=365, nullable=False)
+    # How far back the cycle screen reaches: years of monthly candles the
+    # chart loads (and the pattern/Fisher overlays cover). 15 matches the
+    # desk's reference chart (2013 → today).
+    cycle_history_years = Column(Integer, default=15, nullable=False)
     # Auto risk reduction: when the calendar is inside the projected-bear (or
     # late-bull caution) window, size new entries at cycle_risk_multiplier of
     # the configured risk. Off by default — inert until asked for.
@@ -922,3 +934,37 @@ class RoomSettings(Base):
     cycle_risk_multiplier = Column(Float, default=0.5, nullable=False)
 
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+class TradingAgentsRun(Base):
+    """A TradingAgents multi-agent analysis run (via the sidecar service).
+
+    Stores the complete pipeline output — the four analyst reports, the
+    bull/bear research debate, the trader's plan, the risk debate and the
+    final portfolio decision — so the Trading Room can replay any run and
+    pre-trade validations are auditable instead of opaque.
+    """
+
+    __tablename__ = "tradingagents_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    run_id = Column(String, nullable=False, unique=True, index=True)  # sidecar run id
+    ticker = Column(String, nullable=False, index=True)               # as requested
+    mapped_ticker = Column(String, nullable=True)                     # Yahoo format used
+    trade_date = Column(String(10), nullable=False)
+    source = Column(String, default="manual", nullable=False)         # manual | trade_validation
+    status = Column(String, default="running", nullable=False)        # running | done | error
+
+    decision = Column(String, nullable=True)                          # buy | sell | hold | ...
+    confidence = Column(Float, nullable=True)
+    reasoning = Column(Text, nullable=True)
+
+    # Full pipeline payload from the sidecar: reports, debates, trader plan,
+    # recommendation. JSON so schema evolution upstream never breaks reads.
+    result = Column(JSON, nullable=True)
+    config_used = Column(JSON, nullable=True)                         # provider/models/rounds
+    error = Column(Text, nullable=True)
+
+    duration_s = Column(Float, nullable=True)
+    created_at = Column(DateTime, default=_utcnow, nullable=False, index=True)
+    finished_at = Column(DateTime, nullable=True)

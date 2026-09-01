@@ -203,6 +203,30 @@ def test_windows_mark_history_vs_projection():
     assert history, "past cycles must render as history"
 
 
+def test_windows_returns_all_configured_anchors():
+    """Every anchor's cycle is present — no trimming of older history."""
+    windows = mc.build_windows(ANCHORS)
+    # 3 anchors → 3 bull + 3 bear windows
+    assert len(windows) == 6
+    bull_starts = {w.start for w in windows if w.phase == "bull"}
+    for anchor in ["2015-01-14", "2018-12-15", "2022-11-21"]:
+        assert anchor in bull_starts, f"anchor {anchor} missing from windows"
+
+
+def test_windows_are_chronological():
+    """Windows must be returned in ascending start-date order."""
+    windows = mc.build_windows(ANCHORS)
+    dates = [w.start for w in windows]
+    assert dates == sorted(dates), "windows must be chronological"
+
+
+def test_windows_no_duplicate_live_projection():
+    """The live projected phase must appear exactly once — no duplicates."""
+    windows = mc.build_windows(ANCHORS, today=date(2025, 8, 23))
+    live_bull = [w for w in windows if w.phase == "bull" and w.start == "2022-11-21"]
+    assert len(live_bull) == 1, "live bull window must appear exactly once"
+
+
 def test_calendar_grid_paints_phases_and_marks_today():
     days = mc.build_cycle_calendar(ANCHORS, year=2025, month=10, today=date(2025, 8, 23))
     by_date = {d["date"]: d for d in days}

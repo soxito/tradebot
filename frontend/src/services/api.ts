@@ -79,6 +79,22 @@ export const api = axios.create({
   timeout: 30000,
 });
 
+// Strip `undefined` / `null` / literal "undefined" from query params before
+// the request leaves the browser. Without this, calls like
+// `api.get('/cycle/expectation', { params: { offset: undefined } })` serialize
+// to `?offset=undefined`, which FastAPI rejects with 422 (int_parsing) and
+// surfaces in the UI as a hard AxiosError. This was the bitcoin-cycle 422.
+api.interceptors.request.use((config) => {
+  if (config.params && typeof config.params === 'object') {
+    const cleaned: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(config.params as Record<string, unknown>)) {
+      if (v !== undefined && v !== null && v !== 'undefined') cleaned[k] = v
+    }
+    config.params = cleaned
+  }
+  return config
+})
+
 // Auto-retry interceptor — transparently retries network errors and 502/503/504
 // up to MAX_RETRIES times with a short delay so brief backend restarts / port
 // conflicts don't surface as hard UI errors.
@@ -92,6 +108,9 @@ api.interceptors.response.use(
   async (error) => {
     const config = error.config as AxiosRequestConfig & { _retryCount?: number };
     if (!config) return Promise.reject(error);
+
+    // ERR_CANCELED = intentional AbortController cancellation — never retry or log
+    if (error.code === 'ERR_CANCELED') return Promise.reject(error);
 
     const isNetworkError = !error.response && (error.code === 'ERR_NETWORK' || error.request);
     const isRetryableStatus = error.response?.status === 502 || error.response?.status === 503 || error.response?.status === 504;
@@ -171,8 +190,23 @@ export const apiClient = {
   // ── Bitcoin 1064-day cycle ──
   /** Where the cycle stands today: phase, countdowns, validation hit-rate. */
   getCycleState: () => api.get('/cycle/state', { timeout: 20000 }),
+  /**
+   * The cycle screen's one payload: monthly BTC candles for the configured
+   * years + green/red windows + halvings + anchors.
+   */
+  getCycleChart: (years?: number) =>
+    api.get('/cycle/chart', { params: { years }, timeout: 30000 }),
+  /** Full-history BTC candles for every timeframe — genesis-aware (MN1/W1/D1 via Yahoo+CoinMetrics, H1/H4 via Bitget+synthetic). */
+  getCycleCandles: (timeframe: string = 'D1', limit?: number, signal?: AbortSignal) =>
+    api.get('/cycle/candles', { params: { timeframe, limit }, timeout: 120000, signal }),
   /** Past + projected cycle boxes for chart overlays (green bull / red bear). */
   getCycleWindows: () => api.get('/cycle/windows', { timeout: 20000 }),
+  /** Candlestick pattern markers + Fisher transform for any symbol/timeframe. */
+  getPatternOverlay: (
+    exchange: string,
+    symbol: string,
+    params?: { timeframe?: string; limit?: number; patterns?: string; fisher?: boolean },
+  ) => api.get(`/market/pattern-overlay/${exchange}/${symbol}`, { params, timeout: 30000 }),
   /** A month grid: each day's phase, cycle position and historical expectation. */
   getCycleCalendar: (year?: number, month?: number) =>
     api.get('/cycle/calendar', { params: { year, month }, timeout: 20000 }),
@@ -230,8 +264,9 @@ export const apiClient = {
   }) => api.post('/signals/smc/generate', data),
   getSmcSignals: (params?: { limit?: number; status?: string; symbol?: string; timeframe?: string }) =>
     api.get('/signals/smc/signals', { params }),
-  /** Crypto SMC sniper — same engine, scoring, provider router and learning
-   *  loop as mt5.smcAnalyze; only the candle source differs. */
+  /** SMC sniper for any pair — crypto rides the exchange feed, metals/FX/
+   *  indices ride the universal resolver. Same engine, scoring, provider
+   *  router and learning loop as mt5.smcAnalyze. */
   cryptoSmcAnalyze: (symbol: string, params?: {
     exchange?: string; timeframe?: string; count?: number; min_rr?: number;
     max_rr?: number; sl_buffer_atr?: number; min_confidence?: number; use_ai?: boolean;
@@ -817,9 +852,22 @@ export const apiClient = {
     // Copy Profiles
     getCopyProfiles: () => api.get('/plugins/mt5/copy-profiles'),
     createCopyProfile: (data: any) => api.post('/plugins/mt5/copy-profiles', data),
+    updateCopyProfile: (id: number, data: any) => api.put(`/plugins/mt5/copy-profiles/${id}`, data),
     deleteCopyProfile: (id: number) => api.delete(`/plugins/mt5/copy-profiles/${id}`),
+    toggleCopyProfile: (id: number) => api.post(`/plugins/mt5/copy-profiles/${id}/toggle`),
     getCopySimTrades: (profileId: number) =>
       api.get(`/plugins/mt5/copy-profiles/${profileId}/trades`),
+    getCopyPerformance: (profileId: number) =>
+      api.get(`/plugins/mt5/copy-profiles/${profileId}/performance`),
+    getCopyFollowers: (profileId: number) =>
+      api.get(`/plugins/mt5/copy-profiles/${profileId}/followers`),
+    addCopyFollower: (profileId: number, data: any) =>
+      api.post(`/plugins/mt5/copy-profiles/${profileId}/followers`, data),
+    updateCopyFollower: (followerId: number, data: any) =>
+      api.put(`/plugins/mt5/copy-followers/${followerId}`, data),
+    deleteCopyFollower: (followerId: number) =>
+      api.delete(`/plugins/mt5/copy-followers/${followerId}`),
+    getRoomCopyOverview: () => api.get('/agents/room/copy-overview'),
     // ── Auto-Manage Loop ──
     startAutoManageLoop: (interval?: number) =>
       api.post('/plugins/mt5/auto-manage/loop/start', {}, { params: interval !== undefined ? { interval } : {} }),
@@ -1323,6 +1371,49 @@ export const apiClient = {
     research: (prompt: string, symbol?: string) =>
       api.post('/plugins/openhuman/research', { prompt, symbol }, { timeout: 30000 }),
     getMcpSchema: () => api.get('/plugins/openhuman/mcp/schema'),
+  },
+
+  // ── Hermes (NousResearch/hermes-agent sidecar, :8011) ────────────────
+  hermes: {
+    health: () => api.get('/hermes/health'),
+    overview: () => api.get('/hermes/overview'),
+    repo: () => api.get('/hermes/repo'),
+    repoPull: () => api.post('/hermes/repo/pull'),
+    search: (q: string, symbol?: string, limit = 6) =>
+      api.get('/hermes/search', { params: { q, ...(symbol ? { symbol } : {}), limit } }),
+    skills: () => api.get('/hermes/skills'),
+    skill: (slugOrSymbol: string) => api.get(`/hermes/skills/${encodeURIComponent(slugOrSymbol)}`),
+    evolveSkill: (symbol: string, force = false) => api.post(`/hermes/skills/${encodeURIComponent(symbol)}/evolve`, null, { params: { force } }),
+    profile: () => api.get('/hermes/profile'),
+    updateProfile: (data: { risk_pct?: number; focus_symbol?: string; focus_timeframe?: string; preferred_pairs?: string[]; notes?: string }) =>
+      api.put('/hermes/profile', data),
+    prune: () => api.post('/hermes/prune'),
+  },
+  // ── JARVIS skill recall (B — also via /hermes/skills/{name}) ───────────
+  jarvisSkill: (symbol: string) => api.get('/jarvis/skill', { params: { symbol } }),
+
+  // ── TradingAgents (multi-agent LLM framework, sidecar-backed) ─────────────
+  tradingAgents: {
+    status: () => api.get('/tradingagents/status'),
+    providers: () => api.get('/tradingagents/providers'),
+    analyze: (
+      payload: {
+        ticker: string;
+        trade_date?: string;
+        llm_provider?: string;
+        deep_think_llm?: string;
+        quick_think_llm?: string;
+        reasoning_effort?: string;
+        response_language?: string;
+        max_debate_rounds?: number;
+        max_risk_discuss_rounds?: number;
+      },
+    ) => api.post('/tradingagents/analyze', payload, { timeout: 45000 }),
+    getRuns: (limit = 50) =>
+      api.get('/tradingagents/runs', { params: { limit } }),
+    getRun: (runId: string) => api.get(`/tradingagents/runs/${runId}`),
+    /** SSE progress feed URL — consume with `new EventSource(url)`. */
+    streamUrl: (runId: string) => `${getApiBaseUrl()}/tradingagents/runs/${runId}/stream`,
   },
 };
 

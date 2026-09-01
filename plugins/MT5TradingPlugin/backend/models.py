@@ -65,6 +65,10 @@ class CopySimStatus(str, enum.Enum):
     CLOSED = "closed"
     CANCELLED = "cancelled"
 
+class CopyMode(str, enum.Enum):
+    SIM = "sim"      # paper ledger only
+    LIVE = "live"    # real orders on follower accounts
+
 class MT5ScalpSessionStatus(str, enum.Enum):
     ACTIVE = "active"
     PAUSED = "paused"
@@ -292,6 +296,7 @@ class MT5CopyProfile(MT5Base):
     allocation_value = Column(Float, default=0.01)
     max_open_positions = Column(Integer, default=5)
     symbol_whitelist = Column(JSON, nullable=True)
+    mode = Column(SQLEnum(CopyMode), default=CopyMode.SIM, nullable=False)
     enabled = Column(Boolean, default=False)
     paper_balance = Column(Float, default=10000.0)  # paper simulation wallet
     paper_equity = Column(Float, default=10000.0)
@@ -320,6 +325,32 @@ class MT5CopySimTrade(MT5Base):
 
     __table_args__ = (
         Index("ix_mt5_copy_sim_profile_status", "copy_profile_id", "status"),
+    )
+
+
+class MT5CopyFollower(MT5Base):
+    """A follower account in a live copy profile — mirrors the source's trades.
+
+    Each follower keeps its own sizing rule and a map of copied tickets
+    (source position ticket -> follower ticket) so closes mirror correctly.
+    """
+    __tablename__ = "mt5_copy_followers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    copy_profile_id = Column(Integer, nullable=False, index=True)
+    account_id = Column(Integer, nullable=False, index=True)
+    enabled = Column(Boolean, default=True)
+    allocation_mode = Column(String(20), default="multiplier")  # fixed_lot|risk_percent|multiplier
+    allocation_value = Column(Float, default=1.0)
+    max_open_positions = Column(Integer, default=10)
+    #: source position ticket -> follower position ticket
+    copied_tickets = Column(JSON, default=dict)
+    last_error = Column(String(500), nullable=True)
+    last_sync_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_mt5_copy_follower_profile_account", "copy_profile_id", "account_id"),
     )
 
 

@@ -89,7 +89,7 @@ const COLORS = {
 
 /** Horizontal band: filled strip between two y values across [x0, x1].
  *  `fullHeight` spans the whole pane — the cycle boxes' shape. */
-interface Band { x0: number; x1: number; yTop: number; yBot: number; fill: string; fullHeight?: boolean; edge?: boolean }
+interface Band { x0: number; x1: number; yTop: number; yBot: number; fill: string; fullHeight?: boolean; edge?: boolean; label?: string; labelAlpha?: number }
 /** Straight segment from (x0,y0) → (x1,y1). */
 interface Segment { x0: number; x1: number; y0: number; y1: number; stroke: string }
 
@@ -114,6 +114,21 @@ class ZonesPaneRenderer implements ISeriesPrimitivePaneRenderer {
           ctx.moveTo(b.x1, yTop);
           ctx.lineTo(b.x1, yBot);
           ctx.stroke();
+        }
+        if (b.fullHeight && b.label) {
+          const bandWidth = b.x1 - b.x0;
+          if (bandWidth >= 50) {
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(b.x0 + 1, yTop, bandWidth - 2, yBot - yTop);
+            ctx.clip();
+            ctx.fillStyle = `rgba(255,255,255,${b.labelAlpha ?? 0.35})`;
+            ctx.font = 'bold 9px system-ui, -apple-system, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'top';
+            ctx.fillText(b.label, (b.x0 + b.x1) / 2, yTop + 10);
+            ctx.restore();
+          }
         }
       }
       for (const s of this.segments) {
@@ -201,7 +216,10 @@ export class ZonesOverlay implements ISeriesPrimitive {
       const fill = w.phase === 'bull'
         ? (w.projected ? COLORS.cycleBullProjected : COLORS.cycleBull)
         : (w.projected ? COLORS.cycleBearProjected : COLORS.cycleBear);
-      bands.push({ x0, x1: Math.max(x1, x0 + 1), yTop: 0, yBot: 0, fill, fullHeight: true, edge: true });
+      bands.push({ x0, x1: Math.max(x1, x0 + 1), yTop: 0, yBot: 0, fill, fullHeight: true, edge: true,
+        label: w.phase === 'bull' ? 'BULLISH CYCLE' : 'BEARISH CYCLE',
+        labelAlpha: w.projected ? 0.22 : 0.40,
+      });
     }
 
     // ── Supply / Demand rectangles ─────────────────────────────

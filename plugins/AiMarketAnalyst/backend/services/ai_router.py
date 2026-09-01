@@ -328,6 +328,14 @@ async def get_router_settings(db: AsyncSession) -> AIRouterSettings:
         db.add(settings)
         await db.commit()
         await db.refresh(settings)
+    # One-time legacy fix: rows created before the raise still carry the old
+    # 800 ceiling, which clipped every published agent analysis mid-sentence.
+    # Only the exact legacy value is rewritten, so a deliberately smaller
+    # figure set afterwards is respected.
+    if settings.per_agent_max_tokens == 800:
+        settings.per_agent_max_tokens = 4000
+        await db.commit()
+        await db.refresh(settings)
     return settings
 
 
@@ -484,7 +492,7 @@ async def _call_openai_compatible(
 #: Ceiling for the one widened retry below. Above the seats' own ceiling so the
 #: retry has somewhere to go, and bounded so a model that never stops cannot
 #: spend a free tier's whole minute on one turn.
-_MAX_WIDENED_TOKENS = 16000
+_MAX_WIDENED_TOKENS = 32000
 
 #: Room a structured agent answer gets, whatever model ends up serving it.
 #: Measured across the NVIDIA catalogue on a real room prompt: every model that
@@ -663,27 +671,20 @@ async def _call_openai_compatible_msg(
             # the second, and without it the caller gets a half-finished
             # sentence and blames the provider.
             _widen_rounds = int(current_payload.get("_widened") or 0)
-            if json_mode and _truncated(data) and _widen_rounds < 2:
+            # Widening applies to prose too: an analysis cut mid-sentence is
+            # exactly the "responses are not full" complaint. The retry costs
+            # time even past half the deadline — a truncated answer that fails
+            # over to another provider costs at least as long and still ends
+            # up short somewhere else, so we always spend the extra round.
+            if _truncated(data) and _widen_rounds < 2:
                 widened = min(
                     int(current_payload.get("max_tokens") or 0) * (4 if _widen_rounds else 2),
                     _MAX_WIDENED_TOKENS,
                 )
-                # Asking again costs at least as long as the answer that was cut
-                # off. Past half the deadline there is no room for that, and
-                # spending it anyway is how a provider that was merely verbose
-                # ends up recorded as one that times out — which takes it out
-                # for everything else too.
-                if spent > request_timeout * 0.5:
-                    logger.info(
-                        "[AIRouter] {} was cut off but {:.0f}s of its {:.0f}s "
-                        "deadline is gone — failing over instead of retrying",
-                        current_payload.get("model"), spent, request_timeout,
-                    )
-                    widened = 0
                 if widened > (current_payload.get("max_tokens") or 0):
                     logger.info(
-                        "[AIRouter] {} was cut off before its JSON — retrying with {} tokens",
-                        current_payload.get("model"), widened,
+                        "[AIRouter] {} was cut off after {:.0f}s — retrying with {} tokens",
+                        current_payload.get("model"), spent, widened,
                     )
                     current_payload["max_tokens"] = widened
                     current_payload["_widened"] = _widen_rounds + 1
@@ -1155,17 +1156,13 @@ async def db_chat(
     comp_chars = _chars(send_messages)
 
     # Clamp tokens to the per-agent ceiling when this is an agent call.
-    # Never clamp below 1200 — analysis responses need room to finish sentences.
-    # The budget the caller asked for is kept: a reasoning model is exempt from
-    # the ceiling (see the loop below) and needs the caller's figure, not this.
+    # Never below the floors — analysis responses need room to finish
+    # sentences (prose) or the whole structured object (JSON). The budget the
+    # caller asked for is kept: a reasoning model is exempt from the ceiling
+    # (see the loop below) and needs the caller's figure, not this.
     requested_max_tokens = max_tokens
     if source == "agent" and settings.per_agent_max_tokens:
-        # A structured answer needs more room than a prose one: the model spends
-        # tokens working through the data before it opens the brace, and a JSON
-        # object cut off partway through is worth nothing — unlike a sentence
-        # cut short, it cannot be read at all. Below this floor the ceiling is
-        # not saving quota, it is spending it on answers that get discarded.
-        floor = 2048 if json_mode else 1200
+        floor = 2048 if json_mode else 3000
         max_tokens = max(floor, min(max_tokens, settings.per_agent_max_tokens))
 
     ordered = _order_providers(providers, settings.strategy, settings.round_robin_cursor)

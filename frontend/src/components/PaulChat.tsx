@@ -93,6 +93,21 @@ function isTradingCommand(text: string): boolean {
   )
 }
 
+// Best-trader skill intent (B — A+A skills surfaced in chat via /skill SYMBOL)
+function isSkillIntent(text: string): boolean {
+  const s = text.toLowerCase()
+  return /(?:\/skill|best.trader|playbook)\s*[a-z0-9\/]{2,12}/.test(s)
+    || /^skill\s+[a-z0-9\/]{2,12}/.test(s)
+    || /(?:show|load|what.?s)\s+(?:the\s+)?(?:best.trader\s+)?skill\s+for\s+[a-z0-9\/]{2,12}/.test(s)
+}
+function extractSkillSymbol(text: string): string {
+  const m = text.match(/(?:\/skill|skill|best.trader|playbook)\s*([a-z0-9\/]{2,12})/i)
+  if (m) return m[1].trim().replace(/\s+/g, '').toUpperCase()
+  const m2 = text.match(/skill\s+for\s+([a-z0-9\/]{2,12})/i)
+  if (m2) return m2[1].trim().toUpperCase()
+  return ''
+}
+
 // True when the user is telling JARVIS to EXECUTE / PLACE the limits or orders
 // that were produced by the most recent sniper analysis.
 function isExecuteSetupIntent(text: string): boolean {
@@ -159,6 +174,7 @@ interface Message {
   pending?: boolean
   fromHistory?: boolean  // loaded from server history on mount — must NOT be auto-spoken
   sniperSetups?: SniperSetupAction[]  // ranked sniper setups → rendered as Execute cards
+  skill?: any // best-trader skill card (B)
   image?: string  // data: URI — the screenshot the user attached, or Jarvis's marked-up copy
 }
 
@@ -1407,6 +1423,31 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     if (isExecuteSetupIntent(text)) {
       setMessages(prev => [...prev, { id: nanoid(), role: 'user', content: text }])
       void executeAllSetupsRef.current(text)
+      return
+    }
+
+    // ── Best-trader skill intent (B — /skill SYMBOL, skill EURUSD) ───────
+    // Surfaces the stock playbook linked to ALL 7 seats + JARVIS chair.
+    // Runs before trading commands so "skill EURUSD" is never mis-routed to
+    // the sniper analyzer.
+    if (isSkillIntent(text)) {
+      const symRaw = extractSkillSymbol(text) || text.replace(/[^A-Za-z0-9\/]/g,' ').trim().split(/\s+/).pop() || ''
+      const sym = symRaw.replace(/[^A-Za-z0-9\/]/g,'').toUpperCase() || 'EURUSD'
+      const userMsg: Message = { id: nanoid(), role: 'user', content: text }
+      const loadingMsg: Message = { id: nanoid(), role: 'assistant', content: '', pending: true }
+      setMessages(prev => [...prev, userMsg, loadingMsg])
+      try {
+        const r = await (apiClient as any).jarvisSkill(sym)
+        const d = r.data
+        const linked = (d.linked_agents||[]).join(', ') || 'all 7 seats'
+        const preview = (d.md||'').slice(0, 1200)
+        const win = d.meta?.win_rate != null ? ` · Learned win ${(d.meta.win_rate*100).toFixed(0)}% over ${d.meta.decisions_reviewed||0}` : ''
+        const body = `**${d.symbol} — Best Trader (${d.group || d.asset_class})**${win}\n\nLinked **JARVIS chair + ${linked}**. Stock playbook + evolving Learned block (after 12+ resolved).\n\n${preview}\n\n*Full playbook at /hermes → click ${d.symbol}.*`
+        setMessages(prev => prev.filter(m=>m.id!==loadingMsg.id).concat([{ id: nanoid(), role: 'assistant', content: body, skill: d }]))
+      } catch (e:any) {
+        const msg = e?.response?.data?.detail || 'Skill not found — try /skill EURUSD or /skill BTCUSD (run bootstrap if missing).'
+        setMessages(prev => prev.filter(m=>m.id!==loadingMsg.id).concat([{ id: nanoid(), role: 'assistant', content: `**Skill lookup failed for ${sym}**\n\n${msg}` }]))
+      }
       return
     }
 
@@ -5253,6 +5294,23 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
                       </span>
                     )}
                   </div>
+
+                  {/* Best-trader skill card (B) */}
+                  {msg.role === 'assistant' && msg.skill && (
+                    <div className="w-full rounded-lg border border-violet-500/30 bg-gray-900/80 px-3 py-2.5 text-[11px]">
+                      <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+                        <span className="font-bold text-white font-mono text-xs">{msg.skill.symbol || msg.skill.normalized}</span>
+                        <span className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 text-[10px]">best-trader</span>
+                        {msg.skill.asset_class && <span className="px-1.5 py-0.5 rounded bg-gray-800 text-gray-400 border border-gray-700 text-[10px]">{msg.skill.asset_class}</span>}
+                        <span className="ml-auto px-1.5 py-0.5 rounded bg-violet-500/15 text-violet-300 border border-violet-500/30 text-[10px] flex items-center gap-1">JARVIS chair</span>
+                      </div>
+                      <div className="flex flex-wrap gap-1 mb-2">
+                        {(msg.skill.linked_agents||[]).slice(0,7).map((r:string)=>(<span key={r} className="px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 text-[10px]">{r}</span>))}
+                      </div>
+                      {msg.skill.meta?.win_rate != null && <div className="text-[11px] text-emerald-300 mb-1">Learned win {(msg.skill.meta.win_rate*100).toFixed(0)}% over {msg.skill.meta.decisions_reviewed||0} · {msg.skill.meta.last_rationale||''}</div>}
+                      <a href="/hermes" target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-[11px] text-violet-400 hover:text-violet-300">View full playbook on /hermes →</a>
+                    </div>
+                  )}
 
                   {/* Sniper setup action cards (Execute = place pending limit + TP) */}
                   {msg.role === 'assistant' && msg.sniperSetups && msg.sniperSetups.length > 0 && (

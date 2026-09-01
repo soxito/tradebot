@@ -16,6 +16,107 @@ import {
 import { apiClient } from '@/services/api'
 
 const DEFAULT_PAIR = 'BTC/USDT'
+
+/** One beat of the market-structure story from /smc/analyze. */
+interface NarrativeStep {
+  step: number
+  title: string
+  detail: string
+  reason: string
+}
+
+/**
+ * Market Structure Story — the twelve-beat SMC read (initial trend → liquidity
+ * sweep → accumulation → CHoCH → BOS → FVG → expansion → premium zone) for the
+ * active pair, whatever it trades as: crypto rides the exchange feed, metals,
+ * FX and indices ride the universal resolver. Loads on demand so the page's
+ * first paint never waits on an analysis.
+ */
+function StructureStory({ symbol, timeframe }: { symbol: string; timeframe: string }) {
+  const [steps, setSteps] = useState<NarrativeStep[]>([])
+  const [flow, setFlow] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [open, setOpen] = useState(false)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      const res = await apiClient.cryptoSmcAnalyze(symbol.replace('/', ''), {
+        timeframe,
+        use_ai: false,
+      })
+      const narrative = res.data?.narrative ?? {}
+      setSteps(Array.isArray(narrative.steps) ? narrative.steps : [])
+      setFlow(String(narrative.flow ?? ''))
+    } catch {
+      setSteps([])
+      setFlow('')
+    } finally {
+      setLoading(false)
+    }
+  }, [symbol, timeframe])
+
+  useEffect(() => {
+    if (open) void load()
+  }, [open, load])
+
+  return (
+    <div className="rounded-2xl border border-gray-700/60 bg-gray-900/70 p-4 md:p-5">
+      <div className="flex items-center gap-2">
+        <Brain className="w-4 h-4 text-cyan-300" />
+        <h2 className="text-sm font-semibold text-white">Market Structure Story</h2>
+        <span className="text-[11px] text-gray-500">{symbol} · {timeframe}</span>
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          className="ml-auto rounded-lg border border-gray-700 px-3 py-1 text-[11px] text-gray-300 hover:bg-gray-800"
+        >
+          {open ? 'Hide' : 'Read the structure'}
+        </button>
+        {open && (
+          <button
+            type="button"
+            onClick={() => void load()}
+            disabled={loading}
+            className="rounded-lg border border-gray-700 p-1.5 text-gray-300 hover:bg-gray-800 disabled:opacity-50"
+            title="Re-read the structure"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
+          </button>
+        )}
+      </div>
+      {open && (
+        <>
+          {flow && (
+            <p className="mt-2 text-[11px] leading-snug text-cyan-300/90">{flow}</p>
+          )}
+          {loading && !steps.length && (
+            <p className="mt-3 text-xs text-gray-500">Reading the structure…</p>
+          )}
+          {!loading && !steps.length && (
+            <p className="mt-3 text-xs text-gray-500">
+              No confirmed structure on this timeframe — the story needs a completed
+              swing sequence to narrate.
+            </p>
+          )}
+          <ol className="mt-3 space-y-2">
+            {steps.map((s) => (
+              <li key={s.step} className="rounded-xl border border-gray-800 bg-gray-900/60 p-3">
+                <div className="flex items-baseline gap-2">
+                  <span className="font-mono text-[10px] text-gray-600">{String(s.step).padStart(2, '0')}</span>
+                  <span className="text-xs font-semibold text-gray-200">{s.title}</span>
+                </div>
+                <p className="mt-1 text-[11px] leading-snug text-gray-400">{s.detail}</p>
+                <p className="mt-1 text-[11px] leading-snug text-gray-600">Reason: {s.reason}</p>
+              </li>
+            ))}
+          </ol>
+        </>
+      )}
+    </div>
+  )
+}
+
 const MAX_OVERVIEW_PAIRS = 20
 const TERMINAL_POSITION_STATUSES = new Set(['closed', 'cancelled', 'canceled', 'failed', 'rejected', 'stopped', 'exited'])
 
@@ -788,6 +889,8 @@ export default function SmartMoneyConceptsPage() {
             {error}
           </div>
         )}
+
+        <StructureStory symbol={symbol} timeframe={timeframe} />
 
         <div className="rounded-2xl border border-gray-700/60 bg-gray-900/70 p-4 md:p-5">
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-6 gap-3">

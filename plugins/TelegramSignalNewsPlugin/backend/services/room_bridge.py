@@ -994,6 +994,9 @@ async def run_pair(token: str, chat_id: str, symbol: str, timeframe: str) -> Non
             follow_up = scenario_narrative(await track_symbol(db, symbol))
         except Exception as exc:  # noqa: BLE001 — history never gates the verdict
             logger.debug("[Room] scenario follow-up skipped for {}: {}", symbol, exc)
+            from app.core.database import safe_rollback
+
+            await safe_rollback(db)
 
     await bot_service.send_message(token, chat_id, format_result(result, symbol, timeframe))
 

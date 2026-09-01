@@ -1221,6 +1221,51 @@ async def _crypto_candles(exchange: str, symbol: str, timeframe: str, limit: int
     return candles_from_payload(rows)
 
 
+def _universal_candles(rows: List[list]):
+    """ccxt-shaped rows → SMC Candle list, for pairs no exchange lists."""
+    from plugins.MT5TradingPlugin.backend.services.smc_strategy import Candle
+
+    out = []
+    for r in rows or []:
+        try:
+            out.append(Candle(
+                time=int(r[0]),
+                open=float(r[1]), high=float(r[2]),
+                low=float(r[3]), close=float(r[4]),
+                volume=float(r[5]) if len(r) > 5 and r[5] is not None else 0.0,
+            ))
+        except (TypeError, ValueError, IndexError):
+            continue
+    out.sort(key=lambda c: c.time)
+    return out
+
+
+async def _smc_candles_any(symbol: str, timeframe: str, limit: int):
+    """Candles for any instrument the desk names — crypto or not.
+
+    The exchange path answers first for crypto (tightest spread data), and the
+    universal resolver (Kronos → Yahoo → forex provider) answers for everything
+    else: gold, silver, FX crosses, indices. Before this, /smc/analyze could
+    only ever serve what a crypto exchange lists — the SMC screens stopped at
+    the exact pairs the room's other screens cover.
+    """
+    from app.services import market_data
+
+    try:
+        if market_data.classify(market_data.normalize_symbol(symbol)) == market_data.CRYPTO:
+            try:
+                return await _crypto_candles("bitget", symbol, timeframe, limit)
+            except Exception as exc:  # noqa: BLE001 — fall through to universal
+                logger.debug(f"[crypto/SMC] exchange candles failed for {symbol}: {exc}")
+    except Exception:  # noqa: BLE001 — classification failure must not veto
+        pass
+
+    from app.services import candles as candle_resolver
+
+    rows = await candle_resolver.fetch(symbol, timeframe, limit)
+    return _universal_candles(rows)
+
+
 @router.get("/smc/analyze")
 async def crypto_smc_analyze(
     symbol: str,
@@ -1234,10 +1279,11 @@ async def crypto_smc_analyze(
     use_ai: bool = True,
     db: AsyncSession = Depends(get_db),
 ):
-    """Smart Money Concepts sniper analysis for a crypto pair.
+    """Smart Money Concepts sniper analysis for any pair the desk names.
 
-    Same never-fail contract as the MT5 endpoint: the response always carries a
-    complete `ai` block. When every provider is unreachable the deterministic
+    Crypto rides the exchange feed; metals, FX and indices ride the universal
+    resolver — same engine, same contract. The response always carries a
+    complete `ai` block: when every provider is unreachable the deterministic
     SMC floor answers, so this can never return empty, null, or an error.
     """
     from plugins.MT5TradingPlugin.backend.services import smc_floor, smc_memory
@@ -1248,7 +1294,7 @@ async def crypto_smc_analyze(
     )
 
     try:
-        candles = await _crypto_candles(exchange, symbol, timeframe, count)
+        candles = await _smc_candles_any(symbol, timeframe, count)
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"[crypto/SMC] candle fetch failed for {symbol}: {exc}")
         candles = []
@@ -1258,7 +1304,7 @@ async def crypto_smc_analyze(
     htf_tf = _CRYPTO_HTF_FOR.get(timeframe.lower())
     if htf_tf:
         try:
-            htf_candles = await _crypto_candles(exchange, symbol, htf_tf, 300)
+            htf_candles = await _smc_candles_any(symbol, htf_tf, 300)
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"[crypto/SMC] HTF {htf_tf} skipped for {symbol}: {exc}")
 
@@ -1275,6 +1321,16 @@ async def crypto_smc_analyze(
 
     macro = await resolve_macro_bias(symbol)
     analysis = engine.analyze(candles, htf_candles=htf_candles, macro=macro)
+
+    # The market-structure story — the twelve-beat read the SMC screens and the
+    # room seats quote. Built from what the engine already found; failure is
+    # silence, never an error.
+    try:
+        from plugins.MT5TradingPlugin.backend.services.smc_narrative import build_narrative
+
+        analysis["narrative"] = build_narrative(candles, analysis)
+    except Exception as exc:  # noqa: BLE001 — enrichment only
+        logger.debug(f"[crypto/SMC] narrative skipped for {symbol}: {exc}")
 
     if use_ai:
         try:

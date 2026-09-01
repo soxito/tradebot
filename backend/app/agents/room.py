@@ -383,6 +383,11 @@ async def session_completed(session_id: str, result: Dict[str, Any]) -> None:
             record["final_action"] = result.get("final_action")
             record["final_confidence"] = result.get("final_confidence")
             record["final_reasoning"] = result.get("final_reasoning")
+            # Persist skill + forecast evidence so hydrate shows the same map the seats argued from
+            record["hermes_skill"] = result.get("hermes_skill")
+            record["kronos_forecast"] = result.get("kronos_forecast")
+            record["momentum"] = result.get("momentum")
+            record["btc_cycle"] = result.get("btc_cycle")
             break
 
     for role, state in _agent_state.items():
@@ -407,9 +412,49 @@ async def session_completed(session_id: str, result: Dict[str, Any]) -> None:
             "kronos_forecast": result.get("kronos_forecast"),
             "momentum": result.get("momentum"),
             "price": result.get("price"),
+            # Best-trader skill the seats were prompted with (A+A+B): surfaces in
+            # /trading-room + hermes search + Telegram publisher.
+            "hermes_skill": result.get("hermes_skill"),
+            "hermes_best_trader": result.get("hermes_best_trader"),
+            "btc_cycle": result.get("btc_cycle"),
+            "btc_whales": result.get("btc_whales"),
+            "smc_structure": result.get("smc_structure"),
         },
     )
     await _dispatch_alert(result, consensus)
+    # ── Hermes hooks (episodic ingest + best-trader harvest/evolve — A+A+B) ──
+    try:
+        import asyncio
+        from app.hermes_bridge.state_store import ingest_session
+        from app.hermes_bridge.skill_registry import maybe_create_skill
+        # FTS5 recall ingest (fire best-effort, never block SSE)
+        try:
+            await ingest_session(result, consensus)
+        except Exception as _ie:
+            logger.debug(f"[room] ingest_session skipped: {_ie}")
+        # Session harvest (informational wins coexist with stock best-trader playbooks).
+        try:
+            await maybe_create_skill(result, consensus)
+        except Exception as _e:
+            logger.debug(f"[room] maybe_create_skill skipped: {_e}")
+        # Evolve the stock best-trader skill for this symbol from measured outcomes.
+        # Runs in background so the room's SSE response is not delayed by LLM calls.
+        try:
+            from app.core.database import AsyncSessionLocal
+            from app.hermes_bridge.skill_evolution import evolve_skill
+            sym = (result.get("symbol") or "").strip()
+            if sym:
+                async def _evolve_bg(s=sym):
+                    try:
+                        async with AsyncSessionLocal() as db:
+                            await evolve_skill(db, s, force=False)
+                    except Exception as _be:
+                        logger.debug(f"[room] skill evolve bg skipped for {s}: {_be}")
+                asyncio.create_task(_evolve_bg())
+        except Exception as _e2:
+            logger.debug(f"[room] skill evolve hook skipped: {_e2}")
+    except Exception as _outer:
+        logger.debug(f"[room] hermes hooks skipped: {_outer}")
 
 
 async def _dispatch_alert(result: Dict[str, Any], consensus: Dict[str, Any]) -> None:

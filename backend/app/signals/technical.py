@@ -8,7 +8,7 @@ All calculations use pure numpy/pandas — no external TA libraries needed.
 import math
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from loguru import logger
 
 
@@ -790,6 +790,45 @@ def obv(df: pd.DataFrame) -> pd.Series:
     return (sign * df["volume"]).cumsum()
 
 
+def fisher(df: pd.DataFrame, period: int = 9) -> Tuple[pd.Series, pd.Series]:
+    """Fisher Transform — price mapped to a near-Gaussian, turning points sharpened.
+
+    The cycle screen's lower pane: the fisher line and its 1-bar-ago trigger.
+    Crosses of the trigger around the ±2 bands are the reversal reads the
+    reference chart circles at cycle bottoms.
+
+    Returns ``(fisher, trigger)`` — both aligned to the input index, warm-up
+    bars carried forward from the first computed value so the series never has
+    leading NaNs for charting.
+    """
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    mid = (high + low) / 2.0
+
+    raw = pd.Series(0.0, index=df.index)
+    for i in range(len(mid)):
+        lo = mid.iloc[max(0, i - period + 1): i + 1].min()
+        hi = mid.iloc[max(0, i - period + 1): i + 1].max()
+        span = hi - lo
+        if span <= 0:
+            raw.iloc[i] = 0.0
+        else:
+            x = 2.0 * ((mid.iloc[i] - lo) / span) - 1.0
+            prev = raw.iloc[i - 1] if i > 0 else 0.0
+            raw.iloc[i] = max(-0.999, min(0.999, 0.66 * x + 0.67 * prev))
+
+    val = pd.Series(0.0, index=df.index)
+    for i in range(len(raw)):
+        prev = val.iloc[i - 1] if i > 0 else 0.0
+        val.iloc[i] = 0.5 * np.log((1.0 + raw.iloc[i]) / (1.0 - raw.iloc[i])) + 0.5 * prev
+
+    fish = val.copy()
+    trigger = fish.shift(1)
+    if len(fish):
+        trigger.iloc[0] = fish.iloc[0]
+    return fish, trigger
+
+
 def detect_divergence(
     price_series: pd.Series,
     indicator_series: pd.Series,
@@ -1203,38 +1242,111 @@ def analyze(ohlcv: List[List], timeframe: str = "1h") -> Dict[str, Any]:
         score *= dampen
         reasons.append(f"Score dampened by weak ADX ({dampen:.2f}x)")
 
-    # ── Volatility filter: high ATR percentile dampens signals ──
+    # ── Volatility filter: high ATR percentile dampens signals & raises bar ──
+    # In volatile expansion (2026-08-28 gold sold 1.5% ATR expansion) the desk
+    # must not chase. A mid-range tick becomes a sweep magnet, so we dampen more
+    # and demand stronger confluence.
     atr_val = latest["atr"]
+    atr_pctile = None
     if not np.isnan(atr_val):
         atr_series = df["atr"].dropna()
         if len(atr_series) >= 50:
-            atr_pctile = (atr_series < atr_val).mean()
-            if atr_pctile > 0.85:
-                score *= 0.80
-                reasons.append(f"High volatility (ATR p{atr_pctile * 100:.0f}) — score dampened")
+            atr_pctile = float((atr_series < atr_val).mean())
+            if atr_pctile > 0.90:
+                score *= 0.60
+                reasons.append(f"Extreme volatility (ATR p{atr_pctile * 100:.0f}) — score heavily dampened, waiting for retest")
+            elif atr_pctile > 0.80:
+                score *= 0.72
+                reasons.append(f"High volatility (ATR p{atr_pctile * 100:.0f}) — score dampened, needs level")
+            elif atr_pctile > 0.60:
+                # elevated but not extreme — mild dampen only if not at a level
+                if abs(evaluators.get("zone_reaction", 0)) < 0.25:
+                    score *= 0.88
+                    reasons.append(f"Elevated volatility (ATR p{atr_pctile * 100:.0f}) without zone confluence — score dampened")
+
+    # ── Bollinger bandwidth regime — squeeze vs expansion ──
+    try:
+        if not np.isnan(latest["bb_upper"]) and not np.isnan(latest["bb_lower"]) and not np.isnan(latest["bb_middle"]) and latest["bb_middle"] != 0:
+            bw = (latest["bb_upper"] - latest["bb_lower"]) / abs(latest["bb_middle"])
+            bw_series = (df["bb_upper"] - df["bb_lower"]) / df["bb_middle"].abs()
+            bw_series = bw_series.replace([np.inf, -np.inf], np.nan).dropna()
+            if len(bw_series) >= 50 and not np.isnan(bw):
+                bw_pctile = float((bw_series < bw).mean())
+                if bw_pctile > 0.85:
+                    # Wide bands = expansion — breakout chase risk
+                    if abs(score) < 0.55:
+                        score *= 0.85
+                        reasons.append(f"Bollinger expansion (bandwidth p{bw_pctile*100:.0f}) — chasing needs stronger score")
+                elif bw_pctile < 0.15:
+                    # Squeeze — coil before move, not a trigger
+                    if abs(latest["bb_pct_b"] - 0.5) < 0.25:
+                        score *= 0.70
+                        reasons.append(f"Bollinger squeeze (bandwidth p{bw_pctile*100:.0f}) mid-band — no edge, waiting for break + retest")
+    except Exception:
+        pass
 
     # ── Confluence gate: require multiple evaluators to strongly agree ──
+    # Tightened in volatile regime: when ATR is hot, a 4-evaluator lean is noise.
+    # 2026-08-28 had 4/7 bullish at composite 0.28 but ADX/MACD/volume all bearish.
     strong_bullish = sum(1 for v in evaluators.values() if v > 0.3)
     strong_bearish = sum(1 for v in evaluators.values() if v < -0.3)
     min_confluence = 4
+    if atr_pctile is not None and atr_pctile > 0.80:
+        min_confluence = 5  # volatile — need 5 strong evaluators, not 4
+        if atr_pctile > 0.90:
+            min_confluence = 6
     if score > 0 and strong_bullish < min_confluence:
-        score *= max(0.5, strong_bullish / min_confluence)
+        # In volatile mode, weak confluence is near-fatal; in calm, it's a haircut
+        floor = 0.35 if (atr_pctile is not None and atr_pctile > 0.80) else 0.5
+        score *= max(floor, strong_bullish / min_confluence)
         if strong_bullish < 3:
-            reasons.append(f"Weak confluence ({strong_bullish} bullish evaluators)")
+            reasons.append(f"Weak confluence ({strong_bullish} bullish evaluators, need {min_confluence} in this regime)")
+        else:
+            reasons.append(f"Confluence {strong_bullish}/{min_confluence} bullish — needs more alignment")
     elif score < 0 and strong_bearish < min_confluence:
-        score *= max(0.5, strong_bearish / min_confluence)
+        floor = 0.35 if (atr_pctile is not None and atr_pctile > 0.80) else 0.5
+        score *= max(floor, strong_bearish / min_confluence)
         if strong_bearish < 3:
-            reasons.append(f"Weak confluence ({strong_bearish} bearish evaluators)")
+            reasons.append(f"Weak confluence ({strong_bearish} bearish evaluators, need {min_confluence} in this regime)")
+        else:
+            reasons.append(f"Confluence {strong_bearish}/{min_confluence} bearish — needs more alignment")
+
+    # ── Level check for volatile mid-range — don't trade air ──
+    # If no zone_reaction and BB mid-range, the score may look tradeable but
+    # there is no structure to trade *from*. In expansion this is the exact
+    # shape that wicked the 2026-08-28 longs.
+    try:
+        zone = evaluators.get("zone_reaction", 0)
+        bb_mid = 0.28 <= float(latest["bb_pct_b"]) <= 0.72 if not np.isnan(latest["bb_pct_b"]) else False
+        if abs(zone) < 0.20 and bb_mid and (atr_pctile is None or atr_pctile > 0.55):
+            if abs(score) < 0.50:
+                score *= 0.60
+                reasons.append(f"No level confluence mid-range (%B {float(latest['bb_pct_b']):.2f}, zone {zone:.2f}) — waiting for level")
+    except Exception:
+        pass
 
     score = max(-1.0, min(1.0, score))
 
-    # ── Action thresholds (tighter than before for loss reduction) ──
-    if score >= 0.40:
+    # ── Action thresholds — dynamic with volatility ──
+    # Calm market: 0.40 is enough (needs decent conviction).
+    # Volatile (ATR p80+): 0.45, extreme (>0.90): 0.50 — must earn it.
+    # This is the "wait for the right moment" dial: in chop we hold more.
+    effective_threshold = 0.40
+    if atr_pctile is not None and atr_pctile > 0.90:
+        effective_threshold = 0.50
+    elif atr_pctile is not None and atr_pctile > 0.80:
+        effective_threshold = 0.45
+    elif atr_pctile is not None and atr_pctile > 0.60 and abs(evaluators.get("zone_reaction", 0)) < 0.20:
+        effective_threshold = 0.43  # elevated vol without level → higher bar
+
+    if score >= effective_threshold:
         action = "buy"
-    elif score <= -0.40:
+    elif score <= -effective_threshold:
         action = "sell"
     else:
         action = "hold"
+        if abs(score) >= 0.30 and abs(score) < effective_threshold:
+            reasons.append(f"Score {score:.2f} below volatile threshold {effective_threshold:.2f} — waiting for better entry")
 
     # ── Confidence: score magnitude + agreement + confluence ──
     total_evals = len(evaluators)

@@ -13,6 +13,7 @@ from app.core.scheduler import (
     start_position_monitor,
     start_pump_monitor_loop,
     start_jarvis_learning_loop,
+    start_decision_learning_loop,
     start_research_loop,
     start_scheduler,
     start_signal_research_queue,
@@ -24,6 +25,7 @@ from app.core.scheduler import (
     stop_position_monitor,
     stop_pump_monitor_loop,
     stop_jarvis_learning_loop,
+    stop_decision_learning_loop,
     stop_research_loop,
     stop_scheduler,
     stop_signal_research_queue,
@@ -31,6 +33,7 @@ from app.core.scheduler import (
     stop_sniper_loop,
 )
 from app.workers.room_worker import arm_from_settings, start_room_worker, stop_room_worker
+from app.workers.copy_worker import start_copy_worker, stop_copy_worker
 
 
 def start_background_workers(allow_in_api: bool = False) -> dict[str, bool]:
@@ -126,6 +129,11 @@ def start_background_workers(allow_in_api: bool = False) -> dict[str, bool]:
     else:
         started["jarvis_learning_loop"] = False
 
+    if getattr(settings, "AUTO_START_DECISION_LEARNING_LOOP", True):
+        started["decision_learning_loop"] = start_decision_learning_loop()
+    else:
+        started["decision_learning_loop"] = False
+
     # The room worker arms itself from the saved room settings rather than the
     # env flag alone, so "keep meeting 24/7" survives a restart. Reading that
     # row needs the DB, so it is deferred onto the loop instead of blocking
@@ -145,6 +153,13 @@ def start_background_workers(allow_in_api: bool = False) -> dict[str, bool]:
             settings.ROOM_WORKER_COOLDOWN_SECONDS,
         ) if settings.AUTO_START_ROOM_WORKER else False
 
+    # Copy-trading worker: mirrors source accounts into sim/live followers.
+    # Always on — profiles are individually gated by their own `enabled` flag,
+    # so the loop idles cheaply when nothing is armed.
+    started["copy_worker"] = start_copy_worker(
+        settings.COPY_WORKER_INTERVAL_SECONDS
+    )
+
     return started
 
 
@@ -161,4 +176,6 @@ def stop_background_workers() -> None:
     stop_signal_research_queue()
     stop_vault_sync_loop()
     stop_jarvis_learning_loop()
+    stop_decision_learning_loop()
     stop_room_worker()
+    stop_copy_worker()

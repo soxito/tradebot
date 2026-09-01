@@ -191,10 +191,46 @@ class MT5CopyProfileCreate(BaseModel):
     allocation_value: float = 0.01
     max_open_positions: int = 5
     symbol_whitelist: Optional[List[str]] = None
+    mode: str = "sim"  # sim | live
+
+class MT5CopyFollowerCreate(BaseModel):
+    account_id: int
+    enabled: bool = True
+    allocation_mode: str = "multiplier"
+    allocation_value: float = 1.0
+    max_open_positions: int = 10
+
+class MT5CopyFollowerUpdate(BaseModel):
+    enabled: Optional[bool] = None
+    allocation_mode: Optional[str] = None
+    allocation_value: Optional[float] = None
+    max_open_positions: Optional[int] = None
+
+class MT5CopyFollowerResponse(BaseModel):
+    id: int
+    copy_profile_id: int
+    account_id: int
+    enabled: bool
+    allocation_mode: str
+    allocation_value: float
+    max_open_positions: int
+    copied_tickets: Optional[Dict[str, Any]]
+    last_error: Optional[str]
+    last_sync_at: Optional[datetime]
+    created_at: datetime
+
+class MT5CopyProfileUpdate(BaseModel):
+    name: Optional[str] = Field(None, max_length=100)
+    source_account_id: Optional[int] = None
+    allocation_mode: Optional[str] = None
+    allocation_value: Optional[float] = None
+    max_open_positions: Optional[int] = None
+    symbol_whitelist: Optional[List[str]] = None
 
 class MT5CopyProfileResponse(BaseModel):
     id: int
     name: str
+    mode: str = "sim"
     source_account_id: Optional[int]
     source_group_id: Optional[int]
     allocation_mode: str

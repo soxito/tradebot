@@ -49,7 +49,7 @@ async def whale_holders() -> dict:
 
     snap = await whale_watch.resolve_whale_snapshot()
     if snap is None:
-        return {"ok": False, "detail": "whale feed unreachable", "holders": [], "transfers": []}
+        return {"ok": False, "detail": "whale feed unreachable", "status": "UNKNOWN", "score": "UNKNOWN", "net_flow_7d_btc": None, "holders": [], "transfers": []}
     return _snapshot_payload(snap)
 
 

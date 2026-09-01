@@ -53,6 +53,7 @@ import {
   ROOM_HEIGHT,
   type BoardQuote,
   type ChartCandle,
+  type ChartOverlays,
   type NewsItem,
   type NewsScreenHandle,
   type PriceBoardHandle,
@@ -99,6 +100,8 @@ export interface TradingRoomOptions {
   getQuotes?: () => BoardQuote[]
   /** Real OHLC bars for the back-wall chart. Polled; repaints only on change. */
   getChartCandles?: () => ChartCandle[]
+  /** Pattern flags + cycle season bands for the wall chart. Polled. */
+  getChartOverlays?: () => ChartOverlays | null
   /** Recent headlines for the news screen. Polled; repaints only on change. */
   getNews?: () => NewsItem[]
   /** The turn currently being spoken at the board (drives the speech bubbles). */
@@ -226,7 +229,7 @@ export interface SpeechTurn {
 }
 
 /** How long one speaking turn stays visible above its avatar. */
-export const SPEECH_TTL = 9
+export const SPEECH_TTL = 20
 
 type SpeechBubble = THREE.Sprite & {
   say(text: string, accent: string): void
@@ -256,20 +259,20 @@ function wrapText(text: string, maxChars: number): string[] {
     line = word
   }
   if (line) lines.push(line)
-  return lines.slice(0, 4)
+  return lines.slice(0, 9)
 }
 
 /** Speech bubble drawn to a canvas — tail at the bottom, speaker colour border. */
 function makeSpeechBubble(): SpeechBubble {
   const canvas = document.createElement('canvas')
   canvas.width = 640
-  canvas.height = 320
+  canvas.height = 480
   const ctx = canvas.getContext('2d')!
 
   const paint = (text: string, accent: string) => {
     ctx.clearRect(0, 0, canvas.width, canvas.height)
 
-    const lines = wrapText(text, 44)
+    const lines = wrapText(text, 52)
     const lineHeight = 42
     const padX = 34
     const padTop = 26
@@ -448,7 +451,7 @@ export function maxOrbitDistance(target: THREE.Vector3, cage: CameraCage = ROOM_
 }
 
 export function createTradingRoom(opts: TradingRoomOptions): TradingRoomHandle | null {
-  const { canvas, gfx, reducedMotion, getSeats, getScreenInfo, getQuotes, getChartCandles, getNews, getSpeech, getCycleInfo, onSeatClick } = opts
+  const { canvas, gfx, reducedMotion, getSeats, getScreenInfo, getQuotes, getChartCandles, getChartOverlays, getNews, getSpeech, getCycleInfo, onSeatClick } = opts
 
   let renderer: THREE.WebGLRenderer
   try {
@@ -1100,7 +1103,7 @@ export function createTradingRoom(opts: TradingRoomOptions): TradingRoomHandle |
     {
       const focus = info?.symbol ?? null
       const q = focus ? getQuotes?.().find((x) => x.symbol === focus) : undefined
-      shell.chart.update(focus, q?.price ?? null, q?.prev ?? null, getChartCandles?.(), getCycleInfo?.() ?? null)
+      shell.chart.update(focus, q?.price ?? null, q?.prev ?? null, getChartCandles?.(), getCycleInfo?.() ?? null, getChartOverlays?.() ?? null)
     }
 
     // The lounge TV plays an actual game, rotating through the catalogue every
@@ -1283,7 +1286,7 @@ export function createTradingRoom(opts: TradingRoomOptions): TradingRoomHandle |
         const age = nowSec - turn.at
         const fade = age > SPEECH_TTL - 1.5 ? (SPEECH_TTL - age) / 1.5 : 1
         ;(av.speech.material as THREE.SpriteMaterial).opacity = Math.max(0.15, fade)
-        av.speech.scale.set(bubbleScale, bubbleScale * 0.5, 1)
+        av.speech.scale.set(bubbleScale, bubbleScale * 0.75, 1)
       } else if (seated && seat.state === 'presenting') {
         const conf = seat.confidence ?? 0
         const pct = Math.round(conf * (conf <= 1 ? 100 : 1))
@@ -1291,7 +1294,7 @@ export function createTradingRoom(opts: TradingRoomOptions): TradingRoomHandle |
         av.speech.visible = true
         const bubbleScale = THREE.MathUtils.clamp(camera.position.distanceTo(tmpTarget) * 0.16, 1.1, 3.0)
         ;(av.speech.material as THREE.SpriteMaterial).opacity = 1
-        av.speech.scale.set(bubbleScale, bubbleScale * 0.5, 1)
+        av.speech.scale.set(bubbleScale, bubbleScale * 0.75, 1)
       } else {
         av.speech.clear()
       }

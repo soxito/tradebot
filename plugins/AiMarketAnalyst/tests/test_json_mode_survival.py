@@ -188,30 +188,41 @@ async def test_a_second_cut_off_gets_one_more_widening(client):
 
 
 @pytest.mark.asyncio
-async def test_free_text_calls_are_left_alone(client):
-    """Prose that runs long is still usable — only JSON is all-or-nothing."""
-    made = client([_answer("a long narrative that ran out of room", "length")])
+async def test_a_truncated_prose_answer_is_widened_too(client):
+    """A prose answer cut mid-sentence is exactly what users report as broken.
+
+    JSON used to be the only mode that earned a widening retry; a narrative
+    analysis that ran out of room was published half-finished instead.
+    """
+    made = client([
+        _answer("a long narrative that ran out of room", "length"),
+        _answer("the full narrative, ending on a complete sentence.", "stop"),
+    ])
 
     await _call(json_mode=False)
 
-    assert len(made[0].sent) == 1
+    assert len(made[0].sent) == 2, "truncated prose was not widened"
+    assert made[0].sent[1]["max_tokens"] == 2400
 
 
 @pytest.mark.asyncio
-async def test_a_slow_truncated_answer_fails_over_instead_of_retrying(client, monkeypatch):
-    """Retrying costs at least what the cut-off answer already cost.
+async def test_a_truncated_answer_is_retried_even_late_in_the_deadline(client, monkeypatch):
+    """Failing over past half the deadline still ends in a short answer.
 
-    Past half the deadline there is no room for that, and spending it anyway is
-    how a merely verbose provider gets recorded as one that times out — which
-    takes it out of the pool for every other seat too.
+    The old behaviour skipped the widening retry when more than half the
+    deadline had been spent — but the failover provider needs at least as long
+    and produces another short read. Spending the round on the model that has
+    already done the thinking is the better trade, so retries are unconditional
+    now and the deadline is extended by taking them.
     """
     made = client([
         _answer("still thinking about the 1h structure and", "length"),
         _answer('{"action": "hold"}', "stop"),
     ])
-    clock = iter([0.0, 90.0, 90.0, 90.0])
-    monkeypatch.setattr(ai_router.time, "monotonic", lambda: next(clock))
+    # A clock pinned deep into the deadline: the retry must happen regardless.
+    monkeypatch.setattr(ai_router.time, "monotonic", lambda: 90.0)
 
-    await _call(max_tokens=2048)
+    content, _usage, _via, _msg = await _call(max_tokens=2048)
 
-    assert len(made[0].sent) == 1, "retried with no deadline left to do it in"
+    assert len(made[0].sent) == 2, "late truncation must still be retried"
+    assert json.loads(content)["action"] == "hold"

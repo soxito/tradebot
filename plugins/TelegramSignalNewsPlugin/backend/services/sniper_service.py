@@ -154,6 +154,24 @@ async def get_or_create_settings(db: AsyncSession) -> TelegramSniperSettings:
         db.add(settings)
         await db.commit()
         await db.refresh(settings)
+    # One-time execution bootstrap. The executor shipped disabled, so every
+    # parsed signal piled up as ACTIVE and never traded. On the first touch
+    # after this deploy the engine switches itself fully ON (sandbox + live +
+    # MT5 demo/live) and stamps exec_bootstrap_v1 — afterwards any manual
+    # toggle in the UI wins forever, because this branch never runs again.
+    if not getattr(settings, "exec_bootstrap_v1", False):
+        settings.enabled = True
+        settings.execute_sandbox = True
+        settings.execute_live = True
+        settings.mt5_execute = True
+        settings.mt5_demo_execute = True
+        settings.exec_bootstrap_v1 = True
+        await db.commit()
+        await db.refresh(settings)
+        logger.info(
+            "[Sniper] execution bootstrap applied — enabled=True sandbox=True "
+            "live=True mt5_demo=True mt5_live=True (one-time)"
+        )
     return settings
 
 
@@ -1661,8 +1679,14 @@ async def run_sniper_cycle(db: AsyncSession) -> dict[str, Any]:
             if agent_confirm is not None:
                 ai_confirmed = bool(agent_confirm.get("confirmed"))
                 agent_note = agent_confirm.get("note", "")
+            elif getattr(settings, "ai_confirmation_fail_open", True):
+                # Fail-open: an unreachable AI desk must not freeze the whole
+                # pipeline into PENDING forever. Volume + confidence gates still
+                # apply; only the AI opinion is skipped.
+                ai_confirmed = True
+                agent_note = "AI agents unavailable — fail-open (volume/confidence gates only)"
             else:
-                ai_confirmed = False  # agents unavailable → not auto-confirmed
+                ai_confirmed = False  # fail-closed: agents unavailable → not auto-confirmed
                 agent_note = "AI agents unavailable"
         overall_confirmed = volume_confirmed and (ai_confirmed if settings.require_ai_confirmation else True)
         if _hc and not overall_confirmed:

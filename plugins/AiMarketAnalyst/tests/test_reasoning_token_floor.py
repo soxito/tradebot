@@ -130,18 +130,18 @@ async def test_a_plain_model_still_respects_the_agent_ceiling(db, monkeypatch):
     seen = _capture(monkeypatch)
 
     settings = await ai_router.get_router_settings(db)
-    settings.per_agent_max_tokens = 800
+    settings.per_agent_max_tokens = 1000
     await db.commit()
 
     await ai_router.db_chat(
         db,
         [{"role": "user", "content": "read XAUUSD"}],
-        max_tokens=3000,
+        max_tokens=5000,
         source="agent",
         json_mode=False,
     )
 
-    assert seen["max_tokens"] == 1200  # the clamp's own floor, not the 3000 asked for
+    assert seen["max_tokens"] == 3000  # the clamp's own prose floor, not the 5000 asked for
 
 
 @pytest.mark.asyncio

@@ -11,16 +11,16 @@ Memory-aware pipeline:
   5. Gracefully skip if ENABLE_AI_AGENTS is False or OpenAI is unavailable
 """
 import json
+import time
 import uuid
 import asyncio
-from copy import deepcopy
 from typing import Dict, Any, List, Optional, Sequence
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.models.database import Agent, AgentDecision, Signal, SignalAction, SignalSource, SignalStatus, Trade, SimPosition, SimAccount
-from app.core.database import AsyncSessionLocal
+from app.core.database import AsyncSessionLocal, safe_rollback
 from app.agents.specialists import agent_from_db
 from app.agents.memory import get_past_decisions, build_memory_prompt, try_local_decision
 from app.agents import room
@@ -416,6 +416,29 @@ class AgentOrchestrator:
             if not analysis.get("error"):
                 last = float(analysis.get("last_price") or candles[-1].close)
                 context["smc_zones"] = zones_ahead(analysis.get("zones") or [], last, limit=2)
+
+                # The market-structure story: the same read the SMC screens
+                # render, reduced to the beats a seat can quote. Every seat
+                # argues structure now, not just candles — and the speech
+                # bubbles quote the same phases the dashboard shows.
+                try:
+                    from plugins.MT5TradingPlugin.backend.services.smc_narrative import (
+                        build_narrative, evidence_lines,
+                    )
+
+                    narrative = build_narrative(candles, analysis)
+                    if narrative.get("steps"):
+                        context["smc_structure"] = {
+                            "bias": analysis.get("bias"),
+                            "momentum": analysis.get("momentum"),
+                            "range": analysis.get("range"),
+                            "equilibrium": analysis.get("equilibrium"),
+                            "flow": narrative.get("flow"),
+                            "steps": narrative.get("steps"),
+                            "evidence": evidence_lines(narrative),
+                        }
+                except Exception as exc:  # noqa: BLE001 — enrichment only
+                    logger.debug(f"[Orchestrator] structure narrative skipped for {symbol}: {exc}")
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"[Orchestrator] zone context skipped for {symbol}: {exc}")
 
@@ -437,6 +460,7 @@ class AgentOrchestrator:
                     }
             except Exception as exc:  # noqa: BLE001
                 logger.debug(f"[Orchestrator] scenario context skipped for {symbol}: {exc}")
+                await safe_rollback(db)
 
     @staticmethod
     async def _resolve_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[Any]]:
@@ -559,6 +583,26 @@ class AgentOrchestrator:
                 logger.debug(
                     f"[Orchestrator] HTF forecast skipped for {symbol} {htf}: {exc}"
                 )
+
+        # ── Structure cross-check: the SMC story vs the model's path ───────
+        # The seats get both reads; stating whether they agree is cheaper than
+        # every seat re-deriving the comparison. Structure runs before the
+        # forecast in the context build, so it is already on the board.
+        structure = context.get("smc_structure") or {}
+        fc_dir = str(block.get("direction") or "flat")
+        smc_bias = str(structure.get("bias") or "neutral")
+        if smc_bias != "neutral":
+            smc_dir = "up" if smc_bias == "bullish" else "down"
+            agree = fc_dir in {"flat", smc_dir}
+            block["structure_check"] = {
+                "smc_bias": smc_bias,
+                "forecast_direction": fc_dir,
+                "agreement": bool(agree),
+                "detail": (
+                    f"structure says {smc_bias} ({structure.get('momentum') or 'normal'} "
+                    f"momentum); forecast says {fc_dir or 'flat'}"
+                ),
+            }
 
         # ── Band-derived trade level candidates ───────────────────────────
         # The p10/p90 band and projected path extremes are exactly where a
@@ -859,6 +903,182 @@ class AgentOrchestrator:
                 "a decision that needs its own justification, not the default."
             ),
         }
+        # ── Entry-quality & volatility regime — the "wait for the right moment" ──
+        # The 2026-08-28 wipeout was a strong move chased mid-range with no level.
+        # This block tells every agent explicitly whether price is AT a level worth
+        # trading from, and what regime they are in, so the signal seat cannot
+        # pretend a mid-air tick is an entry.
+        AgentOrchestrator._add_entry_quality(context)
+
+    @staticmethod
+    def _add_entry_quality(context: Dict[str, Any]) -> None:
+        """Volatility regime + is price at a tradeable level? Injected as board fact.
+
+        Not an opinion — distance to the nearest structural level measured in ATRs,
+        and ATR expansion measured against its own recent mean. When this says
+        `wait_for_level`, a market order mid-range is a chase by definition.
+        """
+        try:
+            mom = context.get("momentum") or {}
+            tech = context.get("technical") or {}
+            ind = tech.get("indicators") or {}
+            price = context.get("current_price")
+            if price is None:
+                # fallback: last close from candles
+                try:
+                    price = float(context.get("recent_candles", [])[-1]["close"])
+                except Exception:
+                    price = None
+            atr = None
+            try:
+                atr = float(ind.get("atr") or 0) or None
+            except Exception:
+                atr = None
+            atr_exp = None
+            try:
+                atr_exp = float(mom.get("atr_expansion") or 1.0)
+            except Exception:
+                atr_exp = 1.0
+            # regime
+            regime = "calm"
+            if atr_exp is not None:
+                if atr_exp >= 1.35:
+                    regime = "expansion"
+                elif atr_exp >= 1.20:
+                    regime = "elevated"
+                elif atr_exp <= 0.85:
+                    regime = "compression"
+            # level proximity — reuse the same tolerance as local_analysis
+            tol = 0
+            if price and atr:
+                tol = max(atr * 0.6, price * 0.004)
+            elif price:
+                tol = price * 0.006
+            has_level = False
+            level_desc = ""
+            level_price = None
+            # 1) fib golden zone
+            try:
+                fib = context.get("fib") or {}
+                gz = fib.get("golden_zone") or {}
+                low, high = gz.get("low"), gz.get("high")
+                if low is not None and high is not None and price is not None:
+                    low_f, high_f = float(low), float(high)
+                    if (low_f - tol) <= price <= (high_f + tol):
+                        has_level = True
+                        level_desc = f"fib golden zone {low_f:.2f}-{high_f:.2f}"
+                        level_price = (low_f + high_f) / 2
+            except Exception:
+                pass
+            # 2) SMC zones / supply-demand
+            if not has_level and price is not None:
+                try:
+                    zonas = context.get("smc_zones") or []
+                    if isinstance(zonas, list):
+                        for z in zonas:
+                            if not isinstance(z, dict):
+                                continue
+                            zl = z.get("low") or z.get("price") or z.get("level")
+                            zh = z.get("high") or z.get("price") or z.get("level")
+                            try:
+                                zl_f = float(zl) if zl is not None else None
+                                zh_f = float(zh) if zh is not None else None
+                                if zl_f is None or zh_f is None:
+                                    continue
+                                lo, hi = min(zl_f, zh_f), max(zl_f, zh_f)
+                                if (lo - tol) <= price <= (hi + tol):
+                                    has_level = True
+                                    level_desc = f"SMC {z.get('type','zone')} {lo:.2f}-{hi:.2f}"
+                                    level_price = (lo + hi) / 2
+                                    break
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+            # 3) sd_channels compact
+            if not has_level and price is not None:
+                try:
+                    sd = context.get("sd_channels") or {}
+                    if isinstance(sd, dict):
+                        for bucket in ("demand", "supply", "zones"):
+                            lst = sd.get(bucket)
+                            if isinstance(lst, list):
+                                for z in lst:
+                                    if not isinstance(z, dict):
+                                        continue
+                                    zp = z.get("price") or z.get("center") or z.get("level")
+                                    try:
+                                        zp_f = float(zp) if zp is not None else None
+                                        if zp_f and abs(price - zp_f) <= tol:
+                                            has_level = True
+                                            level_desc = f"SD {bucket} {zp_f:.2f}"
+                                            level_price = zp_f
+                                            break
+                                    except Exception:
+                                        continue
+                            if has_level:
+                                break
+                except Exception:
+                    pass
+
+            # mid-range?
+            bb = None
+            try:
+                bb = float(ind.get("bb_pct_b")) if ind.get("bb_pct_b") is not None else None
+            except Exception:
+                bb = None
+            range_pos = None
+            try:
+                range_pos = float(mom.get("range_position_pct")) if mom.get("range_position_pct") is not None else None
+            except Exception:
+                range_pos = None
+            is_mid_range = False
+            if bb is not None and 0.28 <= bb <= 0.72:
+                if range_pos is not None and 30 <= range_pos <= 70:
+                    is_mid_range = True
+                elif range_pos is None and not has_level:
+                    is_mid_range = True
+
+            # recommendation
+            rec = "tradeable"
+            note = ""
+            if regime in ("expansion", "elevated") and is_mid_range and not has_level:
+                rec = "wait_for_level"
+                note = f"Volatile {regime} (ATR {atr_exp:.2f}x) mid-range %B {bb:.2f} at {price} with no level — wait for pullback to {level_desc or 'fib 0.5-0.618 / nearest OB/demand'}; market order here is chasing."
+            elif is_mid_range and not has_level:
+                rec = "wait_for_level"
+                note = f"Mid-range %B {bb} range {range_pos}% with no level — no edge. Wait for retest of level."
+            elif has_level:
+                note = f"At level: {level_desc} (within {tol:.2f}, ~{tol/price*100:.3f}%)"
+            elif regime == "expansion" and not has_level:
+                rec = "wait_for_retest"
+                note = f"{regime} without level — breakout needs retest before entry."
+
+            dist_atr = None
+            if has_level and level_price and atr:
+                try:
+                    dist_atr = round(abs(price - level_price) / atr, 2)
+                except Exception:
+                    dist_atr = None
+
+            context["volatility"] = {
+                "regime": regime,
+                "atr_expansion": atr_exp,
+                "atr": atr,
+                "note": f"Regime {regime}, ATR {atr_exp:.2f}x" + (f" — {note}" if note else ""),
+            }
+            context["entry_quality"] = {
+                "has_level": has_level,
+                "level": level_desc,
+                "level_price": level_price,
+                "distance_atr": dist_atr,
+                "is_mid_range": is_mid_range,
+                "tolerance": round(tol, 4) if tol else None,
+                "recommendation": rec,
+                "note": note or ("At level — tradeable" if has_level else "No level — use resting order at level"),
+            }
+        except Exception as exc:  # noqa: BLE001 — enrichment only
+            logger.debug(f"[Orchestrator] entry_quality skipped: {exc}")
 
     @staticmethod
     async def _gather_context(
@@ -939,6 +1159,7 @@ class AgentOrchestrator:
             # size against and no calendar to check, so their seats could only
             # describe the chart while a crypto seat could plan a trade.
             await AgentOrchestrator._add_account_and_research(context, symbol, db)
+            AgentOrchestrator._add_best_trader_skill(context, symbol)
             return context
 
         # ── Branch: Crypto symbols via Bitget ─────────────────────────────────
@@ -1033,9 +1254,10 @@ class AgentOrchestrator:
                     "source": quote.source if quote else "unavailable",
                 }
         except Exception:
-            pass
+            await safe_rollback(db)
 
         await AgentOrchestrator._add_account_and_research(context, symbol, db)
+        AgentOrchestrator._add_best_trader_skill(context, symbol)
         return context
 
     @staticmethod
@@ -1058,6 +1280,106 @@ class AgentOrchestrator:
                 context["research"] = await gather_research(db, symbol)
             except Exception as exc:  # noqa: BLE001 - enrichment only
                 logger.debug(f"[Orchestrator] research context unavailable for {symbol}: {exc}")
+                await safe_rollback(db)
+
+    @staticmethod
+    def _add_best_trader_skill(context: Dict[str, Any], symbol: str) -> None:
+        """Inject the stock best-trader skill for this symbol (A+A) into board context.
+
+        Every Trading Room seat + JARVIS chair sees the same playbook, so the
+        board argues from the pair's own stock levels and risk rules instead of
+        a generic template. Evolution's Learned block is included, so wins feed
+        back without overwriting the stock text.
+        """
+        try:
+            from app.hermes_bridge.skill_registry import get_skill_for_symbol, load_skill_md
+
+            norm = (symbol or "").replace("/", "").strip().upper()
+            entry = get_skill_for_symbol(norm)
+            if not entry:
+                return
+            # Load a preview (900 chars) — full SKILL.md stays on /hermes modal
+            preview = ""
+            try:
+                loaded = load_skill_md(entry["name"])
+                if loaded and loaded.get("md"):
+                    md = loaded["md"]
+                    body = md.split("---", 2)[-1] if md.startswith("---") else md
+                    preview = body.strip()[:900]
+            except Exception:
+                preview = entry.get("content_preview") or ""
+            context["hermes_skill"] = {
+                "symbol": entry.get("symbol") or norm,
+                "asset_class": entry.get("asset_class") or "",
+                "group": entry.get("group") or "",
+                "linked_agents": entry.get("linked_agents", []),
+                "jarvis": entry.get("jarvis", {"role": "ceo", "human_name": "JARVIS"}),
+                "is_best_trader": True,
+                "playbook_preview": preview,
+                "path": entry.get("path"),
+                "evolved_at": entry.get("evolved_at"),
+                "win_rate": entry.get("win_rate"),
+                "decisions_reviewed": entry.get("decisions_reviewed", 0),
+                "frontmatter": entry.get("frontmatter", {}),
+            }
+            context["hermes_best_trader"] = context["hermes_skill"]
+        except Exception as exc:  # noqa: BLE001 — enrichment only
+            logger.debug(f"[Orchestrator] best-trader skill inject skipped for {symbol}: {exc}")
+
+    @staticmethod
+    def _build_skill_prompt(context: Dict[str, Any], role: str, symbol: str) -> str:
+        """Role-specific best-trader skill block injected per agent (so results are accurate to the agent).
+
+        Each seat sees the same stock playbook but through its own lens:
+        market_analyst → structure/fib, signal_generator → entry_quality gate,
+        risk_manager → sizing, etc. Includes linked-agent verification + JARVIS
+        chair reminder and the evolving Learned block (win_rate). Returned empty
+        when no skill exists for this symbol so other pairs never get cross-talk.
+        """
+        try:
+            skill = (context.get("hermes_skill") or context.get("hermes_best_trader")) if isinstance(context, dict) else None
+            if not skill or not isinstance(skill, dict):
+                return ""
+            sym = str(skill.get("symbol") or symbol or "").upper()
+            asset = str(skill.get("asset_class") or "")
+            group = str(skill.get("group") or "")
+            preview = str(skill.get("playbook_preview") or "").strip()[:700]
+            linked = skill.get("linked_agents") or []
+            jarvis = skill.get("jarvis") or {"role": "ceo", "human_name": "JARVIS"}
+            evolved = skill.get("evolved_at")
+            win_rate = skill.get("win_rate")
+            reviewed = skill.get("decisions_reviewed", 0)
+            # Verify this agent is among linked_agents (stock skills link ALL 7)
+            is_linked = role in linked if linked else False
+            # Role-specific lens (keeps prompts short while making each seat's job distinct)
+            role_lens: Dict[str, str] = {
+                "market_analyst": "Your lens: structure, fib golden zone (0.5–0.618), SMC OB/FVG, swing high/low, support/resistance, candle window + momentum. Quote the level price the skill names.",
+                "sentiment_analyst": "Your lens: sentiment vs price, crowding/squeeze risk, news catalyst risk, BTC-cycle bias if crypto. Flag when sentiment confirms or contradicts structure.",
+                "signal_generator": "Your lens: entry_quality gate — every BUY/SELL needs price AT a structural level (fib/OB/FVG). Mid-range between levels = HOLD with resting limit at that level. Validate stop 0.8–2.5×ATR, R:R ≥1:1.5, timeframe alignment. Use Kronos level_candidates only at a level.",
+                "risk_manager": "Your lens: size from stop distance vs real equity (1% risk), correlated pairs = one position, max 3 same-direction, daily drawdown 5%, max 10× leverage. Shrink or reject when ATR expansion is high or entry is mid-range.",
+                "trade_executor": "Your lens: limit at the level when spread >0.1% or ATR expansion, market only on confirmed break + close + volume. Verify SL/TP are on the right side of the level before confirming.",
+                "position_reviewer": "Your lens: hold vs sweep-vs-break, RSI/MACD divergence, multi-timeframe confirmation. Move SL to breakeven after ~1R, trail thereafter. Never widen a stop.",
+                "strategy_optimizer": "Your lens: win rate by setup/session/pair, calibration (confidence higher on winners?), regime change detection. With <5 closed trades answer keep with low confidence.",
+            }
+            lens = role_lens.get(role, f"Your lens: {role} — apply skill levels + risk rules to your decision.")
+            header = f"\n\n## Best-Trader Skill — {sym} ({group or asset}) — for {role}"
+            identity = (
+                f"\nThis skill is linked to **all 7 specialists** ({', '.join(linked) if linked else 'all'}) + **JARVIS chair ({jarvis.get('human_name','JARVIS')} {jarvis.get('role','ceo')})**"
+                f" — verified: your role `{role}` {'IS' if is_linked else 'is NOT (still show reasoning)'} listed in `linked_agents`. Apply it as YOUR seat's rules."
+            )
+            body = f"\n{preview}" if preview else ""
+            evo = ""
+            if evolved and win_rate is not None:
+                try:
+                    evo = f"\n\n**Learned (auto, evolved):** win {float(win_rate):.0%} over {reviewed} resolved for {sym} — bias your confidence toward measured outcomes, not the prior."
+                except Exception:
+                    evo = f"\n\n**Learned (auto):** evolved for {sym}."
+            elif evolved:
+                evo = f"\n\n**Learned (auto):** evolved for {sym} over {reviewed} resolved."
+            return f"{header}\n{lens}{identity}{body}{evo}\n"
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[Orchestrator] skill prompt build skipped for {role} {symbol}: {exc}")
+            return ""
 
     @staticmethod
     async def _build_scalp_prompt(symbol: str) -> str:
@@ -1141,6 +1463,7 @@ class AgentOrchestrator:
             }
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"[Orchestrator] room policy unavailable: {exc}")
+            await safe_rollback(db)
 
         try:
             from plugins.MT5TradingPlugin.backend.models import MT5Account
@@ -1160,12 +1483,14 @@ class AgentOrchestrator:
             ]
         except Exception as exc:  # noqa: BLE001 - plugin-optional
             logger.debug(f"[Orchestrator] MT5 account state unavailable: {exc}")
+            await safe_rollback(db)
 
         try:
             from app.trading.live import LiveTradeEngine
             state["crypto"] = await LiveTradeEngine.get_settings_snapshot(db)
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"[Orchestrator] crypto account state unavailable: {exc}")
+            await safe_rollback(db)
 
         try:
             from app.models.database import SimAccount
@@ -1174,6 +1499,7 @@ class AgentOrchestrator:
                 state["sim"] = {"balance": sim.balance, "equity": getattr(sim, "equity", None)}
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"[Orchestrator] sim account state unavailable: {exc}")
+            await safe_rollback(db)
 
         return state
 
@@ -1402,6 +1728,17 @@ class AgentOrchestrator:
         scalp_prompt = context.get("scalp_prompt") if isinstance(context, dict) else None
         if scalp_prompt and agent.role in ("market_analyst", "signal_generator"):
             memory_prompt += scalp_prompt
+
+        # Best-trader skill per agent (A+A+B): role-specific playbook so each AI
+        # call is prompted with the symbol's own levels + this seat's lens.
+        # This is the user request: "/trading-room agents must use the skills
+        # fully and identify the skills of each agent so results are accurate".
+        try:
+            skill_block = AgentOrchestrator._build_skill_prompt(context, agent.role, symbol)
+            if skill_block:
+                memory_prompt += skill_block
+        except Exception as _sk_exc:
+            logger.debug(f"[Orchestrator] skill memory inject skipped for {agent.role} {symbol}: {_sk_exc}")
 
         # Route through connected providers (db passed) → falls back to OpenAI
         decision = await agent.analyze(
@@ -1792,6 +2129,14 @@ class AgentOrchestrator:
             # quote the calendar the seats actually read.
             "btc_cycle": context.get("btc_cycle"),
             "btc_whales": context.get("btc_whales"),
+            # The structure story the seats argued from — quoted in the debate
+            # bubbles and printed under the verdict so the room's read and its
+            # conclusion travel together.
+            "smc_structure": context.get("smc_structure"),
+            # Best-trader skill the seats argued from — so /trading-room + /hermes
+            # + Telegram all quote the same stock playbook the AI was prompted with.
+            "hermes_skill": context.get("hermes_skill"),
+            "hermes_best_trader": context.get("hermes_best_trader"),
             # Who asked. The publisher needs it: an answer a person typed is
             # delivered by whoever they typed to, and publishing it again turns
             # one question into eight messages.
@@ -1801,6 +2146,15 @@ class AgentOrchestrator:
         # both draw the plan against this price, and reading it a moment later
         # meant the Telegram card quoted a level the chart was not drawn at.
         result_payload["price"] = context.get("current_price", 0)
+        # Tag each decision with the skill it was prompted with for traceability
+        try:
+            skill_tag = (context.get("hermes_skill") or {}).get("symbol")
+            if skill_tag:
+                for d in decisions:
+                    d["skill_used"] = skill_tag
+                    d["skill_asset_class"] = (context.get("hermes_skill") or {}).get("asset_class")
+        except Exception:
+            pass
         await room.session_completed(session_id, result_payload)
 
         # The chair reads the verdict aloud — the debate view's closing line.
@@ -2036,94 +2390,83 @@ class AgentOrchestrator:
         provider = str(auto_trade_ai_provider or "orchestrator").strip().lower()
         if provider == "tradingagents":
             ta_session_id = f"trade-ta-{str(uuid.uuid4())[:8]}"
-            logger.info(f"[Orchestrator:{ta_session_id}] Validating trade for {symbol} via TradingAgents")
+            logger.info(f"[Orchestrator:{ta_session_id}] Validating trade for {symbol} via TradingAgents sidecar")
 
             try:
-                from tradingagents.graph.trading_graph import TradingAgentsGraph
+                from app.services import tradingagents_client as ta_client
+                from app.models.database import TradingAgentsRun
 
                 max_debate_rounds = max(1, min(6, int(tradingagents_max_debate_rounds or 2)))
                 max_risk_discuss_rounds = max(1, min(6, int(tradingagents_max_risk_discuss_rounds or 2)))
 
-                ta_config: Any
-                try:
-                    from tradingagents.config import TradingAgentsConfig
+                ta_payload: Dict[str, Any] = {
+                    "ticker": symbol,
+                    "llm_provider": tradingagents_llm_provider or None,
+                    "deep_think_llm": tradingagents_deep_think_llm or None,
+                    "quick_think_llm": tradingagents_quick_think_llm or None,
+                    "max_debate_rounds": max_debate_rounds,
+                    "max_risk_discuss_rounds": max_risk_discuss_rounds,
+                }
+                ta_payload = {k: v for k, v in ta_payload.items() if v is not None}
 
-                    ta_config = TradingAgentsConfig(
-                        llm_provider=str(tradingagents_llm_provider or "openai"),
-                        deep_think_llm=str(tradingagents_deep_think_llm or "gpt-5.4"),
-                        quick_think_llm=str(tradingagents_quick_think_llm or "gpt-5.4-mini"),
-                        max_debate_rounds=max_debate_rounds,
-                        max_risk_discuss_rounds=max_risk_discuss_rounds,
-                        max_recur_limit=30,
-                    )
-                except Exception:
-                    # Compatibility path for older TradingAgents builds exposing DEFAULT_CONFIG.
-                    from tradingagents.default_config import DEFAULT_CONFIG
+                started_at = time.monotonic()
+                snapshot = await ta_client.run_analysis_blocking(ta_payload)
 
-                    ta_config = deepcopy(DEFAULT_CONFIG)
-                    overrides = {
-                        "llm_provider": tradingagents_llm_provider,
-                        "deep_think_llm": tradingagents_deep_think_llm,
-                        "quick_think_llm": tradingagents_quick_think_llm,
-                        "backend_url": tradingagents_backend_url,
-                        "max_debate_rounds": max_debate_rounds,
-                        "max_risk_discuss_rounds": max_risk_discuss_rounds,
-                    }
-                    for key, value in overrides.items():
-                        if value is not None and key in ta_config:
-                            ta_config[key] = value
-
-                graph = TradingAgentsGraph(debug=False, config=ta_config)
-                company_name = (
-                    symbol.replace("/USDT", "")
-                    .replace("/USD", "")
-                    .replace("/", "")
-                    .replace(":", "")
-                    .strip()
+                run_id = snapshot.get("run_id", ta_session_id)
+                result = snapshot.get("result") or {}
+                raw_decision: Any = (
+                    result.get("recommendation")
+                    or snapshot.get("decision_summary")
+                    or result.get("final_trade_decision")
+                    or {}
                 )
-                if not company_name:
-                    company_name = symbol
-
-                trade_date = now_sast().strftime("%Y-%m-%d")
-                ta_result = await asyncio.to_thread(
-                    graph.propagate,
-                    company_name,
-                    trade_date,
-                )
-
-                raw_decision: Any = ta_result
-                if isinstance(ta_result, (tuple, list)):
-                    if len(ta_result) > 1:
-                        raw_decision = ta_result[1]
-                    elif len(ta_result) == 1:
-                        raw_decision = ta_result[0]
-
                 if hasattr(raw_decision, "model_dump"):
                     raw_decision = raw_decision.model_dump()
-                elif hasattr(raw_decision, "dict"):
-                    raw_decision = raw_decision.dict()
-
+                if isinstance(raw_decision, dict) and not (
+                    raw_decision.get("decision")
+                    or raw_decision.get("action")
+                    or raw_decision.get("signal")
+                ):
+                    # Recommendation lacked a direct verdict — fall back to the
+                    # portfolio manager's full text so parsing still works.
+                    raw_decision = {
+                        **raw_decision,
+                        "decision": (result.get("final_trade_decision") or "")[:4000],
+                    }
                 if isinstance(raw_decision, str):
                     try:
                         raw_decision = json.loads(raw_decision)
                     except Exception:
                         raw_decision = {"decision": raw_decision}
 
-                if isinstance(raw_decision, dict):
-                    signal_hint = raw_decision.get("signal")
-                    if (
-                        isinstance(signal_hint, str)
-                        and not raw_decision.get("decision")
-                        and not raw_decision.get("action")
-                        and not raw_decision.get("final_decision")
-                    ):
-                        raw_decision["decision"] = signal_hint
-
-                if not isinstance(raw_decision, dict):
-                    raw_decision = {"decision": str(raw_decision)}
-
                 parsed = AgentOrchestrator._parse_trade_validation_decision(signal.get("action"), raw_decision)
                 decision_action = "approve" if parsed["approved"] else "reject"
+
+                duration_s = round(time.monotonic() - started_at, 1)
+                rec = result.get("recommendation") or {}
+
+                # Persist the full pipeline output so the Trading Room can
+                # replay every analyst report and debate behind this verdict.
+                try:
+                    db.add(TradingAgentsRun(
+                        run_id=run_id,
+                        ticker=symbol,
+                        mapped_ticker=result.get("ticker"),
+                        trade_date=result.get("trade_date") or snapshot.get("trade_date") or "",
+                        source="trade_validation",
+                        status="done" if snapshot.get("status") == "done" else "error",
+                        decision=(rec.get("action") or "").lower() or None,
+                        confidence=parsed["confidence"],
+                        reasoning=reasoning_text(parsed.get("reasoning")),
+                        result=result or None,
+                        config_used={k: v for k, v in ta_payload.items() if k != "api_key"},
+                        error=snapshot.get("error"),
+                        duration_s=duration_s,
+                    ))
+                    await db.commit()
+                except Exception as persist_err:  # noqa: BLE001
+                    logger.warning(f"[Orchestrator:{ta_session_id}] TradingAgents persist failed: {persist_err}")
+
                 decision = {
                     "agent_name": "TradingAgents",
                     "agent_role": "tradingagents",
@@ -2133,6 +2476,8 @@ class AgentOrchestrator:
                     "reasoning": parsed["reasoning"],
                     "raw_decision": raw_decision,
                     "session_id": ta_session_id,
+                    "ta_run_id": run_id,
+                    "duration_s": duration_s,
                 }
 
                 return {

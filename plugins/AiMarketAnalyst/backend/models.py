@@ -299,7 +299,9 @@ class AIRouterSettings(AIBase):
     #   always        — agents analyse on every background scan too.
     agent_token_mode = Column(String(20), nullable=False, default="telegram_only")
     # Hard ceiling on max_tokens any single agent call may request.
-    per_agent_max_tokens = Column(Integer, nullable=False, default=800)
+    # 800 truncated room-seat analyses mid-sentence; 4000 lets the structured
+    # answer (and its reasoning paragraph) finish.
+    per_agent_max_tokens = Column(Integer, nullable=False, default=4000)
     # Stop using a provider once it reaches (limit * (1 - reserve_pct)).
     # e.g. 0.10 keeps a 10% buffer so the free monthly tier is never fully spent.
     reserve_pct = Column(Float, nullable=False, default=0.10)

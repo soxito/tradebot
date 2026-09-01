@@ -6,8 +6,8 @@
  * highlighted. Auto-scrolls to the newest line while you're already reading
  * the bottom; stops following the moment you scroll up.
  */
-import { useEffect, useMemo, useRef } from 'react'
-import { Gavel, MessageSquareText } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { ChevronDown, ChevronUp, Gavel, MessageSquareText } from 'lucide-react'
 import type { DebateTurn } from '@/hooks/useTradingRoom'
 import { toReasoningText } from '@/utils/reasoning'
 
@@ -34,6 +34,7 @@ interface Props {
 }
 
 export default function LiveDebate({ turns, running }: Props) {
+  const [collapsed, setCollapsed] = useState(false)
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const pinnedRef = useRef(true)
 
@@ -55,26 +56,43 @@ export default function LiveDebate({ turns, running }: Props) {
   }, [turns])
 
   return (
-    <div className="flex min-h-[160px] flex-1 flex-col rounded-xl border border-slate-700/70 bg-slate-900/50">
-      <div className="flex items-center gap-2 border-b border-slate-800 px-3 py-2">
-        <MessageSquareText className="h-3.5 w-3.5 text-cyan-300" />
-        <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-300">Live debate</h2>
+    <div className="shrink-0 overflow-hidden rounded-xl border border-slate-700/70 bg-slate-900/50">
+      <div className="flex items-center gap-2 px-3 py-2">
+        <button
+          type="button"
+          onClick={() => setCollapsed((v) => !v)}
+          className="flex items-center gap-2 text-left"
+        >
+          <MessageSquareText className="h-3.5 w-3.5 shrink-0 text-cyan-300" />
+          <span className="text-xs font-semibold uppercase tracking-wide text-slate-300">Live debate</span>
+          {collapsed ? <ChevronDown className="h-3.5 w-3.5 text-slate-500" /> : <ChevronUp className="h-3.5 w-3.5 text-slate-500" />}
+        </button>
         {running && (
-          <span className="ml-auto flex items-center gap-1.5 text-[10px] text-cyan-300">
+          <span className="ml-1 flex items-center gap-1.5 text-[10px] text-cyan-300">
             <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-cyan-400" />
             on air
           </span>
         )}
+        <button
+          type="button"
+          onClick={() => setCollapsed((v) => !v)}
+          className="ml-auto rounded p-1 text-slate-500 hover:bg-slate-800 hover:text-slate-300"
+          title={collapsed ? 'Expand' : 'Collapse'}
+          aria-label={collapsed ? 'Expand live debate' : 'Collapse live debate'}
+        >
+          {collapsed ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronUp className="h-3.5 w-3.5" />}
+        </button>
       </div>
 
-      <div
-        ref={scrollRef}
-        onScroll={(e) => {
-          const el = e.currentTarget
-          pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48
-        }}
-        className="min-h-0 flex-1 space-y-2 overflow-y-auto px-3 py-2"
-      >
+      {collapsed ? null : (
+        <div
+          ref={scrollRef}
+          onScroll={(e) => {
+            const el = e.currentTarget
+            pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48
+          }}
+          className="max-h-[320px] space-y-2 overflow-y-auto border-t border-slate-800 px-3 py-2"
+        >
         {!visible.length && (
           <p className="py-6 text-center text-[11px] text-slate-500">
             The transcript fills in as each agent presents its read.
@@ -113,14 +131,15 @@ export default function LiveDebate({ turns, running }: Props) {
                   )}
                   <span className="ml-auto font-mono text-[10px] text-slate-600">{timeOf(turn.at)}</span>
                 </div>
-                <p className="mt-0.5 line-clamp-4 whitespace-pre-line text-[11px] leading-snug text-slate-400">
+                <p className="mt-0.5 whitespace-pre-line text-[11px] leading-snug text-slate-400">
                   {toReasoningText(turn.text)}
                 </p>
               </div>
             </div>
           )
         })}
-      </div>
+        </div>
+      )}
     </div>
   )
 }

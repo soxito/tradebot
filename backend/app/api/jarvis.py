@@ -2680,6 +2680,71 @@ async def execute_command(req: CommandRequest):
         return CommandResult(ok=False, action="error", detail=friendly, speech=friendly)
 
 
+@router.get("/skill")
+async def get_jarvis_skill(symbol: str = Query(..., min_length=2, description="Pair symbol, e.g. EURUSD or BTC/USDT")):
+    """Best-trader skill recall for JARVIS chat (B). Returns SKILL.md + linked agents + JARVIS chair.
+
+    Used by PaulChat `/skill SYMBOL` and by the Trading Room chair injection preview.
+    Plain `GET /jarvis/skill?symbol=EURUSD` → 200 with skill, 404 if not bootstrapped
+    (hint to run bootstrap).
+    """
+    norm = (symbol or "").replace("/", "").strip().upper()
+    if not norm:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="symbol required")
+    try:
+        from app.hermes_bridge.skill_registry import load_skill_md, get_skill_for_symbol
+        loaded = load_skill_md(norm)
+        if not loaded:
+            # try canonicalize via market_data (handles BTC/USD → BTCUSD)
+            try:
+                from app.services import market_data as _md
+                canon, _ = _md.canonicalize_for_analysis(norm)
+                if canon:
+                    loaded = load_skill_md(canon)
+            except Exception:
+                pass
+        if not loaded:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=404, detail=f"best-trader skill not found for {norm} — run python scripts/bootstrap_hermes_best_trader_skills.py")
+        entry = loaded["entry"]
+        # Enrich with SOUL preview (so chat shows same soul the room sees)
+        soul_preview = ""
+        try:
+            from pathlib import Path as _P
+            from app.core.config import settings as _s
+            sp = _P(getattr(_s, "SOUL_PATH", "SOUL.md") or "SOUL.md")
+            if not sp.is_absolute():
+                for cand in [sp, _P("SOUL.md"), _P("../SOUL.md"), _P(__file__).resolve().parents[3] / "SOUL.md"]:
+                    if cand.exists():
+                        sp = cand
+                        break
+            if sp.exists():
+                soul_preview = sp.read_text(encoding="utf-8")[:600]
+        except Exception:
+            pass
+        return {
+            "symbol": entry.get("symbol") or norm,
+            "normalized": norm,
+            "asset_class": entry.get("asset_class"),
+            "group": entry.get("group"),
+            "linked_agents": entry.get("linked_agents", []),
+            "jarvis": entry.get("jarvis"),
+            "is_best_trader": entry.get("is_best_trader"),
+            "meta": entry.get("meta", {}),
+            "frontmatter": entry.get("frontmatter", {}),
+            "md": loaded["md"],
+            "path": loaded["path"],
+            "soul_preview": soul_preview,
+        }
+    except Exception as e:
+        # Re-raise HTTPException intact
+        if "HTTPException" in type(e).__name__:
+            raise
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=str(e)[:300])
+
+
 async def _dispatch(cmd: str, ex: Optional[str]) -> CommandResult:  # noqa: C901
     """Inner dispatcher — all pattern matching happens here."""
 

@@ -92,6 +92,8 @@ TASK_TIER_POLICY: Dict[str, Dict[str, object]] = {
     "mt5_scalp_bot": {"min_tier": "low", "critical": False, "category": "trading"},
     "mt5_auto_manage": {"min_tier": "low", "critical": False, "category": "trading"},
     "paul_subconscious": {"min_tier": "low", "critical": False, "category": "learning"},
+    "hermes_memory": {"min_tier": "minimal", "critical": False, "category": "learning"},
+    "hermes_gateway": {"min_tier": "low", "critical": False, "category": "learning"},
 }
 
 

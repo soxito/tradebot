@@ -106,6 +106,15 @@ function composeOverlayData(
   return includeZones ? zones : null;
 }
 
+/** Map MT5/TradingView-style timeframe IDs to the backend OHLCV format. */
+const TF_API_MAP: Record<string, string> = {
+  M1: '1m', M3: '3m', M5: '5m', M15: '15m', M30: '30m',
+  H1: '1h', H4: '4h', D1: '1d', W1: '1w', MN1: '1M',
+};
+function toApiTimeframe(tf: string): string {
+  return TF_API_MAP[tf] ?? tf;
+}
+
 export default function TradingViewChart({ 
   symbol, 
   exchange = 'bitget',
@@ -150,6 +159,9 @@ export default function TradingViewChart({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
+  // Incremented each time the chart/series is (re)created so the overlay effect
+  // re-runs even when overlays/markers props haven't changed.
+  const [chartInitCount, setChartInitCount] = useState(0);
 
   // Drag state for SL/TP editing
   const [editingSl, setEditingSl] = useState<number | null>(null);
@@ -207,6 +219,9 @@ export default function TradingViewChart({
           const minMove = calcMinMove(allPrices);
           targetSeries.applyOptions({ priceFormat: { type: 'price', precision, minMove } });
         }
+        // Pre-fetched candles represent a different dataset than any live-exchange
+        // fetch that ran before them — always fit the view to show the full range.
+        didFitRef.current = false;
         fitAndScale();
         setLastUpdate(new Date());
         setLoading(false);
@@ -216,7 +231,7 @@ export default function TradingViewChart({
       const response = await apiClient.getOHLCV(
         exchange,
         symbol,
-        timeframe,
+        toApiTimeframe(timeframe),
         200,  // Fetch 200 candles for good chart history
         controller.signal,
       );
@@ -264,7 +279,10 @@ export default function TradingViewChart({
       // Clear stale candles on error too, so a failed load can't leave the
       // previous symbol's chart on screen under the new symbol's label.
       try { targetSeries?.setData([]); } catch {}
-      setError(err.response?.data?.detail || err.response?.data?.error || 'Failed to load chart data');
+      // FastAPI returns detail as an array of objects for 422 validation errors — coerce to string.
+      const rawDetail = err.response?.data?.detail;
+      const detail = Array.isArray(rawDetail) ? rawDetail.map((d: any) => d?.msg ?? JSON.stringify(d)).join('; ') : rawDetail;
+      setError(detail || err.response?.data?.error || 'Failed to load chart data');
       setLoading(false);
     }
   };
@@ -311,6 +329,7 @@ export default function TradingViewChart({
     chartRef.current = chart;
     candlestickSeriesRef.current = candlestickSeries;
     didFitRef.current = false;
+    setChartInitCount(c => c + 1);
 
     // Zone overlays (supply/demand, fib bands, channels) ride the price pane
     // as a series primitive so they pan/zoom with the candles. Attached
@@ -494,7 +513,7 @@ export default function TradingViewChart({
     } else {
       series.setMarkers([]);
     }
-  }, [overlays, markers]);
+  }, [overlays, markers, chartInitCount]);
 
   // Draw SL/TP/Entry price lines for positions matching this symbol
   // SL/TP lines are click-to-drag editable when onSlTpChange is provided

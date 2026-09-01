@@ -87,7 +87,7 @@ export default function AgentPanel({ seat, focused, onSelect }: Props) {
                 style={{ width: `${confidence}%`, backgroundColor: seat.color }}
               />
             </div>
-            <p className="line-clamp-2 text-[11px] leading-snug text-slate-400">{toReasoningText(decision.reasoning)}</p>
+            <p className="text-[11px] leading-snug text-slate-400">{toReasoningText(decision.reasoning)}</p>
             {!decision.ai_called && (
               <span className="text-[10px] text-slate-500">from memory — no AI call</span>
             )}

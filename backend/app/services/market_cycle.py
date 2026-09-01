@@ -51,6 +51,11 @@ LATE_PHASE_WINDOW_DAYS = 90
 _BTC_SYMBOL = "BTCUSD"
 _BARS_LIMIT = 4000
 
+#: Monthly candles for the cycle screen. Yahoo's 1mo interval reaches back to
+#: Bitcoin's first prints, so the bar count is whatever the configured years
+#: ask for (plus a small buffer for the forming month).
+_MONTHLY_BUFFER = 3
+
 CyclePhaseT = str  # "bull" | "bear"
 
 #: Halving dates inside the covered window — shown on the cycle calendar.
@@ -562,13 +567,13 @@ def build_windows(
     today: Optional[date] = None,
     bull_days: int = BULL_DAYS,
     bear_days: int = BEAR_DAYS,
-    history_cycles: int = 3,
+    history_cycles: int = 3,  # kept for API compatibility; no longer trims output
 ) -> List[CycleWindow]:
-    """Green/red boxes for chart overlays: the last few cycles + the live one.
+    """Green/red boxes for chart overlays: every configured cycle + the live one.
 
-    Past boxes are drawn from anchor to anchor (history, not projection); the
-    live cycle's current phase extends to its projected turn and is flagged so
-    the chart can dim it.
+    All historical anchor cycles are returned so the chart can show the full
+    pattern history. Each phase is marked projected=True when its end date is
+    still in the future.
     """
     day = today or datetime.now(timezone.utc).date()
     bottoms = sorted(parse_anchors(anchors))
@@ -586,25 +591,7 @@ def build_windows(
             phase="bear",
             projected=(bottoms[i + 1] if i + 1 < len(bottoms) else proj_bottom) > day,
         ))
-    # The live box extends past the last anchor's bear projection so the chart
-    # shows where the current phase is heading even before the next bottom is
-    # anchored.
-    if bottoms:
-        last = bottoms[-1]
-        proj_top = last + timedelta(days=bull_days)
-        proj_bottom = proj_top + timedelta(days=bear_days)
-        if day >= last:
-            if day < proj_top:
-                out.append(CycleWindow(
-                    start=last.isoformat(), end=proj_top.isoformat(),
-                    phase="bull", projected=True,
-                ))
-            else:
-                out.append(CycleWindow(
-                    start=proj_top.isoformat(), end=proj_bottom.isoformat(),
-                    phase="bear", projected=True,
-                ))
-    return out[-history_cycles * 2 + 2:]
+    return out
 
 
 # ── Per-symbol bias ──────────────────────────────────────────────────────────
@@ -707,12 +694,563 @@ def evidence_lines(snap: CycleSnapshot) -> List[str]:
 
 _lock = asyncio.Lock()
 _cached: Dict[str, Any] = {"snap": None, "bars": None, "ts": 0.0}
+_monthly_cache: Dict[str, Any] = {"bars": None, "years": 0, "ts": 0.0}
+_early_monthly_cache: Dict[str, Any] = {"bars": None, "ts": 0.0}
+_early_daily_cache: Dict[str, Any] = {"bars": None, "ts": 0.0}
+# Per-timeframe full-history cache for /cycle/candles: {tf: {bars, ts}}
+_btc_tf_cache: Dict[str, Dict[str, Any]] = {}
+
+# CoinMetrics free community API — no key required, carries BTC/USD from 2010-07.
+# page_size 10000 covers 2010→now (~5900 daily) in one call; if the API paginates,
+# the fetcher below follows next_page_token.
+_COINMETRICS_URL = (
+    "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
+    "?assets=btc&metrics=PriceUSD&frequency=1d&page_size=10000"
+    "&start_time=2010-07-01&end_time={end}"
+)
+_COINMETRICS_CACHE_TTL = 86400  # 24 h — early history never changes
 
 
 def reset_cache() -> None:
     """Drop the cached snapshot — anchors or phase lengths just changed."""
     _cached["snap"] = None
     _cached["ts"] = 0.0
+
+
+async def _fetch_early_btc_monthly(yahoo_first_ts: int) -> List[Dict[str, Any]]:
+    """Monthly OHLCV bars for the period before Yahoo's BTC-USD coverage.
+
+    Fetches daily closes from CoinMetrics (free, no key) for 2010-07-18 up to
+    the day before ``yahoo_first_ts``, then aggregates to monthly candles using
+    the same {time, open, high, low, close, volume=0} shape the Yahoo bars use.
+    Returns [] on any error so the chart degrades gracefully.
+    """
+    now_mono = time.monotonic()
+    async with _lock:
+        cached = _early_monthly_cache.get("bars")
+        if cached is not None and now_mono - _early_monthly_cache["ts"] < _COINMETRICS_CACHE_TTL:
+            return cached
+
+    import httpx
+
+    end_date = datetime.utcfromtimestamp(yahoo_first_ts).strftime("%Y-%m-%d")
+    url = _COINMETRICS_URL.format(end=end_date)
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; TradeBot/1.0)"})
+            resp.raise_for_status()
+            rows = resp.json().get("data", [])
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[Cycle] CoinMetrics early history unavailable: {exc}")
+        return []
+
+    # Aggregate daily closes → monthly OHLCV keyed by (year, month)
+    months: Dict[tuple, List[float]] = {}
+    for row in rows:
+        price_str = row.get("PriceUSD")
+        if not price_str:
+            continue
+        try:
+            price = float(price_str)
+        except (ValueError, TypeError):
+            continue
+        t = row.get("time", "")[:7]  # "YYYY-MM"
+        if not t:
+            continue
+        y, m = int(t[:4]), int(t[5:7])
+        months.setdefault((y, m), []).append(price)
+
+    bars: List[Dict[str, Any]] = []
+    sorted_months = sorted(months.keys())
+    prev_close: Optional[float] = None
+    for y, m in sorted_months:
+        closes = months[(y, m)]
+        if not closes:
+            continue
+        # First of month at midnight UTC
+        ts = int(datetime(y, m, 1, tzinfo=timezone.utc).timestamp())
+        o = prev_close if prev_close is not None else closes[0]
+        h = max(closes)
+        lo = min(closes)
+        c = closes[-1]
+        bars.append({"time": ts, "open": o, "high": h, "low": lo, "close": c, "volume": 0.0})
+        prev_close = c
+
+    async with _lock:
+        _early_monthly_cache.update(bars=bars, ts=time.monotonic())
+    logger.debug(f"[Cycle] CoinMetrics backfill: {len(bars)} early monthly candles ({end_date})")
+    return bars
+
+
+async def _fetch_early_btc_daily(yahoo_first_ts: int) -> List[Dict[str, Any]]:
+    """Daily OHLCV bars for 2010-07-17 → yahoo_first_ts (pre-Yahoo gap).
+
+    Same CoinMetrics source as monthly but kept as daily candles
+    (open=prev close, high/low/close from PriceUSD, volume 0). Used to
+    backfill D1/W1 and to synthesize pre-Bitget H1/H4.
+    """
+    now_mono = time.monotonic()
+    async with _lock:
+        cached = _early_daily_cache.get("bars")
+        if cached is not None and now_mono - _early_daily_cache["ts"] < _COINMETRICS_CACHE_TTL:
+            # Filter to requested cutoff without refetching
+            return [b for b in cached if b["time"] < yahoo_first_ts]
+
+    import httpx
+
+    end_date = datetime.utcfromtimestamp(yahoo_first_ts).strftime("%Y-%m-%d")
+    url = _COINMETRICS_URL.format(end=end_date)
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; TradeBot/1.0)"})
+            resp.raise_for_status()
+            rows = resp.json().get("data", [])
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[Cycle] CoinMetrics daily backfill unavailable: {exc}")
+        return []
+
+    # Build sorted daily closes
+    daily: List[tuple[int, float]] = []
+    for row in rows:
+        price_str = row.get("PriceUSD")
+        if not price_str:
+            continue
+        try:
+            price = float(price_str)
+        except (ValueError, TypeError):
+            continue
+        t = row.get("time", "")[:10]
+        if not t:
+            continue
+        try:
+            d = date.fromisoformat(t)
+        except ValueError:
+            continue
+        if price <= 0:
+            continue
+        ts = int(datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp())
+        daily.append((ts, price))
+    daily.sort(key=lambda x: x[0])
+    # Deduplicate same day (keep last)
+    dedup: Dict[int, float] = {}
+    for ts, p in daily:
+        dedup[ts] = p
+    sorted_days = sorted(dedup.items())
+    bars: List[Dict[str, Any]] = []
+    prev_close: Optional[float] = None
+    for ts, close in sorted_days:
+        o = prev_close if prev_close is not None else close
+        h = max(o, close)
+        lo = min(o, close)
+        bars.append({"time": ts, "open": o, "high": h, "low": lo, "close": close, "volume": 0.0})
+        prev_close = close
+    # Cache full daily range
+    async with _lock:
+        _early_daily_cache.update(bars=bars, ts=time.monotonic())
+    logger.debug(f"[Cycle] CoinMetrics daily backfill: {len(bars)} daily candles ({end_date})")
+    return [b for b in bars if b["time"] < yahoo_first_ts]
+
+
+def _daily_to_weekly(daily_bars: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Aggregate daily bars → weekly (Mon 00:00 UTC) OHLCV."""
+    if not daily_bars:
+        return []
+    buckets: Dict[int, List[Dict[str, Any]]] = {}
+    for b in daily_bars:
+        ts = int(b["time"])
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        # Monday 00:00 UTC of that week
+        monday = dt - timedelta(days=dt.weekday())
+        bucket_ts = int(datetime(monday.year, monday.month, monday.day, tzinfo=timezone.utc).timestamp())
+        buckets.setdefault(bucket_ts, []).append(b)
+    out: List[Dict[str, Any]] = []
+    for bucket_ts in sorted(buckets.keys()):
+        group = sorted(buckets[bucket_ts], key=lambda x: x["time"])
+        o = group[0]["open"]
+        c = group[-1]["close"]
+        h = max(x["high"] for x in group)
+        lo = min(x["low"] for x in group)
+        out.append({"time": bucket_ts, "open": o, "high": h, "low": lo, "close": c, "volume": 0.0})
+    return out
+
+
+def _synthesize_hourly_from_daily(daily_bars: List[Dict[str, Any]], interval_hours: int = 1) -> List[Dict[str, Any]]:
+    """Synthesize H1/H4 bars from daily candles for pre-Bitget gap.
+
+    Each daily candle is expanded into 24/6 hourly points with flat OHLC
+    (= daily close) and volume 0, stamped at 00:00,01:00… UTC. Marked synthetic
+    so the chart can display a badge. The values are approximate but the
+    timeline is continuous from genesis.
+    """
+    if not daily_bars or interval_hours not in (1, 4):
+        return []
+    out: List[Dict[str, Any]] = []
+    step = interval_hours * 3600
+    per_day = 24 // interval_hours
+    for b in daily_bars:
+        day_ts = int(b["time"])
+        close = float(b["close"])
+        o = float(b["open"])
+        h = float(b["high"])
+        lo = float(b["low"])
+        for i in range(per_day):
+            ts = day_ts + i * step
+            # For hourly synthetic, flatten to daily close; keep daily high/low only on first bucket
+            out.append({
+                "time": ts,
+                "open": close if i > 0 else o,
+                "high": h if i == 0 else close,
+                "low": lo if i == 0 else close,
+                "close": close,
+                "volume": 0.0,
+                "synthetic": True,
+            })
+    return out
+
+
+async def _fetch_yahoo_btc_full(tf: str, want: int) -> List[Dict[str, Any]]:
+    """Yahoo BTC D1/W1 full history via period1/period2 (avoids range=max bug).
+
+    yahoo_provider's range=max for 1d returns monthly (144 points) — the period API
+    returns true daily 4367+ points from 2014-09-17. This helper uses the period
+    endpoint directly for BTC D1/W1 and parses like _fetch_series.
+    """
+    import httpx
+    ticker = "BTC-USD"
+    interval = "1d" if tf == "D1" else "1wk" if tf == "W1" else "1mo"
+    # Yahoo daily/weekly starts 2014-09-17; ask from that genesis to now
+    period1 = 1410912000  # 2014-09-17 00:00 UTC — first Yahoo BTC daily
+    period2 = int(datetime.now(timezone.utc).timestamp()) + 86400
+    YF_BASE = "https://query1.finance.yahoo.com/v8/finance/chart"
+    _HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; TradeBot/1.0)"}
+    try:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            r = await client.get(
+                f"{YF_BASE}/{ticker}",
+                params={"period1": period1, "period2": period2, "interval": interval, "includePrePost": "false"},
+                headers=_HEADERS,
+            )
+            r.raise_for_status()
+            result = (r.json().get("chart") or {}).get("result") or []
+            if not result:
+                return []
+            node = result[0]
+            stamps = node.get("timestamp") or []
+            quote = ((node.get("indicators") or {}).get("quote") or [{}])[0]
+            opens = quote.get("open") or []
+            highs = quote.get("high") or []
+            lows = quote.get("low") or []
+            closes = quote.get("close") or []
+            vols = quote.get("volume") or []
+            bars: List[Dict[str, Any]] = []
+            for i, ts in enumerate(stamps):
+                try:
+                    o = opens[i]; h = highs[i]; lo = lows[i]; c = closes[i]
+                except IndexError:
+                    continue
+                if None in (o, h, lo, c):
+                    continue
+                v = vols[i] if i < len(vols) else None
+                bars.append({"time": int(ts), "open": float(o), "high": float(h), "low": float(lo), "close": float(c), "volume": float(v) if v is not None else 0.0})
+            bars.sort(key=lambda x: x["time"])
+            # Trim to want most recent
+            if len(bars) > want:
+                bars = bars[-want:]
+            return bars
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[Cycle] Yahoo period fetch {tf} failed: {exc}")
+        return []
+
+
+async def resolve_monthly_bars(years: Optional[int] = None, force: bool = False) -> List[Dict[str, Any]]:
+    """Monthly BTC candles for the cycle screen — as far back as configured.
+
+    Yahoo's monthly interval carries BTC from 2014-09. CoinMetrics backfills
+    the gap back to 2010-07, giving the full exchange-traded history.
+    Cached per year-span; failure is an empty list, never an exception.
+    """
+    cfg = _settings()
+    want = max(1, min(20, int(years or getattr(cfg, "CYCLE_HISTORY_YEARS", 0) or 15)))
+    async with _lock:
+        now = time.monotonic()
+        hit = (
+            not force
+            and _monthly_cache["bars"]
+            and _monthly_cache["years"] == want
+            and now - _monthly_cache["ts"] < max(60, int(getattr(cfg, "CYCLE_CACHE_TTL_SECONDS", 900) or 900))
+        )
+        if hit:
+            return _monthly_cache["bars"]
+
+    from app.exchanges import yahoo_provider
+
+    limit = want * 12 + _MONTHLY_BUFFER
+    try:
+        bars = await yahoo_provider.fetch_candles(_BTC_SYMBOL, "MN1", limit=limit)
+    except Exception as exc:  # noqa: BLE001 — the screen must never break on a feed
+        logger.debug(f"[Cycle] BTC monthlies unavailable: {exc}")
+        bars = []
+    bars = (bars or [])[-limit:]
+
+    # Prepend pre-Yahoo history from CoinMetrics when the Yahoo series is capped.
+    # Yahoo's BTC-USD starts 2014-09; anything beyond that needs the backfill.
+    if bars:
+        early = await _fetch_early_btc_monthly(bars[0]["time"])
+        if early:
+            # Deduplicate: keep early bars strictly before the first Yahoo bar.
+            cutoff = bars[0]["time"]
+            early = [b for b in early if b["time"] < cutoff]
+            bars = early + bars
+
+    async with _lock:
+        if bars:
+            _monthly_cache.update(bars=bars, years=want, ts=time.monotonic())
+    return bars
+
+
+# ── Full-history BTC candles for every timeframe (the cycle chart's data layer)
+
+_TF_GENESIS_LIMIT: Dict[str, int] = {
+    "MN1": 300,     # 195 months from 2010
+    "W1": 1200,     # 842 weeks
+    "D1": 7000,     # 5,900 days
+    "H4": 40000,    # 35k 4h
+    "H1": 150000,   # 141k hours
+}
+_TF_API_TIMELINE_MAP: Dict[str, str] = {"MN1": "MN1", "W1": "W1", "D1": "D1", "H4": "H4", "H1": "H1"}
+
+
+async def _fetch_bitget_paginated(timeframe: str, limit: int) -> List[Dict[str, Any]]:
+    """Bitget OHLCV paginated back to earliest available (used for H1/H4 genesis).
+
+    Bitget's CCXT fetch_ohlcv caps at 1500 per call; H1 genesis needs ~95 pages.
+    Returns [{time: sec, open, high, low, close, volume}] sorted oldest-first.
+    On any failure returns whatever was collected so the chart can still draw.
+    Pages backward from now to handle pre-exchange gap: early since=2010 returns [] on Bitget.
+    """
+    import asyncio as _asyncio
+    # Map display TF to CCXT TF
+    ccxt_tf = "1h" if timeframe == "H1" else "4h" if timeframe == "H4" else timeframe.lower()
+    genesis_ms = int(datetime(2010, 7, 17, tzinfo=timezone.utc).timestamp() * 1000)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    tf_ms = {"H1": 3600_000, "H4": 14_400_000}.get(timeframe, 3600_000)
+    collected: List[Dict[str, Any]] = []
+    seen_start: set[int] = set()
+    # Page backward from now: start at most-recent window, then step back
+    # This avoids the "since=2010 returns [] and we break" trap.
+    since = max(genesis_ms, now_ms - 1500 * tf_ms)
+    pages = 0
+    max_pages = max(1, (limit // 1500) + 5) if limit else 120
+    # Track earliest timestamp seen to know when we reached genesis
+    earliest_seen_ms: int | None = None
+    # Reuse cached public instance pattern to avoid repeated load-markets
+    try:
+        from app.api.exchanges import get_exchange_for_public_data
+        from app.exchanges.manager import SupportedExchange
+        # Try credentialed connector first
+        from app.exchanges.manager import exchange_manager
+        connector = exchange_manager.get_exchange(SupportedExchange.BITGET)
+        if connector is not None:
+            exchange = connector.exchange
+        else:
+            exchange = await get_exchange_for_public_data(SupportedExchange.BITGET)  # type: ignore[arg-type]
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[Cycle] Bitget exchange unavailable for paginated fetch: {exc}")
+        return []
+    # Page backward: each fetch pulls a ~1500-bar window ending near "since+window".
+    # Starting from the most-recent window and stepping the window start back
+    # collects the full Bitget history without needing to know its earliest date.
+    while pages < max_pages and since >= genesis_ms:
+        try:
+            rows = await _asyncio.wait_for(
+                exchange.fetch_ohlcv(symbol="BTC/USDT:USDT", timeframe=ccxt_tf, since=since, limit=1500),
+                timeout=22,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[Cycle] Bitget paginated H1/H4 page {pages} failed: {exc}")
+            # Step further back and retry — don't abort whole history on one blip
+            since -= 1500 * tf_ms
+            pages += 1
+            if pages % 5 == 0:
+                await _asyncio.sleep(0.2)
+            continue
+        if not rows:
+            # Empty window — Bitget has no data in this slice (pre-listing gap).
+            # Step further back to look for earlier history.
+            since -= 1500 * tf_ms
+            pages += 1
+            if since < genesis_ms:
+                break
+            if pages % 10 == 0:
+                await _asyncio.sleep(0.15)
+            continue
+        # rows are [ms, o,h,l,c,v]
+        for r in rows:
+            try:
+                ts_ms = int(r[0])
+                if ts_ms in seen_start:
+                    continue
+                seen_start.add(ts_ms)
+                collected.append({
+                    "time": ts_ms // 1000,
+                    "open": float(r[1]),
+                    "high": float(r[2]),
+                    "low": float(r[3]),
+                    "close": float(r[4]),
+                    "volume": float(r[5]) if len(r) > 5 and r[5] is not None else 0.0,
+                })
+                if earliest_seen_ms is None or ts_ms < earliest_seen_ms:
+                    earliest_seen_ms = ts_ms
+            except (TypeError, ValueError, IndexError):
+                continue
+        pages += 1
+        # Step the window start back before the earliest candle in this batch
+        earliest_in_batch = min(int(r[0]) for r in rows)
+        since = earliest_in_batch - 1500 * tf_ms - tf_ms
+        if earliest_seen_ms is not None and earliest_seen_ms <= genesis_ms + tf_ms:
+            break
+        # Be nice to rate limits
+        if pages % 5 == 0:
+            await _asyncio.sleep(0.15)
+        if len(collected) >= limit:
+            break
+    collected.sort(key=lambda x: x["time"])
+    # Trim to limit most recent if oversized
+    if len(collected) > limit:
+        collected = collected[-limit:]
+    logger.debug(f"[Cycle] Bitget paginated {timeframe}: {len(collected)} candles in {pages} pages")
+    return collected
+
+
+async def resolve_btc_candles(
+    timeframe: str = "D1",
+    limit: Optional[int] = None,
+    force: bool = False,
+) -> List[Dict[str, Any]]:
+    """Full-history BTC candles for the cycle chart — genesis-aware.
+
+    * MN1/W1/D1 → Yahoo `max` + CoinMetrics daily backfill → true 2010 genesis.
+    * H4/H1 → Bitget paginated (real) + synthetic daily→hourly for 2010→Bitget-start gap → continuous 2010 line.
+    Cached per timeframe (TTL = CYCLE_CACHE_TTL_SECONDS). limit=0 or None means "full genesis".
+    """
+    tf = (timeframe or "D1").upper().strip()
+    # Normalize aliases
+    if tf in ("1M", "MN", "MONTH"): tf = "MN1"
+    if tf not in _TF_GENESIS_LIMIT:
+        tf = "D1"
+    genesis_limit = _TF_GENESIS_LIMIT[tf]
+    want = genesis_limit if not limit or limit <= 0 else min(int(limit), max(genesis_limit, int(limit)))
+    # Allow callers to ask larger than genesis (e.g., H1 150k) — cap at 150k
+    want = max(1, min(150000, want))
+    cfg = _settings()
+    ttl = max(60, int(getattr(cfg, "CYCLE_CACHE_TTL_SECONDS", 900) or 900))
+    async with _lock:
+        hit = _btc_tf_cache.get(tf)
+        if not force and hit and hit.get("bars") and (time.monotonic() - hit["ts"]) < ttl and len(hit["bars"]) >= min(want, 100):
+            cached = hit["bars"]
+            # Return slice of cached if caller asked smaller window
+            return cached[-want:] if len(cached) > want else cached
+    # ── MN1 ──
+    if tf == "MN1":
+        bars = await resolve_monthly_bars(years=20, force=force)
+        # resolve_monthly_bars already returns ~195 monthly from 2010
+        bars = bars[-want:] if len(bars) > want else bars
+        async with _lock:
+            _btc_tf_cache[tf] = {"bars": bars, "ts": time.monotonic()}
+        return bars
+    # ── W1 / D1 via Yahoo period + CoinMetrics daily backfill ──
+    # Yahoo's range=max for 1d returns monthly (broken) — use period API for true daily/weekly.
+    if tf in ("D1", "W1"):
+        try:
+            bars = await _fetch_yahoo_btc_full(tf, want)
+            # Fallback to legacy provider if period fetch empty (rate-limit etc.)
+            if not bars:
+                from app.exchanges import yahoo_provider as _yp_fb
+                bars = await _yp_fb.fetch_candles(_BTC_SYMBOL, tf, limit=want) or []
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[Cycle] BTC {tf} Yahoo period unavailable: {exc}")
+            bars = []
+        # Prepend CoinMetrics daily gap. Yahoo BTC-D1/W1 starts 2014-09, so everything before needs backfill.
+        if bars:
+            try:
+                daily_gap = await _fetch_early_btc_daily(bars[0]["time"])
+                if daily_gap:
+                    if tf == "D1":
+                        cutoff = bars[0]["time"]
+                        gap = [b for b in daily_gap if b["time"] < cutoff]
+                        bars = gap + bars
+                    elif tf == "W1":
+                        # Aggregate daily gap → weekly, then prepend
+                        cutoff = bars[0]["time"]
+                        daily_cut = [b for b in daily_gap if b["time"] < cutoff]
+                        weekly_gap = _daily_to_weekly(daily_cut)
+                        weekly_gap = [b for b in weekly_gap if b["time"] < cutoff]
+                        bars = weekly_gap + bars
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"[Cycle] BTC {tf} backfill failed: {exc}")
+        else:
+            # Yahoo empty — serve pure daily backfill as fallback (at least 2010-2014)
+            try:
+                # Use far-future cutoff to get all daily
+                daily_all = await _fetch_early_btc_daily(int(datetime.now(timezone.utc).timestamp()) + 86400)
+                if daily_all:
+                    if tf == "D1":
+                        bars = daily_all[-want:]
+                    else:
+                        bars = _daily_to_weekly(daily_all)[-want:]
+            except Exception:  # noqa: BLE001
+                bars = []
+        # Deduplicate by time (CoinMetrics vs Yahoo overlap at boundary)
+        seen: Dict[int, Dict[str, Any]] = {}
+        for b in bars:
+            seen[int(b["time"])] = b
+        bars = [seen[k] for k in sorted(seen.keys())]
+        bars = bars[-want:] if len(bars) > want else bars
+        async with _lock:
+            _btc_tf_cache[tf] = {"bars": bars, "ts": time.monotonic()}
+        return bars
+    # ── H1 / H4 via Bitget paginated + synthetic gap ──
+    # Fetch real Bitget history first
+    bitget_bars = await _fetch_bitget_paginated(tf, limit=want)
+    # Determine gap between genesis (2010-07-17) and first Bitget bar
+    genesis_ts = int(datetime(2010, 7, 17, tzinfo=timezone.utc).timestamp())
+    gap_end_ts = bitget_bars[0]["time"] if bitget_bars else int(datetime.now(timezone.utc).timestamp())
+    synthetic: List[Dict[str, Any]] = []
+    if gap_end_ts > genesis_ts + 3600:
+        try:
+            # Fetch daily up to gap_end, synthesize hourly/4h
+            daily_gap = await _fetch_early_btc_daily(gap_end_ts)
+            # Also need Yahoo daily for 2014- gap_end if gap extends beyond CoinMetrics cutoff
+            if daily_gap and len(daily_gap) < (gap_end_ts - genesis_ts) // 86400 - 5:
+                # Top up daily gap from Yahoo D1 if needed (covers 2014- gap_end) — use period fetch (range=max is broken)
+                try:
+                    y_daily = await _fetch_yahoo_btc_full("D1", 7000)
+                    if y_daily:
+                        # Merge daily_gap (CoinMetrics) + y_daily filtered to gap window
+                        y_filtered = [b for b in y_daily if genesis_ts <= b["time"] < gap_end_ts]
+                        # Deduplicate
+                        merged: Dict[int, Dict[str, Any]] = {b["time"]: b for b in daily_gap}
+                        for b in y_filtered:
+                            merged.setdefault(int(b["time"]), b)
+                        daily_gap = [merged[k] for k in sorted(merged.keys())]
+                except Exception:  # noqa: BLE001
+                    pass
+            interval = 1 if tf == "H1" else 4
+            synthetic = _synthesize_hourly_from_daily(daily_gap, interval_hours=interval)
+            synthetic = [b for b in synthetic if b["time"] < gap_end_ts]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[Cycle] BTC {tf} synthetic gap failed: {exc}")
+            synthetic = []
+    combined = synthetic + bitget_bars
+    # Deduplicate again and sort
+    seen2: Dict[int, Dict[str, Any]] = {}
+    for b in combined:
+        seen2[int(b["time"])] = b
+    combined = [seen2[k] for k in sorted(seen2.keys())]
+    combined = combined[-want:] if len(combined) > want else combined
+    async with _lock:
+        _btc_tf_cache[tf] = {"bars": combined, "ts": time.monotonic()}
+    return combined
 
 
 async def cached_bars() -> List[Dict[str, Any]]:

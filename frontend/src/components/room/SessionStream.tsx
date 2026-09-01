@@ -111,6 +111,11 @@ export default function SessionStream({ sessions, seats }: Props) {
                 ) : (
                   <span className="text-sm text-slate-500">—</span>
                 )}
+                {session.trigger && (
+                  <span className="rounded bg-slate-700/50 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-slate-400">
+                    {session.trigger.replace('_', ' ')}
+                  </span>
+                )}
                 <span className="font-mono text-[10px] text-slate-500">{timeOf(session.started_at)}</span>
               </span>
             </button>
@@ -141,6 +146,21 @@ export default function SessionStream({ sessions, seats }: Props) {
                   <p className="text-[10px] uppercase tracking-wide text-slate-600">
                     convened by {session.trigger.replace('_', ' ')}
                   </p>
+                )}
+
+                {/* Best-trader skill the seats were prompted with (A+A+B) */}
+                {(session as any).hermes_skill?.symbol && (
+                  <div className="flex flex-wrap items-center gap-1.5 rounded-lg border border-violet-500/20 bg-violet-500/10 px-2.5 py-1.5 text-[11px]">
+                    <span className="rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-bold text-amber-300">stock</span>
+                    <span className="font-mono font-semibold text-violet-200">{(session as any).hermes_skill.symbol}</span>
+                    <span className="text-violet-300/70">{(session as any).hermes_skill.asset_class}</span>
+                    <span className="text-slate-500">·</span>
+                    <span className="flex items-center gap-1 rounded bg-violet-500/20 px-1.5 py-0.5 text-[10px] text-violet-200">JARVIS chair</span>
+                    <span className="text-[10px] text-violet-300/60">+ {(session as any).hermes_skill.linked_agents?.length ?? 7} seats</span>
+                    {(session as any).hermes_skill.win_rate != null && (
+                      <span className="ml-auto rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] text-emerald-300">Learned win {Math.round((session as any).hermes_skill.win_rate * 100)}% over {(session as any).hermes_skill.decisions_reviewed ?? 0}</span>
+                    )}
+                  </div>
                 )}
 
                 {session.final_reasoning && (
@@ -176,6 +196,11 @@ export default function SessionStream({ sessions, seats }: Props) {
                               title="Decided from stored memory without calling an AI model"
                             >
                               <Cpu className="h-2.5 w-2.5" /> local
+                            </span>
+                          )}
+                          {(d as any).skill_used && (
+                            <span className="rounded bg-amber-500/15 px-1 py-px text-[9px] font-mono text-amber-300" title={`Prompted with ${(d as any).skill_used} best-trader skill (${(d as any).skill_asset_class || ''})`}>
+                              {(d as any).skill_used}
                             </span>
                           )}
                         </div>

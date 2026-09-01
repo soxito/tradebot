@@ -14,6 +14,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    text,
     Enum as SQLEnum,
 )
 from sqlalchemy.orm import DeclarativeBase
@@ -210,6 +211,10 @@ class TelegramParsedSignal(TelegramBase):
     trailing_sl = Column(Float, nullable=True)
     # How many TP targets have been crossed (used to advance trailing_sl).
     tp_reached_count = Column(Integer, nullable=False, default=0)
+    # Highest (long) / lowest (short) price seen since the trail activated at
+    # the TP3 milestone. The ratcheting stop derives from this peak minus the
+    # configured tp_trail_pct, so profits above break-even stay locked.
+    trail_peak_price = Column(Float, nullable=True)
     # 'crypto' or 'forex' — determines which price source is used for lifecycle checks.
     market_type = Column(String(10), nullable=False, default="crypto")
 
@@ -248,7 +253,9 @@ class TelegramSniperSettings(TelegramBase):
     __tablename__ = "telegram_sniper_settings"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    enabled = Column(Boolean, nullable=False, default=False)
+    # On by default: signals were piling up as ACTIVE forever because the
+    # executor no-op'd behind this switch (the "signals never execute" bug).
+    enabled = Column(Boolean, nullable=False, default=True)
     mode = Column(String(10), nullable=False, default="paper")  # paper only (sim account)
     trade_type = Column(String(10), nullable=False, default="futures")
     position_size_usdt = Column(Float, nullable=False, default=100.0)
@@ -265,10 +272,26 @@ class TelegramSniperSettings(TelegramBase):
     reanalyze = Column(Boolean, nullable=False, default=True)
     # Execution targets (which order books a confirmed signal is placed on).
     execute_sandbox = Column(Boolean, nullable=False, default=True)   # sim account (/trading sandbox)
-    execute_live = Column(Boolean, nullable=False, default=False)     # REAL money (opt-in, default off)
+    execute_live = Column(Boolean, nullable=False, default=True)     # REAL money (user opted in)
     # Only auto-execute when the core AI agents + exchange volume confirm the
     # signal's direction. Unconfirmed signals stay PENDING for manual execution.
     require_ai_confirmation = Column(Boolean, nullable=False, default=True)
+    # When True (default): if the AI agents are unreachable (providers down,
+    # circuit breaker, import failure) the signal is NOT blocked — execution
+    # proceeds on volume/confidence gates alone. False restores fail-closed
+    # behaviour where an unavailable AI parks every signal as PENDING.
+    # server_default matters: the auto-migrator adds this to a POPULATED
+    # table, and a bare NOT NULL column with only a client-side default
+    # cannot be added (NotNullViolation), which aborts the whole batch.
+    ai_confirmation_fail_open = Column(
+        Boolean, nullable=False, default=True, server_default=text("true")
+    )
+    # One-time execution bootstrap: the first time this row is touched after
+    # deploy, the executor flips itself fully ON (sandbox + live + MT5 demo and
+    # live) and stamps this flag so later manual toggles are respected forever.
+    exec_bootstrap_v1 = Column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
     # Place confirmed signals immediately at market (so they appear on /trading
     # right away) instead of waiting for the optimised sniper limit entry.
     execute_immediately = Column(Boolean, nullable=False, default=True)
@@ -286,7 +309,7 @@ class TelegramSniperSettings(TelegramBase):
     # ── Forex (MT5) execution ────────────────────────────────────────────
     # Route forex signals (XAUUSD, EURUSD, …) to a live-linked MT5 account
     # instead of Bitget (which has no forex). Live forex price = Swissquote.
-    mt5_execute = Column(Boolean, nullable=False, default=False)
+    mt5_execute = Column(Boolean, nullable=False, default=True)
     # Which MT5 account to trade. NULL = first live, api-reachable account.
     mt5_account_id = Column(Integer, nullable=True, default=None)
     # Fixed lot size for MT5 forex orders (broker units, e.g. 0.01).
@@ -308,7 +331,7 @@ class TelegramSniperSettings(TelegramBase):
     # Demo MT5 account for paper-testing forex signals before going live.
     mt5_demo_account_id = Column(Integer, nullable=True, default=None)
     # Route forex signals to the demo account instead of live accounts.
-    mt5_demo_execute = Column(Boolean, nullable=False, default=False)
+    mt5_demo_execute = Column(Boolean, nullable=False, default=True)
     # Aim the position at the channel's FINAL take-profit and let the trailing
     # stop (locked at TP3) protect the ride, instead of exiting at the nearest
     # TP. Off = close at the first target above the entry.

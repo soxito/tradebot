@@ -178,13 +178,20 @@ class PluginLoader:
                     continue
                 try:
                     ddl = CreateColumn(column).compile(sync_conn.engine)
-                    sync_conn.execute(
-                        text(f'ALTER TABLE "{table.name}" ADD COLUMN {ddl}')
-                    )
+                    # Each ADD COLUMN runs inside its own SAVEPOINT. DDL is
+                    # transactional on PostgreSQL: without this, one failing
+                    # column aborts the whole transaction and silently rolls
+                    # back every column added before it in this batch — plus
+                    # anything else the plugin init still had pending.
+                    with sync_conn.begin_nested():
+                        sync_conn.execute(
+                            text(f'ALTER TABLE "{table.name}" ADD COLUMN {ddl}')
+                        )
                     logger.info(f"Added column {table.name}.{column.name}")
                 except Exception as exc:  # noqa: BLE001
-                    # A column that cannot be added (a NOT NULL with no default
-                    # on a populated table) must not stop the rest of boot.
+                    # A column that cannot be added (a NOT NULL with no server
+                    # default on a populated table) must not stop the rest of
+                    # boot.
                     logger.warning(
                         f"Could not add column {table.name}.{column.name}: {exc}"
                     )

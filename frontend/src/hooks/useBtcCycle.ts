@@ -123,22 +123,28 @@ export function useBtcCycleState() {
   return { state, loaded, refresh: load }
 }
 
-/** Windows only — chart overlays. Fetched once per mount; boxes move rarely. */
+/** Windows — chart overlays. Polls with the state so all historical cycles stay current. */
 export function useBtcCycleWindows() {
   const [windows, setWindows] = useState<CycleWindow[]>([])
 
-  useEffect(() => {
-    let alive = true
-    void (async () => {
-      try {
-        const { data } = await apiClient.getCycleWindows()
-        if (alive && data?.ok) setWindows(data.windows ?? [])
-      } catch {
-        /* no overlay is the correct degradation */
-      }
-    })()
-    return () => { alive = false }
+  const load = useCallback(async () => {
+    try {
+      const { data } = await apiClient.getCycleWindows()
+      if (data?.ok) setWindows(data.windows ?? [])
+    } catch {
+      /* no overlay is the correct degradation */
+    }
   }, [])
+
+  useEffect(() => {
+    void load()
+    const timer = window.setInterval(load, STATE_POLL_MS)
+    const unsub = eventStream.subscribe('cycle.transition', () => { void load() })
+    return () => {
+      window.clearInterval(timer)
+      unsub()
+    }
+  }, [load])
 
   return windows
 }

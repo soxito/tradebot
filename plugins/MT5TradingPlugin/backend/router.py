@@ -17,6 +17,7 @@ from app.core.offload import run_cpu, OffloadRejected, OffloadTimeout
 from plugins.MT5TradingPlugin.backend.models import (
     MT5Base, MT5Account, MT5AccountGroup, MT5AccountGroupMember,
     MT5Order, MT5Position, MT5Deal, MT5CopyProfile, MT5CopySimTrade,
+    MT5CopyFollower,
     MT5ReplayRun, MT5AccountSnapshot, MT5PluginSetting,
     MT5AccountType, MT5AccountStatus,
 )
@@ -27,6 +28,8 @@ from plugins.MT5TradingPlugin.backend.schemas import (
     MT5GroupCreate, MT5GroupResponse, MT5GroupMemberUpdate,
     MT5SnapshotResponse, MT5ReplayRequest, MT5ReplayResponse,
     MT5CopyProfileCreate, MT5CopyProfileResponse, MT5CopySimTradeResponse,
+    MT5CopyProfileUpdate, MT5CopyFollowerCreate, MT5CopyFollowerUpdate,
+    MT5CopyFollowerResponse,
     MT5RiskOverviewResponse, MT5OverlayResponse,
     MT5CandlesResponse, MT5CandleResponse, MT5PriceResponse,
     MT5PlaceMarketOrderRequest, MT5ClosePositionRequest, MT5TradeResultResponse,
@@ -823,7 +826,7 @@ async def list_copy_profiles():
         )
         profiles = result.scalars().all()
         return [MT5CopyProfileResponse(
-            id=p.id, name=p.name,
+            id=p.id, name=p.name, mode=p.mode.value if hasattr(p.mode, "value") else str(p.mode),
             source_account_id=p.source_account_id,
             source_group_id=p.source_group_id,
             allocation_mode=p.allocation_mode,
@@ -840,7 +843,18 @@ async def list_copy_profiles():
 @router.post("/copy-profiles", response_model=MT5CopyProfileResponse)
 async def create_copy_profile(data: MT5CopyProfileCreate):
     """Create a new copy-trading simulation profile."""
+    from plugins.MT5TradingPlugin.backend.models import CopyMode
+
+    try:
+        mode = CopyMode(data.mode) if getattr(data, "mode", None) else CopyMode.SIM
+    except ValueError:
+        raise HTTPException(400, "mode must be 'sim' or 'live'")
+
     async with AsyncSessionLocal() as db:
+        if data.source_account_id is not None:
+            account = await db.get(MT5Account, data.source_account_id)
+            if not account:
+                raise HTTPException(404, f"Source account {data.source_account_id} not found")
         profile = MT5CopyProfile(
             user_id=DEFAULT_USER_ID,
             name=data.name,
@@ -850,12 +864,13 @@ async def create_copy_profile(data: MT5CopyProfileCreate):
             allocation_value=data.allocation_value,
             max_open_positions=data.max_open_positions,
             symbol_whitelist=data.symbol_whitelist,
+            mode=mode,
         )
         db.add(profile)
         await db.commit()
         await db.refresh(profile)
         return MT5CopyProfileResponse(
-            id=profile.id, name=profile.name,
+            id=profile.id, name=profile.name, mode=profile.mode.value,
             source_account_id=profile.source_account_id,
             source_group_id=profile.source_group_id,
             allocation_mode=profile.allocation_mode,
@@ -869,6 +884,49 @@ async def create_copy_profile(data: MT5CopyProfileCreate):
         )
 
 
+@router.put("/copy-profiles/{profile_id}", response_model=MT5CopyProfileResponse)
+async def update_copy_profile(profile_id: int, data: MT5CopyProfileUpdate):
+    """Update a copy profile's settings (allocation, whitelist, source)."""
+    async with AsyncSessionLocal() as db:
+        profile = await db.get(MT5CopyProfile, profile_id)
+        if not profile:
+            raise HTTPException(404, "Profile not found")
+        updates = data.model_dump(exclude_unset=True)
+        for field, value in updates.items():
+            setattr(profile, field, value)
+        await db.commit()
+        await db.refresh(profile)
+        return MT5CopyProfileResponse(
+            id=profile.id, name=profile.name, mode=profile.mode.value,
+            source_account_id=profile.source_account_id,
+            source_group_id=profile.source_group_id,
+            allocation_mode=profile.allocation_mode,
+            allocation_value=profile.allocation_value,
+            max_open_positions=profile.max_open_positions,
+            symbol_whitelist=profile.symbol_whitelist,
+            enabled=profile.enabled,
+            paper_balance=profile.paper_balance,
+            paper_equity=profile.paper_equity,
+            created_at=profile.created_at,
+        )
+
+
+@router.delete("/copy-profiles/{profile_id}")
+async def delete_copy_profile(profile_id: int):
+    """Delete a copy profile and all its sim trades + followers."""
+    async with AsyncSessionLocal() as db:
+        profile = await db.get(MT5CopyProfile, profile_id)
+        if not profile:
+            raise HTTPException(404, "Profile not found")
+        await db.execute(delete(MT5CopySimTrade).where(
+            MT5CopySimTrade.copy_profile_id == profile_id))
+        await db.execute(delete(MT5CopyFollower).where(
+            MT5CopyFollower.copy_profile_id == profile_id))
+        await db.delete(profile)
+        await db.commit()
+        return {"deleted": profile_id}
+
+
 @router.post("/copy-profiles/{profile_id}/toggle")
 async def toggle_copy_profile(profile_id: int):
     """Enable/disable a copy simulation profile."""
@@ -879,6 +937,108 @@ async def toggle_copy_profile(profile_id: int):
         profile.enabled = not profile.enabled
         await db.commit()
         return {"enabled": profile.enabled}
+
+
+# ── Copy Followers (live mode) ────────────────────────────
+
+@router.get("/copy-profiles/{profile_id}/followers", response_model=List[MT5CopyFollowerResponse])
+async def list_copy_followers(profile_id: int):
+    """List follower accounts attached to a copy profile."""
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(MT5CopyFollower).where(MT5CopyFollower.copy_profile_id == profile_id)
+        )
+        followers = result.scalars().all()
+        return [MT5CopyFollowerResponse(
+            id=f.id, copy_profile_id=f.copy_profile_id,
+            account_id=f.account_id, enabled=f.enabled,
+            allocation_mode=f.allocation_mode, allocation_value=f.allocation_value,
+            max_open_positions=f.max_open_positions, copied_tickets=f.copied_tickets,
+            last_error=f.last_error, last_sync_at=f.last_sync_at,
+            created_at=f.created_at,
+        ) for f in followers]
+
+
+@router.post("/copy-profiles/{profile_id}/followers", response_model=MT5CopyFollowerResponse)
+async def add_copy_follower(profile_id: int, data: MT5CopyFollowerCreate):
+    """Attach a follower MT5 account to a copy profile (unlimited accounts)."""
+    async with AsyncSessionLocal() as db:
+        profile = await db.get(MT5CopyProfile, profile_id)
+        if not profile:
+            raise HTTPException(404, "Profile not found")
+        account = await db.get(MT5Account, data.account_id)
+        if not account:
+            raise HTTPException(404, f"Account {data.account_id} not found")
+        if account.id == profile.source_account_id and profile.mode.value == "live":
+            raise HTTPException(400, "Source account cannot also be a live follower of itself")
+
+        # One follower row per (profile, account) pair
+        existing = await db.execute(
+            select(MT5CopyFollower).where(
+                MT5CopyFollower.copy_profile_id == profile_id,
+                MT5CopyFollower.account_id == data.account_id,
+            )
+        )
+        if existing.scalar_one_or_none():
+            raise HTTPException(409, f"Account {data.account_id} is already a follower of this profile")
+
+        follower = MT5CopyFollower(
+            copy_profile_id=profile_id,
+            account_id=data.account_id,
+            enabled=data.enabled,
+            allocation_mode=data.allocation_mode,
+            allocation_value=data.allocation_value,
+            max_open_positions=data.max_open_positions,
+            copied_tickets={},
+        )
+        db.add(follower)
+        await db.commit()
+        await db.refresh(follower)
+        return MT5CopyFollowerResponse(
+            id=follower.id, copy_profile_id=follower.copy_profile_id,
+            account_id=follower.account_id, enabled=follower.enabled,
+            allocation_mode=follower.allocation_mode,
+            allocation_value=follower.allocation_value,
+            max_open_positions=follower.max_open_positions,
+            copied_tickets=follower.copied_tickets,
+            last_error=follower.last_error, last_sync_at=follower.last_sync_at,
+            created_at=follower.created_at,
+        )
+
+
+@router.put("/copy-followers/{follower_id}", response_model=MT5CopyFollowerResponse)
+async def update_copy_follower(follower_id: int, data: MT5CopyFollowerUpdate):
+    """Update a follower's sizing rules or enabled state."""
+    async with AsyncSessionLocal() as db:
+        follower = await db.get(MT5CopyFollower, follower_id)
+        if not follower:
+            raise HTTPException(404, "Follower not found")
+        for field, value in data.model_dump(exclude_unset=True).items():
+            setattr(follower, field, value)
+        await db.commit()
+        await db.refresh(follower)
+        return MT5CopyFollowerResponse(
+            id=follower.id, copy_profile_id=follower.copy_profile_id,
+            account_id=follower.account_id, enabled=follower.enabled,
+            allocation_mode=follower.allocation_mode,
+            allocation_value=follower.allocation_value,
+            max_open_positions=follower.max_open_positions,
+            copied_tickets=follower.copied_tickets,
+            last_error=follower.last_error, last_sync_at=follower.last_sync_at,
+            created_at=follower.created_at,
+        )
+
+
+@router.delete("/copy-followers/{follower_id}")
+async def delete_copy_follower(follower_id: int):
+    """Detach a follower account from a copy profile."""
+    async with AsyncSessionLocal() as db:
+        follower = await db.get(MT5CopyFollower, follower_id)
+        if not follower:
+            raise HTTPException(404, "Follower not found")
+        await db.delete(follower)
+        await db.commit()
+        return {"deleted": follower_id}
 
 
 @router.get("/copy-profiles/{profile_id}/trades", response_model=List[MT5CopySimTradeResponse])

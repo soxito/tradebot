@@ -1332,6 +1332,102 @@ def get_jarvis_learning_status() -> dict:
     }
 
 
+# ── Agent Decision Learning Loop ───────────────────────────
+# Closes the room's learning loop: settles every unresolved buy/sell
+# agent_decisions row against closed trades in both order books, then runs the
+# revision-tracked self-improve pass for any seat with enough fresh evidence.
+# Cheap when there is nothing pending — a single indexed query per cycle.
+
+_decision_learning_task = None
+_decision_learning_running = False
+_decision_learning_started_at: str | None = None
+_decision_learning_last_run: dict | None = None
+
+
+async def _decision_learning_loop():
+    """Settle agent decisions and evolve the seats on a timer."""
+    global _decision_learning_running, _decision_learning_last_run
+
+    interval = getattr(settings, "DECISION_LEARNING_INTERVAL_SECONDS", 900)
+    logger.info(f"🧠 [DECISION LEARNING] Started (every {interval}s)")
+
+    while _decision_learning_running:
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            break
+        if not _decision_learning_running:
+            break
+
+        try:
+            from app.services import decision_settlement
+
+            stats = await decision_settlement.run_learning_cycle()
+            if stats.get("settled") or stats.get("improved"):
+                _decision_learning_last_run = {
+                    "at": now_sast().isoformat(),
+                    "status": "ok",
+                    **stats,
+                }
+                logger.info(
+                    "🧠 [DECISION LEARNING] settled={} improved={} pending={}",
+                    stats.get("settled", 0),
+                    len(stats.get("improved", [])),
+                    stats.get("pending", 0),
+                )
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            err_safe = str(e).replace("{", "{{").replace("}", "}}")
+            logger.error(f"🧠 [DECISION LEARNING] Cycle error: {err_safe}")
+            _decision_learning_last_run = {
+                "at": now_sast().isoformat(), "status": "error", "error": str(e),
+            }
+
+    _decision_learning_running = False
+    logger.info("🧠 [DECISION LEARNING] Stopped")
+
+
+def start_decision_learning_loop() -> bool:
+    """Start the agent-decision settlement/evolution loop (idempotent)."""
+    global _decision_learning_task, _decision_learning_running, _decision_learning_started_at
+
+    if _decision_learning_task is not None and not _decision_learning_task.done():
+        logger.warning("Decision learning loop already running")
+        return False
+
+    _decision_learning_running = True
+    _decision_learning_started_at = now_sast().isoformat()
+    _decision_learning_task = asyncio.create_task(_decision_learning_loop())
+    return True
+
+
+def stop_decision_learning_loop() -> bool:
+    """Stop the agent-decision settlement/evolution loop."""
+    global _decision_learning_running, _decision_learning_task, _decision_learning_started_at
+
+    if not _decision_learning_running and (
+        _decision_learning_task is None or _decision_learning_task.done()
+    ):
+        return False
+
+    _decision_learning_running = False
+    if _decision_learning_task:
+        _decision_learning_task.cancel()
+        _decision_learning_task = None
+    _decision_learning_started_at = None
+    return True
+
+
+def get_decision_learning_status() -> dict:
+    """Return the current state of the decision learning loop."""
+    return {
+        "running": _decision_learning_running,
+        "started_at": _decision_learning_started_at,
+        "last_run": _decision_learning_last_run,
+    }
+
+
 # ── SMC Background Research Loop ───────────────────────────
 # Pulls the economic calendar, news feeds and sentiment on a timer and writes
 # the findings into the three memories. Uses IDLE AI providers only — never the

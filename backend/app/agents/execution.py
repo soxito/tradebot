@@ -145,15 +145,22 @@ def mt5_volume_for_risk(
 
 
 async def effective_risk_pct(s: RoomSettings, symbol: str) -> float:
-    """Configured risk after the Bitcoin cycle's auto reduction, when enabled.
+    """Configured risk after cycle and metal-volatility reductions.
 
-    Inside the projected-bear phase — or the late-bull caution window — new
-    entries on cycle-driven symbols are sized at ``cycle_risk_multiplier`` of
-    the configured risk. The multiplier can only shrink (the settings API caps
-    it at 1.0), and a calendar that fails to resolve leaves risk untouched:
+    Two independent dampers stack:
+    1. Bitcoin cycle's auto reduction (when enabled) for cycle-driven symbols.
+    2. Metals dampener: XAU/XAG move $40-100 per day on 0.01 lot; a flat 1% on a
+       $4M demo is $40k of absolute risk, which is how 2026-08-28 produced $50k
+       single-trade losses. Metals are sized at 0.45× the configured risk so a
+       1% setting risks 0.45% on gold/silver until a dollar cap (below) engages.
+    Both only shrink. A calendar that fails to resolve leaves risk untouched:
     sizing must never depend on the cycle resolving.
     """
     base = float(getattr(s, "risk_pct", 1.0) or 1.0)
+    # Metals dampener — always on, not gated by cycle_auto_risk
+    sym_norm = (symbol or "").upper().replace("/", "")
+    if sym_norm.startswith("XAU") or sym_norm.startswith("XAG"):
+        base = round(base * 0.45, 4)  # 1% → 0.45% on metals
     if not bool(getattr(s, "cycle_auto_risk", False)):
         return base
     try:
@@ -292,8 +299,42 @@ async def _check_gates(s: RoomSettings, result: Dict[str, Any], consensus: Dict[
     if confidence < s.min_confidence:
         raise Blocked(f"confidence {confidence:.0%} below the {s.min_confidence:.0%} floor")
 
+    # ── Post-mortem 2026-08-28: local fallback at 0.355 was taking BUY while the
+    # market analyst correctly called bearish 0.65 into heavy selling. Any AI
+    # call that disagrees strongly with a bearish high-conviction analyst read
+    # on a metal should be blocked unless sentiment + signal both agree bearish.
+    try:
+        symbol = str(result.get("symbol") or "").upper()
+        is_metal = symbol.replace("/", "").startswith(("XAU", "XAG"))
+        if is_metal and action == "buy":
+            decisions = result.get("decisions") or []
+            analyst = next((d for d in decisions if str(d.get("agent_role","")).lower()=="market_analyst"), None)
+            if analyst and str(analyst.get("action","")).lower() in {"bearish", "sell", "short", "down"}:
+                try:
+                    a_conf = float(analyst.get("confidence") or 0)
+                except Exception:
+                    a_conf = 0.0
+                if a_conf >= 0.55:
+                    raise Blocked(
+                        f"metal BUY vetoed: market analyst is {analyst.get('action')} ({a_conf:.0%}) into heavy selling — board disagreement, require aligned bearish confirmation"
+                    )
+    except Blocked:
+        raise
+    except Exception:
+        pass
+
     if trades_today() >= s.max_trades_per_day:
         raise Blocked(f"daily cap of {s.max_trades_per_day} trades reached")
+
+    # ── Daily loss circuit breaker: if the account already lost > threshold
+    # today, stop opening new risk until tomorrow. The 2026-08-28 session lost
+    # $50k per trade while continuing to open new longs into the same sell-off.
+    # Check is best-effort (requires DB) and never blocks when data unavailable.
+    try:
+        # This check is intentionally lightweight and is enriched in the caller where DB is available.
+        pass
+    except Exception:
+        pass
 
 
 def venues_for(symbol: str, s: RoomSettings) -> list:
@@ -402,6 +443,56 @@ def _summarise(orders: list) -> tuple:
     )
 
 
+async def _daily_loss_blocked(db: AsyncSession, s: RoomSettings) -> Optional[str]:
+    """Has the desk already lost too much today? Returns a block reason or None.
+
+    Post-mortem 2026-08-28: the desk kept opening new XAU longs while the same
+    sell-off was bleeding the book — each new loss added to a day that already
+    printed -$118k on XAU alone. A daily stop must be absolute, not per-trade.
+
+    Threshold is the tighter of a % of starting equity and a dollar cap. Defaults
+    are conservative on large demos where % risk is misleading: $4M @ 3% = $120k
+    is a whole quarter's edge, so the dollar cap (default $12k) binds first.
+    Tunable via RoomSettings.max_daily_loss_pct / max_daily_loss_usd when those
+    columns exist; otherwise defaults apply. Best-effort: any DB error is silence.
+    """
+    try:
+        from datetime import datetime, timedelta
+        from sqlalchemy import text as _text
+        # Resolve the account the cap is measured against (demo when armed).
+        from plugins.MT5TradingPlugin.backend.models import MT5Account
+        acct_id = getattr(s, "mt5_demo_account_id", None) or getattr(s, "mt5_account_id", None)
+        if not acct_id:
+            return None
+        acct = await db.get(MT5Account, acct_id)
+        if acct is None:
+            return None
+        equity = float(getattr(acct, "equity", 0) or getattr(acct, "balance", 0) or 0)
+        if equity <= 0:
+            return None
+        pct = float(getattr(s, "max_daily_loss_pct", 0) or 0) or 3.0
+        cap_usd = float(getattr(s, "max_daily_loss_usd", 0) or 0)
+        # Default dollar caps only on large books; small accounts are governed by %.
+        if cap_usd <= 0:
+            cap_usd = 12000.0 if equity > 300_000 else equity * (pct / 100.0) * 1.2
+        # Tighter for metals-heavy days: XAU can lose $45k in one wick, so cap is lower when the book is metals-concentrated.
+        # For now keep one cap; a per-symbol cap can be added later.
+        threshold = min(equity * (pct / 100.0), cap_usd)
+        # Sum of today's deal PnL for this account (UTC date).
+        row = await db.execute(_text(
+            "SELECT COALESCE(SUM(profit+swap+commission+fee),0) FROM mt5_deals "
+            "WHERE account_id=:aid AND mt5_time::date = (NOW() AT TIME ZONE 'UTC')::date"
+        ), {"aid": acct_id})
+        pnl_today = float(row.scalar() or 0)
+        # pnl_today is net (wins-losses). Only block when deep negative.
+        if pnl_today < -abs(threshold):
+            return f"daily loss limit hit: {pnl_today:+.0f} vs {threshold:.0f} limit ({pct:.1f}% / ${cap_usd:.0f}) — no new risk until tomorrow"
+    except Exception as exc:  # noqa: BLE001 — never block on a failed check
+        from loguru import logger as _lg
+        _lg.debug(f"[execution] daily loss check skipped: {exc}")
+    return None
+
+
 async def execute_decision(
     db: AsyncSession, result: Dict[str, Any], consensus: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -412,6 +503,8 @@ async def execute_decision(
     try:
         s = await get_settings(db)
         await _check_gates(s, result, consensus)
+        if reason := await _daily_loss_blocked(db, s):
+            raise Blocked(reason)
     except Blocked as exc:
         return await _report(symbol, action, "skipped", str(exc))
     except Exception as exc:  # noqa: BLE001
@@ -499,13 +592,18 @@ async def mt5_targets(db: AsyncSession, s: RoomSettings) -> Dict[str, Any]:
 # ── Venues ──────────────────────────────────────────────────────────────────
 
 
-async def _prepare_account(db: AsyncSession, account: Any, s: RoomSettings) -> None:
+async def _prepare_account(db: AsyncSession, account: Any, s: RoomSettings, symbol: str = "") -> None:
     """Make sure the broker's own numbers are fresh enough to size against.
 
     A never-synced or stale account still holds its default zero equity, which
     reads downstream as "unfunded" and blocks every order — the usual shape of
     "demo trades but live does nothing" right after a live account is first
     selected.
+
+    Post-mortem 2026-08-28 adds two guards kept here because this is the single
+    choke-point every MT5 order passes through: a dollar-risk cap for large demo
+    balances (4M @ 1% = 40k per trade is how the $50k losses were sized) and a
+    correlated-metal exposure check (XAU+XAG counted as one bucket).
     """
     from plugins.MT5TradingPlugin.backend.models import MT5AccountStatus
 
@@ -533,6 +631,30 @@ async def _prepare_account(db: AsyncSession, account: Any, s: RoomSettings) -> N
     open_count = getattr(account, "position_count", 0) or 0
     if open_count >= s.max_open_positions:
         raise Blocked(f"{open_count} positions already open (cap {s.max_open_positions})")
+    # ── Post-mortem 2026-08-28: XAU had 4-6 concurrent longs (15+ lots each) while
+    # max_open_positions=3 was per-account total. Gold and silver are 0.85 correlated —
+    # treat XAU+XAG longs as one bucket: if the requested symbol is a metal and the
+    # account already holds metal exposure, require stricter capacity.
+    if symbol:
+        try:
+            norm = symbol.upper().replace("/", "")
+            is_metal = norm.startswith(("XAU", "XAG"))
+            if is_metal:
+                from plugins.MT5TradingPlugin.backend.models import MT5Position
+                from sqlalchemy import select as _sel
+                rows = (await db.execute(_sel(MT5Position).where(MT5Position.account_id == account.id))).scalars().all()
+                metal_longs = sum(1 for p in rows if str(getattr(p, "symbol", "") or "").upper().replace("/", "").startswith(("XAU", "XAG")) and str(getattr(getattr(p, "side", ""), "value", getattr(p, "side", ""))).lower() == "buy")
+                # Allow at most 2 concurrent metal longs regardless of total cap; the 3rd metal long is highly correlated.
+                if metal_longs >= 2:
+                    raise Blocked(f"metal exposure cap: {metal_longs} XAU/XAG longs already open (limit 2) — metals are correlated, cannot add {symbol}")
+                # Also block if total correlated longs would exceed the global cap when accounting for metals overlap
+                if metal_longs >= 1 and open_count >= max(2, s.max_open_positions - 1):
+                    raise Blocked(f"correlated cap: {open_count} positions with {metal_longs} metal longs — adding another metal would breach concentration")
+        except Blocked:
+            raise
+        except Exception as exc:  # noqa: BLE001 — DB failure should not block, but log
+            from loguru import logger as _lg
+            _lg.debug(f"[execution] metal exposure check skipped for {symbol}: {exc}")
 
 
 async def _place_on(
@@ -577,7 +699,7 @@ async def _place_on(
     }
 
     try:
-        await _prepare_account(db, account, s)
+        await _prepare_account(db, account, s, symbol=symbol)
     except Blocked as exc:
         return {**order, "status": "skipped", "reason": str(exc)}
 
@@ -585,6 +707,31 @@ async def _place_on(
     if equity <= 0:
         return {**order, "status": "skipped",
                 "reason": "account equity unavailable — refusing to size blind"}
+
+    # ── Dollar-risk cap (post-mortem 2026-08-28): a 4M demo @ 1% risks $40k per trade,
+    # which is how the $50k losses were sized. Even with the 0.45× metals dampener
+    # above, 0.45% of 4M is still $18k. Cap absolute risk so a single idea cannot
+    # lose > $X regardless of demo equity. Tunable via RoomSettings.max_usd_risk_per_trade
+    # when that column exists; otherwise use a sensible default that scales with account size.
+    orig_equity = equity
+    try:
+        cap = float(getattr(s, "max_usd_risk_per_trade", 0) or 0)
+        sym_norm = (symbol or "").upper().replace("/", "")
+        is_metal = sym_norm.startswith(("XAU", "XAG"))
+        if cap <= 0 and equity > 300_000:
+            # Default caps only engage on large balances where % risk becomes dangerous in absolute terms.
+            cap = 6000.0 if is_metal else 9000.0
+            # On very large demos (>1M) tighten further: the notional is already huge.
+            if equity > 1_500_000 and is_metal:
+                cap = 4500.0
+        if cap > 0 and risk_pct > 0:
+            implied_equity_at_cap = cap / (risk_pct / 100.0)
+            if equity > implied_equity_at_cap:
+                equity = implied_equity_at_cap
+                order["equity_capped"] = True
+                order["cap_usd"] = cap
+    except Exception:
+        equity = orig_equity
 
     # The risk budget AND the free margin both bound the lot, rounding floors so
     # it can never exceed the budget, and an account too small for one broker
@@ -601,6 +748,8 @@ async def _place_on(
         max_risk_pct=float(getattr(s, "mt5_max_risk_pct", 5.0) or 5.0),
         small_account_mode=bool(getattr(s, "mt5_small_account_mode", True)),
     )
+    if order.get("equity_capped"):
+        size_note = f"${order['cap_usd']:.0f} cap (equity {orig_equity:,.0f}→{equity:,.0f}) · " + size_note
     order.update(equity=equity, volume=volume, sizing=size_note)
     if volume is None:
         return {**order, "status": "skipped",
@@ -815,6 +964,8 @@ async def mirror_published_card(
             raise Blocked(f"daily cap of {s.max_trades_per_day} trades reached")
         if ordered_recently(symbol):
             raise Blocked("the room already placed this pair — not doubling up")
+        if reason := await _daily_loss_blocked(db, s):
+            raise Blocked(reason)
     except Blocked as exc:
         return await _report(symbol, action, "skipped", str(exc))
 
