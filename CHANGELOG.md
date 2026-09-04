@@ -8,6 +8,72 @@ entries are grouped under `[Unreleased]` and dated milestone headings.
 
 ## [Unreleased]
 
+### Added — 2026-09-02 / 2026-09-04
+
+#### Kronos — auto-update, paper-aware agents & fine-tuning
+- **Kronos stays current on every launch.** `start.py` now records the vendored
+  upstream commit (`vendor/.kronos_commit`) and, when Kronos is already vendored,
+  compares it against `git ls-remote HEAD` for
+  [shiyu-coder/Kronos](https://github.com/shiyu-coder/Kronos) on each run. If they
+  differ it re-vendors the `model/` package and rewrites the hash (guarded by git
+  availability with a 10-second timeout, so no network = no-op).
+- **Every trading-room seat reads the forecast the way the paper intends.** A
+  compact fact-sheet from the Kronos paper (arXiv:2508.02739) — decoder-only,
+  pre-trained on 12B K-lines from 45 exchanges, p10/p90 band = conviction,
+  `NO_TRADE` = no volume (not bearish), confidence = path-agreement × volume ×
+  macro — is injected into the JARVIS analysis system prompt (`config.py`
+  `KRONOS_PAPER_KNOWLEDGE`) and into each forecast block the orchestrator hands
+  the seven agent seats.
+- **Fine-tune Kronos on your own data (a share-market example).** Full
+  tokenizer → predictor pipeline mirroring the upstream repo:
+  - Setup scripts vendor `finetune_csv/` from upstream
+    (`scripts/setup_kronos_finetune.sh` / `.ps1`, idempotent, `--force`).
+  - Backend: an OHLCV→CSV exporter, a `FinetuneManager` that runs
+    export → tokenizer training → predictor training as a background job and can
+    hot-swap the engine to a finished model, a `kronos_finetune_jobs` table, and
+    seven REST endpoints under `/api/v1/plugins/kronos/finetune/*`
+    (`setup-status`, `export`, `start`, `jobs`, `jobs/{id}`, cancel, `load/{id}`).
+  - Frontend: a **Fine-tune on your own data** panel on `/kronos-forecast` —
+    setup banner, data-source export/preview, training hyper-parameters, Start,
+    a job-history table with Load/Cancel, and a live training-log tail.
+- **Telegram.** `/forecast` now shows the model-context line and a 🎯 fine-tuned
+  badge when a locally trained model is loaded; `/room agents` notes the seats'
+  shared Kronos paper context; a new **`/finetune`** command
+  (`start` / `status` / `load` / `setup`) with help text and autorun-safe
+  registration.
+
+
+- **AI Scraper tab** on `/x-monitor` — second tab alongside the existing Monitor tab, powered by a new `backend/app/api/x_scraper.py` router at `prefix=/x-scraper`.
+- **Two-mode scraping**: basic mode (stdlib only, always active, zero extra packages) uses Twitter's public syndication API + t.co URL resolution via `urllib.request` and `re`; AI mode upgrades to ScrapeGraphAI when installed.
+- **One-click install / upgrade to AI mode** — Install button tries three pip strategies (standard, `--pre`, bounded `>=1.0,<2.0`) and installs `playwright` + Chromium separately so a browser error never blocks the core install. Full pip output is shown in the UI on failure.
+- **Persistent error panel** — install failures no longer disappear as a flash message; the complete pip output is shown with a pre-filled copy-to-clipboard manual install command using the backend's exact `python_executable`.
+- **Auto-install in `start.py`** — preflight check installs `scrapegraphai` into the backend venv (checked with `PY_BIN` subprocess, not start.py's own Python) and reports version in the startup banner.
+- **`scrapegraphai>=1.0` added to `backend/requirements.txt`** so pip can resolve it alongside `openai==1.82.0` and other existing deps in one pass.
+- **`GET /x-scraper/status`** returns `installed` (always `true`), `ai_mode`, `scrape_mode` (`"basic"` / `"ai"`), `installed_version`, `python_executable`, and `last_install_error` — status endpoint does a fresh `_detect_installed()` on every call.
+- **`POST /x-scraper/scrape/{username}`** and **`POST /x-scraper/scrape-all`** — work in both basic and AI mode; results persisted to `data/x_scraper_results.json`.
+- **`PUT /x-scraper/config`** — live-patches dedicated scraper credentials (`SCRAPEGRAPH_AI_API_KEY`, `SCRAPEGRAPH_AI_BASE_URL`, `SCRAPEGRAPH_AI_MODEL`) into runtime settings without restart.
+- **Configure Dedicated AI Provider** panel in the UI — optional separate API key / base URL / model for the scraper, isolated from system-wide NVIDIA/OpenAI credentials.
+- **Scraped Social Links table** — per-account results with expandable link list, website primary URL, bio excerpt, scrape timestamp, and per-account re-scrape button; all buttons enabled in both modes.
+- New env vars: `SCRAPEGRAPH_AI_API_KEY`, `SCRAPEGRAPH_AI_BASE_URL`, `SCRAPEGRAPH_AI_MODEL` (all optional, blank = use system credentials).
+- New settings fields in `backend/app/core/config.py`.
+
+#### X Monitor — Auth & API fixes
+- **OAuth 1.0a user-context monitoring** — home-timeline polling via `GET /1.1/statuses/home_timeline.json` (v1.1, no project enrollment required); falls back to app-only Bearer token path if OAuth keys absent.
+- **HMAC-SHA1 OAuth 1.0a signing** in `x_monitor.py` (`_oauth1_header`) using Python stdlib only — no extra packages.
+- **`_poll_home_timeline`** — single API call per cycle fetches up to 200 tweets from all followed accounts, filtered to monitored accounts server-side.
+- **Fixed `/2/users/me` 403** — startup probe and `test_connection` both changed from `GET /2/users/me` (user-context only) to appropriate endpoints: OAuth 1.0a uses `GET /1.1/account/verify_credentials.json`; Bearer uses `GET /2/users/by/username/twitter`.
+- **Auth mode exposed** — `GET /x-monitor/config` and `GET /x-monitor/status` both now return `auth_mode` (`"oauth1"` / `"bearer"` / `"none"`) and `oauth1_set`; `POST /x-monitor/start` accepts either credential set.
+- **AI Scraper tab status card** shows active auth mode instead of generic "Bearer Token" label.
+- **`TWITTER_USER_ID`** added to `.env` and settings — numeric ID for home-timeline endpoint (detected automatically via Twitter's public GraphQL endpoint).
+- **`start.py` X Monitor banner** — specific messages for 401 (token rejected), 403 (no Basic-tier access), and transient errors; new X AI Scraper status line showing scrapegraphai version.
+
+### Fixed — 2026-09-02
+
+- `start.py` scrapegraphai version check now uses `subprocess.run([PY_BIN, "-c", ...])` (backend venv Python) instead of `importlib.metadata` in start.py's own process — these are different Python environments and the old check always falsely reported "not installed".
+- Install endpoint returns full pip output on failure (was truncated to 500 chars).
+- `_detect_installed()` has a two-stage fallback: `importlib.metadata` → direct `import scrapegraphai` — handles cases where pip installs code but metadata is missing.
+- `scrape_account` and `scrape_all` endpoints no longer raise HTTP 400 when scrapegraphai is absent (basic mode handles both).
+
 ### Fixed
 - **The board no longer answers "hold" into a trending market.** Four of the
   seven live seats were still running the repo's *original crypto-only* system

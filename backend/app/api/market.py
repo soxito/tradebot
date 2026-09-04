@@ -467,7 +467,7 @@ async def indicator_overlay(
     exchange: str,
     symbol: str,
     timeframe: str = Query(default="1d"),
-    limit: int = Query(default=400, ge=30, le=1500),
+    limit: int = Query(default=400, ge=30, le=10000),
     indicators: str = Query(default="ema,rsi,macd", description="Comma set: ema, rsi, macd"),
 ):
     """Trend + momentum indicators as chart overlay series.
@@ -483,27 +483,39 @@ async def indicator_overlay(
     wanted = {t.strip().lower() for t in (indicators or "").split(",") if t.strip()}
 
     try:
+        # For BTC, use full-history Yahoo+CoinMetrics when venue history is thin
+        # (Bitget weekly only has 13 bars, not enough for EMA). This ensures W1/D1
+        # indicators show full genesis like the candles do.
+        is_btc = symbol.replace("/", "").upper() in ("BTCUSD", "BTCUSDT", "BTC")
         connector = exchange_manager.get_exchange(SupportedExchange(exchange.lower()))
         if not connector:
             return empty
         ohlcv = await connector.get_ohlcv(symbol=symbol, timeframe=timeframe, limit=limit)
-        if not ohlcv or len(ohlcv) < 30:
+        ohlcv = ohlcv or []
+        # Don't give up early for BTC — try Yahoo before returning empty
+        if (not ohlcv or len(ohlcv) < 30) and not is_btc:
             return empty
-
-        # Venues cap their own history (Bitget serves 90 dailies), which would
+        # Venues cap their own history (Bitget serves 90 dailies / 13 weeklies), which would
         # leave the 200-day EMA — the trend line this endpoint exists for — as
-        # warm-up NaNs. On the daily, top up from the Yahoo provider, which
-        # carries ~10 years of BTC.
-        if len(ohlcv) < min(limit, 210) and (timeframe or "").upper() in {"1D", "D1"}:
+        # warm-up NaNs. On BTC D1/W1, top up from Yahoo period fetch which carries full genesis.
+        if len(ohlcv) < min(limit, 210) and (timeframe or "").upper() in {"1D", "D1", "1W", "W1"}:
             try:
-                from app.exchanges import yahoo_provider
-
-                ybars = await yahoo_provider.fetch_candles(
-                    symbol, "D1", limit=max(limit, 400)
-                )
+                ybars = None
+                if is_btc:
+                    try:
+                        from app.services.market_cycle import _fetch_yahoo_btc_full
+                        tf_key = "W1" if (timeframe or "").upper() in {"1W", "W1"} else "D1"
+                        ybars_period = await _fetch_yahoo_btc_full(tf_key, max(limit, 400))
+                        ybars = ybars_period or []
+                    except Exception:
+                        ybars = None
+                if ybars is None:
+                    from app.exchanges import yahoo_provider
+                    y_tf = "W1" if (timeframe or "").upper() in {"1W", "W1"} else "D1"
+                    ybars = await yahoo_provider.fetch_candles(symbol, y_tf, limit=max(limit, 400))
                 converted = [
                     [int(b["time"]) * 1000, b.get("open"), b.get("high"),
-                     b.get("low"), b.get("close"), b.get("volume") or 0]
+                      b.get("low"), b.get("close"), b.get("volume") or 0]
                     for b in (ybars or []) if b.get("time") and b.get("close")
                 ]
                 if len(converted) > len(ohlcv):
@@ -604,7 +616,7 @@ async def pattern_overlay(
     exchange: str,
     symbol: str,
     timeframe: str = Query(default="1d"),
-    limit: int = Query(default=400, ge=30, le=3000),
+    limit: int = Query(default=400, ge=30, le=10000),
     patterns: str = Query(
         default="morning_star,evening_star,inverted_hammer,hammer,shooting_star,engulfing",
         description="Comma set of candlestick patterns to flag",
@@ -627,6 +639,16 @@ async def pattern_overlay(
 
         rows = await candle_resolver.fetch(symbol, timeframe, limit)
         tf_up = (timeframe or "").upper()
+        # BTC weekly venue history is only 13 bars — use Yahoo period for full genesis so W1 shows all cycles
+        is_btc_w = symbol.replace("/", "").upper() in ("BTCUSD", "BTCUSDT", "BTC") and tf_up in {"1W", "W1"}
+        if is_btc_w and (not rows or len(rows) < 100):
+            try:
+                from app.services.market_cycle import _fetch_yahoo_btc_full
+                ybars = await _fetch_yahoo_btc_full("W1", limit)
+                if ybars and len(ybars) > len(rows or []):
+                    rows = [[int(b["time"]) * 1000, b["open"], b["high"], b["low"], b["close"], b["volume"] or 0] for b in ybars]
+            except Exception:
+                pass
         if not rows and tf_up in {"MN1", "1M"}:
             # Monthly is the cycle screen's timeframe; only the Yahoo provider
             # carries it, so ask there directly before giving up.
@@ -645,7 +667,7 @@ async def pattern_overlay(
         events = detect_patterns(rows, patterns=wanted or None)
         markers = [
             {
-                "time": int(ev["time"]) if int(ev["time"]) > 10**12 else int(ev["time"]),
+                "time": int(ev["time"]) // 1000 if int(ev["time"]) > 10**12 else int(ev["time"]),
                 "position": "belowBar" if ev["direction"] == "bull" else "aboveBar",
                 "color": "#22c55e" if ev["direction"] == "bull" else "#ef4444",
                 "shape": "arrowUp" if ev["direction"] == "bull" else "arrowDown",

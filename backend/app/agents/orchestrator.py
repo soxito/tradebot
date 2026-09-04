@@ -514,6 +514,16 @@ class AgentOrchestrator:
             "decision": getattr(resp, "decision", None),
             "anchor_price": getattr(resp, "anchor_price", None),
             "note": getattr(resp, "note", None),
+            # What the model IS, so every seat reasons about the forecast
+            # correctly (band = conviction, NO_TRADE = no volume, not bearish).
+            "model_context": (
+                "Kronos (arXiv:2508.02739) — decoder-only foundation model "
+                "pre-trained on 12B K-lines from 45 exchanges. Forecast is the "
+                "mean of many sampled paths; p10/p90 band = model conviction "
+                "(tight=high, wide=low); confidence = path agreement × volume × "
+                "macro; a NO_TRADE decision means volume could not be established, "
+                "NOT a bearish call."
+            ),
         }
         if signal is not None:
             block.update({
@@ -737,6 +747,70 @@ class AgentOrchestrator:
             }
         except Exception as exc:  # noqa: BLE001 — enrichment only
             logger.debug(f"[Orchestrator] cycle context skipped for {symbol}: {exc}")
+
+    @staticmethod
+    async def _add_cycle_analogs(context: Dict[str, Any], symbol: str) -> None:
+        """Previous cycles aligned vs current — % from each bottom by day_of_cycle.
+
+        Gives every seat the ghost-vs-current view the bitcoin-cycle page renders
+        (W1/D1). Advisory only; failure is silence.
+        """
+        try:
+            from app.services import market_cycle
+            if not market_cycle.cycle_applies(symbol):
+                return
+            # Use cached daily bars (same as cycle_analogs endpoint) — no extra Yahoo hit
+            bars = await market_cycle.cached_bars()
+            if not bars:
+                return
+            payload = market_cycle.cycle_analogs(
+                market_cycle.parse_anchors(market_cycle.DEFAULT_ANCHORS),
+                bars,
+            )
+            # Keep only summary for prompt (full points are 5k) — ghosts count + current day offset
+            context["cycle_analogs"] = {
+                "cycles": [c["bottom"] for c in payload.get("cycles", [])],
+                "current_bottom": (payload.get("current") or {}).get("bottom"),
+                "bull_days": payload.get("bull_days"),
+                "bear_days": payload.get("bear_days"),
+                "note": "Each cycle as % from its bottom by day_of_cycle; current vs ghosts where attention is due",
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[Orchestrator] cycle_analogs skipped for {symbol}: {exc}")
+
+    @staticmethod
+    async def _add_pattern_signal(context: Dict[str, Any], symbol: str, timeframe: str) -> None:
+        """Hammer / engulfing / morning_star etc as board evidence for signal focus.
+
+        Runs candle_patterns.detect_patterns on the same window the desk sees
+        (200 bars via market_data/candle_resolver). Counts drive signal_generator
+        to focus on that movement.
+        """
+        try:
+            from app.services import candles as candle_resolver
+            from app.signals.candle_patterns import detect_patterns
+            # Use the timeframe the room is actually analysing (H1/H4 get 4y context, but patterns on last 500)
+            rows = await candle_resolver.fetch(symbol, timeframe, limit=500)
+            if not rows or len(rows) < 5:
+                return
+            events = detect_patterns(rows, patterns=None)  # all: hammer, engulfing, etc.
+            if not events:
+                return
+            # Last 20 bars are what matters for "now"
+            recent = [e for e in events if e.get("index", 0) >= len(rows) - 20]
+            counts: Dict[str, int] = {}
+            for e in recent:
+                counts[e["name"]] = counts.get(e["name"], 0) + 1
+            context["pattern_signal"] = {
+                "timeframe": timeframe,
+                "recent_count": len(recent),
+                "counts": counts,
+                "last": recent[-1]["name"] if recent else None,
+                "last_direction": recent[-1]["direction"] if recent else None,
+                "note": "Recent hammer/engulfing/morning_star on this TF — focus signal on this movement",
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[Orchestrator] pattern_signal skipped for {symbol} {timeframe}: {exc}")
 
     @staticmethod
     async def _add_whales(context: Dict[str, Any], symbol: str) -> None:
@@ -1141,6 +1215,8 @@ class AgentOrchestrator:
 
             await AgentOrchestrator._add_forecast(context, symbol, timeframe)
             await AgentOrchestrator._add_cycle(context, symbol)
+            await AgentOrchestrator._add_cycle_analogs(context, symbol)
+            await AgentOrchestrator._add_pattern_signal(context, symbol, timeframe)
             await AgentOrchestrator._add_whales(context, symbol)
 
             # Sentiment stub (no exchange needed)
@@ -1204,6 +1280,8 @@ class AgentOrchestrator:
 
         await AgentOrchestrator._add_forecast(context, symbol, timeframe)
         await AgentOrchestrator._add_cycle(context, symbol)
+        await AgentOrchestrator._add_cycle_analogs(context, symbol)
+        await AgentOrchestrator._add_pattern_signal(context, symbol, timeframe)
         await AgentOrchestrator._add_whales(context, symbol)
 
         # Sentiment (basic — detailed sentiment comes from the pipeline context)
@@ -1271,7 +1349,7 @@ class AgentOrchestrator:
         answer; without the research the board can buy straight into an NFP
         print the research loop flagged fifteen minutes earlier.
         """
-        context["accounts"] = await AgentOrchestrator._gather_account_state(db)
+        context["accounts"] = await AgentOrchestrator._gather_account_state(db, symbol=symbol)
 
         if db is not None:
             try:
@@ -1434,8 +1512,8 @@ class AgentOrchestrator:
         )
 
     @staticmethod
-    async def _gather_account_state(db: AsyncSession) -> Dict[str, Any]:
-        """Live equity, free margin and open exposure across every venue."""
+    async def _gather_account_state(db: AsyncSession, symbol: str = "") -> Dict[str, Any]:
+        """Live equity, free margin, leverage and margin health across every venue."""
         state: Dict[str, Any] = {"mt5": [], "crypto": None, "sim": None, "policy": None}
 
         try:
@@ -1452,6 +1530,7 @@ class AgentOrchestrator:
                     if s.dry_run else "demo and live accounts take every trade together"
                 ),
                 "risk_pct": s.risk_pct,
+                "min_margin_level_pct": float(getattr(s, "min_margin_level_pct", 0) or 0) or 500.0,
                 "max_open_positions": s.max_open_positions,
                 "max_leverage": s.max_leverage,
                 "trades_today": trades_today(),
@@ -1468,19 +1547,43 @@ class AgentOrchestrator:
         try:
             from plugins.MT5TradingPlugin.backend.models import MT5Account
             rows = (await db.execute(select(MT5Account))).scalars().all()
-            state["mt5"] = [
-                {
+            _acct_list = []
+            for a in rows:
+                _eq = float(a.equity or a.balance or 0)
+                _margin = float(getattr(a, "margin", 0) or 0)
+                _free = float(getattr(a, "free_margin", 0) or 0)  # correct field name
+                _ml = float(getattr(a, "margin_level", 0) or 0)
+                # Derive margin level when the broker hasn't sent it yet.
+                if _ml <= 0 and _margin > 0:
+                    _ml = round((_eq / _margin) * 100, 1)
+                _lev = int(getattr(a, "leverage", 0) or 0)
+                # Human-readable health label so agents can reason about capacity.
+                if _ml <= 0:
+                    _health = "no open margin"
+                elif _ml < 150:
+                    _health = "CRITICAL — near stop-out, NO new trades"
+                elif _ml < 300:
+                    _health = "DANGER — well below safe floor, NO new trades"
+                elif _ml < 500:
+                    _health = "WARNING — below 500% floor, orders will be blocked"
+                elif _ml < 1000:
+                    _health = "caution — monitor closely"
+                else:
+                    _health = "healthy"
+                _acct_list.append({
                     "account_id": a.id,
                     "name": a.name,
                     "balance": a.balance,
-                    "equity": a.equity,
-                    "free_margin": getattr(a, "margin_free", None),
+                    "equity": _eq,
+                    "margin_used": _margin,
+                    "free_margin": _free,
+                    "margin_level_pct": _ml,
+                    "margin_health": _health,
                     "currency": a.currency,
-                    "leverage": a.leverage,
+                    "leverage": _lev,
                     "open_positions": getattr(a, "position_count", 0),
-                }
-                for a in rows
-            ]
+                })
+            state["mt5"] = _acct_list
         except Exception as exc:  # noqa: BLE001 - plugin-optional
             logger.debug(f"[Orchestrator] MT5 account state unavailable: {exc}")
             await safe_rollback(db)
@@ -1500,6 +1603,42 @@ class AgentOrchestrator:
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"[Orchestrator] sim account state unavailable: {exc}")
             await safe_rollback(db)
+
+        # ── Lot preview per MT5 account ───────────────────────────────────────
+        # Give risk_manager and trade_executor a concrete sizing anchor for the
+        # symbol being analysed (1% risk at the account's equity and leverage).
+        if symbol and state["mt5"]:
+            try:
+                from plugins.TelegramSignalNewsPlugin.backend.services.sniper_service import (
+                    affordable_mt5_lot,
+                )
+                from app.services import market_data as _md
+                _price = 0.0
+                try:
+                    _q = await _md.get_quote(symbol, db=db)
+                    _price = float(getattr(_q, "price", 0) or 0)
+                except Exception:
+                    pass
+                for _acct in state["mt5"]:
+                    if _price > 0 and _acct.get("equity", 0) > 0:
+                        # Use a 1% stop-distance estimate (ATR proxy) for the preview.
+                        _est_sl = _price * 0.99
+                        _lot, _note = affordable_mt5_lot(
+                            equity=_acct["equity"],
+                            free_margin=_acct.get("free_margin"),
+                            leverage=_acct.get("leverage"),
+                            risk_pct=float((state.get("policy") or {}).get("risk_pct", 1.0) or 1.0),
+                            entry=_price,
+                            stop_loss=_est_sl,
+                            symbol=symbol,
+                            floor_lot=0.01,
+                            max_risk_pct=5.0,
+                            small_account_mode=True,  # match _place_on default so preview matches execution
+                        )
+                        _acct["lot_preview_1pct_stop"] = _lot
+                        _acct["lot_preview_note"] = f"~{_lot:g} lot at 1% stop from {_price:g}" if _lot else _note
+            except Exception:  # noqa: BLE001
+                pass
 
         return state
 
@@ -1675,10 +1814,30 @@ class AgentOrchestrator:
         # Account state so sizing advice is grounded in real equity, not a guess.
         accounts = context.get("accounts") if isinstance(context, dict) else None
         if accounts and agent.role in ("risk_manager", "trade_executor", "signal_generator"):
+            # Build a concise summary before the full dump so agents parse key facts first.
+            _mt5_summaries = []
+            for _a in (accounts.get("mt5") or []):
+                _ml = _a.get("margin_level_pct", 0)
+                _lev = _a.get("leverage", 0)
+                _lot = _a.get("lot_preview_1pct_stop")
+                _health = _a.get("margin_health", "")
+                _mt5_summaries.append(
+                    f"  {_a.get('name','MT5')}: equity={_a.get('equity',0):.2f} {_a.get('currency','USD')}, "
+                    f"free_margin={_a.get('free_margin',0):.2f}, leverage=1:{_lev}, "
+                    f"margin_level={_ml:.0f}% [{_health}]"
+                    + (f", lot_preview={_lot:g}" if _lot else ", lot_preview=<below floor>")
+                )
+            _pol = accounts.get("policy") or {}
             memory_prompt += (
                 "\n### Live account state\n"
-                f"{json.dumps(accounts, default=str)[:2000]}\n"
+                + "\n".join(_mt5_summaries) + "\n"
+                f"Risk policy: {_pol.get('risk_pct',1)}% per trade, "
+                f"min_margin_level={_pol.get('min_margin_level_pct',150):.0f}%, "
+                f"max_positions={_pol.get('max_open_positions',3)}, "
+                f"trades_today={_pol.get('trades_today',0)}/{_pol.get('max_trades_per_day',10)}\n"
+                "NOTE: lot_preview uses 1% price stop as estimate; actual lot uses the real SL distance.\n"
                 "Size every recommendation against this equity and these limits.\n"
+                "DO NOT recommend a trade when margin_health is CRITICAL, DANGER, or WARNING.\n"
             )
 
         # Inject stored knowledge + Graphify code map (plugin-optional)
@@ -1703,10 +1862,9 @@ class AgentOrchestrator:
                 logger.debug(f"[Orchestrator] Vault context skipped: {_vault_exc}")
 
         # ── Agent-Reach live research (plugin-optional) ────────────────────────
-        # market_analyst/sentiment_analyst only: the other 4 roles already see
-        # this indirectly via signal_context["agent_analyses"], so injecting it
-        # again downstream would just add latency without new information.
-        if settings.AGENT_REACH_INJECT_CONTEXT and agent.role in ("market_analyst", "sentiment_analyst"):
+        # Per 2026-08-31 plan, enabled for all 7 seats so every agent can research the focused pair.
+        # Previously only market_analyst/sentiment_analyst got it; now all roles get direct web context.
+        if settings.AGENT_REACH_INJECT_CONTEXT:
             try:
                 from app.services import agent_reach_client
                 research_summary = await agent_reach_client.research_summary_for_symbol(
@@ -2053,14 +2211,14 @@ class AgentOrchestrator:
         if final_action in ("buy", "sell"):
             confidence = signal_decision.get("confidence", 0) if signal_decision else 0
             sig = Signal(
-                source=SignalSource.SYSTEM.value,
+                source=SignalSource.SYSTEM,
                 symbol=symbol,
-                action=SignalAction.BUY.value if final_action == "buy" else SignalAction.SELL.value,
+                action=SignalAction.BUY if final_action == "buy" else SignalAction.SELL,
                 price=context.get("current_price", 0),
                 timeframe=timeframe,
                 strength=confidence,
                 confidence=confidence,
-                status=SignalStatus.PENDING.value,
+                status=SignalStatus.PENDING,
                 raw_data=json.dumps({
                     "session_id": session_id,
                     "agent_decisions": [d.get("reasoning", "") for d in decisions],
@@ -2898,14 +3056,14 @@ class AgentOrchestrator:
                 # Ensure close signals always pass the 0.3 confidence threshold
                 close_confidence = max(review_decision.get("confidence", 0.5), 0.5)
                 close_sig = Signal(
-                    source=SignalSource.SYSTEM.value,
+                    source=SignalSource.SYSTEM,
                     symbol=symbol,
-                    action=close_action.value,
+                    action=close_action,
                     price=current_price,
                     timeframe="1h",
                     strength=close_confidence,
                     confidence=close_confidence,
-                    status=SignalStatus.PENDING.value,
+                    status=SignalStatus.PENDING,
                     raw_data=json.dumps({
                         "source": "position_review",
                         "session_id": session_id,
@@ -3177,12 +3335,12 @@ class AgentOrchestrator:
             if review_action == "close" and review_decision.get("urgency") in ("high", "medium"):
                 close_action = SignalAction.SELL if pos.side == "long" else SignalAction.BUY
                 db.add(Signal(
-                    source=SignalSource.SYSTEM.value, symbol=symbol,
-                    action=close_action.value, price=current_price,
+                    source=SignalSource.SYSTEM, symbol=symbol,
+                    action=close_action, price=current_price,
                     timeframe="1h",
                     strength=review_decision.get("confidence", 0.5),
                     confidence=review_decision.get("confidence", 0.5),
-                    status=SignalStatus.PENDING.value,
+                    status=SignalStatus.PENDING,
                     raw_data=json.dumps({
                         "source": "sim_position_review", "session_id": session_id,
                         "position_id": pos.id, "review_action": review_action,

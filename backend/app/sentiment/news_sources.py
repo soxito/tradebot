@@ -234,8 +234,8 @@ RSS_SOURCES: Dict[str, Dict] = {
         "max": 15,
     },
     "reuters_business": {
-        "url": "https://feeds.reuters.com/reuters/businessNews",
-        "reliability": 0.95,
+        "url": "https://feeds.bbci.co.uk/news/business/rss.xml",
+        "reliability": 0.92,
         "category": "macro",
         "max": 15,
     },
@@ -270,7 +270,7 @@ RSS_SOURCES: Dict[str, Dict] = {
         "max": 15,
     },
     "barrons": {
-        "url": "https://feeds.barrons.com/marketcurrents/xml",
+        "url": "https://feeds.a.dj.com/rss/RSSOpinion.xml",
         "reliability": 0.88,
         "category": "macro",
         "max": 10,
@@ -702,7 +702,7 @@ async def fetch_coingecko_news(
                             reliability=0.80,
                             category="crypto",
                         ))
-            elif resp.status != 403:  # 403 = plan limitation, ignore silently
+            elif resp.status not in (401, 403):  # 401/403 = plan limitation, ignore silently
                 logger.warning(f"CoinGecko gainers/losers: HTTP {resp.status}")
     except Exception as e:
         logger.warning(f"CoinGecko gainers/losers: {e}")
@@ -797,11 +797,18 @@ async def fetch_coinmarketcap_news(
 # Alternative.me Fear & Greed Index
 # ────────────────────────────────────────────────────────────
 
+# Last-known FNG result — returned when api.alternative.me is unreachable
+_fng_cache: List[NewsItem] = []
+_fng_cache_time: Optional[datetime] = None
+_FNG_CACHE_TTL = timedelta(hours=6)
+
+
 async def fetch_alternative_fng(
     session: aiohttp.ClientSession,
     max_age_hours: int = 24,
 ) -> List[NewsItem]:
     """Fetch crypto fear/greed sentiment snapshots."""
+    global _fng_cache, _fng_cache_time
     cutoff = now_sast() - timedelta(hours=max_age_hours)
 
     try:
@@ -811,7 +818,7 @@ async def fetch_alternative_fng(
         ) as resp:
             if resp.status != 200:
                 logger.warning(f"Alternative.me FNG: HTTP {resp.status}")
-                return []
+                return _fng_cache if _fng_cache else []
             data = await resp.json()
 
         items: List[NewsItem] = []
@@ -847,10 +854,19 @@ async def fetch_alternative_fng(
                 category="macro",
             ))
 
+        # Cache the fresh result so DNS outages serve stale-but-useful data
+        if items:
+            _fng_cache = items
+            _fng_cache_time = now_sast()
+
         logger.info(f"📰 alternative_fng: {len(items)} updates")
         return items
 
     except Exception as e:
+        # Return cached data if it's still within TTL
+        if _fng_cache and _fng_cache_time and (now_sast() - _fng_cache_time) < _FNG_CACHE_TTL:
+            logger.debug(f"Alternative.me FNG unavailable ({e}); using cached data")
+            return _fng_cache
         logger.warning(f"Alternative.me FNG: {e}")
         return []
 
@@ -953,11 +969,15 @@ async def fetch_marketaux_news(
 async def fetch_coincap_movers(
     session: aiohttp.ClientSession,
 ) -> List[NewsItem]:
-    """Create sentiment items from real-time CoinCap 24h movers."""
+    """Create sentiment items from Binance 24-hour movers.
+
+    Replaced defunct CoinCap v2 (api.coincap.io — NXDomain) with the Binance
+    /api/v3/ticker/24hr endpoint, which is free, requires no auth, and returns
+    the same 24-hour price-change data.
+    """
     try:
         async with session.get(
-            "https://api.coincap.io/v2/assets",
-            params={"limit": 30},
+            "https://api.binance.com/api/v3/ticker/24hr",
             timeout=aiohttp.ClientTimeout(total=12),
         ) as resp:
             if resp.status != 200:
@@ -965,33 +985,35 @@ async def fetch_coincap_movers(
                 return []
             payload = await resp.json()
 
-        assets = payload.get("data", [])
-        if not assets:
-            return []
-
-        # Highest absolute movers are strongest sentiment signals.
+        # Keep only USDT spot pairs with at least $1M 24-h volume
+        usdt = [
+            t for t in payload
+            if isinstance(t, dict)
+            and t.get("symbol", "").endswith("USDT")
+            and float(t.get("quoteVolume") or 0) >= 1_000_000
+        ]
         ranked = sorted(
-            assets,
-            key=lambda a: abs(float(a.get("changePercent24Hr") or 0.0)),
+            usdt,
+            key=lambda t: abs(float(t.get("priceChangePercent") or 0.0)),
             reverse=True,
         )[:8]
 
         now = now_sast()
         items: List[NewsItem] = []
-        for asset in ranked:
-            name = (asset.get("name") or "").strip()
-            symbol = (asset.get("symbol") or "").upper().strip()
-            if not name or not symbol:
+        for ticker in ranked:
+            raw_sym = ticker.get("symbol", "")
+            symbol = raw_sym[:-4]  # strip trailing "USDT"
+            if not symbol:
                 continue
 
             try:
-                pct = float(asset.get("changePercent24Hr") or 0.0)
+                pct = float(ticker.get("priceChangePercent") or 0.0)
             except Exception:
                 pct = 0.0
 
-            title = f"{name} ({symbol}) moved {pct:+.1f}% in 24h on CoinCap"
+            title = f"{symbol}/USDT moved {pct:+.1f}% in 24h (Binance)"
             summary = (
-                f"CoinCap real-time market pulse: {name} ({symbol}) is "
+                f"Binance market pulse: {symbol}/USDT is "
                 f"{pct:+.1f}% over the last 24h."
             )
 
@@ -999,7 +1021,7 @@ async def fetch_coincap_movers(
                 title=title,
                 summary=summary,
                 source="coincap_movers",
-                url=f"https://coincap.io/assets/{(asset.get('id') or '').lower()}",
+                url=f"https://www.binance.com/en/trade/{symbol}_USDT",
                 published_at=now,
                 symbols=[symbol, "_MARKET_"],
                 reliability=0.76,

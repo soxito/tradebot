@@ -105,6 +105,22 @@ def _mt5_ticket_from(result: Any) -> Optional[str]:
     return None
 
 
+def _mt5_symbol(symbol: str) -> str:
+    """Normalise a symbol to the MT5/CFD format Exness (and similar) uses.
+
+    Exchange-format symbols use USDT as the quote (BTCUSDT, ETH/USDT); MT5
+    brokers list the same instruments against USD (BTCUSD, ETHUSD). Stripping
+    the slash and dropping the trailing T on USDT is safe for any pair:
+    XAUUSD and EURUSD pass through unchanged because they don't end in USDT.
+    """
+    s = (symbol or "").upper().replace("/", "")
+    if s.endswith("USDT") and len(s) > 4:
+        return s[:-1]   # BTCUSDT → BTCUSD
+    if s.endswith("USDC") and len(s) > 4:
+        return s[:-4] + "USD"   # BTCUSDC → BTCUSD
+    return s
+
+
 def _round_lot(volume: float) -> float:
     """Brokers reject odd volumes — snap to 0.01 lots, floor at the minimum."""
     return max(0.01, round(volume / 0.01) * 0.01)
@@ -361,9 +377,13 @@ def venues_for(symbol: str, s: RoomSettings) -> list:
     has_mt5 = bool(s.allow_mt5 and (s.mt5_account_id or getattr(s, "mt5_demo_account_id", None)))
 
     if is_crypto:
-        if s.allow_crypto:
+        # USDT/USDC-quoted (ETHUSDT, BTC/USDT) → exchange format; Bitget lists these.
+        # USD-quoted (ETHUSD, BTCUSD) → MT5 CFD format; Bitget does NOT list these.
+        sym_norm = (symbol or "").upper().replace("/", "")
+        is_usdt_quoted = sym_norm.endswith(("USDT", "USDC"))
+        if s.allow_crypto and is_usdt_quoted:
             out.append("crypto")
-        elif has_mt5:
+        if has_mt5:
             out.append("mt5")
     else:
         if has_mt5:
@@ -631,6 +651,30 @@ async def _prepare_account(db: AsyncSession, account: Any, s: RoomSettings, symb
     open_count = getattr(account, "position_count", 0) or 0
     if open_count >= s.max_open_positions:
         raise Blocked(f"{open_count} positions already open (cap {s.max_open_positions})")
+
+    # ── Margin level guard ─────────────────────────────────────────────────
+    # margin_level = (equity / margin_used) × 100.  At 100% the account has
+    # no buffer; below ~150% most brokers are near stop-out.  We block new
+    # orders before the account reaches that danger zone.
+    try:
+        _margin_used = float(getattr(account, "margin", 0) or 0)
+        _ml = float(getattr(account, "margin_level", 0) or 0)
+        if _ml <= 0 and _margin_used > 0:
+            # Derive from components when the broker field is absent/null.
+            _eq = float(getattr(account, "equity", 0) or 0)
+            _ml = (_eq / _margin_used) * 100.0
+        # Configurable floor; default 500 % — orders only when the account has
+        # ample headroom. Set min_margin_level_pct in room settings to override.
+        _min_ml = float(getattr(s, "min_margin_level_pct", 0) or 0) or 500.0
+        if 0 < _ml < _min_ml:
+            raise Blocked(
+                f"margin level {_ml:.0f}% is below the {_min_ml:.0f}% floor — "
+                "close positions or add funds before opening new trades"
+            )
+    except Blocked:
+        raise
+    except Exception as exc:  # noqa: BLE001 — never block on a failed check
+        logger.debug(f"[execution] margin level check skipped for {getattr(account, 'login', '?')}: {exc}")
     # ── Post-mortem 2026-08-28: XAU had 4-6 concurrent longs (15+ lots each) while
     # max_open_positions=3 was per-account total. Gold and silver are 0.85 correlated —
     # treat XAU+XAG longs as one bucket: if the requested symbol is a metal and the
@@ -682,6 +726,25 @@ async def _place_on(
     )
 
     # The cycle's auto risk reduction applies per symbol before any sizing.
+
+    # Verify the symbol is listed on this specific broker/server before sizing.
+    # MetaQuotes and other forex-only demos don't carry crypto CFDs (ETHUSD, BTCUSD).
+    mt5_sym = _mt5_symbol(symbol)
+    try:
+        _sym_info = await mt5_client.get_symbol_info(
+            account.login, account.server, account.password_encrypted, mt5_sym
+        )
+        _msg = str((_sym_info or {}).get("message", "")).lower()
+        if "not found" in _msg or "symbol" in _msg and "not" in _msg:
+            return {
+                "venue": "mt5", "account_id": account.id,
+                "account": f"{account.login}@{account.server}",
+                "role": "demo" if account.id == getattr(s, "mt5_demo_account_id", None) else "live",
+                "symbol": symbol, "status": "skipped",
+                "reason": f"{mt5_sym} is not available on {account.server} — skipping this account",
+            }
+    except Exception:  # noqa: BLE001 — symbol check is best-effort; proceed if API unreachable
+        pass
     risk_pct = await effective_risk_pct(s, symbol)
 
     order: Dict[str, Any] = {
@@ -696,6 +759,7 @@ async def _place_on(
         "stop_loss": round(stop_loss, 5),
         "take_profit": round(take_profit, 5),
         "risk_pct": risk_pct,
+        "leverage": int(getattr(account, "leverage", 0) or 0) or None,
     }
 
     try:
@@ -707,6 +771,11 @@ async def _place_on(
     if equity <= 0:
         return {**order, "status": "skipped",
                 "reason": "account equity unavailable — refusing to size blind"}
+
+    # Annotate the order with the live margin level so the response and logs show it.
+    _ml_live = float(getattr(account, "margin_level", 0) or 0)
+    if _ml_live > 0:
+        order["margin_level_pct"] = round(_ml_live, 1)
 
     # ── Dollar-risk cap (post-mortem 2026-08-28): a 4M demo @ 1% risks $40k per trade,
     # which is how the $50k losses were sized. Even with the 0.45× metals dampener
@@ -759,7 +828,7 @@ async def _place_on(
         placed = await mt5_client.place_order(
             login=account.login, server=account.server,
             password=account.password_encrypted,
-            symbol=symbol, order_type=action, volume=volume, price=0,
+            symbol=_mt5_symbol(symbol), order_type=action, volume=volume, price=0,
             sl=stop_loss, tp=take_profit,
             # Tagged so the position is identifiable in MT5, separable from
             # orders placed by hand, and manageable by the room's own guard.
@@ -897,14 +966,14 @@ async def _signal_row_for_card(
         risk = abs(entry - stop_loss)
         reward = abs(take_profit - entry)
         sig = Signal(
-            source=SignalSource.SYSTEM.value,
+            source=SignalSource.SYSTEM,
             symbol=symbol,
-            action=SignalAction.BUY.value if action == "buy" else SignalAction.SELL.value,
+            action=SignalAction.BUY if action == "buy" else SignalAction.SELL,
             price=entry,
             timeframe="1h",
             strength=0.7,
             confidence=0.7,
-            status=SignalStatus.PENDING.value,
+            status=SignalStatus.PENDING,
             raw_data=json.dumps({"origin": "published_signal_card"}),
             indicators=json.dumps({
                 "sl_pct": round(risk / entry * 100, 4) if entry else 2.0,
@@ -1015,7 +1084,7 @@ async def _mark_signal_executed(db: AsyncSession, signal_id: Any) -> None:
     try:
         row = await db.get(Signal, signal_id)
         if row is not None:
-            row.status = SignalStatus.EXECUTED.value
+            row.status = SignalStatus.EXECUTED
             await db.commit()
     except Exception as exc:  # noqa: BLE001 — the trade is already placed
         logger.debug(f"[room-exec] could not close out signal {signal_id}: {exc}")

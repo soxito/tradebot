@@ -28,6 +28,8 @@ from app.api.market_cycle import router as market_cycle_router
 from app.api.whale import router as whale_router
 from app.api.tradingagents import router as tradingagents_router
 from app.api.hermes import router as hermes_router
+from app.api.x_monitor import router as x_monitor_router
+from app.api.x_scraper import router as x_scraper_router
 
 # WhatsApp Plugin - loaded via plugin system
 # Fallback import if plugin system doesn't load it
@@ -71,6 +73,8 @@ api_router.include_router(market_cycle_router)
 api_router.include_router(whale_router)
 api_router.include_router(tradingagents_router)
 api_router.include_router(hermes_router)
+api_router.include_router(x_monitor_router)
+api_router.include_router(x_scraper_router)
 
 if HAS_WHATSAPP:
     api_router.include_router(whatsapp_router)

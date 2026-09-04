@@ -90,9 +90,19 @@ KRONOS_PLUGIN_DIR = (ROOT / "plugins" / "KronosForecastPlugin").resolve()
 KRONOS_SCRIPTS_DIR = KRONOS_PLUGIN_DIR / "scripts"
 KRONOS_SETUP_SH = KRONOS_SCRIPTS_DIR / "setup_kronos.sh"
 KRONOS_SETUP_PS1 = KRONOS_SCRIPTS_DIR / "setup_kronos.ps1"
+KRONOS_FINETUNE_SH = KRONOS_SCRIPTS_DIR / "setup_kronos_finetune.sh"
+KRONOS_FINETUNE_PS1 = KRONOS_SCRIPTS_DIR / "setup_kronos_finetune.ps1"
 KRONOS_VENDOR_MODEL = KRONOS_PLUGIN_DIR / "backend" / "vendor" / "model"
+# Idempotency marker for the fine-tune pipeline (vendored from upstream finetune_csv/).
+KRONOS_VENDOR_FINETUNE = KRONOS_PLUGIN_DIR / "backend" / "vendor" / "finetune_csv" / "train_sequential.py"
+# Records the upstream commit the vendored model/ was copied from, so every run
+# can cheaply check whether shiyu-coder/Kronos moved on and re-vendor if so.
+KRONOS_VENDOR_COMMIT = KRONOS_PLUGIN_DIR / "backend" / "vendor" / ".kronos_commit"
+KRONOS_UPSTREAM_REPO = "https://github.com/shiyu-coder/Kronos"
 # Opt-out with TRADEBOT_SKIP_KRONOS_SETUP=1 (keeps the heuristic fallback).
 KRONOS_SETUP_ENABLED = os.environ.get("TRADEBOT_SKIP_KRONOS_SETUP", "").strip().lower() not in ("1", "true", "yes", "on")
+# Opt-out of the per-run upstream update check with TRADEBOT_SKIP_KRONOS_UPDATE=1.
+KRONOS_UPDATE_ENABLED = os.environ.get("TRADEBOT_SKIP_KRONOS_UPDATE", "").strip().lower() not in ("1", "true", "yes", "on")
 
 # ── Vibe-Trading plugin setup ─────────────────────────────────────────────────
 # HKUDS/Vibe-Trading — personal trading agent with backtesting, alpha zoo,
@@ -1402,19 +1412,17 @@ def _headroom_env_pairs() -> List[Tuple[str, str]]:
     openai_target = os.environ.get("OPENAI_TARGET_API_URL", "https://api.openai.com/v1")
     anthropic_target = os.environ.get("ANTHROPIC_TARGET_API_URL", "https://api.anthropic.com")
     
+    # Headroom v0.32+ env surface. The old per-message toggles
+    # (HEADROOM_COMPRESS_SYSTEM_MESSAGES / _COMPRESS_USER_MESSAGES /
+    # _FORCE_KOMPRESS / _MIN_TOKENS / _PROTECT_RECENT / _PROTECT_ANALYSIS_CONTEXT /
+    # _INTERCEPT_TOOL_RESULTS / _COMPRESSION_STABLE_AFTER_TURN /
+    # _STALE_READ_COMPRESS_AFTER_TURNS) were removed upstream. The coding
+    # savings profile now compresses user + tool messages by default.
     return [
         ("OPENAI_TARGET_API_URL", openai_target),
         ("ANTHROPIC_TARGET_API_URL", anthropic_target),
-        ("HEADROOM_COMPRESS_SYSTEM_MESSAGES", "1"),
-        ("HEADROOM_COMPRESS_USER_MESSAGES", "1"),
-        ("HEADROOM_MIN_TOKENS", "1"),
         ("HEADROOM_TARGET_RATIO", "0.4"),
-        ("HEADROOM_FORCE_KOMPRESS", "1"),
-        ("HEADROOM_COMPRESSION_STABLE_AFTER_TURN", "0"),
-        ("HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS", "0"),
-        ("HEADROOM_PROTECT_RECENT", "0"),
-        ("HEADROOM_PROTECT_ANALYSIS_CONTEXT", "0"),
-        ("HEADROOM_INTERCEPT_TOOL_RESULTS", "1"),
+        ("HEADROOM_PROTECT_TOOL_RESULTS", "0"),
         ("HEADROOM_DATA_DIR", str(HEADROOM_DATA_DIR)),
         # Only set ANTHROPIC_API_KEY if a real key is available
         # (Removed dummy HEADROOM_PROXY_KEY that breaks auth)
@@ -1576,9 +1584,11 @@ def start_headroom() -> bool:
     if not config.get("compress_user_messages"):
         fail("Headroom started but compress_user_messages is disabled")
         return False
+    # Headroom v0.32+ no longer exposes a knob to force system-prompt
+    # compression; the coding profile intentionally leaves it off to protect
+    # instructions. Treat it as best-effort rather than a hard requirement.
     if not config.get("compress_system_messages"):
-        fail("Headroom started but compress_system_messages is disabled")
-        return False
+        warn("Headroom system-message compression is off (v0.32 coding-profile default)")
 
     ok("Headroom healthy with compression enabled")
     return True
@@ -2203,6 +2213,57 @@ def preflight_check(mode: str) -> bool:
         else:
             _check("Python packages (fastapi, uvicorn, sqlalchemy …)", True,
                    "all core packages present")
+
+    # ── scrapegraphai (optional — auto-install for X Monitor AI Scraper tab) ──
+    # Check using PY_BIN (backend venv Python), not start.py's own Python.
+    if venv_exists:
+        _sg_check = subprocess.run(
+            [str(PY_BIN), "-c", "import importlib.metadata; print(importlib.metadata.version('scrapegraphai'))"],
+            capture_output=True, text=True, timeout=10
+        )
+        _sg_installed = _sg_check.returncode == 0
+        _sg_ver = _sg_check.stdout.strip() if _sg_installed else ""
+        if _sg_installed:
+            _check(f"scrapegraphai v{_sg_ver}", True, "X AI Scraper ready")
+        else:
+            info("scrapegraphai not found — installing for X Monitor AI Scraper tab …")
+            # Try up to 3 strategies: normal, --pre (for Python 3.14+), pinned range
+            _sg_ok = False
+            _sg_err = ""
+            for _sg_cmd in [
+                [str(PY_BIN), "-m", "pip", "install", "--quiet", "--upgrade", "scrapegraphai"],
+                [str(PY_BIN), "-m", "pip", "install", "--quiet", "--upgrade", "--pre", "scrapegraphai"],
+                [str(PY_BIN), "-m", "pip", "install", "--quiet", "--upgrade", "scrapegraphai>=1.0,<2.0"],
+            ]:
+                _sg_ok, _sg_err = _spinner_run(_sg_cmd, " ".join(_sg_cmd[-2:]), timeout=360)
+                if _sg_ok:
+                    break
+            if _sg_ok:
+                # playwright browser — background, non-fatal
+                _spinner_run(
+                    [str(PY_BIN), "-m", "pip", "install", "--quiet", "playwright"],
+                    "pip install playwright",
+                    timeout=120,
+                )
+                try:
+                    subprocess.Popen(
+                        [str(PY_BIN), "-m", "playwright", "install", "chromium"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                except Exception:
+                    pass
+                _sg_check2 = subprocess.run(
+                    [str(PY_BIN), "-c", "import importlib.metadata; print(importlib.metadata.version('scrapegraphai'))"],
+                    capture_output=True, text=True, timeout=10
+                )
+                if _sg_check2.returncode == 0:
+                    _check(f"scrapegraphai v{_sg_check2.stdout.strip()}", True, "installed")
+                else:
+                    _check("scrapegraphai", True, "installed (version unconfirmed)")
+            else:
+                _check("scrapegraphai", False,
+                       "all install strategies failed — UI Install button still available",
+                       _sg_err[:120])
 
     # ── npm / Node modules ────────────────────────────────────────────────────
     sep()
@@ -3420,6 +3481,17 @@ def setup_tradingagents_sidecar() -> bool:
     pinned requirements. The clone under integrations/ keeps the upstream
     source available for reading; runtime uses the PyPI release.
     """
+    # Skip the heavy langchain/langgraph/pandas venv on low-power machines. The
+    # backend also refuses to auto-spawn the sidecar below `medium` tier
+    # (config.apply_resource_tier), so building it there would just burn disk and
+    # install time for a process that never starts. Opt in explicitly with
+    # TRADINGAGENTS_SERVICE_AUTOSTART=true.
+    _ta_optin = os.environ.get("TRADINGAGENTS_SERVICE_AUTOSTART", "").strip().lower() in ("1", "true", "yes")
+    if not _ta_optin and str(get_resources().get("ui_tier")) == "low":
+        info("TradingAgents sidecar skipped on low-power tier "
+             "(set TRADINGAGENTS_SERVICE_AUTOSTART=true to force)")
+        return False
+
     if TA_VENV_PY.exists():
         return True
 
@@ -3599,6 +3671,42 @@ def ensure_npm_deps() -> bool:
 
 
 # ── Backend ───────────────────────────────────────────────────────────────────
+def _kronos_remote_commit() -> Optional[str]:
+    """Latest upstream commit hash of shiyu-coder/Kronos, or None if unreachable.
+
+    Best-effort network probe: `git ls-remote` with a short timeout so a slow or
+    offline network never delays startup. Returns the 40-char HEAD sha.
+    """
+    git = shutil.which("git")
+    if not git:
+        return None
+    try:
+        r = subprocess.run(
+            [git, "ls-remote", KRONOS_UPSTREAM_REPO, "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    sha = r.stdout.split()[0].strip()
+    return sha if len(sha) >= 7 else None
+
+
+def _kronos_local_commit() -> Optional[str]:
+    try:
+        return KRONOS_VENDOR_COMMIT.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def _kronos_write_commit(sha: str) -> None:
+    try:
+        KRONOS_VENDOR_COMMIT.write_text(sha.strip())
+    except OSError:
+        pass
+
+
 def ensure_kronos_model() -> bool:
     """Run the Kronos plugin's model setup once (cross-platform: macOS/Linux + Windows).
 
@@ -3606,6 +3714,10 @@ def ensure_kronos_model() -> bool:
     this only does real work on the first run. Best-effort: the plugin falls
     back to a heuristic forecast when the model is absent, so a failure here
     never blocks startup. Opt out with TRADEBOT_SKIP_KRONOS_SETUP=1.
+
+    On every run (unless TRADEBOT_SKIP_KRONOS_UPDATE=1) we also check whether the
+    upstream repo moved on and re-vendor the model/ package if so, so local
+    Kronos code never silently drifts behind shiyu-coder/Kronos.
 
     Windows runs the PowerShell port (setup_kronos.ps1); POSIX runs the bash
     script (setup_kronos.sh). The self-test is skipped (--no-test / -NoTest) to
@@ -3615,9 +3727,26 @@ def ensure_kronos_model() -> bool:
         warn("Kronos setup skipped (TRADEBOT_SKIP_KRONOS_SETUP set) — heuristic fallback stays active")
         return True
 
-    # Already vendored → nothing to do (cheap check every run).
+    # Already vendored → still verify it's current against upstream, then skip.
     if KRONOS_VENDOR_MODEL.exists() and any(KRONOS_VENDOR_MODEL.iterdir()):
-        ok("Kronos model already set up (vendored) — skipping")
+        if KRONOS_UPDATE_ENABLED and shutil.which("git"):
+            remote = _kronos_remote_commit()
+            local = _kronos_local_commit()
+            if remote and local and remote != local:
+                info(f"Kronos upstream changed ({local[:7]} → {remote[:7]}) — re-vendoring model/ …")
+                if _run_kronos_setup():
+                    _kronos_write_commit(remote)
+                    ok("Kronos model updated to latest upstream")
+                else:
+                    warn("Kronos re-vendor did not complete — keeping the current model")
+            elif remote and not local:
+                # Vendored before this check existed: record the current head.
+                _kronos_write_commit(remote)
+                ok("Kronos model already set up (vendored) — recorded upstream commit")
+            else:
+                ok("Kronos model already set up (vendored, up to date) — skipping")
+        else:
+            ok("Kronos model already set up (vendored) — skipping")
         return True
 
     if not KRONOS_SCRIPTS_DIR.exists():
@@ -3632,30 +3761,99 @@ def ensure_kronos_model() -> bool:
 
     info("Setting up Kronos ML forecaster (one-time: installs torch + vendors model) …")
 
+    if _run_kronos_setup():
+        ok("Kronos model installed — real ML forecasts enabled after backend start")
+        if KRONOS_UPDATE_ENABLED:
+            remote = _kronos_remote_commit()
+            if remote:
+                _kronos_write_commit(remote)
+        return True
+
+    warn("Kronos setup did not complete. "
+         "Heuristic fallback stays active; you can re-run the setup script later.")
+    return True
+
+
+def _run_kronos_setup() -> bool:
+    """Run the platform Kronos setup script (vendors model/ + installs torch).
+
+    Returns True only when the script succeeded AND the model/ package is present.
+    Assumes callers already verified git + the scripts dir exist.
+    """
     if IS_WINDOWS:
         if not KRONOS_SETUP_PS1.exists():
             warn("setup_kronos.ps1 not found — skipping Kronos setup")
-            return True
+            return False
         pwsh = shutil.which("pwsh") or shutil.which("powershell")
         if not pwsh:
             warn("PowerShell not found — run setup_kronos.ps1 manually to enable Kronos")
-            return True
+            return False
         cmd = [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass",
                "-File", str(KRONOS_SETUP_PS1), "-NoTest"]
     else:
         if not KRONOS_SETUP_SH.exists():
             warn("setup_kronos.sh not found — skipping Kronos setup")
-            return True
+            return False
         bash = shutil.which("bash") or "/bin/bash"
         cmd = [bash, str(KRONOS_SETUP_SH), "--no-test"]
 
     ok_run, err = _spinner_run(cmd, "Kronos model setup", cwd=str(ROOT), timeout=1800)
-    if ok_run and KRONOS_VENDOR_MODEL.exists():
-        ok("Kronos model installed — real ML forecasts enabled after backend start")
+    if ok_run and KRONOS_VENDOR_MODEL.exists() and any(KRONOS_VENDOR_MODEL.iterdir()):
+        return True
+    if err:
+        warn(f"Kronos setup output: {err[:160]}")
+    return False
+
+
+def ensure_kronos_finetune() -> bool:
+    """Vendor the Kronos fine-tuning pipeline once (cross-platform: POSIX + Windows).
+
+    Runs setup_kronos_finetune.sh (POSIX) / .ps1 (Windows), which vendors the
+    upstream finetune_csv/ trainers so `/finetune` can train Kronos on your own
+    OHLCV data. Idempotent: skips when finetune_csv is already vendored.
+    Best-effort: a failure here never blocks startup. Shares the same opt-out
+    (TRADEBOT_SKIP_KRONOS_SETUP=1) as the base model setup.
+    """
+    if not KRONOS_SETUP_ENABLED:
         return True
 
-    warn(f"Kronos setup did not complete ({(err or 'see output above')[:160]}). "
-         "Heuristic fallback stays active; you can re-run the setup script later.")
+    # Already vendored → nothing to do.
+    if KRONOS_VENDOR_FINETUNE.exists():
+        ok("Kronos fine-tune pipeline already set up (vendored) — skipping")
+        return True
+
+    if not KRONOS_SCRIPTS_DIR.exists():
+        return True
+
+    if not shutil.which("git"):
+        warn("Git not found — cannot vendor Kronos fine-tune pipeline. "
+             "Run the setup script manually to enable /finetune.")
+        return True
+
+    if IS_WINDOWS:
+        if not KRONOS_FINETUNE_PS1.exists():
+            warn("setup_kronos_finetune.ps1 not found — skipping Kronos fine-tune setup")
+            return True
+        pwsh = shutil.which("pwsh") or shutil.which("powershell")
+        if not pwsh:
+            warn("PowerShell not found — run setup_kronos_finetune.ps1 manually to enable /finetune")
+            return True
+        cmd = [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(KRONOS_FINETUNE_PS1)]
+    else:
+        if not KRONOS_FINETUNE_SH.exists():
+            warn("setup_kronos_finetune.sh not found — skipping Kronos fine-tune setup")
+            return True
+        bash = shutil.which("bash") or "/bin/bash"
+        cmd = [bash, str(KRONOS_FINETUNE_SH)]
+
+    info("Setting up Kronos fine-tuning pipeline (one-time: vendors finetune_csv/) …")
+    ok_run, err = _spinner_run(cmd, "Kronos fine-tune setup", cwd=str(ROOT), timeout=1800)
+    if ok_run and KRONOS_VENDOR_FINETUNE.exists():
+        ok("Kronos fine-tune pipeline installed — /finetune enabled")
+        return True
+    if err:
+        warn(f"Kronos fine-tune setup output: {err[:160]}")
+    warn("Kronos fine-tune setup did not complete — /finetune stays unavailable until re-run.")
     return True
 
 
@@ -5347,6 +5545,43 @@ def print_sox_banner(mode: str, pg_port: int, redis_port: int) -> None:
         print(f"  {C.GREEN}✓{C.RESET}  {C.BOLD}Hermes has started{C.RESET} — gateway on {C.CYAN}http://localhost:{HERMES_PORT}/health{C.RESET}  ·  page {C.CYAN}http://localhost:{FRONTEND_PORT}/hermes{C.RESET}  ·  SOUL {C.CYAN}SOUL.md{C.RESET} (JARVIS/Paul/SOX merged)")
     else:
         print(f"  {C.YELLOW}!{C.RESET}  Hermes gateway not running on :{HERMES_PORT} — backend will use local FTS5 fallback (check {ROOT}/hermes.log)")
+
+    # ── X (Twitter) whale monitor status ──────────────────────────────────────
+    twitter_token = _DOTENV.get("TWITTER_BEARER_TOKEN", "").strip()
+    if twitter_token:
+        # Quick probe using app-only Bearer auth (same type the monitor uses for timelines)
+        import urllib.request, json as _json
+        try:
+            req = urllib.request.Request(
+                "https://api.twitter.com/2/users/by/username/twitter",
+                headers={"Authorization": f"Bearer {twitter_token}"},
+            )
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                _json.loads(resp.read())
+            print(f"  {C.GREEN}✓{C.RESET}  X Monitor token verified (app-only auth)  ·  page {C.CYAN}http://localhost:{FRONTEND_PORT}/x-monitor{C.RESET}")
+        except Exception as _xe:
+            _xe_str = str(_xe)
+            if "401" in _xe_str:
+                print(f"  {C.YELLOW}!{C.RESET}  X Monitor: Bearer token rejected (401) — check TWITTER_BEARER_TOKEN in .env")
+            elif "403" in _xe_str:
+                print(f"  {C.YELLOW}!{C.RESET}  X Monitor: Token set but no Basic-tier access (403) — upgrade your Twitter Developer App plan")
+            else:
+                print(f"  {C.YELLOW}!{C.RESET}  X Monitor: Token set but could not verify ({_xe_str[:60]}) — monitor will still try at runtime")
+    else:
+        print(f"  {C.YELLOW}!{C.RESET}  X Monitor: TWITTER_BEARER_TOKEN not set — X whale monitoring disabled  ·  see {C.CYAN}http://localhost:{FRONTEND_PORT}/x-monitor{C.RESET}")
+
+    # ── X AI Scraper status (ScrapeGraphAI) ───────────────────────────────────
+    _sg_status = subprocess.run(
+        [str(PY_BIN), "-c",
+         "import importlib.metadata; print(importlib.metadata.version('scrapegraphai'))"],
+        capture_output=True, text=True, timeout=8
+    )
+    if _sg_status.returncode == 0:
+        _sg_v = _sg_status.stdout.strip()
+        print(f"  {C.GREEN}✓{C.RESET}  X AI Scraper: scrapegraphai v{_sg_v} ready  ·  AI Scraper tab {C.CYAN}http://localhost:{FRONTEND_PORT}/x-monitor{C.RESET}")
+    else:
+        print(f"  {C.YELLOW}!{C.RESET}  X AI Scraper: scrapegraphai not installed — use the Install button on the AI Scraper tab")
+
     print(f"\n  {DIM}Logs:{RS} {ROOT}/backend.log  |  {ROOT}/frontend.log  |  {ROOT}/hermes.log\n")
 
 
@@ -5522,6 +5757,8 @@ def main() -> None:
     # Kronos ML forecaster — one-time model setup (macOS/Linux + Windows).
     # Best-effort: never blocks startup (heuristic fallback covers failures).
     ensure_kronos_model()
+    # Kronos fine-tuning pipeline — one-time vendoring of finetune_csv/ trainers.
+    ensure_kronos_finetune()
 
     # Vibe-Trading AI — install vibe-trading-ai into backend venv (one-time).
     # Sidecar auto-starts lazily on first API request to /plugins/vibe-trading/*.

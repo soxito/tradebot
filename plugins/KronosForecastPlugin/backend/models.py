@@ -52,3 +52,45 @@ class KronosForecast(KronosBase):
 
     scored = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+
+class KronosFinetuneJob(KronosBase):
+    """A fine-tuning run: export live OHLCV → CSV → train tokenizer + predictor.
+
+    Standalone table; no cross-plugin foreign keys. The subprocess trainer
+    writes progress to ``log_path`` and its checkpoints under ``output_dir``.
+    """
+
+    __tablename__ = "kronos_finetune_jobs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    exchange = Column(String(32), nullable=False)
+    symbol = Column(String(64), nullable=False, index=True)
+    timeframe = Column(String(8), nullable=False)
+
+    # pending | exporting | running | completed | failed | cancelled
+    status = Column(String(16), nullable=False, default="pending", index=True)
+
+    # Training parameters
+    lookback = Column(Integer, nullable=False, default=512)
+    pred_len = Column(Integer, nullable=False, default=48)
+    tokenizer_epochs = Column(Integer, nullable=False, default=30)
+    predictor_epochs = Column(Integer, nullable=False, default=20)
+    batch_size = Column(Integer, nullable=False, default=32)
+    base_model = Column(String(128), nullable=True)      # pretrained start point
+
+    # Paths + process
+    data_path = Column(String(512), nullable=True)
+    config_path = Column(String(512), nullable=True)
+    log_path = Column(String(512), nullable=True)
+    output_dir = Column(String(512), nullable=True)      # finetuned checkpoints
+    pid = Column(Integer, nullable=True)
+
+    rows_exported = Column(Integer, nullable=True)
+    error = Column(String(1024), nullable=True)
+
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+

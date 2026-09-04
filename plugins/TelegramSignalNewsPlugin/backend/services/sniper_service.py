@@ -564,14 +564,14 @@ async def _execute_live(
     side = "buy" if direction.lower() == "long" else "sell"
     try:
         sig = Signal(
-            source=SignalSource.SYSTEM.value,
+            source=SignalSource.SYSTEM,
             symbol=symbol,
-            action=SignalAction.BUY.value if side == "buy" else SignalAction.SELL.value,
+            action=SignalAction.BUY if side == "buy" else SignalAction.SELL,
             price=entry or 0,
             timeframe="1h",
             strength=0.8,
             confidence=0.8,
-            status=SignalStatus.PENDING.value,
+            status=SignalStatus.PENDING,
             raw_data=_json.dumps({"source": "telegram_sniper", "direction": direction}, default=str),
             indicators=_json.dumps(
                 {"stop_loss": stop_loss, "take_profit": take_profit, "leverage": leverage}, default=str
@@ -803,6 +803,14 @@ async def _execute_mt5(
             symbol=mt5_symbol, order_type=side, volume=lot_size, price=0,
             sl=stop_loss, tp=take_profit, comment=comment,
         )
+        # SYMBOL_NOT_FOUND means the instrument is not listed on this broker
+        # (e.g. BTCUSD on a forex-only MetaQuotes demo). Skip cleanly.
+        if isinstance(result, dict) and result.get("code") == "SYMBOL_NOT_FOUND":
+            return {
+                "success": False, "skipped": True,
+                "error": result.get("message", f"{mt5_symbol} not listed on this broker"),
+                "account_id": acct.id, "account_name": acct.name,
+            }
         ticket = _mt5_ticket(result)
         if ticket is None:
             # No ticket means no position. Treating this as a fill created

@@ -145,6 +145,8 @@ interface Tradability {
   exchange: string;
   symbol: string;
   tradable: boolean;
+  tradable_via_mt5?: boolean;
+  venue?: string;
   margin_coin: string;
   available_margin: number;
   max_leverage: number | null;
@@ -154,6 +156,44 @@ interface Tradability {
   max_open_margin: number;
   max_open_notional: number;
   note?: string | null;
+}
+
+interface MT5AccountInfo {
+  id: number;
+  name: string;
+  server: string;
+  equity: number;
+  balance: number;
+  free_margin: number;
+  leverage: number;
+  currency: string;
+  online?: boolean;
+}
+
+interface MT5PlacedResult {
+  account: string;
+  account_id: number;
+  lot: number;
+  size_note: string;
+  order_id?: string | number;
+  equity: number;
+  currency: string;
+  risk_pct: number;
+  dry_run?: boolean;
+}
+
+interface MT5ExecResponse {
+  ok: boolean;
+  symbol: string;
+  side: string;
+  entry: number;
+  stop_loss: number;
+  take_profit?: number | null;
+  risk_pct: number;
+  placed: MT5PlacedResult[];
+  errors: { account: string; account_id: number; reason: string }[];
+  dry_run?: boolean;
+  error?: string;
 }
 
 const fmtUsd = (v?: number | null): string => {
@@ -422,6 +462,12 @@ export default function KronosForecastPage() {
   const [execId, setExecId] = useState<string | null>(null);
   const [execResults, setExecResults] = useState<Record<string, { ok: boolean; msg: string }>>({});
 
+  // ── MT5 direct execution ───────────────────────────────────────────────────
+  const [mt5Accounts, setMT5Accounts] = useState<MT5AccountInfo[] | null>(null);
+  const [mt5ConfirmId, setMT5ConfirmId] = useState<string | null>(null);
+  const [mt5ExecId, setMT5ExecId] = useState<string | null>(null);
+  const [mt5ExecResults, setMT5ExecResults] = useState<Record<string, { ok: boolean; msg: string }>>({});
+
   // Live exchange context for order sizing (available margin, max open, etc.)
   const [tradability, setTradability] = useState<Tradability | null>(null);
   const [tradabilityLoading, setTradabilityLoading] = useState(false);
@@ -483,8 +529,19 @@ export default function KronosForecastPage() {
     }
   };
 
+  // Linked live MT5 accounts for the MT5 execution panel.
+  const fetchMT5Accounts = async () => {
+    try {
+      const r = await apiClient.kronos.mt5Accounts();
+      setMT5Accounts(r.data?.accounts ?? []);
+    } catch {
+      setMT5Accounts([]);
+    }
+  };
+
   useEffect(() => {
     fetchTradability();
+    fetchMT5Accounts();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol, exchange]);
 
@@ -543,6 +600,24 @@ export default function KronosForecastPage() {
           ...p,
           [s.id]: { ok: true, msg: `Paper ${s.side.toUpperCase()} · $${effMargin.toFixed(2)} margin (${sizeStr} @ ${s.leverage}x)` },
         }));
+      } else if (tradability?.venue === 'mt5' || tradability?.tradable_via_mt5) {
+        // Route through the room engine so both MT5 and exchange execute when both are configured.
+        const r = await apiClient.kronos.execute({
+          symbol,
+          side: s.side === 'long' ? 'buy' : 'sell',
+          entry,
+          stop_loss: s.stop_loss,
+          take_profit: s.take_profit_1,
+          timeframe,
+        });
+        const ok = r.data?.ok ?? false;
+        const venues = (r.data?.placed ?? []).map((o: any) => `${o.venue}/${o.role ?? ''}`.replace(/\/$/, '')).join(', ');
+        setExecResults((p) => ({
+          ...p,
+          [s.id]: ok
+            ? { ok: true, msg: `MT5 ${s.side.toUpperCase()} sent → ${venues || 'room engine'}` }
+            : { ok: false, msg: r.data?.errors?.[0]?.reason ?? r.data?.reason ?? 'Execution failed' },
+        }));
       } else {
         await apiClient.createBitgetFuturesOrder({
           symbol: symbol.replace('/', ''),
@@ -573,6 +648,48 @@ export default function KronosForecastPage() {
       setExecResults((p) => ({ ...p, [s.id]: { ok: false, msg } }));
     } finally {
       setExecId(null);
+    }
+  };
+
+  // Execute a sniper entry directly on MT5 with room risk % lot sizing.
+  const executeOnMT5 = async (s: SniperSignal) => {
+    if (mt5ConfirmId !== s.id) {
+      setMT5ConfirmId(s.id);
+      return;
+    }
+    setMT5ConfirmId(null);
+    setMT5ExecId(s.id);
+    setMT5ExecResults((prev) => { const n = { ...prev }; delete n[s.id]; return n; });
+    try {
+      const entry = s.entry > 0 ? s.entry : (sniper?.anchor_price || 0);
+      if (entry <= 0) throw new Error('No valid entry price');
+      const r = await apiClient.kronos.executeMT5({
+        symbol,
+        side: s.side === 'long' ? 'buy' : 'sell',
+        entry,
+        stop_loss: s.stop_loss,
+        take_profit: s.take_profit_1,
+        timeframe,
+      });
+      const data = r.data as MT5ExecResponse;
+      if (data.ok) {
+        const summary = data.placed
+          .map((p) => `${p.account}: ${p.lot}L · #${p.order_id ?? '—'} (${p.size_note})`)
+          .join(' | ');
+        setMT5ExecResults((p) => ({ ...p, [s.id]: { ok: true, msg: `MT5 ${s.side.toUpperCase()} → ${summary}` } }));
+        fetchMT5Accounts();
+      } else {
+        const errMsg = data.error || data.errors?.[0]?.reason || 'MT5 execution failed';
+        setMT5ExecResults((p) => ({ ...p, [s.id]: { ok: false, msg: errMsg } }));
+      }
+    } catch (e: any) {
+      const detail = e?.response?.data?.detail;
+      const msg = typeof detail === 'string' ? detail
+        : Array.isArray(detail) ? detail.map((d: any) => d.msg || JSON.stringify(d)).join('; ')
+        : (detail?.msg || e?.message || 'MT5 error');
+      setMT5ExecResults((p) => ({ ...p, [s.id]: { ok: false, msg } }));
+    } finally {
+      setMT5ExecId(null);
     }
   };
 
@@ -894,6 +1011,11 @@ export default function KronosForecastPage() {
               tradability={tradability}
               tradabilityLoading={tradabilityLoading}
               onRefreshTradability={fetchTradability}
+              mt5Accounts={mt5Accounts}
+              mt5ConfirmId={mt5ConfirmId}
+              mt5ExecId={mt5ExecId}
+              mt5ExecResults={mt5ExecResults}
+              onMT5Execute={executeOnMT5}
             />
           </div>
 
@@ -1111,6 +1233,9 @@ export default function KronosForecastPage() {
             </div>
           </div>
         </div>
+
+        {/* Fine-tune Kronos on your own data (tokenizer → predictor) */}
+        <FinetunePanel symbol={symbol} exchange={exchange} timeframe={timeframe} />
       </div>
     </>
   );
@@ -1161,6 +1286,12 @@ interface SniperPanelProps {
   tradability: Tradability | null;
   tradabilityLoading: boolean;
   onRefreshTradability: () => void;
+  // MT5 direct execution
+  mt5Accounts: MT5AccountInfo[] | null;
+  mt5ConfirmId: string | null;
+  mt5ExecId: string | null;
+  mt5ExecResults: Record<string, { ok: boolean; msg: string }>;
+  onMT5Execute: (s: SniperSignal) => void;
 }
 
 function SniperPanel({
@@ -1169,10 +1300,13 @@ function SniperPanel({
   marginMode, setMarginMode,
   confirmId, execId, execResults, onExecute, onRefresh,
   tradability, tradabilityLoading, onRefreshTradability,
+  mt5Accounts, mt5ConfirmId, mt5ExecId, mt5ExecResults, onMT5Execute,
 }: SniperPanelProps) {
   const signals = sniper?.signals ?? [];
   const overMargin = !paperMode && !!tradability?.tradable
     && tradability.available_margin > 0 && marginUsd > tradability.available_margin;
+  const hasMT5 = mt5Accounts !== null && mt5Accounts.length > 0;
+  const totalMT5Equity = mt5Accounts?.reduce((s, a) => s + (a.equity || a.balance), 0) ?? 0;
 
   return (
     <div className="bg-gray-900/60 border border-gray-700/50 rounded-xl p-4">
@@ -1274,6 +1408,41 @@ function SniperPanel({
         <div className="flex items-center gap-2 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2 text-xs text-red-300 mb-3">
           <ShieldAlert className="w-4 h-4 shrink-0" />
           Live mode places real Bitget futures orders with SL/TP attached. Click once to arm, again to confirm.
+        </div>
+      )}
+
+      {/* MT5 linked accounts summary (always visible when accounts exist) */}
+      {hasMT5 && (
+        <div className="flex flex-wrap items-center gap-2 mb-3 text-[11px] bg-blue-500/[0.04] border border-blue-700/30 rounded-lg px-3 py-2">
+          <Crosshair className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+          <span className="text-blue-300 font-medium">MT5:</span>
+          {mt5Accounts!.map((a) => {
+            const bal = a.equity || a.balance;
+            const offline = a.online === false;
+            const noFunds = !offline && bal === 0;
+            return (
+              <span
+                key={a.id}
+                title={
+                  offline ? `${a.name} — offline / not reachable`
+                  : noFunds ? `${a.name} — connected but balance is 0 (check ${a.server})`
+                  : `${a.name} · ${a.server}`
+                }
+                className={`rounded px-1.5 py-0.5 border tabular-nums ${
+                  offline ? 'bg-gray-700/40 border-gray-600/40 text-gray-500 line-through'
+                  : noFunds ? 'bg-amber-500/10 border-amber-700/30 text-amber-300'
+                  : 'bg-blue-500/15 border-blue-700/30 text-blue-200'
+                }`}
+              >
+                <span className={`mr-1 ${offline ? 'text-gray-600' : noFunds ? 'text-amber-400' : 'text-green-400'}`}>●</span>
+                {a.name}
+                {!offline && <>{': '}<span className="text-white">{a.currency}&nbsp;{bal.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span></>}
+                {offline && <span className="ml-1 text-[9px] text-gray-600">offline</span>}
+                {noFunds && <span className="ml-1 text-[9px] text-amber-500">no funds</span>}
+              </span>
+            );
+          })}
+          <span className="text-blue-400/70 ml-auto">Lot sized by room risk %&nbsp;·&nbsp;click once to arm</span>
         </div>
       )}
 
@@ -1476,6 +1645,114 @@ function SniperPanel({
                     Execution available for USDT crypto pairs — chart-only for {symbol}
                   </div>
                 )}
+
+                {/* ── MT5 direct execution ────────────────────────────── */}
+                {(() => {
+                  const mt5Armed = mt5ConfirmId === s.id;
+                  const mt5Busy = mt5ExecId === s.id;
+                  const mt5Result = mt5ExecResults[s.id];
+                  return (
+                    <div className="mt-2 space-y-1.5">
+                      {/* Divider */}
+                      <div className="flex items-center gap-2">
+                        <div className="flex-1 h-px bg-gray-700/60" />
+                        <span className="text-[10px] text-gray-500 font-medium tracking-wide">MT5</span>
+                        <div className="flex-1 h-px bg-gray-700/60" />
+                      </div>
+
+                      {/* Account summary */}
+                      {mt5Accounts === null ? (
+                        <div className="text-[11px] text-gray-500 flex items-center gap-1">
+                          <Loader2 className="w-3 h-3 animate-spin" /> Loading MT5 accounts…
+                        </div>
+                      ) : mt5Accounts.length === 0 ? (
+                        <div className="text-[11px] text-amber-300">
+                          No live MT5 accounts configured — add one under{' '}
+                          <span
+                            className="text-purple-300 hover:underline cursor-pointer"
+                            onClick={() => window.location.href = '/mt5-live'}
+                          >
+                            /mt5-live
+                          </span>
+                        </div>
+                      ) : (
+                        <div className="flex flex-wrap gap-1.5 text-[10px]">
+                          {mt5Accounts.map((a) => {
+                            const bal = a.equity || a.balance;
+                            const offline = a.online === false;
+                            const noFunds = !offline && bal === 0;
+                            return (
+                              <span
+                                key={a.id}
+                                title={
+                                  offline ? `${a.name} offline — not reachable via MT5 API`
+                                  : noFunds ? `${a.name}: connected but balance is 0 (check ${a.server})`
+                                  : undefined
+                                }
+                                className={`rounded px-1.5 py-0.5 border tabular-nums ${
+                                  offline ? 'bg-gray-700/30 border-gray-600/30 text-gray-500'
+                                  : noFunds ? 'bg-amber-500/10 border-amber-700/30 text-amber-300'
+                                  : 'bg-blue-500/10 border-blue-700/30 text-blue-200'
+                                }`}
+                              >
+                                <span className={`mr-0.5 ${offline ? 'text-gray-600' : noFunds ? 'text-amber-400' : 'text-green-400'}`}>●</span>
+                                {a.name}
+                                {!offline && (
+                                  <>{': '}<span className="text-white">{a.currency}&nbsp;{bal.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span></>
+                                )}
+                                {a.free_margin > 0 && !offline && (
+                                  <span className="text-blue-300"> / {a.free_margin.toLocaleString(undefined, { maximumFractionDigits: 0 })} free</span>
+                                )}
+                                {offline && <span className="ml-1 text-gray-600">(offline)</span>}
+                                {noFunds && !offline && <span className="ml-1 text-amber-500">(no funds)</span>}
+                              </span>
+                            );
+                          })}
+                        </div>
+                      )}
+
+                      {/* MT5 execution result */}
+                      {mt5Result && (
+                        <div
+                          className={`flex items-start gap-1.5 rounded-lg px-2.5 py-1.5 text-[11px] ${
+                            mt5Result.ok
+                              ? 'bg-blue-500/10 text-blue-200 border border-blue-500/30'
+                              : 'bg-red-500/10 text-red-300 border border-red-500/30'
+                          }`}
+                        >
+                          {mt5Result.ok
+                            ? <Check className="w-3.5 h-3.5 mt-px shrink-0 text-blue-300" />
+                            : <X className="w-3.5 h-3.5 mt-px shrink-0" />}
+                          <span>{mt5Result.msg}</span>
+                        </div>
+                      )}
+
+                      {/* MT5 execute button */}
+                      {mt5Accounts !== null && mt5Accounts.length > 0 && (
+                        <button
+                          onClick={() => onMT5Execute(s)}
+                          disabled={mt5Busy}
+                          title="Execute on MT5 using room risk % lot sizing"
+                          className={`w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm font-semibold transition-all disabled:opacity-60 ${
+                            mt5Armed
+                              ? (long
+                                  ? 'bg-blue-600 hover:bg-blue-500 text-white ring-2 ring-blue-400/50'
+                                  : 'bg-blue-800 hover:bg-blue-700 text-white ring-2 ring-blue-400/50')
+                              : 'bg-blue-700/70 hover:bg-blue-700 text-white'
+                          }`}
+                        >
+                          {mt5Busy ? (
+                            <><Loader2 className="w-4 h-4 animate-spin" /> Placing on MT5…</>
+                          ) : mt5Armed ? (
+                            <><Check className="w-4 h-4" /> Confirm MT5 {long ? 'BUY' : 'SELL'} · room risk % lot</>
+                          ) : (
+                            <><Crosshair className="w-4 h-4" /> Execute {long ? 'BUY' : 'SELL'} on MT5 · {mt5Accounts.length} account{mt5Accounts.length !== 1 ? 's' : ''}</>
+                          )}
+                        </button>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
             );
           })}
@@ -1499,6 +1776,321 @@ function Level({ label, value, tone }: { label: string; value: string; tone: 'up
     <div className="bg-gray-800/60 rounded-lg py-1.5">
       <div className="text-[10px] text-gray-500 uppercase tracking-wide">{label}</div>
       <div className={`text-xs font-semibold tabular-nums ${color}`}>{value}</div>
+    </div>
+  );
+}
+
+// ── Fine-tune Kronos on your own data ────────────────────────────────────────
+
+interface FinetuneJob {
+  id: number;
+  exchange: string;
+  symbol: string;
+  timeframe: string;
+  status: 'pending' | 'exporting' | 'running' | 'completed' | 'failed' | 'cancelled';
+  rows_exported?: number | null;
+  error?: string | null;
+  output_dir?: string | null;
+  log_tail?: string | null;
+}
+
+const FT_STATUS_STYLE: Record<string, string> = {
+  pending: 'bg-gray-500/15 text-gray-300',
+  exporting: 'bg-blue-500/15 text-blue-300',
+  running: 'bg-amber-500/15 text-amber-300',
+  completed: 'bg-green-500/15 text-green-300',
+  failed: 'bg-red-500/15 text-red-300',
+  cancelled: 'bg-gray-500/15 text-gray-400',
+};
+
+function FinetunePanel({ symbol, exchange, timeframe }: { symbol: string; exchange: string; timeframe: string }) {
+  const [open, setOpen] = useState(false);
+  const [setup, setSetup] = useState<{ vendored: boolean; setup_command?: string } | null>(null);
+
+  // Data-source form (seeded from the page's current pair).
+  const [ftSymbol, setFtSymbol] = useState(symbol);
+  const [ftExchange, setFtExchange] = useState(exchange);
+  const [ftTimeframe, setFtTimeframe] = useState(timeframe);
+  const [limit, setLimit] = useState(4000);
+
+  // Training hyper-params.
+  const [lookback, setLookback] = useState(512);
+  const [predLen, setPredLen] = useState(120);
+  const [tokEpochs, setTokEpochs] = useState(10);
+  const [predEpochs, setPredEpochs] = useState(20);
+  const [batchSize, setBatchSize] = useState(16);
+
+  const [exporting, setExporting] = useState(false);
+  const [exportResult, setExportResult] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [starting, setStarting] = useState(false);
+  const [startErr, setStartErr] = useState<string | null>(null);
+  const [jobs, setJobs] = useState<FinetuneJob[]>([]);
+  const [selected, setSelected] = useState<FinetuneJob | null>(null);
+  const [loadingId, setLoadingId] = useState<number | null>(null);
+
+  const inputCls = 'bg-gray-800 border border-gray-700 rounded-lg px-2 py-1.5 text-xs text-white focus:outline-none focus:border-fuchsia-500';
+
+  // Keep the form seeded from the page pair until the user opens the panel.
+  useEffect(() => {
+    if (!open) { setFtSymbol(symbol); setFtExchange(exchange); setFtTimeframe(timeframe); }
+  }, [symbol, exchange, timeframe, open]);
+
+  const refreshSetup = async () => {
+    try { const r = await apiClient.kronos.finetune.setupStatus(); setSetup(r.data); }
+    catch { setSetup(null); }
+  };
+  const refreshJobs = async () => {
+    try { const r = await apiClient.kronos.finetune.list(); setJobs(r.data?.jobs ?? []); }
+    catch { /* keep last */ }
+  };
+
+  // Load setup + jobs on first open, then poll the list while the panel is open.
+  useEffect(() => {
+    if (!open) return;
+    refreshSetup();
+    refreshJobs();
+    const id = setInterval(refreshJobs, 5000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  // While a job is selected and still running, poll its live log every 3s.
+  useEffect(() => {
+    if (!selected) return;
+    const active = selected.status === 'running' || selected.status === 'exporting' || selected.status === 'pending';
+    if (!active) return;
+    const id = setInterval(async () => {
+      try {
+        const r = await apiClient.kronos.finetune.job(selected.id);
+        setSelected(r.data);
+      } catch { /* ignore */ }
+    }, 3000);
+    return () => clearInterval(id);
+  }, [selected?.id, selected?.status]);
+
+  const doExport = async () => {
+    setExporting(true);
+    setExportResult(null);
+    try {
+      const r = await apiClient.kronos.finetune.export({
+        exchange: ftExchange, symbol: ftSymbol, timeframe: ftTimeframe, limit,
+      });
+      const d = r.data;
+      setExportResult(d?.ok
+        ? { ok: true, msg: `Exported ${d.rows ?? '?'} rows → ${d.path ?? 'CSV'}` }
+        : { ok: false, msg: d?.error || 'Export failed' });
+    } catch (e: any) {
+      setExportResult({ ok: false, msg: e?.response?.data?.detail || e?.message || 'Export failed' });
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const doStart = async () => {
+    setStarting(true);
+    setStartErr(null);
+    try {
+      const r = await apiClient.kronos.finetune.start({
+        exchange: ftExchange, symbol: ftSymbol, timeframe: ftTimeframe, limit,
+        lookback, pred_len: predLen, tokenizer_epochs: tokEpochs,
+        predictor_epochs: predEpochs, batch_size: batchSize,
+      });
+      setSelected(r.data);
+      refreshJobs();
+    } catch (e: any) {
+      setStartErr(e?.response?.data?.detail || e?.message || 'Could not start fine-tune');
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  const doLoad = async (id: number) => {
+    setLoadingId(id);
+    try {
+      await apiClient.kronos.finetune.load(id);
+      refreshJobs();
+    } catch (e: any) {
+      setStartErr(e?.response?.data?.detail || e?.message || 'Load failed');
+    } finally {
+      setLoadingId(null);
+    }
+  };
+
+  const doCancel = async (id: number) => {
+    try { await apiClient.kronos.finetune.cancel(id); refreshJobs(); } catch { /* ignore */ }
+  };
+
+  return (
+    <div className="bg-gray-900/60 border border-gray-700/50 rounded-xl">
+      {/* Collapsible header */}
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="w-full flex items-center justify-between px-4 py-3 text-left"
+      >
+        <span className="flex items-center gap-2">
+          <div className="p-1.5 rounded-lg bg-fuchsia-500/15">
+            <Sparkles className="w-5 h-5 text-fuchsia-400" />
+          </div>
+          <span>
+            <span className="block text-sm font-semibold text-white">Fine-tune on your own data</span>
+            <span className="block text-[11px] text-gray-500">
+              Tokenizer → predictor, exactly like the share-market example in the Kronos repo
+            </span>
+          </span>
+        </span>
+        <ChevronDown className={`w-4 h-4 text-gray-500 transition-transform ${open ? 'rotate-180' : ''}`} />
+      </button>
+
+      {open && (
+        <div className="px-4 pb-4 space-y-4">
+          {/* Setup banner */}
+          {setup && !setup.vendored && (
+            <div className="flex items-start gap-2 bg-amber-500/10 border border-amber-500/30 rounded-lg px-3 py-2 text-xs text-amber-200">
+              <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-medium">Training pipeline not installed yet.</p>
+                <p className="mt-1">Run this once on the server, then reopen this panel:</p>
+                <code className="mt-1 block bg-black/40 rounded px-2 py-1 text-amber-100 break-all">
+                  {setup.setup_command || 'bash plugins/KronosForecastPlugin/scripts/setup_kronos_finetune.sh'}
+                </code>
+              </div>
+            </div>
+          )}
+
+          {/* Data source */}
+          <div>
+            <p className="text-[11px] font-semibold text-gray-400 uppercase tracking-wide mb-2">1 · Data source</p>
+            <div className="flex flex-wrap items-end gap-3">
+              <FtField label="Symbol"><input value={ftSymbol} onChange={(e) => setFtSymbol(e.target.value)} className={`${inputCls} w-32`} /></FtField>
+              <FtField label="Exchange"><input value={ftExchange} onChange={(e) => setFtExchange(e.target.value)} className={`${inputCls} w-28`} /></FtField>
+              <FtField label="Timeframe"><input value={ftTimeframe} onChange={(e) => setFtTimeframe(e.target.value)} className={`${inputCls} w-20`} /></FtField>
+              <FtField label="Candles"><input type="number" min={256} value={limit} onChange={(e) => setLimit(Math.max(256, Number(e.target.value) || 0))} className={`${inputCls} w-24`} /></FtField>
+              <button
+                onClick={doExport}
+                disabled={exporting}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-200 text-xs font-medium disabled:opacity-50"
+              >
+                {exporting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+                Export &amp; preview
+              </button>
+            </div>
+            {exportResult && (
+              <p className={`mt-2 text-[11px] ${exportResult.ok ? 'text-green-300' : 'text-red-300'}`}>
+                {exportResult.msg}
+              </p>
+            )}
+          </div>
+
+          {/* Training config */}
+          <div>
+            <p className="text-[11px] font-semibold text-gray-400 uppercase tracking-wide mb-2">2 · Training</p>
+            <div className="flex flex-wrap items-end gap-3">
+              <FtField label="Lookback"><input type="number" min={64} value={lookback} onChange={(e) => setLookback(Math.max(64, Number(e.target.value) || 0))} className={`${inputCls} w-20`} /></FtField>
+              <FtField label="Pred len"><input type="number" min={1} value={predLen} onChange={(e) => setPredLen(Math.max(1, Number(e.target.value) || 0))} className={`${inputCls} w-20`} /></FtField>
+              <FtField label="Tok epochs"><input type="number" min={1} value={tokEpochs} onChange={(e) => setTokEpochs(Math.max(1, Number(e.target.value) || 0))} className={`${inputCls} w-16`} /></FtField>
+              <FtField label="Pred epochs"><input type="number" min={1} value={predEpochs} onChange={(e) => setPredEpochs(Math.max(1, Number(e.target.value) || 0))} className={`${inputCls} w-16`} /></FtField>
+              <FtField label="Batch"><input type="number" min={1} value={batchSize} onChange={(e) => setBatchSize(Math.max(1, Number(e.target.value) || 0))} className={`${inputCls} w-16`} /></FtField>
+              <button
+                onClick={doStart}
+                disabled={starting || (setup !== null && !setup.vendored)}
+                className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-fuchsia-600 hover:bg-fuchsia-500 text-white text-xs font-semibold disabled:opacity-50"
+              >
+                {starting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Zap className="w-3.5 h-3.5" />}
+                Start fine-tune
+              </button>
+            </div>
+            {startErr && (
+              <p className="mt-2 text-[11px] text-red-300 flex items-center gap-1">
+                <AlertTriangle className="w-3.5 h-3.5" /> {startErr}
+              </p>
+            )}
+          </div>
+
+          {/* Jobs + live log */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            {/* Job history */}
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <p className="text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Jobs</p>
+                <button onClick={refreshJobs} className="text-gray-500 hover:text-gray-300"><RefreshCw className="w-3.5 h-3.5" /></button>
+              </div>
+              {jobs.length === 0 ? (
+                <p className="text-xs text-gray-600">No fine-tune jobs yet.</p>
+              ) : (
+                <div className="space-y-1.5 max-h-56 overflow-y-auto pr-1">
+                  {jobs.map((j) => (
+                    <div
+                      key={j.id}
+                      onClick={() => setSelected(j)}
+                      className={`flex items-center justify-between gap-2 rounded-lg px-2.5 py-1.5 text-xs cursor-pointer border ${
+                        selected?.id === j.id ? 'border-fuchsia-600/60 bg-fuchsia-500/[0.06]' : 'border-gray-800 bg-gray-800/40 hover:bg-gray-800/70'
+                      }`}
+                    >
+                      <span className="flex items-center gap-2 min-w-0">
+                        <span className="text-gray-500">#{j.id}</span>
+                        <span className="text-white truncate">{j.symbol}</span>
+                        <span className="text-gray-500">{j.timeframe}</span>
+                      </span>
+                      <span className="flex items-center gap-1.5 shrink-0">
+                        <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-semibold uppercase ${FT_STATUS_STYLE[j.status] || ''}`}>
+                          {j.status}
+                        </span>
+                        {j.status === 'completed' && (
+                          <button
+                            onClick={(e) => { e.stopPropagation(); doLoad(j.id); }}
+                            disabled={loadingId === j.id}
+                            title="Load this fine-tuned model for forecasts"
+                            className="p-1 rounded bg-green-600/80 hover:bg-green-500 text-white disabled:opacity-50"
+                          >
+                            {loadingId === j.id ? <Loader2 className="w-3 h-3 animate-spin" /> : <Check className="w-3 h-3" />}
+                          </button>
+                        )}
+                        {(j.status === 'running' || j.status === 'exporting' || j.status === 'pending') && (
+                          <button
+                            onClick={(e) => { e.stopPropagation(); doCancel(j.id); }}
+                            title="Cancel this job"
+                            className="p-1 rounded bg-red-600/70 hover:bg-red-500 text-white"
+                          >
+                            <X className="w-3 h-3" />
+                          </button>
+                        )}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Live training log */}
+            <div>
+              <p className="text-[11px] font-semibold text-gray-400 uppercase tracking-wide mb-2">
+                {selected ? `Log — job #${selected.id} (${selected.status})` : 'Log'}
+              </p>
+              {selected ? (
+                <>
+                  {selected.error && (
+                    <p className="mb-1 text-[11px] text-red-300">{selected.error}</p>
+                  )}
+                  <pre className="bg-black/50 border border-gray-800 rounded-lg p-2 text-[10px] leading-relaxed text-gray-300 h-52 overflow-auto whitespace-pre-wrap">
+                    {selected.log_tail || '(no log output yet)'}
+                  </pre>
+                </>
+              ) : (
+                <p className="text-xs text-gray-600">Select a job to watch its training log.</p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FtField({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <label className="block text-[10px] text-gray-500 mb-1 uppercase tracking-wide">{label}</label>
+      {children}
     </div>
   );
 }

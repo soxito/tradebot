@@ -51,13 +51,18 @@ import { toReasoningText } from '@/utils/reasoning'
 
 const TradingViewChart = dynamic(() => import('@/components/TradingViewChart'), { ssr: false })
 
-/** How many candles to ask for per TF to reach genesis (2010-07-17). */
+/** How many candles to ask for per TF — 4y / last halving for H1/H4 (35040/8760) so agents have enough context without 96k crash. */
 export const TF_GENESIS_LIMIT: Record<string, number> = {
-  MN1: 300,   // ~195 months + buffer
-  W1: 1200,   // 842 weeks + buffer
-  D1: 7000,   // 5.9k days
-  H4: 40000,  // 35k 4h
-  H1: 150000, // 141k hours
+  MN1: 300,   // ~195 months from 2010
+  W1: 1200,   // 842 weeks from 2010
+  D1: 7000,   // 5.9k days from 2010
+  H4: 8760,   // 4y of 4h — last halving cycle (2022-11-21 → now)
+  H1: 35040,  // 4y of 1h — last halving cycle
+}
+/** Full-genesis caps (used only when user explicitly requests "Full" for H1/H4). */
+export const TF_FULL_GENESIS_LIMIT: Record<string, number> = {
+  H4: 40000,  // 15y
+  H1: 150000, // 15y
 }
 function tfToCycleApi(tf: string): string {
   const u = (tf || 'D1').toUpperCase()
@@ -80,10 +85,35 @@ interface CycleChartCandle {
   volume?: number
   synthetic?: boolean
 }
-/** Genesis-aware candle feed for every TF: MN1/W1/D1 via Yahoo+CoinMetrics, H1/H4 via Bitget+synthetic. */
+/** Downsample large intraday series for chart performance (e.g., 96k H1 → 5k). */
+function downsampleCandles(candles: CycleChartCandle[], maxPoints = 5000): CycleChartCandle[] {
+  if (candles.length <= maxPoints) return candles
+  const step = Math.ceil(candles.length / maxPoints)
+  const out: CycleChartCandle[] = []
+  for (let i = 0; i < candles.length; i += step) {
+    // For each bucket, aggregate OHLC to preserve extremes
+    const bucket = candles.slice(i, i + step)
+    if (!bucket.length) continue
+    const first = bucket[0], last = bucket[bucket.length - 1]
+    out.push({
+      time: first.time,
+      open: first.open,
+      high: Math.max(...bucket.map(b => b.high)),
+      low: Math.min(...bucket.map(b => b.low)),
+      close: last.close,
+      volume: bucket.reduce((s, b) => s + (b.volume || 0), 0),
+      synthetic: bucket.some(b => b.synthetic),
+    })
+  }
+  return out
+}
+/** Genesis-aware candle feed for every TF: MN1/W1/D1 via Yahoo+CoinMetrics, H1/H4 via Bitget+synthetic.
+ * For H1/H4, the full genesis is 96k/22k points — downsampled to 5k for chart perf but full count kept for meta strip.
+ */
 function useCycleCandles(timeframe: string) {
   const tf = tfToCycleApi(timeframe)
   const [candles, setCandles] = useState<CycleChartCandle[]>([])
+  const [displayCandles, setDisplayCandles] = useState<CycleChartCandle[]>([])
   const [markers, setMarkers] = useState<IndicatorMarker[]>([])
   const [fisherOverlays, setFisherOverlays] = useState<IndicatorOverlaySeries[]>([])
   const [count, setCount] = useState<number>(0)
@@ -100,24 +130,61 @@ function useCycleCandles(timeframe: string) {
     setError(null)
     void (async () => {
       try {
+        // H1/H4 default to 4y / last halving (35040/8760) — full 15y behind explicit toggle to avoid 96k crash
         const limit = TF_GENESIS_LIMIT[tf] ?? 7000
         const { data } = await apiClient.getCycleCandles(tf, limit, ctrl.signal)
         if (!alive) return
-        setCandles(data?.candles ?? [])
+        const raw = data?.candles ?? []
+        setCandles(raw)
+        // Downsample H1/H4 4y view (35k H1, 8.7k H4) to 5k for chart perf — preserves OHLC extremes per bucket
+        const isIntraday = tf === 'H1' || tf === 'H4'
+        if (isIntraday && raw.length > 5000) {
+          setDisplayCandles(downsampleCandles(raw, 5000))
+        } else {
+          setDisplayCandles(raw)
+        }
         setCount(data?.count ?? 0)
         setEarliest(data?.earliest ?? null)
         setEarliestIso(data?.earliest_iso ?? null)
         setSynthetic(data?.synthetic_count ?? 0)
-        // Pattern + Fisher for the same TF so markers align with the visible TF
+        // Pattern + Fisher for the same TF so markers align; H1/H4 4y needs 10k to cover last halving (was 3k → only 125d of H1)
         const reach = Math.max((data?.candles?.length ?? 0), limit)
+        const patLimit = tf === 'H1' || tf === 'H4' ? Math.min(reach, 10000) : Math.min(reach, 3000)
         try {
           const pat = await apiClient.getPatternOverlay('bitget', 'BTCUSDT', {
             timeframe: tfToPatternApi(tf),
-            limit: Math.min(reach, 3000),
+            limit: patLimit,
           })
           if (!alive) return
-          setMarkers(pat.data?.markers ?? [])
-          setFisherOverlays(pat.data?.overlays ?? [])
+          // Pattern API returns time in ms (candle_resolver), chart expects sec — normalize
+          const rawMarkers: IndicatorMarker[] = pat.data?.markers ?? []
+          const normMarkers = rawMarkers.map((m: any) => ({
+            ...m,
+            time: m.time > 1e11 ? Math.floor(Number(m.time) / 1000) : Number(m.time),
+          }))
+          // For H1/H4, limit to key markers only (last 15, at least 10 bars apart) to reduce noise
+          let filtered = normMarkers
+          if ((tf === 'H1' || tf === 'H4') && normMarkers.length > 20) {
+            // Sort by time, keep only last 20, and ensure at least 10 bars apart
+            const sorted = [...normMarkers].sort((a, b) => a.time - b.time)
+            const recent = sorted.slice(-30) // last 30 candidates
+            const key: IndicatorMarker[] = []
+            for (const m of recent) {
+              if (!key.length || Math.abs(m.time - key[key.length - 1].time) > (tf === 'H1' ? 3600 * 10 : 3600 * 4 * 10)) {
+                key.push(m)
+              }
+              if (key.length >= 15) break
+            }
+            // If still too many, take last 15
+            filtered = key.length >= 5 ? key.slice(-15) : sorted.slice(-15)
+          } else if (normMarkers.length > 40) {
+            // For D1/W1/MN1, cap at 30 most recent
+            filtered = [...normMarkers].sort((a, b) => a.time - b.time).slice(-30)
+          }
+          setMarkers(filtered)
+          // Fisher overlays are already in seconds, keep as is; only show Fisher on MN1 to avoid price-scale squash on D1/W1/H*
+          const fisher = (pat.data?.overlays ?? []) as IndicatorOverlaySeries[]
+          setFisherOverlays(tf === 'MN1' ? fisher : [])
         } catch {
           /* chart stands without pattern flags */
         }
@@ -132,7 +199,7 @@ function useCycleCandles(timeframe: string) {
     return () => { alive = false; ctrl.abort() }
   }, [tf])
 
-  return { candles, markers, fisherOverlays, count, earliest, earliestIso, synthetic, loaded, error }
+  return { candles, displayCandles, markers, fisherOverlays, count, earliest, earliestIso, synthetic, loaded, error }
 }
 // Backward compat alias — old page code used useCycleMonthly for MN1 only.
 function useCycleMonthly() {
@@ -174,9 +241,9 @@ function useIndicatorOverlays(chartTf?: string) {
     void (async () => {
       try {
         const patTf = tfToPatternApi(tf)
-        // Ask enough history for EMA200 warm-up: need >200 bars regardless of TF
+        // Ask enough history for EMA200 warm-up: 4y H1 needs 35040, capped at 10000 for backend perf
         const want = Math.max(TF_GENESIS_LIMIT[tf] ?? 500, 500)
-        const lim = Math.min(want, 1500) // indicator endpoint caps at 1500 for performance, EMA200 still covered
+        const lim = Math.min(want, 10000)
         const { data } = await apiClient.technical.indicatorOverlay('bitget', 'BTCUSDT', {
           timeframe: patTf, limit: lim, indicators: 'ema,rsi,macd',
         })
@@ -202,7 +269,38 @@ function useIndicatorOverlays(chartTf?: string) {
     [overlays, enabled],
   )
 
-  return { visible, trend, enabled, setEnabled }
+  return { visible, trend, enabled, setEnabled, raw: overlays }
+}
+
+/** Local EMA fallback when backend returns empty (e.g., W1 weekly 13-bar limit). */
+function calcEMA(values: number[], period: number): (number | null)[] {
+  if (values.length < period) return values.map(() => null)
+  const k = 2 / (period + 1)
+  const out: (number | null)[] = []
+  let ema = values.slice(0, period).reduce((a, b) => a + b, 0) / period
+  for (let i = 0; i < values.length; i++) {
+    if (i < period - 1) { out.push(null); continue }
+    if (i === period - 1) { out.push(ema); continue }
+    ema = values[i] * k + ema * (1 - k)
+    out.push(ema)
+  }
+  return out
+}
+function buildLocalEMAOverlays(candles: CycleChartCandle[], enabled: Record<IndicatorGroup, boolean>): IndicatorOverlaySeries[] {
+  if (!enabled.ema || candles.length < 20) return []
+  const closes = candles.map(c => c.close)
+  const times = candles.map(c => c.time)
+  const overlays: IndicatorOverlaySeries[] = []
+  for (const period of [20, 50, 200] as const) {
+    if (candles.length < period) continue
+    const vals = calcEMA(closes, period)
+    const data = vals.map((v, i) => v == null ? null : ({ time: times[i], value: v }))
+      .filter((p): p is { time: number; value: number } => p != null && Number.isFinite(p.value))
+    if (!data.length) continue
+    const color = period === 20 ? '#f59e0b' : period === 50 ? '#38bdf8' : '#a78bfa'
+    overlays.push({ name: `EMA ${period}`, type: 'line', pane: 'main', color, lineWidth: period === 200 ? 2 : 1, data })
+  }
+  return overlays
 }
 
 /** The header strip: season, position, countdowns, and how much to trust it. */
@@ -769,7 +867,7 @@ const CHART_TFS = [
   { label: '1M', value: 'MN1' },
 ] as const
 
-function CandleMetaStrip({ tf, count, earliestIso, synthetic, loaded, error }: { tf: string; count: number; earliestIso: string | null; synthetic: number; loaded: boolean; error: string | null }) {
+function CandleMetaStrip({ tf, count, earliestIso, synthetic, loaded, error, displayCount }: { tf: string; count: number; earliestIso: string | null; synthetic: number; loaded: boolean; error: string | null; displayCount?: number }) {
   const label = tf === 'MN1' ? '1M' : tf
   if (!loaded) {
     return <div className="flex items-center gap-2 text-[11px] text-slate-500"><Loader2 className="h-3 w-3 animate-spin" /> Loading {label} full history…</div>
@@ -779,16 +877,19 @@ function CandleMetaStrip({ tf, count, earliestIso, synthetic, loaded, error }: {
   }
   const start = earliestIso ? earliestIso.slice(0, 10) : '2010-07-17'
   const genesisOk = start <= '2010-08-01'
+  const isDownsampled = displayCount != null && displayCount < count
   return (
     <div className="flex flex-wrap items-center gap-2 text-[11px]">
       <span className={`rounded-full border px-2 py-0.5 text-[10px] ${genesisOk ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300' : 'border-amber-500/40 bg-amber-500/10 text-amber-300'}`}>
         {genesisOk ? '✓ Genesis' : '◐ Limited history'}
       </span>
-      <span className="font-mono text-slate-300">{count.toLocaleString()} {label} candles</span>
+      <span className="font-mono text-slate-300">{isDownsampled ? `${displayCount!.toLocaleString()} shown` : `${count.toLocaleString()} ${label} candles`}</span>
+      {isDownsampled && <span className="text-slate-500" title={`${count.toLocaleString()} total, downsampled to ${displayCount} for chart perf`}>· {count.toLocaleString()} total</span>}
       <span className="text-slate-500">· from {start}</span>
       <span className="text-slate-500">· to now</span>
       {synthetic > 0 && <span className="rounded-full border border-violet-500/30 bg-violet-500/10 px-2 py-0.5 text-[10px] text-violet-300" title="Pre-Bitget H1/H4 (2010→exchange start) synthesized from daily closes; flat OHLC, volume 0">{synthetic.toLocaleString()} synthetic</span>}
       {genesisOk && <span className="text-emerald-400/70">· day 1 ✓</span>}
+      {isDownsampled && <span className="text-amber-300/70">· downsampled for perf</span>}
     </div>
   )
 }
@@ -808,11 +909,33 @@ export default function BitcoinCyclePage() {
     return 'MN1'
   })()
   const [chartTf, setChartTf] = useState<string>(initialTf)
+  // For H1/H4, default to recent (zoomed to current bar) to avoid showing 4y of noisy data at once
+  const [fitMode, setFitMode] = useState<'genesis' | 'recent'>(initialTf === 'H1' || initialTf === 'H4' ? 'recent' : 'genesis')
+  // Auto-switch to recent when user selects H1/H4 for the first time
+  useEffect(() => {
+    if (chartTf === 'H1' || chartTf === 'H4') setFitMode('recent')
+  }, [chartTf])
   const candleFeed = useCycleCandles(chartTf)
-  const { visible: indicatorOverlays, enabled: indicatorsOn, setEnabled: setIndicatorEnabled } = useIndicatorOverlays(chartTf)
+  const { visible: backendVisible, enabled: indicatorsOn, setEnabled: setIndicatorEnabled } = useIndicatorOverlays(chartTf)
+  // For H1/H4 recent mode: pass NO initial candles so TradingViewChart fetches the last
+  // 200 live bars directly from the exchange (current price, proper 10s realtime updates).
+  // The cycle candles endpoint for H1/H4 only has historical cached data (2021-2022) which
+  // would show stale prices. Genesis mode uses the full historical dataset as before.
+  const chartCandles = useMemo<CycleChartCandle[]>(() => {
+    if (fitMode === 'recent' && (chartTf === 'H1' || chartTf === 'H4')) {
+      return []  // chart falls through to exchange OHLCV (live)
+    }
+    return (candleFeed.displayCandles?.length ? candleFeed.displayCandles : candleFeed.candles) as CycleChartCandle[]
+  }, [fitMode, chartTf, candleFeed.displayCandles, candleFeed.candles])
+  // Local EMA fallback: backend weekly returns 13 bars (not enough for EMA), so compute from display candles (downsampled for H1/H4)
+  const localEMAOverlays = useMemo(() => buildLocalEMAOverlays(chartCandles as any, indicatorsOn), [chartCandles, indicatorsOn])
+  const indicatorOverlays = useMemo(() => {
+    if (backendVisible.length > 0) return backendVisible
+    if (indicatorsOn.ema && localEMAOverlays.length > 0) return localEMAOverlays
+    return backendVisible
+  }, [backendVisible, localEMAOverlays, indicatorsOn.ema])
   const { whale: whales, loaded: whaleLoaded } = useWhaleWatch()
   const [selected, setSelected] = useState<CycleCalendarDay | null>(null)
-  const [fitMode, setFitMode] = useState<'genesis' | 'recent'>('genesis')
 
   // Keep URL in sync when TF changes (without full reload)
   useEffect(() => {
@@ -904,19 +1027,31 @@ export default function BitcoinCyclePage() {
                     </div>
                   </div>
                   <div className="px-1 pb-1.5">
-                    <CandleMetaStrip tf={chartTf} count={candleFeed.count} earliestIso={candleFeed.earliestIso} synthetic={candleFeed.synthetic} loaded={candleFeed.loaded} error={candleFeed.error} />
+                    <CandleMetaStrip
+                      tf={chartTf}
+                      count={candleFeed.count}
+                      earliestIso={candleFeed.earliestIso}
+                      synthetic={candleFeed.synthetic}
+                      loaded={candleFeed.loaded}
+                      error={candleFeed.error}
+                      // For H1/H4 recent mode the chart is using live exchange data (not
+                      // the cycle candles), so skip the 'X shown' breakdown to avoid
+                      // showing a misleading '0 shown' figure.
+                      displayCount={fitMode === 'recent' && (chartTf === 'H1' || chartTf === 'H4') ? undefined : chartCandles.length}
+                    />
                   </div>
                   <TradingViewChart
                     key={`${chartTf}-${fitMode}`}
                     symbol="BTC/USDT"
                     exchange="bitget"
                     timeframe={chartTf}
-                    initialCandles={candleFeed.candles.length ? candleFeed.candles : undefined}
+                    initialCandles={chartCandles.length ? chartCandles as any : undefined}
                     sourceLabel={candleSourceLabel}
                     cycleWindows={boxes}
                     overlays={[...candleFeed.fisherOverlays, ...indicatorOverlays]}
                     markers={candleFeed.markers}
                     showZones={false}
+                    fitMode={fitMode}
                   />
                   {candleFeed.synthetic > 0 && (
                     <p className="px-1 pt-1 text-[10px] leading-snug text-violet-300/70">

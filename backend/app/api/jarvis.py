@@ -4341,19 +4341,31 @@ async def _analyze_symbol(symbol: str, original_cmd: str, ex_name: Optional[str]
     display_name = coin_name or symbol
 
     # ── Fetch 4H OHLCV (200 candles) ─────────────────────────────────────────
+    # Route through the shared candle resolver first: it walks MT5 → keyless
+    # public spot exchanges → forex/metals, so pairs the Bitget *futures*
+    # connector cannot serve (ETH/USD, BTC/USD, XRP/USD — anything not quoted
+    # in USDT) still return candles instead of "Not enough data".
+    ohlcv = []
     try:
-        ohlcv = await connector.exchange.fetch_ohlcv(
-            f"{ccxt_sym}:USDT", timeframe="4h", limit=200
-        )
-    except Exception:
+        from app.services import candles as _candle_source
+        ohlcv = await _candle_source.fetch(symbol, "4h", 200) or []
+    except Exception as _ce:  # noqa: BLE001
+        logger.debug("[JARVIS] shared candle resolver failed for {}: {}", symbol, _ce)
+        ohlcv = []
+    if not ohlcv or len(ohlcv) < 20:
         try:
             ohlcv = await connector.exchange.fetch_ohlcv(
-                ccxt_sym, timeframe="4h", limit=200
+                f"{ccxt_sym}:USDT", timeframe="4h", limit=200
             )
-        except BaseException as e:
-            if _is_network_error(e):
-                return _err("analyze", "Exchange unreachable — check network.")
-            return _err("analyze", _friendly_exchange_error(e))
+        except Exception:
+            try:
+                ohlcv = await connector.exchange.fetch_ohlcv(
+                    ccxt_sym, timeframe="4h", limit=200
+                )
+            except BaseException as e:
+                if _is_network_error(e):
+                    return _err("analyze", "Exchange unreachable — check network.")
+                return _err("analyze", _friendly_exchange_error(e))
 
     if not ohlcv or len(ohlcv) < 20:
         return _err("analyze", f"Not enough data for {symbol}.")

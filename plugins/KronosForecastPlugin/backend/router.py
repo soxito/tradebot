@@ -11,6 +11,8 @@ from loguru import logger
 from plugins.KronosForecastPlugin.backend.schemas import (
     ForecastResponse, ForecastStatus, BatchForecastRequest, JarvisAnalysisResponse,
     SniperSignalsResponse,
+    FinetuneStartRequest, FinetuneExportRequest, FinetuneExportResponse,
+    FinetuneJobResponse, FinetuneSetupStatus,
 )
 from plugins.KronosForecastPlugin.backend.services import forecast_service, jarvis_analysis
 from plugins.KronosForecastPlugin.backend.config import KRONOS_MODELS
@@ -240,6 +242,288 @@ async def get_tradability(exchange: str, symbol: str):
     return await forecast_service.get_pair_tradability(exchange, _normalize_symbol(symbol))
 
 
+@router.get("/mt5-accounts")
+async def list_mt5_accounts():
+    """Return all linked live MT5 accounts with equity/margin for sniper sizing display.
+
+    Shows every LIVE account regardless of ``api_reachable`` so users always
+    see their accounts — a disconnected account is shown with an ``online``
+    flag of False so the UI can grey it out rather than hide it entirely.
+    """
+    try:
+        from app.core.database import AsyncSessionLocal
+        from sqlalchemy import select
+        from plugins.MT5TradingPlugin.backend.models import MT5Account, MT5AccountType
+    except ImportError:
+        return {"available": False, "accounts": []}
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(MT5Account)
+            .where(MT5Account.account_type == MT5AccountType.LIVE)
+            .order_by(MT5Account.id)
+        )
+        rows = result.scalars().all()
+        return {
+            "available": True,
+            "accounts": [
+                {
+                    "id": a.id,
+                    "name": a.name,
+                    "server": a.server,
+                    "equity": float(a.equity or 0),
+                    "balance": float(a.balance or 0),
+                    "free_margin": float(a.free_margin or 0),
+                    "leverage": int(a.leverage or 100),
+                    "currency": a.currency or "USD",
+                    "online": bool(a.api_reachable),
+                }
+                for a in rows
+            ],
+        }
+
+
+@router.post("/execute-mt5")
+async def execute_mt5_sniper(
+    symbol: str = Query(..., description="Instrument, e.g. XAUUSD or EURUSD"),
+    side: str = Query(..., description="buy | sell"),
+    entry: float = Query(...),
+    stop_loss: float = Query(...),
+    take_profit: Optional[float] = Query(None),
+    timeframe: str = Query("1h"),
+    dry_run: bool = Query(False, description="True → compute lots without placing orders"),
+):
+    """Execute a Kronos sniper entry on all linked live MT5 accounts.
+
+    Uses the same lot-sizing logic as the Telegram sniper service:
+    - Reads room risk % from RoomSettings (default 1 %)
+    - Calls ``affordable_mt5_lot`` per account (risk-budget × free-margin cap)
+    - Floors at broker minimum (0.01 lots)
+    - Sizes independently per account using each account's equity
+    - dry_run=true → returns the computed lots without sending to the broker
+    """
+    from app.core.database import AsyncSessionLocal
+
+    sym = _normalize_symbol(symbol)
+    side_lower = side.lower()
+    if side_lower not in {"buy", "sell"}:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="side must be 'buy' or 'sell'")
+    direction = "long" if side_lower == "buy" else "short"
+
+    try:
+        from plugins.TelegramSignalNewsPlugin.backend.services.sniper_service import (
+            _get_room_settings,
+            _get_live_mt5_accounts,
+            _execute_mt5 as _do_execute_mt5,
+            affordable_mt5_lot,
+            _equity_in_quote,
+        )
+        from plugins.TelegramSignalNewsPlugin.backend.services.forex_price_service import _parse_pair
+        from app.trading.order_tags import SOURCE_ROOM, build_comment
+    except ImportError as exc:
+        return {"ok": False, "error": f"Required plugin unavailable: {exc}", "placed": [], "errors": []}
+
+    async with AsyncSessionLocal() as db:
+        room = await _get_room_settings(db)
+        risk_pct = float(getattr(room, "risk_pct", 1.0) or 1.0)
+        max_risk_pct = 5.0  # hard ceiling: never risk more than 5 % on a single lot
+
+        # _get_live_mt5_accounts filters by api_reachable; also do a direct fallback
+        # so we always attempt reachable accounts first, then any remaining live ones.
+        accounts = await _get_live_mt5_accounts(db, None)
+        if not accounts:
+            # Fallback: query all LIVE accounts regardless of api_reachable
+            try:
+                from sqlalchemy import select as _sa_select
+                from plugins.MT5TradingPlugin.backend.models import MT5Account as _MT5A, MT5AccountType as _AT
+                result = await db.execute(
+                    _sa_select(_MT5A).where(_MT5A.account_type == _AT.LIVE).order_by(_MT5A.id)
+                )
+                accounts = list(result.scalars().all())
+            except Exception:
+                pass
+        if not accounts:
+            return {
+                "ok": False,
+                "error": "No live MT5 accounts found — add one under /mt5-live",
+                "placed": [], "errors": [],
+            }
+
+        pp = _parse_pair(sym)
+        quote_ccy = pp[1] if pp else "USD"
+
+        placed: list = []
+        errors: list = []
+
+        for acct in accounts:
+            equity_native = float(getattr(acct, "equity", 0) or getattr(acct, "balance", 0) or 0)
+            acct_ccy = (getattr(acct, "currency", None) or "USD").upper()
+            equity_q = await _equity_in_quote(equity_native, acct_ccy, quote_ccy)
+            eff_equity = equity_q if equity_q is not None else 0.0
+            free_native = getattr(acct, "free_margin", None)
+            free_q = (
+                await _equity_in_quote(float(free_native), acct_ccy, quote_ccy)
+                if free_native else None
+            )
+
+            lot, size_note = affordable_mt5_lot(
+                equity=eff_equity,
+                free_margin=free_q,
+                leverage=getattr(acct, "leverage", None),
+                risk_pct=risk_pct,
+                entry=entry,
+                stop_loss=stop_loss,
+                symbol=sym,
+                floor_lot=0.01,
+                max_risk_pct=max_risk_pct,
+                small_account_mode=True,
+            )
+
+            acct_label = getattr(acct, "name", None) or f"acct {acct.id}"
+            ccy_note = (
+                f" ({acct_ccy} {equity_native:g}→{quote_ccy} {eff_equity:g})"
+                if acct_ccy != quote_ccy else ""
+            )
+
+            if lot is None:
+                errors.append({"account": acct_label, "account_id": acct.id, "reason": size_note})
+                continue
+
+            if dry_run:
+                placed.append({
+                    "account": acct_label,
+                    "account_id": acct.id,
+                    "lot": lot,
+                    "size_note": size_note + ccy_note,
+                    "equity": equity_native,
+                    "currency": acct_ccy,
+                    "risk_pct": risk_pct,
+                    "dry_run": True,
+                })
+                continue
+
+            comment = build_comment(SOURCE_ROOM, f"KR-{sym[:6]}")
+            res = await _do_execute_mt5(
+                db,
+                symbol=sym,
+                direction=direction,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                lot_size=lot,
+                account_id=acct.id,
+                comment=comment,
+            )
+            if res.get("success"):
+                placed.append({
+                    "account": acct_label,
+                    "account_id": acct.id,
+                    "lot": lot,
+                    "size_note": size_note + ccy_note,
+                    "order_id": res.get("order_id"),
+                    "equity": equity_native,
+                    "currency": acct_ccy,
+                    "risk_pct": risk_pct,
+                    "venue": "mt5",
+                })
+            elif res.get("skipped"):
+                # Symbol not listed on this broker — a clean skip, not a failure.
+                errors.append({
+                    "account": acct_label,
+                    "account_id": acct.id,
+                    "reason": res.get("error", f"{sym} not listed on this broker — skipped"),
+                    "skipped": True,
+                })
+            else:
+                errors.append({
+                    "account": acct_label,
+                    "account_id": acct.id,
+                    "reason": str(res.get("error", "unknown"))[:200],
+                })
+
+        if not dry_run:
+            await db.commit()
+
+    return {
+        "ok": len(placed) > 0,
+        "symbol": sym,
+        "side": side_lower,
+        "entry": entry,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "risk_pct": risk_pct,
+        "placed": placed,
+        "errors": errors,
+        "dry_run": dry_run,
+    }
+
+
+@router.post("/execute")
+async def execute_sniper_order(
+    symbol: str = Query(..., description="Instrument, e.g. ETHUSD or XAUUSD"),
+    side: str = Query(..., description="buy | sell"),
+    entry: float = Query(...),
+    stop_loss: float = Query(...),
+    take_profit: float = Query(...),
+    timeframe: str = Query("1h"),
+):
+    """Route a Kronos sniper entry to every configured venue (Bitget, Exness/MT5,
+    or both) using the same room execution engine as the trading desk.
+
+    Works for any instrument — crypto CFDs (ETHUSD, BTCUSD), FX (EURUSD),
+    metals (XAUUSD) — by delegating venue selection to ``venues_for``.
+    Respects room ``dry_run``: True → demo only, False → demo + live.
+    """
+    import json
+    from app.core.database import AsyncSessionLocal
+    from app.agents.execution import _route, get_settings
+    from app.models.database import Signal, SignalAction, SignalSource, SignalStatus
+
+    sym = _normalize_symbol(symbol)
+    action = side.lower()
+    if action not in {"buy", "sell"}:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="side must be 'buy' or 'sell'")
+
+    async with AsyncSessionLocal() as db:
+        s = await get_settings(db)
+        if not s.execution_enabled:
+            return {"ok": False, "placed": [], "reason": "execution is switched off in room settings"}
+
+        # Signal row so _crypto_fill (Bitget path) can read the levels.
+        sig = Signal(
+            source=SignalSource.SYSTEM,
+            symbol=sym,
+            action=SignalAction.BUY if action == "buy" else SignalAction.SELL,
+            price=entry, timeframe=timeframe,
+            strength=0.8, confidence=0.8,
+            status=SignalStatus.PENDING,
+            raw_data=json.dumps({"source": "kronos_sniper"}),
+            indicators=json.dumps({"stop_loss": stop_loss, "take_profit": take_profit}),
+        )
+        db.add(sig)
+        await db.flush()
+
+        orders = await _route(
+            db, s,
+            symbol=sym, action=action,
+            price=entry, stop_loss=stop_loss, take_profit=take_profit,
+            level_source="kronos_sniper", signal_id=sig.id,
+        )
+        await db.commit()
+
+    placed = [o for o in orders if o.get("status") == "placed"]
+    errors = [o for o in orders if o.get("status") == "error"]
+    return {
+        "symbol": sym,
+        "side": action,
+        "placed": placed,
+        "errors": errors,
+        "orders": orders,
+        "ok": len(placed) > 0,
+    }
+
+
 @router.post("/batch")
 async def batch_forecast(req: BatchForecastRequest):
     """Forecast several symbols at once (sequential to stay within model memory)."""
@@ -256,3 +540,81 @@ async def batch_forecast(req: BatchForecastRequest):
             logger.warning(f"[Kronos] batch forecast failed for {sym}: {exc}")
             results.append({"symbol": sym, "error": str(exc)})
     return {"count": len(results), "results": results}
+
+
+# ── Fine-tuning ───────────────────────────────────────────────────────────────
+
+@router.get("/finetune/setup-status", response_model=FinetuneSetupStatus)
+async def finetune_setup_status() -> FinetuneSetupStatus:
+    """Whether the finetune_csv pipeline is vendored, and how to install it."""
+    from plugins.KronosForecastPlugin.backend.services import finetune_service
+    return FinetuneSetupStatus(**finetune_service.setup_status())
+
+
+@router.post("/finetune/export", response_model=FinetuneExportResponse)
+async def finetune_export(req: FinetuneExportRequest) -> FinetuneExportResponse:
+    """Export live OHLCV to a Kronos-format CSV (preview) without training."""
+    from pathlib import Path
+    from plugins.KronosForecastPlugin.backend.services import (
+        finetune_data_exporter as exporter, finetune_service,
+    )
+    sym = _normalize_symbol(req.symbol)
+    out = Path(finetune_service._WORK_DIR) / "preview" / f"{sym.replace('/', '')}_{req.timeframe}.csv"
+    try:
+        summary = await exporter.export_training_data(req.exchange, sym, req.timeframe, req.limit, out)
+        return FinetuneExportResponse(ok=True, **summary)
+    except Exception as exc:
+        return FinetuneExportResponse(
+            ok=False, symbol=sym, exchange=req.exchange, timeframe=req.timeframe,
+            error=str(exc),
+        )
+
+
+@router.post("/finetune/start", response_model=FinetuneJobResponse)
+async def finetune_start(req: FinetuneStartRequest) -> FinetuneJobResponse:
+    """Export data + start tokenizer→predictor fine-tuning as a background job."""
+    from fastapi import HTTPException
+    from plugins.KronosForecastPlugin.backend.services import finetune_service
+    req.symbol = _normalize_symbol(req.symbol)
+    try:
+        job = await finetune_service.finetune_manager.start(req)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return FinetuneJobResponse(**job)
+
+
+@router.get("/finetune/jobs")
+async def finetune_jobs():
+    """List recent fine-tune jobs (newest first)."""
+    from plugins.KronosForecastPlugin.backend.services import finetune_service
+    return {"jobs": await finetune_service.finetune_manager.list()}
+
+
+@router.get("/finetune/jobs/{job_id}", response_model=FinetuneJobResponse)
+async def finetune_job(job_id: int) -> FinetuneJobResponse:
+    """One fine-tune job with a tail of its live training log."""
+    from fastapi import HTTPException
+    from plugins.KronosForecastPlugin.backend.services import finetune_service
+    job = await finetune_service.finetune_manager.get(job_id, log_lines=50)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Fine-tune job {job_id} not found")
+    return FinetuneJobResponse(**job)
+
+
+@router.delete("/finetune/jobs/{job_id}")
+async def finetune_cancel(job_id: int):
+    """Cancel a running fine-tune job (SIGTERM the trainer, mark cancelled)."""
+    from plugins.KronosForecastPlugin.backend.services import finetune_service
+    ok = await finetune_service.finetune_manager.cancel(job_id)
+    return {"ok": ok, "job_id": job_id}
+
+
+@router.post("/finetune/load/{job_id}")
+async def finetune_load(job_id: int):
+    """Hot-swap the engine to a completed job's finetuned model."""
+    from fastapi import HTTPException
+    from plugins.KronosForecastPlugin.backend.services import finetune_service
+    try:
+        return await finetune_service.finetune_manager.load_finetuned(job_id)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))

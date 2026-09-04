@@ -198,6 +198,9 @@ async def get_ohlcv(
 
     # Accept URL-safe format: BTCUSDT -> BTC/USDT, PEPEUSDT -> PEPE/USDT
     if "/" not in symbol:
+        # Strip URL-safe hyphens (ETH-USD → ETHUSD) before further processing
+        if "-" in symbol:
+            symbol = symbol.replace("-", "")
         upper = symbol.upper()
         # 1. Explicit alias map (highest priority — handles XAUUSD → XAU/USDT etc.)
         if is_crypto and upper in _SYMBOL_ALIASES:
@@ -213,6 +216,83 @@ async def get_ohlcv(
             # 3. USD quote on crypto exchange → upgrade to USDT
             if not matched and is_crypto and upper.endswith("USD") and len(upper) > 3:
                 symbol = symbol[:-3] + "/USDT"
+
+    # ── Fast-path: MT5 then Yahoo for non-USDT crypto and all FX/metals ──────
+    # Avoids routing ETH/USD / EUR/USD through Bitget futures (wrong venue).
+    _is_non_usdt_spot = (
+        is_crypto
+        and symbol.endswith("/USD")
+        and not symbol.endswith("/USDT")
+        and symbol.split("/")[0] not in ("XAU", "XAG", "XPT", "XPD")
+    )
+    _is_fx_metal = not is_crypto
+
+    if _is_non_usdt_spot or _is_fx_metal:
+        try:
+            from app.core.database import AsyncSessionLocal as _ASL
+            from sqlalchemy import select as _sel
+            from plugins.MT5TradingPlugin.backend.models import MT5Account as _MT5Acct
+            from plugins.MT5TradingPlugin.backend.services.mt5_client import mt5_client as _mt5
+            _TF = {"1m":"M1","5m":"M5","15m":"M15","30m":"M30","1h":"H1","4h":"H4","1d":"D1"}
+            async with _ASL() as _db:
+                _accts = (await _db.execute(
+                    _sel(_MT5Acct).where(_MT5Acct.api_reachable.is_(True)).limit(3)
+                )).scalars().all()
+            for _acct in _accts:
+                try:
+                    _base = symbol.upper().replace("/", "").replace("-", "")
+                    # Exness broker appends "m"; try both bare and suffixed forms
+                    _sym_variants = [_base, _base + "m"]
+                    if _base.endswith("USD") and not _base.endswith("USDT"):
+                        _sym_variants.append(_base[:-3] + "USDTm")
+                    _bars = None
+                    for _sym in _sym_variants:
+                        try:
+                            _bars = await asyncio.wait_for(
+                                _mt5.get_candles(str(_acct.login), _acct.server,
+                                                 _acct.password_encrypted,
+                                                 _sym, _TF.get(timeframe, "H1"), limit),
+                                timeout=8.0,
+                            )
+                            if _bars:
+                                break
+                        except Exception:
+                            _bars = None
+                    if _bars and len(_bars) >= 5:
+                        return {
+                            "exchange": f"mt5:{_acct.server}", "symbol": symbol,
+                            "timeframe": timeframe, "count": len(_bars),
+                            "data": [{"time": int(b["time"]), "open": float(b["open"]),
+                                      "high": float(b["high"]), "low": float(b["low"]),
+                                      "close": float(b["close"]),
+                                      "volume": float(b.get("volume", 0) or 0)}
+                                     for b in _bars],
+                        }
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        if _is_fx_metal:
+            try:
+                from app.exchanges.yahoo_provider import fetch_candles as _yf
+                _YF_TF = {"1m":"M1","5m":"M5","15m":"M15","30m":"M30",
+                          "1h":"H1","4h":"H4","1d":"D1"}
+                _yf_bars = await asyncio.wait_for(
+                    _yf(symbol, _YF_TF.get(timeframe, "H1"), limit), timeout=12.0
+                )
+                if _yf_bars and len(_yf_bars) >= 5:
+                    return {
+                        "exchange": "yahoo", "symbol": symbol,
+                        "timeframe": timeframe, "count": len(_yf_bars),
+                        "data": [{"time": int(b["time"]), "open": float(b["open"]),
+                                  "high": float(b["high"]), "low": float(b["low"]),
+                                  "close": float(b["close"]),
+                                  "volume": float(b.get("volume", 0) or 0)}
+                                 for b in _yf_bars],
+                    }
+            except Exception:
+                pass
 
     cache_key = f"{exchange.value}:{symbol}:{timeframe}:{limit}"
     now_ts = time.time()

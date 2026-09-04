@@ -186,6 +186,11 @@ class MT5Client:
         # the log when MT5_API_URL is empty/schemeless in the environment.
         self._url_err_last: float = 0.0   # monotonic timestamp of last bad-URL event
         self._url_err_logged = False       # have we logged the actionable message?
+        # Per-account SymbolList cache for symbol resolution (login@server →
+        # (expires_monotonic, [names])). Brokers spell the same instrument
+        # differently (BTCUSDm, BTCUSD.r, #BTCUSD, BTC/USD); resolving against
+        # the broker's own list avoids "Symbol not found" order rejections.
+        self._symbol_cache: Dict[str, tuple] = {}
 
     @staticmethod
     def _resolve_url(base_url: Optional[str]) -> str:
@@ -701,6 +706,118 @@ class MT5Client:
         token = await self.get_token(login, server, password)
         return await self._get("/SymbolParams", params={"id": token, "symbol": symbol})
 
+    # ── Symbol resolution ─────────────────────────────────────────────────────
+    # Every broker lists the same instrument under its own name. Crypto CFDs are
+    # the worst offenders: Exness Standard/Cent append 'm' (BTCUSDm), raw/ECN
+    # books use '.r'/'.raw'/'#'/'.a', some brokers slash it (BTC/USD), and the
+    # MetaQuotes demo carries no crypto at all. Sending the bare canonical name
+    # ("BTCUSD") gets rejected with "Symbol not found". Professional multi-broker
+    # EAs solve this by scanning the terminal's own symbol table and matching —
+    # never by hardcoding one broker's suffix — so that is what we do here.
+
+    _SYMBOL_CACHE_TTL = 300  # seconds; broker symbol tables change rarely
+
+    # A few brokers (Kraken-lineage feeds, some EU books) list Bitcoin under the
+    # ISO-style 'XBT' code instead of 'BTC'. Match either spelling both ways.
+    _BASE_ALIASES = {"BTC": "XBT", "XBT": "BTC"}
+
+    @staticmethod
+    def _canonical_symbol(sym: str) -> str:
+        """Uppercase, drop separators, fold stablecoin quotes to USD.
+
+        'BTC/USDT' → 'BTCUSD', 'ETH-USD' → 'ETHUSD', 'XAUUSD' → 'XAUUSD'.
+        Lets a broker's 'BTCUSDm' and an exchange's 'BTCUSDT' compare equal.
+        """
+        s = re.sub(r"[^A-Z0-9]", "", (sym or "").upper())
+        if s.endswith("USDT") and len(s) > 4:
+            return s[:-1]              # BTCUSDT → BTCUSD
+        if s.endswith("USDC") and len(s) > 4:
+            return s[:-4] + "USD"      # BTCUSDC → BTCUSD
+        return s
+
+    def _canonical_wants(self, symbol: str) -> List[str]:
+        """Canonical form(s) to match against, including base-code aliases."""
+        want = self._canonical_symbol(symbol)
+        if not want:
+            return []
+        wants = [want]
+        for base, alias in self._BASE_ALIASES.items():
+            if want.startswith(base):
+                wants.append(alias + want[len(base):])   # BTCUSD ↔ XBTUSD
+        return wants
+
+    async def _list_symbols_cached(self, login: str, server: str, password: str) -> List[str]:
+        """SymbolList for one account, cached for a few minutes."""
+        import time as _t
+        key = f"{login}@{server}"
+        now = _t.monotonic()
+        hit = self._symbol_cache.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+        syms = await self.get_symbols(login, server, password)
+        if syms:
+            self._symbol_cache[key] = (now + self._SYMBOL_CACHE_TTL, syms)
+        return syms
+
+    async def resolve_symbol(
+        self, login: str, server: str, password: str, symbol: str,
+    ) -> Optional[str]:
+        """Return the broker's exact symbol name for a pair, or None if absent.
+
+        Matching order: exact canonical → shortest suffixed (BTCUSDm, BTCUSD.r) →
+        shortest prefixed (#BTCUSD). Returns None when the instrument simply is
+        not listed on this server (e.g. crypto on a MetaQuotes forex demo) so the
+        caller skips that account instead of firing a doomed order.
+        """
+        wants = self._canonical_wants(symbol)
+        if not wants:
+            return None
+        try:
+            syms = await self._list_symbols_cached(login, server, password)
+        except Exception:  # noqa: BLE001 — a SymbolList hiccup must not block a valid symbol
+            syms = []
+        if not syms:
+            # No table to match against — fall back to the requested spelling so a
+            # transient SymbolList failure doesn't reject a normally-valid order.
+            fallback = re.sub(r"[^A-Z0-9]", "", (symbol or "").upper())
+            return fallback or None
+        exact: List[str] = []
+        suffixed: List[str] = []
+        prefixed: List[str] = []
+        for name in syms:
+            c = self._canonical_symbol(name)
+            for want in wants:
+                if c == want:
+                    exact.append(name)
+                elif c.startswith(want) and (len(c) - len(want)) <= 5:
+                    suffixed.append(name)    # BTCUSD + 'M'/'.R'/'PRO' …
+                elif c.endswith(want) and (len(c) - len(want)) <= 5:
+                    prefixed.append(name)    # '#'/'.'/'C' + BTCUSD
+        pool = exact or suffixed or prefixed
+        if not pool:
+            return None
+        return min(pool, key=len)            # shortest = least-decorated variant
+
+    async def get_symbol_info(
+        self, login: str, server: str, password: str, symbol: str,
+    ) -> Dict[str, Any]:
+        """Availability probe used by the room executor before sizing a trade.
+
+        Returns ``{available, symbol, requested, message}``. A ``message``
+        containing "not found" tells the caller to skip this account (the
+        instrument isn't listed here — e.g. BTCUSD on a MetaQuotes forex demo).
+        """
+        try:
+            resolved = await self.resolve_symbol(login, server, password, symbol)
+        except Exception as exc:  # noqa: BLE001
+            return {"available": False, "symbol": symbol, "message": str(exc)}
+        if resolved is None:
+            return {
+                "available": False, "symbol": symbol, "requested": symbol,
+                "message": f"Symbol not found: {symbol} is not listed on {server}",
+            }
+        return {"available": True, "symbol": resolved, "requested": symbol, "message": ""}
+
     # ── Trading ───────────────────────────────────────────────────────────────
 
     async def place_order(
@@ -711,6 +828,23 @@ class MT5Client:
     ) -> Dict:
         """OrderSendSafe: market or pending order."""
         token = await self.get_token(login, server, password)
+        # Resolve to the broker's own spelling BEFORE sending. Without this a
+        # bare "BTCUSD" is rejected on brokers that list it as BTCUSDm / BTCUSD.r
+        # / #BTCUSD, and a MetaQuotes forex demo (no crypto) returns a hard
+        # "Symbol not found". Resolving first turns those into a clean skip
+        # instead of a broker error and a phantom no-ticket fill.
+        try:
+            resolved = await self.resolve_symbol(login, server, password, symbol)
+        except Exception:  # noqa: BLE001 — never let resolution crash the order path
+            resolved = None
+        if resolved is None:
+            return {
+                "message": f"Symbol not found: {symbol} is not listed on {server}",
+                "code": "SYMBOL_NOT_FOUND",
+                "symbol": symbol,
+                "ticket": None,
+            }
+        symbol = resolved
         op_map = {
             "buy": "Buy", "sell": "Sell",
             "buy_limit": "BuyLimit",  "sell_limit": "SellLimit",

@@ -56,6 +56,23 @@ _FRONTEND_LEARNING_SOURCES = {
 def _source_label(key: str, backend_source: str) -> str:
     return f"{backend_source}|{key}_page" if key in _FRONTEND_LEARNING_SOURCES else backend_source
 
+
+def _as_list(payload: Any, *keys: str) -> list:
+    """Normalise an API response into a list.
+
+    Endpoints may return a bare list or wrap it in a dict (e.g. ``{"data": [...]}``).
+    Iterating/slicing a dict is what produced ``'str' object has no attribute 'get'``
+    and ``KeyError: slice(...)`` errors during harvest.
+    """
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in (*keys, "data", "items", "results"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. HARVEST
 # ─────────────────────────────────────────────────────────────────────────────
@@ -72,7 +89,7 @@ async def harvest_intelligence(db: AsyncSession) -> dict[str, Any]:
         try:
             r = await client.get(f"{_BASE}/sentiment/")
             if r.status_code == 200:
-                items = r.json() or []
+                items = _as_list(r.json(), "sentiment", "sentiments")
                 # Top 5 most extreme sentiment scores
                 sorted_items = sorted(items, key=lambda x: abs(x.get("score", 0)), reverse=True)[:5]
                 for s in sorted_items:
@@ -103,7 +120,7 @@ async def harvest_intelligence(db: AsyncSession) -> dict[str, Any]:
         try:
             r = await client.get(f"{_BASE}/sentiment/enhanced/all")
             if r.status_code == 200:
-                data = r.json() or []
+                data = _as_list(r.json(), "sentiment", "sentiments")
                 for item in data[:3]:
                     sym = item.get("symbol", "")
                     if not sym:
@@ -130,7 +147,7 @@ async def harvest_intelligence(db: AsyncSession) -> dict[str, Any]:
         try:
             r = await client.get(f"{_BASE}/signals/smc/signals", params={"limit": 20})
             if r.status_code == 200:
-                signals = r.json() or []
+                signals = _as_list(r.json(), "signals")
                 for sig in signals[:10]:
                     sym = sig.get("symbol", "UNKNOWN")
                     action = sig.get("action") or sig.get("signal", "HOLD")
@@ -220,7 +237,7 @@ async def harvest_intelligence(db: AsyncSession) -> dict[str, Any]:
                 params={"limit": 30, "status": "active"},
             )
             if r.status_code == 200:
-                signals = r.json() or []
+                signals = _as_list(r.json(), "signals")
                 for sig in (signals or [])[:12]:
                     sym = sig.get("symbol", "")
                     direction = sig.get("direction") or sig.get("action") or ""
@@ -256,7 +273,7 @@ async def harvest_intelligence(db: AsyncSession) -> dict[str, Any]:
                 params={"limit": 15},
             )
             if r.status_code == 200:
-                decisions = r.json() or []
+                decisions = _as_list(r.json(), "decisions")
                 for d in decisions[:8]:
                     sym = d.get("symbol", "")
                     action = d.get("action", d.get("decision", "HOLD"))
@@ -286,7 +303,7 @@ async def harvest_intelligence(db: AsyncSession) -> dict[str, Any]:
                 params={"limit": 20, "min_sentiment": 0.4},
             )
             if r.status_code == 200:
-                articles = r.json() or []
+                articles = _as_list(r.json(), "articles", "news")
                 for art in articles[:5]:
                     title = art.get("title", "")
                     content_snippet = (art.get("summary") or art.get("content") or "")[:300]

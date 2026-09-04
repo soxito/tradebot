@@ -11,6 +11,10 @@
 # ══════════════════════════════════════════════════════════
 set -euo pipefail
 
+# macOS: drop MallocStackLogging so child Python procs don't warn
+# "can't turn off malloc stack logging because it was not enabled"
+unset MallocStackLogging MallocStackLoggingNoCompact 2>/dev/null || true
+
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 

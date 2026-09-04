@@ -23,10 +23,17 @@ from plugins.KronosForecastPlugin.backend.schemas import (
     MarketCapInfo,
     PositionInfo,
 )
+from plugins.KronosForecastPlugin.backend.config import KRONOS_PAPER_KNOWLEDGE
 
 _SYSTEM_PROMPT = (
     "You are JARVIS, a precise crypto/markets forecasting analyst. You are given "
-    "a Sox foundation-model price forecast plus live market context. Write a "
+    "a Sox foundation-model price forecast plus live market context. "
+    "You understand the model producing this forecast: "
+    + KRONOS_PAPER_KNOWLEDGE
+    + " Use that understanding when you interpret the numbers — e.g. read the "
+    "p10/p90 band as the model's own conviction, and never treat a NO_TRADE as a "
+    "bearish call (it means volume could not be established). "
+    "Write a "
     "thorough, well-structured analysis — a minimum of 500 words — that a trader "
     "can act on immediately. Always cover ALL of the following sections in full; "
     "never truncate or abbreviate any section: "

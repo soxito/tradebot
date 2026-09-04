@@ -151,6 +151,18 @@ class Settings(BaseSettings):
     CURRENTS_API_KEY: str = ""
     FRED_API_KEY: str = ""
     TWITTER_BEARER_TOKEN: str = ""
+    # OAuth 1.0a user-context creds — enables free-tier home-timeline monitoring
+    TWITTER_API_KEY: str = ""
+    TWITTER_API_SECRET: str = ""
+    TWITTER_ACCESS_TOKEN: str = ""
+    TWITTER_ACCESS_TOKEN_SECRET: str = ""
+    TWITTER_USER_ID: str = ""   # your numeric Twitter user ID
+
+    # ScrapeGraphAI — optional dedicated provider (falls back to system OPENAI/NVIDIA)
+    SCRAPEGRAPH_AI_API_KEY:  str = ""
+    SCRAPEGRAPH_AI_BASE_URL: str = ""
+    SCRAPEGRAPH_AI_MODEL:    str = ""
+
     REDDIT_CLIENT_ID: str = ""
     REDDIT_CLIENT_SECRET: str = ""
 
@@ -372,30 +384,26 @@ class Settings(BaseSettings):
     OBSIDIAN_CONTEXT_TOKEN_BUDGET: int = 800
 
     # Agent-Reach integration (github.com/Panniantong/Agent-Reach) — gives
-    # agents web read/search, YouTube and GitHub research. Off by default:
-    # the CLI must be installed on the host (`agent-reach install --env=auto`)
-    # before this does anything. ENABLED gates the client + on-demand tools;
+    # agents web read/search, YouTube and GitHub research. ENABLED gates the client + on-demand tools;
     # INJECT_CONTEXT separately gates always-on prompt injection into
-    # trading-decision paths (orchestrator/JARVIS), which adds latency.
-    AGENT_REACH_ENABLED: bool = False
+    # trading-decision paths (orchestrator/JARVIS). Now enabled for all 7 seats so every agent can research.
+    AGENT_REACH_ENABLED: bool = True
     AGENT_REACH_BIN: str = "agent-reach"
     AGENT_REACH_TIMEOUT_S: float = 15.0
     AGENT_REACH_CONTEXT_TOKEN_BUDGET: int = 800
-    AGENT_REACH_INJECT_CONTEXT: bool = False
+    AGENT_REACH_INJECT_CONTEXT: bool = True
 
     # ── Hermes Agent (NousResearch/hermes-agent) ─────────────────────
-    # Self-aware upgrade: episodic + skill + user-model (locked scope per plan).
-    # Runs as isolated sidecar on 8011 (like TradingAgents on 8010). Vault stays
-    # as async exporter only; hermes_state.db is recall source (90d retention,
-    # recall-only — scoring stays on Postgres AgentDecision).
-    HERMES_ENABLED: bool = False
+    # Self-aware upgrade: episodic + skill + user-model. Now with cron + mini_swe_runner for self-coding.
+    # Vault stays as async exporter; hermes_state.db is recall source (90d retention).
+    HERMES_ENABLED: bool = True
     HERMES_GATEWAY_URL: str = "http://127.0.0.1:8011"
     HERMES_STATE_PATH: str = ""              # default: DATA_DIR/hermes_state.db or ./data/hermes_state.db
     HERMES_SKILLS_PATH: str = ""             # default: DATA_DIR/hermes_skills or ./hermes_skills
     HERMES_RETENTION_DAYS: int = 90
-    HERMES_CRON_ENABLED: bool = False        # episodic+skill+user-model only — no Honcho/nudge by default
+    HERMES_CRON_ENABLED: bool = True         # enabled for mini_swe_runner self-coding
     HERMES_AUTO_INGEST: bool = True          # ingest every Trading Room session + JARVIS turn
-    HERMES_GATEWAY_AUTOSTART: bool = False   # start sidecar as child process (like TradingAgents)
+    HERMES_GATEWAY_AUTOSTART: bool = True    # start sidecar as child process (like TradingAgents)
     SOUL_PATH: str = "SOUL.md"               # merged JARVIS/Paul/SOX directive
 
     # ── Desktop (packaged Electron app) ───────────────────────
@@ -507,6 +515,7 @@ class Settings(BaseSettings):
                 "PRICE_TICK_INTERVAL_SECONDS",
                 "SIM_AUTO_TRADE_LOOP_INTERVAL_SECONDS",
                 "LIVE_AUTO_TRADE_LOOP_INTERVAL_SECONDS",
+                "COPY_WORKER_INTERVAL_SECONDS",
             ]
             for name in _interval_fields:
                 if name in pinned:
@@ -547,11 +556,24 @@ class Settings(BaseSettings):
         if "PRICE_TICK_MAX_SYMBOLS" not in pinned:
             self.PRICE_TICK_MAX_SYMBOLS = min(self.PRICE_TICK_MAX_SYMBOLS, _tick_symbol_cap)
 
-        # Hermes: disable entirely on minimal/low, gate cron on medium+
-        if tier_index(tier) <= 1 and "HERMES_ENABLED" not in pinned:
+        # TradingAgents sidecar is a *separate* Python process carrying a heavy
+        # langchain/pandas stack (hundreds of MB RSS). Weak machines can't spare
+        # it, so keep it off below `medium` unless the user pinned it in .env.
+        # The in-app code paths already degrade gracefully when the sidecar is
+        # absent (they health-check first), so nothing breaks — it just isn't
+        # auto-spawned. Opt back in with TRADINGAGENTS_SERVICE_AUTOSTART=true.
+        if (
+            tier_index(tier) < tier_index("medium")
+            and "TRADINGAGENTS_SERVICE_AUTOSTART" not in pinned
+        ):
+            self.TRADINGAGENTS_SERVICE_AUTOSTART = False
+
+        # Hermes: per 2026-08-31 plan, keep enabled on all tiers (user wants full autonomy)
+        # Only gate on minimal if not pinned — don't disable on low/medium
+        if tier_index(tier) <= 0 and "HERMES_ENABLED" not in pinned:
             self.HERMES_ENABLED = False
-        if tier_index(tier) <= 2 and "HERMES_CRON_ENABLED" not in pinned:
-            self.HERMES_CRON_ENABLED = False
+        # Cron (mini_swe_runner) enabled on all per user request — no tier gate
+        pass
 
         return self
 

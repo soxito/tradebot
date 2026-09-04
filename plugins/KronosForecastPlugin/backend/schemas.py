@@ -246,3 +246,74 @@ class SniperSignalsResponse(BaseModel):
     rationale: List[str] = Field(default_factory=list)
     note: Optional[str] = None
 
+
+# ── Fine-tuning ───────────────────────────────────────────────────────────────
+
+FinetuneStatusT = Literal[
+    "pending", "exporting", "running", "completed", "failed", "cancelled"
+]
+
+
+class FinetuneStartRequest(BaseModel):
+    """Kick off a fine-tune on live OHLCV for one instrument/timeframe."""
+    symbol: str
+    exchange: str = "bitget"
+    timeframe: str = "1h"
+    limit: int = Field(5000, ge=256, le=100000, description="Candles to export for training")
+    lookback: int = Field(512, ge=64, le=2048)
+    pred_len: int = Field(48, ge=1, le=512)
+    tokenizer_epochs: int = Field(30, ge=1, le=200)
+    predictor_epochs: int = Field(20, ge=1, le=200)
+    batch_size: int = Field(32, ge=1, le=256)
+    base_model: Optional[str] = None            # HF id/local path to start from
+
+
+class FinetuneExportRequest(BaseModel):
+    symbol: str
+    exchange: str = "bitget"
+    timeframe: str = "1h"
+    limit: int = Field(3000, ge=256, le=100000)
+
+
+class FinetuneExportResponse(BaseModel):
+    ok: bool
+    path: Optional[str] = None
+    rows: int = 0
+    symbol: str
+    exchange: str
+    timeframe: str
+    first_ts: Optional[str] = None
+    last_ts: Optional[str] = None
+    error: Optional[str] = None
+
+
+class FinetuneJobResponse(BaseModel):
+    id: int
+    symbol: str
+    exchange: str
+    timeframe: str
+    status: FinetuneStatusT
+    lookback: int
+    pred_len: int
+    tokenizer_epochs: int
+    predictor_epochs: int
+    batch_size: int
+    base_model: Optional[str] = None
+    rows_exported: Optional[int] = None
+    data_path: Optional[str] = None
+    output_dir: Optional[str] = None
+    log_path: Optional[str] = None
+    pid: Optional[int] = None
+    error: Optional[str] = None
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    created_at: Optional[str] = None
+    log_tail: Optional[str] = None              # last N lines of the training log
+
+
+class FinetuneSetupStatus(BaseModel):
+    vendored: bool                              # finetune_csv pipeline present?
+    model_vendored: bool                        # base model/ package present?
+    setup_command: str                          # how to vendor it if missing
+    finetune_dir: str
+

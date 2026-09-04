@@ -207,6 +207,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:  # never fatal — plugin may be absent
         logger.warning(f"Telegram monitor autostart skipped: {e}")
 
+    # X Scraper (ScrapeGraphAI) — version check + results load; never fatal
+    try:
+        from app.api.x_scraper import startup_check as _scraper_startup
+        await _scraper_startup()
+    except Exception as e:
+        logger.debug(f"X Scraper startup skipped: {e}")
+
     # Unified task supervisor — register every background loop as a supervised
     # adapter (observational: does not change what starts) and launch the memory
     # watchdog so the app throttles itself under pressure instead of swapping.

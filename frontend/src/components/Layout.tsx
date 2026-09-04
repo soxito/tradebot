@@ -54,6 +54,7 @@ import {
   Users,
   Plug,
   Repeat,
+  Twitter,
 } from 'lucide-react';
 
 interface NavItem {
@@ -69,6 +70,7 @@ const navItems: NavItem[] = [
   { href: '/futures', label: 'Futures', icon: Layers },
   { href: '/signals', label: 'Signals', icon: Radio },
   { href: '/telegram-signals', label: 'Telegram Signals', icon: MessageSquareText },
+  { href: '/x-monitor', label: 'X Monitor', icon: Twitter },
   { href: '/trending', label: 'Trending', icon: TrendingUp },
   { href: '/strategies', label: 'Strategies', icon: Zap },
   { href: '/sentiment', label: 'Sentiment', icon: Brain },

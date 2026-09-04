@@ -1014,9 +1014,17 @@ _TF_GENESIS_LIMIT: Dict[str, int] = {
     "MN1": 300,     # 195 months from 2010
     "W1": 1200,     # 842 weeks
     "D1": 7000,     # 5,900 days
-    "H4": 40000,    # 35k 4h
-    "H1": 150000,   # 141k hours
+    "H4": 40000,    # 35k 4h (full genesis)
+    "H1": 150000,   # 141k hours (full genesis)
 }
+# 4-year / last-halving window: H1 4y=35040h, H4 4y=8760, keeps intraday perf while covering last halving cycle
+_TF_4Y_LIMIT: Dict[str, int] = {
+    "H4": 8760,    # 4y of 4h
+    "H1": 35040,   # 4y of 1h
+}
+# Last halving anchor — also the start of the 4y window when it is later than now-4y
+_LAST_HALVING_BOTTOM = date(2022, 11, 21)
+_HALVING_4Y_SINCE_MS = int(datetime(2022, 11, 21, tzinfo=timezone.utc).timestamp() * 1000)
 _TF_API_TIMELINE_MAP: Dict[str, str] = {"MN1": "MN1", "W1": "W1", "D1": "D1", "H4": "H4", "H1": "H1"}
 
 
@@ -1036,11 +1044,12 @@ async def _fetch_bitget_paginated(timeframe: str, limit: int) -> List[Dict[str, 
     tf_ms = {"H1": 3600_000, "H4": 14_400_000}.get(timeframe, 3600_000)
     collected: List[Dict[str, Any]] = []
     seen_start: set[int] = set()
-    # Page backward from now: start at most-recent window, then step back
-    # This avoids the "since=2010 returns [] and we break" trap.
-    since = max(genesis_ms, now_ms - 1500 * tf_ms)
+    # Bitget caps at 1000 per call for 1h (35040 needs 35 pages), 500 for some TFs — use 1000 as safe page size
+    page_size = 1000
+    # Page backward from now: start at the beginning of the desired window (now - limit*tf) so 4y gives 2022, not 41 days
+    since = max(genesis_ms, now_ms - limit * tf_ms)
     pages = 0
-    max_pages = max(1, (limit // 1500) + 5) if limit else 120
+    max_pages = max(1, (limit // page_size) + 8) if limit else 120
     # Track earliest timestamp seen to know when we reached genesis
     earliest_seen_ms: int | None = None
     # Reuse cached public instance pattern to avoid repeated load-markets
@@ -1063,13 +1072,13 @@ async def _fetch_bitget_paginated(timeframe: str, limit: int) -> List[Dict[str, 
     while pages < max_pages and since >= genesis_ms:
         try:
             rows = await _asyncio.wait_for(
-                exchange.fetch_ohlcv(symbol="BTC/USDT:USDT", timeframe=ccxt_tf, since=since, limit=1500),
+                exchange.fetch_ohlcv(symbol="BTC/USDT:USDT", timeframe=ccxt_tf, since=since, limit=page_size),
                 timeout=22,
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"[Cycle] Bitget paginated H1/H4 page {pages} failed: {exc}")
             # Step further back and retry — don't abort whole history on one blip
-            since -= 1500 * tf_ms
+            since -= page_size * tf_ms
             pages += 1
             if pages % 5 == 0:
                 await _asyncio.sleep(0.2)
@@ -1077,7 +1086,7 @@ async def _fetch_bitget_paginated(timeframe: str, limit: int) -> List[Dict[str, 
         if not rows:
             # Empty window — Bitget has no data in this slice (pre-listing gap).
             # Step further back to look for earlier history.
-            since -= 1500 * tf_ms
+            since -= page_size * tf_ms
             pages += 1
             if since < genesis_ms:
                 break
@@ -1106,7 +1115,7 @@ async def _fetch_bitget_paginated(timeframe: str, limit: int) -> List[Dict[str, 
         pages += 1
         # Step the window start back before the earliest candle in this batch
         earliest_in_batch = min(int(r[0]) for r in rows)
-        since = earliest_in_batch - 1500 * tf_ms - tf_ms
+        since = earliest_in_batch - page_size * tf_ms - tf_ms
         if earliest_seen_ms is not None and earliest_seen_ms <= genesis_ms + tf_ms:
             break
         # Be nice to rate limits
@@ -1126,26 +1135,39 @@ async def resolve_btc_candles(
     timeframe: str = "D1",
     limit: Optional[int] = None,
     force: bool = False,
+    full: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Full-history BTC candles for the cycle chart — genesis-aware.
+    """BTC candles for the cycle chart — 4y default for H1/H4, genesis for others.
 
-    * MN1/W1/D1 → Yahoo `max` + CoinMetrics daily backfill → true 2010 genesis.
-    * H4/H1 → Bitget paginated (real) + synthetic daily→hourly for 2010→Bitget-start gap → continuous 2010 line.
-    Cached per timeframe (TTL = CYCLE_CACHE_TTL_SECONDS). limit=0 or None means "full genesis".
+    * MN1/W1/D1 → Yahoo `max` + CoinMetrics daily backfill → true 2010 genesis (always).
+    * H4/H1 → Bitget paginated (real) + synthetic daily→hourly for gap.
+      Default `full=False` → 4y / last halving (`max(now-4y, 2022-11-21)`, 35040 H1 / 8760 H4)
+      so agents have enough context without 96k crash. `full=True` → 15y genesis (150k/40k).
+    Cached per timeframe+full (TTL = CYCLE_CACHE_TTL_SECONDS). limit=0/None means default window.
     """
     tf = (timeframe or "D1").upper().strip()
     # Normalize aliases
     if tf in ("1M", "MN", "MONTH"): tf = "MN1"
     if tf not in _TF_GENESIS_LIMIT:
         tf = "D1"
-    genesis_limit = _TF_GENESIS_LIMIT[tf]
-    want = genesis_limit if not limit or limit <= 0 else min(int(limit), max(genesis_limit, int(limit)))
-    # Allow callers to ask larger than genesis (e.g., H1 150k) — cap at 150k
+    # H1/H4 default to 4y / last halving (35040/8760) unless caller explicitly asks for full 15y
+    if tf in _TF_4Y_LIMIT and not full:
+        genesis_limit = _TF_4Y_LIMIT[tf]
+        # When not full, clamp to 4y even if caller asks for more
+        if limit and int(limit) > 0:
+            want = min(int(limit), genesis_limit)
+        else:
+            want = genesis_limit
+    else:
+        genesis_limit = _TF_GENESIS_LIMIT[tf]
+        want = genesis_limit if not limit or limit <= 0 else min(int(limit), max(genesis_limit, int(limit)))
+    # Cap at 150k
     want = max(1, min(150000, want))
     cfg = _settings()
     ttl = max(60, int(getattr(cfg, "CYCLE_CACHE_TTL_SECONDS", 900) or 900))
+    cache_key = f"{tf}:{'full' if full else '4y'}" if tf in _TF_4Y_LIMIT else tf
     async with _lock:
-        hit = _btc_tf_cache.get(tf)
+        hit = _btc_tf_cache.get(cache_key)
         if not force and hit and hit.get("bars") and (time.monotonic() - hit["ts"]) < ttl and len(hit["bars"]) >= min(want, 100):
             cached = hit["bars"]
             # Return slice of cached if caller asked smaller window
@@ -1156,7 +1178,7 @@ async def resolve_btc_candles(
         # resolve_monthly_bars already returns ~195 monthly from 2010
         bars = bars[-want:] if len(bars) > want else bars
         async with _lock:
-            _btc_tf_cache[tf] = {"bars": bars, "ts": time.monotonic()}
+            _btc_tf_cache[cache_key] = {"bars": bars, "ts": time.monotonic()}
         return bars
     # ── W1 / D1 via Yahoo period + CoinMetrics daily backfill ──
     # Yahoo's range=max for 1d returns monthly (broken) — use period API for true daily/weekly.
@@ -1207,16 +1229,23 @@ async def resolve_btc_candles(
         bars = [seen[k] for k in sorted(seen.keys())]
         bars = bars[-want:] if len(bars) > want else bars
         async with _lock:
-            _btc_tf_cache[tf] = {"bars": bars, "ts": time.monotonic()}
+            _btc_tf_cache[cache_key] = {"bars": bars, "ts": time.monotonic()}
         return bars
     # ── H1 / H4 via Bitget paginated + synthetic gap ──
     # Fetch real Bitget history first
     bitget_bars = await _fetch_bitget_paginated(tf, limit=want)
-    # Determine gap between genesis (2010-07-17) and first Bitget bar
-    genesis_ts = int(datetime(2010, 7, 17, tzinfo=timezone.utc).timestamp())
+    # For 4y window (default), no synthetic needed — Bitget covers last 4y fully (since 2018)
+    # For full 15y, gap is 2010→Bitget start (2018) — synthesize from daily
+    # Determine 4y window start for synthetic decision: use max(now-4y, last halving) when not full
+    is_4y = not full and tf in _TF_4Y_LIMIT
+    four_y_since = int((datetime.now(timezone.utc) - timedelta(days=4*365)).timestamp())
+    halving_since = _HALVING_4Y_SINCE_MS // 1000
+    window_start_ts = max(four_y_since, halving_since) if is_4y else int(datetime(2010, 7, 17, tzinfo=timezone.utc).timestamp())
     gap_end_ts = bitget_bars[0]["time"] if bitget_bars else int(datetime.now(timezone.utc).timestamp())
     synthetic: List[Dict[str, Any]] = []
-    if gap_end_ts > genesis_ts + 3600:
+    # Only synthesize if gap is before the 4y window (for full genesis) or if 4y window still has gap
+    effective_gap_start = max(window_start_ts, int(datetime(2010, 7, 17, tzinfo=timezone.utc).timestamp()))
+    if gap_end_ts > effective_gap_start + 3600:
         try:
             # Fetch daily up to gap_end, synthesize hourly/4h
             daily_gap = await _fetch_early_btc_daily(gap_end_ts)
@@ -1249,7 +1278,7 @@ async def resolve_btc_candles(
     combined = [seen2[k] for k in sorted(seen2.keys())]
     combined = combined[-want:] if len(combined) > want else combined
     async with _lock:
-        _btc_tf_cache[tf] = {"bars": combined, "ts": time.monotonic()}
+        _btc_tf_cache[cache_key] = {"bars": combined, "ts": time.monotonic()}
     return combined
 
 

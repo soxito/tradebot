@@ -426,10 +426,10 @@ def _policy(**over):
     return s
 
 
-def test_a_crypto_pair_goes_to_the_exchange_not_the_broker():
-    """The old if/elif gave MT5 every trade and left the exchange idle."""
+def test_a_crypto_pair_goes_to_the_exchange_and_also_mt5_when_both_enabled():
+    """Exness (and similar) list crypto CFDs — both venues execute concurrently."""
     venues = execution.venues_for("BTCUSDT", _policy())
-    assert "crypto" in venues and "mt5" not in venues
+    assert "crypto" in venues and "mt5" in venues
 
 
 def test_gold_and_the_crosses_go_to_the_broker():

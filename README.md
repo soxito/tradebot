@@ -71,7 +71,7 @@ Network: **Bitcoin mainnet**
 - **Frontend:** Next.js 16, React 19, TypeScript, Tailwind, TradingView Lightweight Charts, Three.js, react-force-graph-3d/2d
 - **Exchanges:** Binance, Bitget (spot + futures), Bybit, OKX, KuCoin, Coinbase — plus MetaTrader 5 (forex/metals/indices) via the `MT5TradingPlugin`
 - **AI agents:** multi-agent orchestrator (Market+Sentiment → Signal → Risk → Executor pipeline) with per-agent decision memory to skip redundant LLM calls, backed by OpenAI and a multi-provider LLM router (`AiMarketAnalyst`)
-- **Sentiment & news:** CryptoPanic, RSS feeds, Reddit, Telegram and WhatsApp channels → VADER + TextBlob scoring
+- **Sentiment & news:** CryptoPanic, RSS feeds, Reddit, Telegram and WhatsApp channels → VADER + TextBlob scoring; **X (Twitter) whale monitor** (OAuth 1.0a home-timeline polling, 19 accounts, free tier)
 - **Realtime:** Server-Sent Events over a Redis pub/sub `EventBus` (in-memory fallback)
 - **Assistant:** JARVIS / Paul / S.O.X — global voice + chat widget, 3D robot avatar, WebGL command room, and live face-vision
 - **Background workers:** a central scheduler drives sentiment, signal generation, sim/live auto-trade loops, position monitoring, the crypto sniper (pump/rug detection), pair-catalog sync, research, and vault sync — all independently toggleable
@@ -94,6 +94,7 @@ The sidebar (`frontend/src/components/Layout.tsx`) contains every page below. A 
 | **Market Cap** | `/market-cap` | TOTAL3 macro monitor: market cap/volume/change cards, BTC & ETH dominance, Fear & Greed index, bull/bear signal banner, dollar/macro context gauges, TOTAL/TOTAL2/TOTAL3 TradingView chart and a 30-day volume-divergence regime panel. Refreshes every 60 s. |
 | **Trending** | `/trending` | CoinGecko trending tokens board with sparklines, Top Gainers/Losers tables, and auto-monitoring badges — trending pairs auto-sync into the signal pipeline every ~3 minutes. |
 | **Bitcoin Cycle** | `/bitcoin-cycle` | The 1064-day Bitcoin cycle dashboard: live bull/bear phase, day-of-cycle, projected top/bottom countdowns, cycle-aligned comparison chart of past cycles, base-rate expectation table, month calendar grid, whale-watch panel (holder flows, large transfers), and validation of projected vs actual tops/bottoms. |
+| **X Monitor** | `/x-monitor` | X (Twitter) whale account monitor with two tabs. **Monitor tab:** watches 19 market-moving accounts (Trump, Musk, Saylor, Fed, SEC, Vitalik, CZ, Goldman Sachs …), injects breaking tweets directly into the sentiment pipeline every 2 min (configurable), shows auth mode (OAuth 1.0a / Bearer), live tweet feed with bullish/bearish sentiment highlights, account tier badges and pausing. **AI Scraper tab:** extracts social-media links (website, LinkedIn, GitHub, Telegram, Discord …) from each account's X profile in two modes — Basic (stdlib, always active, no install) and AI (ScrapeGraphAI + LLM, optional upgrade). Includes one-click install with full error output, dedicated AI provider config (API key, base URL, model), results table with expandable link lists and per-account re-scrape. |
 
 ### 📡 Signals & Detection
 
@@ -106,7 +107,7 @@ The sidebar (`frontend/src/components/Layout.tsx`) contains every page below. A 
 | **Pump Monitor** | `/pump-monitor` | Deep pump detection using 8 indicators (volume spike, price acceleration, social, order flow, momentum, BTC-relative, volatility, ATH breakout). Start/Stop auto-scanner, status pipeline cards (Watchlist → Detected → Confirmed → Signalled → Traded → Pumped/Faded) and expandable token score breakdowns. |
 | **Rug Pulled** | `/rug-pulled` | Rug-pull/dump tracker: lists tokens that pumped ≥30 % with buying-power-decline analysis, AI short-entry recommendations (entry/SL/TP with Fibonacci levels), sniper loop controls and Survived/Dumped marking. |
 | **Delistings** | `/delistings` | Exchange delisting warnings so you can exit affected pairs before removal dates. |
-| **Kronos Forecast** | `/kronos-forecast` | Kronos foundation-model candle forecasting studio: crypto + forex/metals pair search, horizon/samples/temperature sliders, hot-swappable model chips, predicted path with p10–p90 confidence bands, forecast signal panel with NO_TRADE gating, JARVIS analysis, and executable Sniper Entries (paper/live). |
+| **Kronos Forecast** | `/kronos-forecast` | Kronos foundation-model candle forecasting studio: crypto + forex/metals pair search, horizon/samples/temperature sliders, hot-swappable model chips, predicted path with p10–p90 confidence bands, forecast signal panel with NO_TRADE gating, JARVIS analysis, executable Sniper Entries (paper/live), and a Fine-tune panel to train Kronos on your own OHLCV (tokenizer → predictor) with live job logs and one-click model load. |
 | **Sentiment** | `/sentiment` | Sentiment dashboard: news/social/on-chain sentiment feeds plus an AI sentiment-agents status strip. |
 
 ### 🤖 AI Agents & Intelligence
@@ -163,6 +164,8 @@ The sidebar (`frontend/src/components/Layout.tsx`) contains every page below. A 
 - ✅ Multi-exchange connectors (Binance, Bitget, Bybit, OKX, KuCoin, Coinbase) with a native Bitget v2 SDK for spot + futures, plus dedicated spot-price providers for forex/metals
 - ✅ TradingView webhook receiver with signature validation
 - ✅ News + sentiment pipeline (RSS + CryptoPanic → VADER + TextBlob), plus Telegram/WhatsApp channel ingestion with dedupe and structured signal extraction
+- ✅ **X (Twitter) whale monitor** — tracks 19 market-moving accounts, OAuth 1.0a free-tier home-timeline polling, Breaking tweets injected into sentiment pipeline in real time
+- ✅ **X AI Scraper** — extracts social media links from whale profiles (basic stdlib mode always active; ScrapeGraphAI AI mode optional upgrade)
 - ✅ Multi-agent AI orchestrator: Market+Sentiment → Signal → Risk → Executor pipeline with persisted decision history and per-agent learning stats
 - ✅ Signal & strategy engine: technical signals, Pine Script strategies, Smart Money Concepts (order blocks, FVGs, premium/discount zones), Strategy Lab
 - ✅ Risk management (position sizing, SL/TP, exposure limits) across simulated (paper) and live engines
@@ -359,6 +362,19 @@ NVIDIA_API_KEY=            # free frontier models from build.nvidia.com ("nvapi-
 CRYPTOPANIC_API_KEY=
 REDDIT_CLIENT_ID=
 REDDIT_CLIENT_SECRET=
+
+# X (Twitter) whale monitor — OAuth 1.0a (free tier, no upgrade needed)
+TWITTER_BEARER_TOKEN=      # app-only bearer token (optional; Basic tier for per-account reads)
+TWITTER_API_KEY=           # OAuth 1.0a consumer key
+TWITTER_API_SECRET=        # OAuth 1.0a consumer secret
+TWITTER_ACCESS_TOKEN=      # OAuth 1.0a access token (for your developer account)
+TWITTER_ACCESS_TOKEN_SECRET=
+TWITTER_USER_ID=           # numeric user ID — auto-detected by start.py
+
+# X AI Scraper (optional — leave blank to use NVIDIA/OpenAI credentials)
+SCRAPEGRAPH_AI_API_KEY=
+SCRAPEGRAPH_AI_BASE_URL=
+SCRAPEGRAPH_AI_MODEL=
 
 # Alerts (optional)
 TELEGRAM_BOT_TOKEN=

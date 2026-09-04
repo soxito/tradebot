@@ -256,7 +256,89 @@ async def _fetch_public_ccxt_ohlcv(
     return []
 
 
+# ── MT5 primary source — all pair types (crypto spot, FX, metals, indices) ──
+# Tried first so ETH/USD, BTC/USD, XRP/USD get broker-native candles from
+# Swissquote-SPOT / Exness / any configured account.
+
+_MT5_TF_MAP: Dict[str, str] = {
+    "1m": "M1", "5m": "M5", "15m": "M15", "30m": "M30",
+    "1h": "H1", "2h": "H2", "4h": "H4", "6h": "H6", "12h": "H12",
+    "1d": "D1", "1w": "W1",
+}
+
+
+async def _fetch_mt5_ohlcv(symbol: str, timeframe: str, limit: int) -> Tuple[List[list], str]:
+    """Fetch OHLCV from the first reachable MT5 account for any pair type.
+
+    Returns (ccxt_rows, server_name); both empty/blank on failure.
+    """
+    try:
+        from app.core.database import AsyncSessionLocal
+        from sqlalchemy import select
+        from plugins.MT5TradingPlugin.backend.models import MT5Account
+        from plugins.MT5TradingPlugin.backend.services.mt5_client import mt5_client
+
+        async with AsyncSessionLocal() as db:
+            res = await db.execute(
+                select(MT5Account)
+                .where(MT5Account.api_reachable.is_(True))
+                .order_by(MT5Account.id)
+                .limit(5)
+            )
+            accounts = res.scalars().all()
+
+        if not accounts:
+            return [], ""
+
+        base_sym = symbol.upper().replace("/", "").replace("-", "")
+        tf_mt5 = _MT5_TF_MAP.get((timeframe or "").lower(), "H1")
+
+        # Build broker-specific symbol variants (Exness appends "m"; also try
+        # USD→USDT swap for pairs like BTC/USD where only BTCUSDTm is listed).
+        variants: List[str] = [base_sym]
+        if not base_sym.endswith("m"):
+            variants.append(base_sym + "m")
+        if base_sym.endswith("USD") and not base_sym.endswith("USDT"):
+            variants.append(base_sym[:-3] + "USDTm")
+
+        for acct in accounts:
+            for mt5_sym in variants:
+                try:
+                    bars = await mt5_client.get_candles(
+                        str(acct.login), acct.server, acct.password_encrypted,
+                        mt5_sym, tf_mt5, limit,
+                    )
+                    if not bars:
+                        continue
+                    rows = [
+                        [int(b["time"]) * 1000,
+                         float(b["open"]), float(b["high"]),
+                         float(b["low"]),  float(b["close"]),
+                         float(b.get("volume", 0) or 0)]
+                        for b in bars
+                    ]
+                    if rows:
+                        logger.info(
+                            f"[Kronos] MT5 OHLCV {mt5_sym} {timeframe}: "
+                            f"{len(rows)} bars from {acct.server}"
+                        )
+                        return rows, acct.server
+                except Exception as e:
+                    logger.debug(f"[Kronos] MT5 {mt5_sym}/{timeframe} on {acct.server}: {e}")
+    except Exception as exc:
+        logger.debug(f"[Kronos] MT5 OHLCV unavailable for {symbol}: {exc}")
+    return [], ""
+
+
 async def _fetch_ohlcv(exchange: str, symbol: str, timeframe: str, limit: int) -> List[list]:
+    # 0) MT5 first for ALL pairs — Swissquote-SPOT/Exness supports crypto spot,
+    #    FX, metals and indices natively; this eliminates Bitget-futures failures.
+    mt5_rows, _mt5_server = await _fetch_mt5_ohlcv(symbol, timeframe, limit)
+    if mt5_rows and len(mt5_rows) >= 5:
+        if _is_forex(symbol):
+            return await _anchor_to_swissquote(symbol, mt5_rows)
+        return mt5_rows
+
     # Route forex / metals / indices to Yahoo first: it serves the requested
     # intraday timeframe *and* carries CME contract volume. forex_provider is
     # only a price fallback — Frankfurter answers every timeframe with daily
@@ -353,10 +435,11 @@ def _rows_to_frame(rows: List[list]) -> Tuple[pd.DataFrame, pd.Series]:
 def _historical_candles(rows: List[list], symbol: str) -> List[ForecastCandle]:
     """History as ForecastCandles so the frontend can draw the series itself.
 
-    Populated for forex/metals where the exchange has no data; empty for crypto
-    (the frontend fetches crypto OHLCV directly for better resolution).
+    Populated for all pair types when MT5 was the source (covers crypto spot,
+    FX, metals, indices). The frontend uses these directly so it never falls
+    back to a futures-only exchange endpoint for non-USDT pairs (e.g. ETH/USD).
     """
-    if not _is_forex(symbol):
+    if not rows:
         return []
     out: List[ForecastCandle] = []
     for r in rows:
@@ -1119,17 +1202,27 @@ def _available_margin(accounts: Optional[List[dict]], margin_coin: str = "USDT")
 
 
 def is_order_placeable(symbol: str) -> bool:
-    """True when an entry for ``symbol`` can actually be sent to an exchange.
+    """True when an entry for ``symbol`` can be sent to a crypto exchange (Bitget etc.).
 
-    FX, metals, indices and energy are *forecastable* — Kronos reads them from
-    Yahoo with CME contract volume — but the crypto connectors list none of
-    them, so a sniper entry on one is analysis, never an executable order.
+    FX, metals, indices and USD-quoted crypto CFDs (ETHUSD, BTCUSD) are not
+    listed on USDT-margined futures exchanges. Any surface that renders an
+    exchange execute button must gate on this.
 
-    Any surface that renders an execute button (the Telegram sniper keyboard,
-    the sniper panel) must gate on this: emitting a "LIVE $5" button for GBP/USD
-    offers an order Bitget cannot fill.
+    USD-quoted crypto (ETHUSD) is an MT5 CFD; ``tradable_via_mt5`` in
+    ``get_pair_tradability`` covers that path.
     """
-    return not _is_forex(symbol)
+    if _is_forex(symbol):
+        return False
+    # USD-quoted crypto (ETHUSD, BTCUSD) → MT5 CFD, not exchange-tradeable.
+    s = (symbol or "").upper().replace("/", "")
+    if s.endswith("USD") and not s.endswith(("USDT", "USDC")) and len(s) > 3:
+        from app.exchanges.yahoo_provider import _CRYPTO_BASES
+        try:
+            if s[:-3] in _CRYPTO_BASES:
+                return False
+        except Exception:
+            pass
+    return True
 
 
 async def get_pair_tradability(exchange: str, symbol: str) -> dict:
@@ -1138,15 +1231,38 @@ async def get_pair_tradability(exchange: str, symbol: str) -> dict:
     resulting max-open-remaining (notional + margin) for the symbol.
 
     Read-only; used by the sniper panel to size orders against what's actually
-    available on the exchange. Returns tradable=False for non-crypto pairs.
+    available on the exchange. Falls back to the room's MT5 account (Exness,
+    etc.) when the crypto exchange is not configured or the pair is FX/metals.
     """
     result: dict = {
         "exchange": exchange, "symbol": symbol, "tradable": False,
+        "venue": "exchange",  # 'exchange' | 'mt5'
         "margin_coin": "USDT", "available_margin": 0.0, "max_leverage": None,
         "min_trade_size": None, "size_precision": None, "min_notional": None,
         "current_position": None, "max_open_margin": 0.0, "max_open_notional": 0.0,
-        "note": None,
+        "note": None, "tradable_via_mt5": False,
     }
+
+    # ── Check MT5 (always — MT5 brokers list both crypto CFDs and FX/metals) ──
+    try:
+        from app.agents.execution import get_settings
+        from app.core.database import AsyncSessionLocal
+        async with AsyncSessionLocal() as _db:
+            _s = await get_settings(_db)
+        _has_mt5 = bool(
+            getattr(_s, "allow_mt5", False)
+            and (getattr(_s, "mt5_account_id", None) or getattr(_s, "mt5_demo_account_id", None))
+        )
+        result["tradable_via_mt5"] = _has_mt5
+        if _has_mt5 and not is_order_placeable(symbol):
+            # FX/metals can only execute via MT5 — skip Bitget entirely.
+            result["venue"] = "mt5"
+            result["tradable"] = True
+            result["note"] = "MT5 broker (e.g., Exness) — order will route to your configured account."
+            return result
+    except Exception as _exc:  # noqa: BLE001
+        logger.debug(f"[Kronos] MT5 tradability check skipped: {_exc}")
+
     if not is_order_placeable(symbol):
         result["note"] = "Order placement is only available for crypto USDT futures pairs."
         return result
@@ -1156,7 +1272,13 @@ async def get_pair_tradability(exchange: str, symbol: str) -> dict:
     except (ValueError, Exception):
         exch = None
     if exch is None or not hasattr(exch, "get_futures_balance"):
-        result["note"] = f"{exchange} does not support futures order placement."
+        # Crypto pair but Bitget not configured — try MT5 if available.
+        if result.get("tradable_via_mt5"):
+            result["venue"] = "mt5"
+            result["tradable"] = True
+            result["note"] = "Bitget not configured — routing to MT5 broker."
+        else:
+            result["note"] = f"{exchange} does not support futures order placement."
         return result
 
     compact = symbol.replace("/", "").upper()

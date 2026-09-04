@@ -1236,9 +1236,43 @@ export const apiClient = {
      *  leverage, min size/precision, existing position, and max-open-remaining. */
     tradability: (exchange: string, symbol: string) =>
       api.get(`/plugins/kronos/tradability/${exchange}/${symbol.replace('/', '')}`, { timeout: 30000 }),
+    /** Execute a sniper entry via the room engine (handles Bitget AND MT5/Exness). */
+    execute: (params: { symbol: string; side: string; entry: number; stop_loss: number; take_profit: number; timeframe?: string }) =>
+      api.post('/plugins/kronos/execute', null, { params, timeout: 30000 }),
+    /** Linked live MT5 accounts with equity/margin for sizing display. */
+    mt5Accounts: () => api.get('/plugins/kronos/mt5-accounts', { timeout: 10000 }),
+    /** Execute a Kronos sniper entry on MT5 with room risk % lot sizing.
+     *  dry_run=true returns computed lots without placing. */
+    executeMT5: (params: {
+      symbol: string; side: string; entry: number; stop_loss: number;
+      take_profit?: number; timeframe?: string; dry_run?: boolean;
+    }) => api.post('/plugins/kronos/execute-mt5', null, { params, timeout: 30000 }),
     /** Batch forecast several symbols at once. */
     batch: (data: { exchange?: string; timeframe?: string; symbols: string[]; lookback?: number; pred_len?: number; samples?: number }) =>
       api.post('/plugins/kronos/batch', data),
+
+    // ── Fine-tuning on your own data (tokenizer → predictor) ──────────────
+    finetune: {
+      /** Is the finetune_csv pipeline vendored + how to install it. */
+      setupStatus: () => api.get('/plugins/kronos/finetune/setup-status'),
+      /** Export live OHLCV to a Kronos CSV (preview, no training). */
+      export: (data: { exchange?: string; symbol: string; timeframe?: string; limit?: number }) =>
+        api.post('/plugins/kronos/finetune/export', data, { timeout: 120000 }),
+      /** Start a fine-tune job (export → tokenizer → predictor). */
+      start: (data: {
+        exchange?: string; symbol: string; timeframe?: string; limit?: number;
+        lookback?: number; pred_len?: number; tokenizer_epochs?: number;
+        predictor_epochs?: number; batch_size?: number; base_model?: string;
+      }) => api.post('/plugins/kronos/finetune/start', data, { timeout: 30000 }),
+      /** List recent fine-tune jobs. */
+      list: () => api.get('/plugins/kronos/finetune/jobs'),
+      /** One job with a tail of its live training log. */
+      job: (jobId: number) => api.get(`/plugins/kronos/finetune/jobs/${jobId}`),
+      /** Cancel a running fine-tune job. */
+      cancel: (jobId: number) => api.delete(`/plugins/kronos/finetune/jobs/${jobId}`),
+      /** Hot-swap the engine to a completed job's model. */
+      load: (jobId: number) => api.post(`/plugins/kronos/finetune/load/${jobId}`, null, { timeout: 60000 }),
+    },
   },
 
   // ── Background research + news/FOMO prediction ───────────────────────────
@@ -1415,6 +1449,45 @@ export const apiClient = {
     /** SSE progress feed URL — consume with `new EventSource(url)`. */
     streamUrl: (runId: string) => `${getApiBaseUrl()}/tradingagents/runs/${runId}/stream`,
   },
+
+  // ── X (Twitter) Whale Monitor ───────────────────────────
+  getXMonitorConfig: () => api.get('/x-monitor/config'),
+  updateXMonitorConfig: (data: { interval_seconds?: number; enabled?: boolean }) =>
+    api.put('/x-monitor/config', data),
+  getXMonitorAccounts: () => api.get('/x-monitor/accounts'),
+  addXMonitorAccount: (data: {
+    username: string;
+    display_name?: string;
+    symbols?: string[];
+    tier?: number;
+    reliability?: number;
+  }) => api.post('/x-monitor/accounts', data),
+  removeXMonitorAccount: (username: string) =>
+    api.delete(`/x-monitor/accounts/${encodeURIComponent(username)}`),
+  updateXMonitorAccount: (username: string, data: {
+    display_name?: string;
+    symbols?: string[];
+    tier?: number;
+    reliability?: number;
+    active?: boolean;
+  }) => api.put(`/x-monitor/accounts/${encodeURIComponent(username)}`, data),
+  getXMonitorStatus: () => api.get('/x-monitor/status'),
+  startXMonitor: () => api.post('/x-monitor/start'),
+  stopXMonitor: () => api.post('/x-monitor/stop'),
+  getXMonitorFeed: (limit?: number) =>
+    api.get('/x-monitor/feed', { params: { limit } }),
+  pollXMonitorNow: () => api.post('/x-monitor/poll-now'),
+  testXMonitorConnection: () => api.get('/x-monitor/test-connection'),
+
+  // ── X Scraper (ScrapeGraphAI social link extractor) ──────────────────────
+  getXScraperStatus:      () => api.get('/x-scraper/status'),
+  installXScraper:        () => api.post('/x-scraper/install'),
+  refreshXScraperVersion: () => api.post('/x-scraper/refresh-version'),
+  updateXScraperConfig: (data: { api_key?: string; base_url?: string; model?: string }) =>
+    api.put('/x-scraper/config', data),
+  getXScraperResults:     () => api.get('/x-scraper/results'),
+  scrapeXAccount:         (username: string) => api.post(`/x-scraper/scrape/${encodeURIComponent(username)}`),
+  scrapeAllXAccounts:     () => api.post('/x-scraper/scrape-all'),
 };
 
 export default apiClient;

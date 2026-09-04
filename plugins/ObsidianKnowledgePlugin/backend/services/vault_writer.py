@@ -39,7 +39,9 @@ def _slug(text: str) -> str:
 def _yaml_str(value: Any) -> str:
     if isinstance(value, str):
         if any(c in value for c in (':', '"', "'", "\n", "#")):
-            return f'"{value}"'
+            # Escape embedded quotes so YAML remains valid
+            escaped = value.replace('\\', '\\\\').replace('"', '\\"')
+            return f'"{escaped}"'
         return value
     if isinstance(value, (list, dict)):
         return json.dumps(value)

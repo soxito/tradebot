@@ -36,7 +36,7 @@ _PENDING_OFFER: dict[str, tuple[str, str]] = {}
 #: text that offered it was written by the model, not by the user.
 _AUTORUN_SAFE = frozenset({
     "forecast", "analyze", "signals", "sniper", "status", "positions",
-    "portfolio", "mt5",
+    "portfolio", "mt5", "finetune",
 })
 
 #: Non-symbol words that are legitimately arguments to those commands, so an
@@ -44,7 +44,14 @@ _AUTORUN_SAFE = frozenset({
 #: you" drops the prose.
 _OFFER_SUBCOMMANDS = frozenset({
     "status", "positions", "orders", "scalp", "smc", "bitget", "binance",
+    "load", "setup",
 })
+
+#: Status → emoji for /finetune job listings.
+_FT_STATUS_EMOJI = {
+    "pending": "⏳", "exporting": "📤", "running": "🏋️",
+    "completed": "✅", "failed": "❌", "cancelled": "🚫",
+}
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
@@ -163,6 +170,7 @@ async def _dispatch(
         "order":     _handle_order,
         "analyze":   _handle_analyze,
         "mt5":       _handle_mt5,
+        "finetune":  _handle_finetune,
     }
     handler = handlers.get(cmd, _handle_unknown)
     try:
@@ -218,14 +226,24 @@ async def _dispatch_callback(
             kind_flag = "limit " if kind == "limit" else ""
             cmd_paper = f"/order {kind_flag}{side} {sym} "
             cmd_live  = f"/order live {kind_flag}{side} {sym} "
+            # Detect whether this pair is FX/metals (→ MT5) or crypto (→ exchange).
+            live_venue = "📈 LIVE MT5"
+            try:
+                from plugins.KronosForecastPlugin.backend.services.forecast_service import is_order_placeable
+                if is_order_placeable(sym):
+                    live_venue = "🔴 LIVE Exchange"
+            except Exception:  # noqa: BLE001
+                live_venue = "🔴 LIVE"
             msg = (
                 f"✏️ <b>Custom amount order — {sym}</b>\n"
                 f"Copy and send one of these commands, replacing the amount:\n\n"
-                f"📋 <b>Paper:</b>\n"
+                f"📋 <b>Paper (simulation):</b>\n"
                 f"<code>{cmd_paper}50</code>\n\n"
-                f"🔴 <b>LIVE Bitget:</b>\n"
+                f"{live_venue}:\n"
                 f"<code>{cmd_live}50</code>\n\n"
-                f"<i>Replace <code>50</code> with any amount in USD (min $1).</i>"
+                f"<i>Replace <code>50</code> with any amount in USD (min $1).\n"
+                f"For MT5 live orders the amount is used for paper sizing only; "
+                f"the actual lot is calculated from your account equity and risk settings.</i>"
             )
             return msg, "HTML", None
         return "❓ Invalid custom order action.", "HTML", None
@@ -262,6 +280,9 @@ async def _handle_start(_args: str, _db: AsyncSession) -> tuple[str, str]:
         "/order long BTCUSDT 100 — Paper trade from Kronos signal ($100 margin)",
         "/order live long BTCUSDT 100 — LIVE Bitget futures order",
         "/analyze BTCUSDT — Deep AI analysis (Kronos + news + position)",
+        "/finetune BTCUSDT [1h] — Fine-tune Kronos on your own data",
+        "/finetune status [id] — Fine-tune jobs / live training log",
+        "/finetune load &lt;id&gt; — Use a fine-tuned model for forecasts",
         "<i>Both work on every pair — crypto and MT5 (FX majors/crosses/exotics,</i>",
         "<i>metals, indices, energy, softs). e.g. /forecast XAUUSD 4h, /analyze GBPJPY.</i>",
         "<i>MT5 pairs are analysis-only — place those with your broker.</i>",
@@ -840,11 +861,12 @@ async def _fib_context(symbols: list[str]) -> str | None:
         try:
             ohlcv, _ = await market_data.fetch_ohlcv_universal(sym, timeframe="1h", limit=200)
             if not ohlcv or len(ohlcv) < 20:
+                # Shared resolver walks MT5 -> keyless public spot -> forex, so
+                # crypto pairs the Bitget *futures* connector cannot serve
+                # (ETH/USD, BTC/USD, XRP/USD) still return candles for the fib block.
                 try:
-                    from app.exchanges.manager import exchange_manager, SupportedExchange
-                    connector = exchange_manager.get_exchange(SupportedExchange.BITGET)
-                    if connector:
-                        ohlcv = await connector.get_ohlcv(symbol=sym, timeframe="1h", limit=200)
+                    from app.services import candles as _candle_source
+                    ohlcv = await _candle_source.fetch(sym, "1h", 200) or []
                 except Exception:  # noqa: BLE001
                     ohlcv = []
             if not ohlcv or len(ohlcv) < 20:
@@ -1648,6 +1670,12 @@ async def _room_seats_reply() -> tuple[str, str, dict | None]:
         lines.append(f"🏛 <b>{html.escape(str(ceo.get('human_name', 'CEO')))}</b> chairs.")
     if not snap.get("agents"):
         lines.append("No seats have convened yet — run <code>/room PAIR 1h</code> to wake the board.")
+    lines.append("")
+    lines.append(
+        "🧠 <i>Every seat reads the Kronos forecast with the model's own context "
+        "(arXiv:2508.02739): p10/p90 band = conviction, NO_TRADE = no volume "
+        "(not bearish), confidence blends path-agreement × volume × macro.</i>"
+    )
     return "\n".join(lines), "HTML", None
 
 
@@ -2152,9 +2180,20 @@ async def _handle_forecast(args: str, db: AsyncSession) -> tuple[str, str, dict 
     _display_target = ((sig.target_price * _scale) if sig and sig.target_price else None)
     target = _fmt_p(_display_target) if _display_target else "—"
 
+    # Is a locally FINE-TUNED model loaded? (path, not a NeoQuasar/ HF id)
+    _model_name = getattr(forecast_resp, "model_name", "") or ""
+    _finetuned = bool(_model_name) and not _model_name.startswith("NeoQuasar/")
+    _engine_line = f"Engine: <code>{forecast_resp.engine}</code>"
+    if _finetuned:
+        _engine_line += "  🎯 <i>fine-tuned model</i>"
+
     lines: list[str] = [
         f"🔮 <b>Kronos Forecast — {symbol} ({timeframe})</b>",
-        f"Engine: <code>{forecast_resp.engine}</code>",
+        _engine_line,
+        # What the model is, so the reader trusts the numbers correctly.
+        "🧠 <i>Kronos — decoder-only foundation model (arXiv:2508.02739), "
+        "pre-trained on 12B K-lines from 45 exchanges. Confidence = path "
+        "agreement × volume × macro; p10/p90 band = conviction.</i>",
         "",
         f"{dir_emoji} <b>{direction}  |  {pct_chg:+.2f}%  |  {conf_pct}% confidence</b>",
         f"Now: <code>{_fmt_p(_live_now)}</code>  →  "
@@ -2240,22 +2279,91 @@ async def _handle_forecast(args: str, db: AsyncSession) -> tuple[str, str, dict 
     # ── Sniper entries ─────────────────────────────────────────────────────────
     inline_keyboard: list[list[dict]] = []
 
-    # FX, metals and indices forecast fine (Yahoo prices them and CME volume
-    # backs the gate) but Bitget lists none of them, so their entries are
-    # analysis only — rendering an execute button would offer an unfillable
-    # order. See KronosForecastPlugin.forecast_service.is_order_placeable.
+    # FX, metals and indices are not listed on crypto exchanges but MT5 brokers
+    # (Exness etc.) trade them natively. Show execute buttons for any pair when
+    # at least one execution venue is reachable.
+    placeable_exchange = False  # Bitget/ccxt exchange can fill this pair
+    has_mt5 = False             # room has a live or demo MT5 account configured
+
     try:
         from plugins.KronosForecastPlugin.backend.services.forecast_service import (
             is_order_placeable,
         )
-        placeable = is_order_placeable(symbol)
-    except Exception:  # noqa: BLE001 — never break the forecast over this
-        placeable = True
+        placeable_exchange = is_order_placeable(symbol)
+    except Exception:  # noqa: BLE001
+        # Fail-safe: infer from quote currency — USDT/USDC → exchange, USD → MT5 CFD.
+        _sn = (symbol or "").upper().replace("/", "")
+        placeable_exchange = _sn.endswith(("USDT", "USDC"))
+
+    try:
+        from app.core.database import AsyncSessionLocal
+        from app.agents.execution import get_settings as _get_room_settings
+        async with AsyncSessionLocal() as _rdb:
+            _rs = await _get_room_settings(_rdb)
+        has_mt5 = bool(
+            getattr(_rs, "allow_mt5", False)
+            and (getattr(_rs, "mt5_account_id", None) or getattr(_rs, "mt5_demo_account_id", None))
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    # ── Pre-fetch MT5 account for lot-size display in buttons ─────────────────
+    # Load once; used per-signal below. Falls back gracefully when unavailable.
+    _mt5_equity: float = 0.0
+    _mt5_free_margin: float | None = None
+    _mt5_leverage: int | None = None
+    _mt5_margin_level: float = 0.0
+    _mt5_risk_pct: float = 1.0
+    _mt5_floor_lot: float = 0.01
+    _mt5_max_risk_pct: float = 5.0
+    _mt5_small_acct: bool = True  # match _place_on default
+    _mt5_min_ml: float = 500.0    # floor below which orders are blocked
+    if has_mt5:
+        try:
+            from app.core.database import AsyncSessionLocal
+            from app.agents.execution import get_settings as _get_rs2
+            from plugins.MT5TradingPlugin.backend.models import MT5Account
+            from plugins.MT5TradingPlugin.backend.services.sync_service import MT5SyncService
+            async with AsyncSessionLocal() as _rdb2:
+                _rs2 = await _get_rs2(_rdb2)
+                # Respect dry_run: demo-only when on, live when off.
+                _is_dry = bool(getattr(_rs2, "dry_run", True))
+                _demo_id = getattr(_rs2, "mt5_demo_account_id", None)
+                _live_id = getattr(_rs2, "mt5_account_id", None)
+                _acct_id = (_demo_id if _is_dry else _live_id) or _demo_id or _live_id
+                _acct = await _rdb2.get(MT5Account, _acct_id) if _acct_id else None
+                # Sync if stale so lot preview uses fresh margin data.
+                if _acct:
+                    try:
+                        await MT5SyncService.sync_account(_rdb2, _acct)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    _mt5_equity = float(getattr(_acct, "equity", 0) or getattr(_acct, "balance", 0) or 0)
+                    _mt5_free_margin = float(getattr(_acct, "free_margin", 0) or 0) or None
+                    _mt5_leverage = int(getattr(_acct, "leverage", 0) or 0) or None
+                    _ml_raw = float(getattr(_acct, "margin_level", 0) or 0)
+                    _margin_used = float(getattr(_acct, "margin", 0) or 0)
+                    if _ml_raw <= 0 and _margin_used > 0 and _mt5_equity > 0:
+                        _ml_raw = round((_mt5_equity / _margin_used) * 100, 1)
+                    _mt5_margin_level = _ml_raw
+                _mt5_risk_pct = float(getattr(_rs2, "risk_pct", 1.0) or 1.0)
+                _mt5_floor_lot = float(getattr(_rs2, "mt5_lot_size", 0.01) or 0.01)
+                _mt5_max_risk_pct = float(getattr(_rs2, "mt5_max_risk_pct", 5.0) or 5.0)
+                _mt5_small_acct = bool(getattr(_rs2, "mt5_small_account_mode", True))
+                _mt5_min_ml = float(getattr(_rs2, "min_margin_level_pct", 0) or 0) or 500.0
+        except Exception:  # noqa: BLE001
+            pass
+
+    # True when margin level would block the order (< configured floor).
+    _mt5_ml_blocked = _mt5_margin_level > 0 and _mt5_margin_level < _mt5_min_ml
+
+    placeable = placeable_exchange or has_mt5
 
     if signals:
         header = (
-            "⚡ <b>Sniper Entries</b>  (tap a button to execute)" if placeable
-            else "⚡ <b>Sniper Entries</b>  (analysis only — see note below)"
+            "⚡ <b>Sniper Entries</b>  (tap a button to execute)"
+            if placeable else
+            "⚡ <b>Sniper Entries</b>  (analysis only — no execution venue configured)"
         )
         lines += ["", header]
         for i, s in enumerate(signals[:4], 1):
@@ -2273,20 +2381,65 @@ async def _handle_forecast(args: str, db: AsyncSession) -> tuple[str, str, dict 
             if not placeable:
                 continue
 
-            # Inline keyboard — Row 1: quick $5 execute (paper + live)
+            # Buttons — paper always available; live label shows computed lot when possible.
             cb_base = f"cq_order:{s.side}:{s.order_kind}:{symbol}:5"
             paper_btn = {
                 "text": f"[{i}] {side_emoji.split()[1]} {kind_label} — $5 Paper",
                 "callback_data": cb_base,
             }
-            live_btn = {
-                "text": "🔴 LIVE $5",
-                "callback_data": f"{cb_base}:live",
-            }
+            if placeable_exchange:
+                live_label = "🔴 LIVE $5"
+                live_btn = {
+                    "text": live_label,
+                    "callback_data": f"{cb_base}:live",
+                }
+            else:
+                # Compute the recommended lot from live account equity × risk % ÷ stop-distance.
+                _lot_label = "MT5"
+                if _mt5_equity > 0 and s.entry and s.stop_loss:
+                    try:
+                        from plugins.TelegramSignalNewsPlugin.backend.services.sniper_service import (
+                            affordable_mt5_lot,
+                        )
+                        _lot, _note = affordable_mt5_lot(
+                            equity=_mt5_equity,
+                            free_margin=_mt5_free_margin,
+                            leverage=_mt5_leverage,
+                            risk_pct=_mt5_risk_pct,
+                            entry=s.entry * _scale,
+                            stop_loss=s.stop_loss * _scale,
+                            symbol=symbol,
+                            floor_lot=_mt5_floor_lot,
+                            max_risk_pct=_mt5_max_risk_pct,
+                            small_account_mode=_mt5_small_acct,
+                        )
+                        if _lot is not None:
+                            # Show margin level with a health indicator.
+                            if _mt5_margin_level <= 0:
+                                ml_hint = ""
+                            elif _mt5_margin_level < 500:
+                                ml_hint = f"  ⚠️ML {_mt5_margin_level:.0f}%"
+                            else:
+                                ml_hint = f"  ML {_mt5_margin_level:.0f}%"
+                            _lot_label = f"{_lot:g} lot{ml_hint}"
+                        else:
+                            _lot_label = "sizing error"
+                    except Exception:  # noqa: BLE001
+                        pass
+                if _mt5_ml_blocked:
+                    # Margin too low — show blocked indicator; button still sends
+                    # the command so _prepare_account can explain why it was rejected.
+                    live_label = f"🚫 BLOCKED ML {_mt5_margin_level:.0f}%"
+                else:
+                    live_label = f"📊 MT5 {_lot_label}"
+                live_btn = {
+                    "text": live_label,
+                    "callback_data": f"{cb_base}:live",
+                }
             # Row 2: custom amount helper
             kind_flag = "limit " if s.order_kind == "limit" else ""
             custom_btn = {
-                "text": f"✏️ Custom amount",
+                "text": "✏️ Custom amount",
                 "callback_data": f"cq_custom_order:{s.side}:{s.order_kind}:{symbol}",
             }
             inline_keyboard.append([paper_btn, live_btn, custom_btn])
@@ -2294,10 +2447,20 @@ async def _handle_forecast(args: str, db: AsyncSession) -> tuple[str, str, dict 
         if not placeable:
             lines.append("")
             lines.append(
-                f"ℹ️ <i>{symbol} is not listed on {exchange} — these levels are "
-                f"analysis only. Place the trade with your FX/CFD broker "
-                f"(e.g. MT5).</i>"
+                f"ℹ️ <i>No execution venue is reachable for {symbol}. "
+                f"Configure Bitget (crypto) or link an MT5 account in the Trading Room settings.</i>"
             )
+        elif not placeable_exchange and has_mt5:
+            lines.append("")
+            _ml = _mt5_margin_level
+            _eq_note = f"Equity: {_mt5_equity:,.2f}" if _mt5_equity > 0 else ""
+            if _ml > 0 and _ml < 500:
+                _ml_tag = f"⚠️ <b>Margin level {_ml:.0f}% — below 500% floor. Orders will be BLOCKED until margin recovers.</b>"
+                lines.append(_ml_tag)
+            elif _ml >= 500:
+                lines.append(f"ℹ️ <i>MT5 ({_mt5_risk_pct:g}% risk · {_eq_note} · ML {_ml:.0f}%)</i>")
+            else:
+                lines.append(f"ℹ️ <i>MT5 ({_mt5_risk_pct:g}% risk · {_eq_note})</i>")
     else:
         lines.append("")
         # A pair whose feed carries no volume at all (the cash indices — GER40,
@@ -2330,7 +2493,139 @@ async def _handle_forecast(args: str, db: AsyncSession) -> tuple[str, str, dict 
     }])
 
     reply_markup = {"inline_keyboard": inline_keyboard} if inline_keyboard else None
-    return "\n".join(lines)[:4096], "HTML", reply_markup
+    # Prepend live account state so every /forecast shows margin health first.
+    _acct_hdr = await _mt5_account_header()
+    body = "\n".join(lines)
+    if _acct_hdr:
+        body = _acct_hdr + "\n\n" + body
+    return body[:4096], "HTML", reply_markup
+
+
+# ── Kronos fine-tuning ────────────────────────────────────────────────────────
+
+async def _handle_finetune(args: str, db: AsyncSession) -> tuple[str, str, dict | None]:
+    """Fine-tune Kronos on your own market data (a share-market example).
+
+    Usage:
+      /finetune <SYMBOL> [exchange] [timeframe]   → start a fine-tune job
+      /finetune status [job_id]                   → list jobs / one job's log
+      /finetune load <job_id>                     → swap engine to a job's model
+      /finetune setup                             → install the training pipeline
+    """
+    try:
+        from plugins.KronosForecastPlugin.backend.services import finetune_service
+        from plugins.KronosForecastPlugin.backend.services.finetune_service import (
+            finetune_manager,
+        )
+        from plugins.KronosForecastPlugin.backend.schemas import FinetuneStartRequest
+    except ImportError as ie:
+        return f"⚠️ KronosForecastPlugin not installed: {ie}", "HTML", None
+
+    tokens = args.split()
+    head = (tokens[0].lower() if tokens else "")
+
+    # ── setup — make sure the finetune_csv pipeline is vendored ───────────────
+    if head == "setup":
+        st = finetune_service.setup_status()
+        if st.get("vendored"):
+            return (
+                "✅ <b>Fine-tune pipeline ready.</b>\n"
+                "Start a job with <code>/finetune BTCUSDT 1h</code>."
+            ), "HTML", None
+        return (
+            "🔧 <b>Fine-tune pipeline not installed yet.</b>\n"
+            "Run this once on the server:\n"
+            f"<code>{finetune_service.finetune_setup_command()}</code>\n\n"
+            "It vendors <code>finetune_csv/</code> from the upstream Kronos repo."
+        ), "HTML", None
+
+    # ── status — list jobs, or one job's tail ─────────────────────────────────
+    if head == "status":
+        if len(tokens) > 1 and tokens[1].isdigit():
+            job = await finetune_manager.get(int(tokens[1]), log_lines=20)
+            if not job:
+                return f"❓ No fine-tune job #{tokens[1]}.", "HTML", None
+            log = job.get("log_tail") or ""
+            emoji = _FT_STATUS_EMOJI.get(job.get("status", ""), "•")
+            out = [
+                f"{emoji} <b>Fine-tune #{job['id']} — {job['symbol']} "
+                f"({job['timeframe']})</b>",
+                f"Status: <code>{job['status']}</code>  |  "
+                f"rows: {job.get('rows_exported') or '—'}",
+            ]
+            if job.get("error"):
+                out.append(f"❌ {job['error']}")
+            if log:
+                out.append("\n<pre>" + log[-1200:] + "</pre>")
+            if job.get("status") == "completed":
+                out.append(f"\n→ <code>/finetune load {job['id']}</code> to use it.")
+            return "\n".join(out)[:4096], "HTML", None
+        jobs = await finetune_manager.list(limit=8)
+        if not jobs:
+            return (
+                "📭 No fine-tune jobs yet.\n"
+                "Start one: <code>/finetune BTCUSDT 1h</code>"
+            ), "HTML", None
+        lines = ["🧬 <b>Kronos fine-tune jobs</b>"]
+        for j in jobs:
+            emoji = _FT_STATUS_EMOJI.get(j.get("status", ""), "•")
+            lines.append(
+                f"{emoji} #{j['id']} {j['symbol']} ({j['timeframe']}) — "
+                f"<code>{j['status']}</code>"
+            )
+        lines.append("\n<code>/finetune status &lt;id&gt;</code> for the live log.")
+        return "\n".join(lines)[:4096], "HTML", None
+
+    # ── load — hot-swap the engine to a finished job's model ──────────────────
+    if head == "load":
+        if len(tokens) < 2 or not tokens[1].isdigit():
+            return "❓ Usage: <code>/finetune load &lt;job_id&gt;</code>", "HTML", None
+        try:
+            res = await finetune_manager.load_finetuned(int(tokens[1]))
+        except (ValueError, RuntimeError) as exc:
+            return f"❌ {exc}", "HTML", None
+        return (
+            f"🎯 <b>Loaded fine-tuned model from job #{tokens[1]}.</b>\n"
+            f"{res.get('detail', 'Engine now uses your fine-tuned Kronos.')}\n"
+            "Every <code>/forecast</code> now runs through it."
+        ), "HTML", None
+
+    # ── default: start a new fine-tune job ────────────────────────────────────
+    if not tokens:
+        return (
+            "❓ <b>Usage</b>\n"
+            "<code>/finetune &lt;SYMBOL&gt; [exchange] [timeframe]</code> — start\n"
+            "<code>/finetune status [id]</code> — jobs / live log\n"
+            "<code>/finetune load &lt;id&gt;</code> — use a fine-tuned model\n"
+            "<code>/finetune setup</code> — install the pipeline\n\n"
+            "Fine-tunes Kronos on your own OHLCV, exactly like the share-market "
+            "example in the upstream repo (tokenizer → predictor)."
+        ), "HTML", None
+
+    if not finetune_service.setup_status().get("vendored"):
+        return (
+            "🔧 Fine-tune pipeline not installed. Run <code>/finetune setup</code> "
+            "first."
+        ), "HTML", None
+
+    raw_sym = tokens[0]
+    exchange, timeframe = _parse_exchange_timeframe(tokens[1:])
+    symbol = _norm_sym(raw_sym)
+
+    try:
+        job = await finetune_manager.start(FinetuneStartRequest(
+            exchange=exchange, symbol=symbol, timeframe=timeframe,
+        ))
+    except RuntimeError as exc:
+        return f"❌ {exc}", "HTML", None
+
+    return (
+        f"🧬 <b>Fine-tune started — {symbol} ({timeframe})</b>\n"
+        f"Job <code>#{job['id']}</code>: exporting data → training tokenizer → "
+        "training predictor.\n"
+        f"Track it: <code>/finetune status {job['id']}</code>\n"
+        "This runs for a while; you'll keep trading normally meanwhile."
+    ), "HTML", None
 
 
 # ── Order execution from Kronos sniper signal ─────────────────────────────────
@@ -2391,24 +2686,41 @@ async def _handle_order(args: str, db: AsyncSession) -> tuple[str, str]:
     compact = symbol.replace("/", "")
 
     # ── Tradability guard ─────────────────────────────────────────────────────
-    # Kronos forecasts FX, metals and indices, so a sniper entry can legitimately
-    # exist for GBP/USD — but no crypto connector lists it. Refuse here rather
-    # than sizing a position and firing an order the exchange cannot fill. This
-    # is the single choke point: typed /order and every inline button land here.
+    # Kronos forecasts FX, metals and indices — the crypto connectors don't list
+    # them. For live orders on those pairs we route to the room's MT5 broker
+    # (Exness, etc.) if one is configured.  Paper mode works for any pair.
+    placeable_on_exchange = True
     try:
         from plugins.KronosForecastPlugin.backend.services.forecast_service import (
             is_order_placeable,
         )
-        if not is_order_placeable(symbol):
-            return (
-                f"🚫 <b>{symbol} cannot be ordered here.</b>\n"
-                f"{exchange} lists crypto USDT futures only — FX, metals and "
-                f"indices are forecast-only.\n\n"
-                f"Use <code>/forecast {raw_sym}</code> for the levels and place "
-                f"the trade with your FX/CFD broker."
-            ), "HTML"
+        placeable_on_exchange = is_order_placeable(symbol)
     except ImportError:
         pass  # plugin missing is reported by the call below
+
+    if not placeable_on_exchange and live_mode:
+        # FX/metals: paper always works; live needs MT5.
+        # Check room settings before blocking.
+        try:
+            from app.core.database import AsyncSessionLocal
+            from app.agents.execution import get_settings
+            async with AsyncSessionLocal() as _db:
+                _s = await get_settings(_db)
+            _has_mt5 = bool(
+                getattr(_s, "allow_mt5", False)
+                and (getattr(_s, "mt5_account_id", None) or getattr(_s, "mt5_demo_account_id", None))
+            )
+        except Exception:
+            _has_mt5 = False
+        if not _has_mt5:
+            return (
+                f"🚫 <b>{symbol} cannot be ordered here.</b>\n"
+                f"FX, metals and indices are not listed on the crypto exchange. "
+                f"Configure an MT5 broker (e.g., Exness) in the Trading Room settings "
+                f"to execute these pairs.\n\n"
+                f"Use <code>/forecast {raw_sym}</code> for the levels."
+            ), "HTML"
+        # MT5 is configured — fall through; the room execution engine routes it there.
 
     # ── Get sniper signals to find entry/SL/TP ────────────────────────────────
     try:
@@ -2496,39 +2808,67 @@ async def _handle_order(args: str, db: AsyncSession) -> tuple[str, str]:
             f"R:R ≈ {match.risk_reward}  Engine: {resp.engine}"
         ), "HTML"
 
-    # ── LIVE order via exchange connector ─────────────────────────────────────
-    try:
-        from app.exchanges.manager import exchange_manager, SupportedExchange
-        connector = exchange_manager.get_exchange(SupportedExchange(exchange))
-        if connector is None:
-            return f"❌ Exchange '{exchange}' not configured.", "HTML"
-
-        result = await connector.create_futures_order(
-            symbol=compact,
-            margin_coin="USDT",
-            side=bs,
-            order_type=order_kind,
-            size=str(size),
-            price=str(entry) if order_kind == "limit" else None,
-            margin_mode="isolated",
-            leverage=leverage,
-            trade_side="open",
-            product_type="USDT-FUTURES",
-            stop_loss=sl,
-            take_profit=tp,
-        )
-        order_id = result.get("orderId") or result.get("order_id") or "—"
-    except Exception as exc:  # noqa: BLE001
-        return f"❌ Live order failed: {exc}", "HTML"
-
-    return (
-        f"✅ {mode_label} order sent!\n\n"
-        f"<b>{side.upper()} {symbol}</b> @ {_fmt_p(entry)}\n"
-        f"Size: <code>{size}</code>  Leverage: {leverage}x\n"
-        f"Margin: ${margin_usd:.2f}  Order ID: <code>{order_id}</code>\n"
-        f"SL: {_fmt_p(sl)} ({sl_pct:.1f}%)  TP: {_fmt_p(tp)} ({tp_pct:.1f}%)\n"
-        f"R:R ≈ {match.risk_reward}  Engine: {resp.engine}"
-    ), "HTML"
+    # ── LIVE order via room execution engine ──────────────────────────────────
+    # Always route through the room engine for live orders: it fans out to every
+    # configured venue (Bitget, MT5/Exness, or both) and respects dry_run so
+    # demo/live accounts are handled correctly without duplicating that logic here.
+    if live_mode:
+        try:
+            import json as _json
+            from app.core.database import AsyncSessionLocal
+            from app.agents.execution import _route, get_settings
+            from app.models.database import Signal, SignalAction, SignalSource, SignalStatus
+            async with AsyncSessionLocal() as _db:
+                _s = await get_settings(_db)
+                if not _s.execution_enabled:
+                    return "❌ Room execution is switched off. Enable it in Trading Room settings.", "HTML"
+                # Signal row so _crypto_fill (Bitget path) has the levels to read.
+                _sig = Signal(
+                    source=SignalSource.SYSTEM,
+                    symbol=symbol,
+                    action=SignalAction.BUY if bs == "buy" else SignalAction.SELL,
+                    price=entry, timeframe="1h",
+                    strength=0.8, confidence=0.8,
+                    status=SignalStatus.PENDING,
+                    raw_data=_json.dumps({"source": "forecast_order"}),
+                    indicators=_json.dumps({"stop_loss": sl, "take_profit": tp}),
+                )
+                _db.add(_sig)
+                await _db.flush()
+                orders = await _route(
+                    _db, _s, symbol=symbol, action=bs, price=entry,
+                    stop_loss=sl, take_profit=tp, level_source="/order command",
+                    signal_id=_sig.id,
+                )
+                await _db.commit()
+            placed = [o for o in orders if o.get("status") == "placed"]
+            errors = [o for o in orders if o.get("status") == "error"]
+            if placed:
+                # Build a per-account line showing lot size and sizing rationale.
+                lot_lines = []
+                for o in placed:
+                    vol = o.get("volume")
+                    note = (o.get("sizing") or "")[:80]
+                    acct = o.get("role", o.get("venue", ""))
+                    ticket = f" #{o['ticket']}" if o.get("ticket") else ""
+                    ml = o.get("margin_level_pct")
+                    ml_str = f"  ML {ml:.0f}%" if ml else ""
+                    if vol is not None:
+                        lot_lines.append(f"  {acct}{ticket}: <code>{vol}</code> lot — {note}{ml_str}")
+                    else:
+                        lot_lines.append(f"  {acct}{ticket}{ml_str}")
+                lot_block = "\n".join(lot_lines)
+                return (
+                    f"✅ {mode_label} order sent!\n\n"
+                    f"<b>{side.upper()} {symbol}</b> @ {_fmt_p(entry)}\n"
+                    f"{lot_block}\n"
+                    f"SL: {_fmt_p(sl)} ({sl_pct:.1f}%)  TP: {_fmt_p(tp)} ({tp_pct:.1f}%)\n"
+                    f"Engine: {resp.engine}"
+                ), "HTML"
+            reason = "; ".join(o.get("reason", o.get("status", "?")) for o in (errors or orders))
+            return f"❌ Order skipped: {reason[:300]}", "HTML"
+        except Exception as exc:  # noqa: BLE001
+            return f"❌ Room execution failed: {exc}", "HTML"
 
 
 # ── Analyze (deep Jarvis) ─────────────────────────────────────────────────────
@@ -2539,8 +2879,57 @@ async def _handle_analyze(args: str, db: AsyncSession) -> tuple[str, str]:
     Usage: /analyze BTCUSDT
     """
     if not args:
-        return "❓ Usage: /analyze &lt;SYMBOL&gt;  e.g. /analyze BTCUSDT", "HTML"
-    return await _jarvis_command(f"analyze {args}", db)
+        return "❓ Usage: /analyze &lt;SYMBOL&gt; e.g. /analyze BTCUSDT", "HTML"
+
+    # Prepend live account/margin state so the analysis always includes context.
+    header = await _mt5_account_header()
+    text, mode = await _jarvis_command(f"analyze {args}", db)
+    if header:
+        text = header + "\n" + text
+    return text[:4096], mode
+
+
+async def _mt5_account_header() -> str:
+    """One-line MT5 account health banner for /forecast and /analyze responses."""
+    try:
+        from app.core.database import AsyncSessionLocal
+        from app.agents.execution import get_settings as _gs
+        from plugins.MT5TradingPlugin.backend.models import MT5Account
+        async with AsyncSessionLocal() as _db:
+            _s = await _gs(_db)
+            _is_dry = bool(getattr(_s, "dry_run", True))
+            _demo_id = getattr(_s, "mt5_demo_account_id", None)
+            _live_id = getattr(_s, "mt5_account_id", None)
+            # Mirror _place_on account selection: demo when dry_run, live otherwise.
+            _acct_id = (_demo_id if _is_dry else _live_id) or _demo_id or _live_id
+            if not _acct_id:
+                return ""
+            _a = await _db.get(MT5Account, _acct_id)
+            if not _a:
+                return ""
+        _eq = float(_a.equity or _a.balance or 0)
+        _margin = float(getattr(_a, "margin", 0) or 0)
+        _free = float(getattr(_a, "free_margin", 0) or 0)
+        _ml = float(getattr(_a, "margin_level", 0) or 0)
+        if _ml <= 0 and _margin > 0:
+            _ml = round((_eq / _margin) * 100, 1)
+        _lev = int(getattr(_a, "leverage", 0) or 0)
+        if _ml <= 0:
+            _status = "✅ no open positions"
+        elif _ml < 300:
+            _status = f"🔴 ML {_ml:.0f}% CRITICAL"
+        elif _ml < 500:
+            _status = f"⚠️ ML {_ml:.0f}% WARNING (orders blocked)"
+        elif _ml < 1000:
+            _status = f"🟡 ML {_ml:.0f}% caution"
+        else:
+            _status = f"🟢 ML {_ml:.0f}%"
+        return (
+            f"<b>📊 MT5 Account</b>  {_a.name} · eq <code>{_eq:,.2f}</code> · "
+            f"free <code>{_free:,.2f}</code> · 1:{_lev} · {_status}"
+        )
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 # ── MT5 commands ──────────────────────────────────────────────────────────────

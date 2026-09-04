@@ -87,6 +87,8 @@ interface TradingViewChartProps {
   showZones?: boolean;
   /** Bitcoin 1064-day cycle boxes (green bull / red bear) behind the candles. */
   cycleWindows?: CycleWindowBox[];
+  /** Fit mode for the time scale: genesis fits all candles, recent shows last 2 cycles */
+  fitMode?: 'genesis' | 'recent';
 }
 
 /**
@@ -133,6 +135,7 @@ export default function TradingViewChart({
   sourceLabel,
   showZones = false,
   cycleWindows,
+  fitMode = 'genesis',
 }: TradingViewChartProps) {
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -201,9 +204,47 @@ export default function TradingViewChart({
     try {
       setError(null);
 
-      // If pre-fetched candles were supplied (e.g. forex/metals from Kronos),
+      // If pre-fetched candles were supplied (e.g. forex/metals from Kronos or BTC cycle),
       // use them directly without hitting the crypto exchange endpoint.
+      // For BTC cycle 1h/4h with 4y window, also poll the latest 2 bars for realtime last-bar updates.
       if (initialCandles && initialCandles.length > 0 && targetSeries) {
+        const isBtcCycle = symbol.toUpperCase().replace('/','').startsWith('BTC') && initialCandles.length > 500
+        // On refresh (didFitRef already true), only update the last bar for realtime, don't reset whole series
+        if (didFitRef.current && isBtcCycle && isStale() === false) {
+          // Try to fetch just the latest 2 bars for realtime update, fallback to full setData if fails
+          try {
+            // Use the cycle endpoint's latest 2 for BTC cycle to keep realtime accurate
+            const tfMap: Record<string,string> = { H1:'H1', H4:'H4', D1:'D1', W1:'W1', MN1:'MN1' }
+            const cycleTf = tfMap[timeframe] ?? timeframe
+            if (['H1','H4','D1','W1','MN1'].includes(cycleTf)) {
+              const { data: latestData } = await apiClient.getCycleCandles(cycleTf, 2) as any
+              const latest = latestData?.candles?.slice(-1)[0]
+              if (latest && latest.time && latest.close) {
+                const last = initialCandles[initialCandles.length-1]
+                // If latest is newer or same bar with new close, update
+                if (latest.time >= (last.time as number)) {
+                  targetSeries.update({ time: latest.time as any, open: latest.open, high: latest.high, low: latest.low, close: latest.close } as any)
+                  setLastUpdate(new Date())
+                  setLoading(false)
+                  return
+                }
+              }
+            }
+          } catch {}
+          // Fallback: still set full data but don't refit (preserve zoom)
+          const data = initialCandles.map((c) => ({
+            time: c.time as any,
+            open: c.open,
+            high: c.high,
+            low: c.low,
+            close: c.close,
+          }));
+          if (isStale()) return;
+          targetSeries.setData(data);
+          setLastUpdate(new Date());
+          setLoading(false);
+          return;
+        }
         const data = initialCandles.map((c) => ({
           time: c.time as any,
           open: c.open,
@@ -342,14 +383,17 @@ export default function TradingViewChart({
     // Initial data fetch
     fetchChartData();
 
-    // Adaptive refresh: fast timeframes get more frequent updates for real-time feel.
-    // 1m → 10 s | 3m/5m → 15 s | 15m/30m → 30 s | 1h+ → 60 s
+    // Adaptive refresh: realtime for all TFs like TradingView — H1/H4 need frequent last-bar updates
     const refreshMs = (() => {
       const tf = timeframe.toLowerCase();
-      if (tf === '1m') return 10_000;
-      if (tf === '3m' || tf === '5m') return 15_000;
-      if (tf === '15m' || tf === '30m') return 30_000;
-      return 60_000;
+      if (tf === '1m') return 5_000;
+      if (tf === '3m' || tf === '5m') return 10_000;
+      if (tf === '15m' || tf === '30m') return 15_000;
+      if (tf === 'h1') return 10_000; // 1H realtime: every 10s
+      if (tf === 'h4') return 15_000; // 4H realtime: every 15s
+      if (tf === '1d' || tf === 'd1') return 30_000;
+      if (tf === '1w' || tf === 'w1' || tf === 'mn1' || tf === '1m') return 60_000;
+      return 30_000;
     })();
     const refreshInterval = setInterval(fetchChartData, refreshMs);
 
@@ -432,8 +476,15 @@ export default function TradingViewChart({
         }));
     };
 
+    // Configure separate price scale for Fisher to avoid squashing BTC price (70k vs 0-2)
+    const isFisherOverlay = (name: string) => name.toLowerCase().includes('fisher')
+    try { chart.priceScale('fisher').applyOptions({ borderColor: '#2a2e4a', scaleMargins: { top: 0.85, bottom: 0 } }) } catch {}
+    try { chart.priceScale('right').applyOptions({ scaleMargins: { top: 0.05, bottom: 0.15 } }) } catch {}
+
     overlays.forEach(overlay => {
       const overlayType = overlay.type === 'histogram' ? 'histogram' : 'line';
+      const isFisher = isFisherOverlay(overlay.name)
+      const priceScaleId = isFisher ? 'fisher' : (overlay.pane && overlay.pane !== 'main' ? overlay.pane : undefined)
 
       if (overlayType === 'histogram') {
         const histogramData = normalizeHistogramData(
@@ -447,6 +498,7 @@ export default function TradingViewChart({
             color: overlay.color,
             priceLineVisible: false,
             lastValueVisible: false,
+            priceScaleId: priceScaleId as any,
           });
           histogramSeries.setData(histogramData as any);
           overlaySeriesRef.current.push(histogramSeries);
@@ -461,6 +513,7 @@ export default function TradingViewChart({
             crosshairMarkerVisible: false,
             priceLineVisible: false,
             lastValueVisible: false,
+            priceScaleId: priceScaleId as any,
           });
           signalSeries.setData(signalLine as any);
           overlaySeriesRef.current.push(signalSeries);
@@ -479,6 +532,7 @@ export default function TradingViewChart({
         crosshairMarkerVisible: false,
         priceLineVisible: false,
         lastValueVisible: false,
+        priceScaleId: priceScaleId as any,
       });
       lineSeries.setData(lineData as any);
       overlaySeriesRef.current.push(lineSeries);
@@ -486,6 +540,8 @@ export default function TradingViewChart({
       (overlay.extra_lines || []).forEach(extra => {
         const extraData = normalizeLineData(extra.data);
         if (extraData.length === 0) return;
+        const extraIsFisher = isFisherOverlay(extra.name)
+        const extraScaleId = extraIsFisher ? 'fisher' : undefined
         const extraSeries = chart.addLineSeries({
           color: extra.color,
           lineWidth: 1,
@@ -493,15 +549,20 @@ export default function TradingViewChart({
           crosshairMarkerVisible: false,
           priceLineVisible: false,
           lastValueVisible: false,
+          priceScaleId: extraScaleId as any,
         });
         extraSeries.setData(extraData as any);
         overlaySeriesRef.current.push(extraSeries);
       });
     });
 
-    // Set markers on candlestick series
+    // Set markers on candlestick series — normalize ms→sec if needed (backend sends ms)
     if (markers.length > 0) {
-      const sortedMarkers = [...markers].sort((a, b) => a.time - b.time);
+      const normMarkers = markers.map(m => ({
+        ...m,
+        time: (m.time as unknown as number) > 1e11 ? Math.floor(Number(m.time) / 1000) as Time : m.time as Time,
+      }))
+      const sortedMarkers = [...normMarkers].sort((a, b) => (a.time as number) - (b.time as number));
       const chartMarkers: SeriesMarker<Time>[] = sortedMarkers.map(m => ({
         time: m.time as Time,
         position: m.position,
@@ -514,6 +575,44 @@ export default function TradingViewChart({
       series.setMarkers([]);
     }
   }, [overlays, markers, chartInitCount]);
+
+  // Fit mode: genesis shows all candles from day 1, recent shows last 2 cycles (~2858d).
+  // For intraday (H1/H4) recent mode the page passes only 2000/1000 actual bars, so
+  // we show a tight viewport of 200 bars so the current/live bar is immediately visible.
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart || !initialCandles || initialCandles.length === 0) return;
+    const id = setTimeout(() => {
+      try {
+        if (fitMode === 'genesis') {
+          chart.timeScale().fitContent();
+        } else {
+          const tfUpper = (timeframe || 'D1').toUpperCase();
+          const endIdx = initialCandles.length - 1;
+          if (tfUpper === 'H1' || tfUpper === 'H4') {
+            // Show last 200 H1/H4 bars in the viewport so the live bar is front and centre.
+            // The caller already limited the dataset to ~2000 real bars for recent mode so
+            // older data is still reachable via scroll.
+            const startIdx = Math.max(0, endIdx - 200);
+            const startTime = initialCandles[startIdx]?.time as Time;
+            const endTime = initialCandles[endIdx]?.time as Time;
+            if (startTime && endTime) chart.timeScale().setVisibleRange({ from: startTime, to: endTime });
+            else chart.timeScale().fitContent();
+          } else {
+            // D1/W1/MN1: show the last 2-cycle window (time-based to handle varying dataset sizes)
+            const recentMap: Record<string, number> = { MN1: 100, W1: 420, D1: 2858 };
+            const want = recentMap[tfUpper] ?? 800;
+            const startIdx = Math.max(0, endIdx - want + 1);
+            const startTime = initialCandles[startIdx]?.time as Time;
+            const endTime = initialCandles[endIdx]?.time as Time;
+            if (startTime && endTime) chart.timeScale().setVisibleRange({ from: startTime, to: endTime });
+            else chart.timeScale().fitContent();
+          }
+        }
+      } catch {}
+    }, 80);
+    return () => clearTimeout(id);
+  }, [fitMode, initialCandles, timeframe]);
 
   // Draw SL/TP/Entry price lines for positions matching this symbol
   // SL/TP lines are click-to-drag editable when onSlTpChange is provided

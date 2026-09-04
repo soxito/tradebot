@@ -185,7 +185,14 @@ class LiveTradeEngine:
 
     @staticmethod
     def _bitget_symbol(symbol: str) -> str:
-        return symbol.replace("/", "").upper()
+        s = symbol.replace("/", "").upper()
+        # MT5-format crypto CFDs quote in USD (BTCUSD, ETHUSD); Bitget needs USDT.
+        if s.endswith("USD") and not s.endswith(("USDT", "USDC")):
+            from app.exchanges.yahoo_provider import _CRYPTO_BASES
+            base = s[:-3]
+            if base in _CRYPTO_BASES:
+                return base + "USDT"
+        return s
 
     @staticmethod
     def _hold_side_for_order(side: str) -> str:
@@ -1384,7 +1391,7 @@ class LiveTradeEngine:
 
             signals_processed += 1
             symbol = sig.symbol
-            action = sig.action.value
+            action = sig.action.value if isinstance(sig.action, SignalAction) else str(sig.action)
             price = sig.price or 0
             confidence = sig.confidence or 0
 
@@ -1908,7 +1915,7 @@ class LiveTradeEngine:
             return {"error": f"Signal {signal_id} not found"}
 
         symbol = sig.symbol
-        action = sig.action.value
+        action = sig.action.value if isinstance(sig.action, SignalAction) else str(sig.action)
         price = sig.price or 0
         confidence = sig.confidence or 0
 

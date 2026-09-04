@@ -252,6 +252,7 @@ JARVIS_COMMANDS: list[dict[str, str]] = [
     {"command": "analyze",    "description": "Deep AI analysis (Kronos+news+position) — /analyze BTCUSDT"},
     {"command": "mt5",        "description": "MT5 accounts/positions/scalp — /mt5 status|positions|scalp|close"},
     {"command": "room",       "description": "Trading room agents — /room BTCUSDT 4h, a question, or a chart image"},
+    {"command": "finetune",   "description": "Fine-tune Kronos on your own data — /finetune BTCUSDT [1h] | status | load | setup"},
 ]
 
 
