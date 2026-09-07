@@ -2018,12 +2018,23 @@ def preflight_check(mode: str) -> bool:
             unfixable.append("Docker CLI not found (install Docker Desktop)")
 
         if docker_cli_ok:
+            # `docker info` hangs (then times out) when Docker Desktop is
+            # installed but its daemon isn't running — common on Windows where
+            # the CLI shim exists before the WSL2/HyperV backend is up. A raw
+            # subprocess.run raises TimeoutExpired, which used to crash the whole
+            # preflight; treat any timeout/error as "daemon not reachable".
+            def _docker_daemon_up(timeout: int) -> bool:
+                try:
+                    return subprocess.run(
+                        ["docker", "info"], capture_output=True, timeout=timeout
+                    ).returncode == 0
+                except (OSError, subprocess.SubprocessError):
+                    return False
+
             # Docker Desktop on Windows uses WSL2/HyperV which can take
             # 20-30 s to respond on first call; use a longer timeout there.
             _docker_info_timeout = 30 if IS_WINDOWS else 5
-            r = subprocess.run(["docker", "info"], capture_output=True,
-                               timeout=_docker_info_timeout)
-            daemon_ok = r.returncode == 0
+            daemon_ok = _docker_daemon_up(_docker_info_timeout)
             if not daemon_ok:
                 info("Docker daemon not running — attempting to start Docker Desktop …")
                 # Launching Docker Desktop is platform-specific; wrap each call
@@ -2044,9 +2055,7 @@ def preflight_check(mode: str) -> bool:
                     pass
                 for _ in range(30):
                     time.sleep(2)
-                    if subprocess.run(["docker", "info"],
-                                      capture_output=True,
-                                      timeout=10 if IS_WINDOWS else 3).returncode == 0:
+                    if _docker_daemon_up(10 if IS_WINDOWS else 3):
                         daemon_ok = True
                         fixed_items.append("Docker daemon")
                         break
@@ -2057,11 +2066,14 @@ def preflight_check(mode: str) -> bool:
             if not daemon_ok:
                 unfixable.append("Docker daemon not running")
 
-            r2 = subprocess.run(["docker", "compose", "version"],
-                                capture_output=True, text=True,
-                                timeout=30 if IS_WINDOWS else 5)
-            compose_ok = r2.returncode == 0
-            ver2 = r2.stdout.strip().splitlines()[0] if compose_ok else ""
+            try:
+                r2 = subprocess.run(["docker", "compose", "version"],
+                                    capture_output=True, text=True,
+                                    timeout=30 if IS_WINDOWS else 5)
+                compose_ok = r2.returncode == 0
+                ver2 = r2.stdout.strip().splitlines()[0] if compose_ok else ""
+            except (OSError, subprocess.SubprocessError):
+                compose_ok, ver2 = False, ""
             _check("docker compose (v2 plugin)", compose_ok, ver2,
                    "upgrade Docker Desktop to ≥ 4.x")
             if not compose_ok:
@@ -2310,14 +2322,21 @@ def preflight_check(mode: str) -> bool:
         _check(f"MT5 REST running  (:{mt5_port_val})", True, MT5_API_URL)
     else:
         docker_avail = bool(shutil.which("docker"))
-        daemon_up = docker_avail and \
-            subprocess.run(["docker", "info"], capture_output=True, timeout=5).returncode == 0
+        try:
+            daemon_up = docker_avail and \
+                subprocess.run(["docker", "info"], capture_output=True,
+                               timeout=30 if IS_WINDOWS else 5).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            daemon_up = False
         if daemon_up:
-            r = subprocess.run(
-                ["docker", "inspect", "--format", "{{.State.Status}}", MT5_CONTAINER],
-                capture_output=True, text=True, timeout=5
-            )
-            state = r.stdout.strip() if r.returncode == 0 else "not_found"
+            try:
+                r = subprocess.run(
+                    ["docker", "inspect", "--format", "{{.State.Status}}", MT5_CONTAINER],
+                    capture_output=True, text=True, timeout=10 if IS_WINDOWS else 5
+                )
+                state = r.stdout.strip() if r.returncode == 0 else "not_found"
+            except (OSError, subprocess.SubprocessError):
+                state = "not_found"
             if state in ("exited", "created"):
                 info(f"MT5 container '{MT5_CONTAINER}' stopped — starting it now …")
                 subprocess.run(["docker", "start", MT5_CONTAINER],
@@ -2586,23 +2605,39 @@ def detect_and_sync_mt5_url() -> None:
 
 
 def _docker_available() -> bool:
-    return bool(shutil.which("docker")) and \
-           subprocess.run(["docker", "info"], capture_output=True, timeout=5).returncode == 0
+    # `docker info` hangs when Docker Desktop is installed but its daemon isn't
+    # running (common on Windows). Treat a timeout/error as "not available"
+    # rather than letting TimeoutExpired crash the caller.
+    if not shutil.which("docker"):
+        return False
+    try:
+        return subprocess.run(
+            ["docker", "info"], capture_output=True,
+            timeout=30 if IS_WINDOWS else 5
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def _container_running(name: str) -> bool:
-    r = subprocess.run(
-        ["docker", "inspect", "--format", "{{.State.Running}}", name],
-        capture_output=True, text=True, timeout=5
-    )
+    try:
+        r = subprocess.run(
+            ["docker", "inspect", "--format", "{{.State.Running}}", name],
+            capture_output=True, text=True, timeout=10 if IS_WINDOWS else 5
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
     return r.stdout.strip() == "true"
 
 
 def _container_exists(name: str) -> bool:
-    r = subprocess.run(
-        ["docker", "inspect", "--format", "{{.Name}}", name],
-        capture_output=True, text=True, timeout=5
-    )
+    try:
+        r = subprocess.run(
+            ["docker", "inspect", "--format", "{{.Name}}", name],
+            capture_output=True, text=True, timeout=10 if IS_WINDOWS else 5
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
     return r.returncode == 0
 
 

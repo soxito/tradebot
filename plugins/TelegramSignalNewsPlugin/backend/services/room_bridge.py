@@ -969,6 +969,163 @@ async def build_room_chart(
     return chart
 
 
+def _align_series_to_candles(
+    series: list[Any], candles: list[list]
+) -> list[float | None]:
+    """Map a Kronos OverlaySeries (time/value points, unix seconds) onto the
+    candle list so it can be drawn as a per-candle ``custom_lines`` entry."""
+    by_ts: dict[int, float] = {}
+    for pt in series or []:
+        t = getattr(pt, "time", None)
+        v = getattr(pt, "value", None)
+        if t is not None and v is not None:
+            by_ts[int(t)] = float(v)
+    out: list[float | None] = []
+    for c in candles:
+        ts = int(c[0]) // 1000
+        out.append(by_ts.get(ts))
+    return out
+
+
+def forecast_overlay_from_kronos(
+    resp: Any, candles: list[list], symbol: str = ""
+) -> PlanOverlay:
+    """Build a chart overlay from a Kronos ``ForecastResponse``.
+
+    Entry/SL/TP come from the first market sniper entry when one exists (so the
+    picture matches the plan the card describes); otherwise they are synthesised
+    from the forecast bands. The HLC3/Kaufman bfma & bsma lines are drawn as
+    custom lines, and the S&R nearest levels become support/resistance zones.
+    """
+    from plugins.KronosForecastPlugin.backend.services.forecast_service import (
+        build_sniper_signals,
+    )
+
+    sig = getattr(resp, "signal", None)
+    direction = None
+    if sig is not None:
+        if sig.direction == "up":
+            direction = "long"
+        elif sig.direction == "down":
+            direction = "short"
+
+    entry = stop = None
+    targets: list[float] = []
+    try:
+        snipers = build_sniper_signals(resp)
+        market = next((s for s in snipers if s.order_kind == "market"), None)
+        if market:
+            entry = market.entry
+            stop = market.stop_loss
+            targets = [t for t in (market.take_profit_1, market.take_profit_2) if t]
+            direction = "long" if market.side == "long" else "short"
+    except Exception as exc:  # noqa: BLE001 — chart must not fail on sniper build
+        logger.debug("[Forecast] sniper levels unavailable for the chart: {}", exc)
+
+    anchor = float(getattr(resp, "anchor_price", 0) or (candles[-1][4] if candles else 0))
+    if entry is None:
+        entry = anchor or None
+    if stop is None and resp.lower_band and resp.upper_band:
+        lows = [b.value for b in resp.lower_band]
+        highs = [b.value for b in resp.upper_band]
+        if direction == "long" and lows:
+            stop = min(lows) * 0.997
+            targets = targets or [max(highs)] if highs else []
+        elif direction == "short" and highs:
+            stop = max(highs) * 1.003
+            targets = targets or [min(lows)] if lows else []
+
+    # Forecast path as the projection (mean predicted closes).
+    projection = [float(c.close) for c in (resp.forecast[:6] if resp.forecast else [])]
+
+    # HLC3/Kaufman lines + S&R level lines from the response overlays. The two
+    # HLC3 series vary per candle (aligned by timestamp); the Support/Resistance
+    # series are flat 2-point levels drawn as full horizontal dashed lines.
+    custom_lines: list[dict[str, Any]] = []
+
+    def _flat_level(series: list[Any]) -> list[float | None]:
+        level = next(
+            (float(getattr(p, "value")) for p in (series or [])
+             if getattr(p, "value", None) is not None),
+            None,
+        )
+        return [level] * len(candles) if level is not None else []
+
+    for ov in getattr(resp, "overlays", []) or []:
+        name = getattr(ov, "name", "")
+        if name == "HLC3 Daily HTF":
+            custom_lines.append({
+                "values": _align_series_to_candles(ov.data, candles),
+                "color": (34, 211, 238), "label": "HLC3 HTF", "width": 2,
+            })
+        elif name == "HLC3 KAMA":
+            custom_lines.append({
+                "values": _align_series_to_candles(ov.data, candles),
+                "color": (249, 115, 22), "label": "KAMA", "width": 2,
+            })
+        elif name.startswith("Support"):
+            vals = _flat_level(ov.data)
+            if vals:
+                custom_lines.append({
+                    "values": vals, "color": (8, 153, 129),
+                    "label": name, "width": 1, "dashed": True,
+                })
+        elif name.startswith("Resistance"):
+            vals = _flat_level(ov.data)
+            if vals:
+                custom_lines.append({
+                    "values": vals, "color": (242, 54, 69),
+                    "label": name, "width": 1, "dashed": True,
+                })
+
+    # S&R zones from the response.
+    support_zones: list[dict[str, Any]] = []
+    resistance_zones: list[dict[str, Any]] = []
+    sr = getattr(resp, "sr_signals", None)
+    if sr is not None and getattr(sr, "enabled", False) and not getattr(sr, "error", None):
+        for z in getattr(sr, "support_zones", []) or []:
+            support_zones.append({"low": z.zone_bottom, "high": z.zone_top})
+        for z in getattr(sr, "resistance_zones", []) or []:
+            resistance_zones.append({"low": z.zone_bottom, "high": z.zone_top})
+
+    blocks: list[dict[str, Any]] = []
+    if entry and stop:
+        blocks.append({
+            "low": min(entry, stop), "high": max(entry, stop),
+            "kind": "bullish" if direction == "long" else "bearish",
+            "label": "Entry / risk zone",
+        })
+
+    return PlanOverlay(
+        direction=direction, entry=entry, stop_loss=stop, take_profits=targets,
+        order_blocks=blocks, projection=projection,
+        support_zones=support_zones, resistance_zones=resistance_zones,
+        custom_lines=custom_lines,
+    )
+
+
+async def build_forecast_chart(symbol: str, timeframe: str, resp: Any) -> bytes | None:
+    """Render a zoomed chart for a Kronos ``/forecast`` with both indicators.
+
+    Fetches fresh candles, overlays the forecast plan + HLC3/Kaufman + S&R, and
+    zooms the frame to the entry/SL/TP so the plan fills the image.
+    """
+    candles = await _fetch_candles(symbol, timeframe, limit=150)
+    if not candles:
+        return None
+
+    overlay = forecast_overlay_from_kronos(resp, candles, symbol=symbol)
+    engine = str(getattr(resp, "engine", "") or "").capitalize()
+    sig = getattr(resp, "signal", None)
+    direction = (getattr(sig, "direction", "") or "").upper() if sig else ""
+    conf = int(round((getattr(sig, "confidence", 0) or 0) * 100)) if sig else 0
+    subtitle = f"Kronos {engine} {direction} {conf}% conf".strip()
+    return render_plan_chart(
+        candles, symbol=symbol, timeframe=timeframe, overlay=overlay,
+        subtitle=subtitle, candle_count=100, zoom_to_levels=True,
+    )
+
+
 async def run_pair(token: str, chat_id: str, symbol: str, timeframe: str) -> None:
     """Convene the room on ``symbol`` and reply with the verdict and a chart."""
     from app.agents.orchestrator import AgentOrchestrator

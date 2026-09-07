@@ -2,7 +2,7 @@
 type: community
 name: Bitget (c72)
 node_count: 18
-synced: 2026-09-04
+synced: 2026-09-07
 tags:
   - community
   - Bitget-c72
@@ -10,7 +10,7 @@ tags:
 
             # Bitget (c72)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-04.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-07.
 
 
             ## Key Nodes (18 total)

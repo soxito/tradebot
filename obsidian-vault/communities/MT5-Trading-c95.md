@@ -2,7 +2,7 @@
 type: community
 name: MT5 & Trading (c95)
 node_count: 13
-synced: 2026-09-04
+synced: 2026-09-07
 tags:
   - community
   - MT5-Trading-c95
@@ -10,7 +10,7 @@ tags:
 
             # MT5 & Trading (c95)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-04.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-07.
 
 
             ## Key Nodes (13 total)

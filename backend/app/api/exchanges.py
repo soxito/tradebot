@@ -196,11 +196,25 @@ async def get_ohlcv(
     }
     is_crypto = exchange.value in _CRYPTO_EXCHANGES
 
-    # Accept URL-safe format: BTCUSDT -> BTC/USDT, PEPEUSDT -> PEPE/USDT
-    if "/" not in symbol:
-        # Strip URL-safe hyphens (ETH-USD → ETHUSD) before further processing
-        if "-" in symbol:
-            symbol = symbol.replace("-", "")
+    # Strip URL-safe hyphens (ETH-USD → ETHUSD, CAD-JPY → CADJPY) up front.
+    if "/" not in symbol and "-" in symbol:
+        symbol = symbol.replace("-", "")
+
+    # Classify FX / metals / index by the SYMBOL, independent of the exchange
+    # dropdown. The Kronos page always selects a crypto venue (Bitget), so an FX
+    # cross like CADJPY would otherwise be treated as crypto and fail with
+    # "bitget does not have market symbol CADJPY". Forex/metals must price off
+    # Swissquote (via MT5/Yahoo), never a crypto exchange.
+    _sym_is_fx_metal = False
+    try:
+        from app.exchanges.yahoo_provider import supports_non_crypto as _supports_non_crypto
+        _sym_is_fx_metal = _supports_non_crypto(symbol)
+    except Exception:
+        _sym_is_fx_metal = False
+
+    # Accept URL-safe format: BTCUSDT -> BTC/USDT, PEPEUSDT -> PEPE/USDT. FX and
+    # metals keep their native spelling so they reach the Swissquote path below.
+    if "/" not in symbol and not _sym_is_fx_metal:
         upper = symbol.upper()
         # 1. Explicit alias map (highest priority — handles XAUUSD → XAU/USDT etc.)
         if is_crypto and upper in _SYMBOL_ALIASES:
@@ -225,7 +239,7 @@ async def get_ohlcv(
         and not symbol.endswith("/USDT")
         and symbol.split("/")[0] not in ("XAU", "XAG", "XPT", "XPD")
     )
-    _is_fx_metal = not is_crypto
+    _is_fx_metal = _sym_is_fx_metal or not is_crypto
 
     if _is_non_usdt_spot or _is_fx_metal:
         try:
@@ -259,6 +273,14 @@ async def get_ohlcv(
                         except Exception:
                             _bars = None
                     if _bars and len(_bars) >= 5:
+                        # Put FX/metals bars on Swissquote's price scale — the
+                        # broker the user actually trades — so every chart agrees.
+                        if _is_fx_metal:
+                            try:
+                                from app.exchanges.forex_provider import anchor_bars_to_swissquote as _anchor_sq
+                                _bars = await _anchor_sq(symbol, _bars)
+                            except Exception:
+                                pass
                         return {
                             "exchange": f"mt5:{_acct.server}", "symbol": symbol,
                             "timeframe": timeframe, "count": len(_bars),
@@ -282,6 +304,13 @@ async def get_ohlcv(
                     _yf(symbol, _YF_TF.get(timeframe, "H1"), limit), timeout=12.0
                 )
                 if _yf_bars and len(_yf_bars) >= 5:
+                    # Anchor Yahoo FX/metals bars to Swissquote's price scale
+                    # (corrects e.g. the COMEX gold-future premium over spot).
+                    try:
+                        from app.exchanges.forex_provider import anchor_bars_to_swissquote as _anchor_sq
+                        _yf_bars = await _anchor_sq(symbol, _yf_bars)
+                    except Exception:
+                        pass
                     return {
                         "exchange": "yahoo", "symbol": symbol,
                         "timeframe": timeframe, "count": len(_yf_bars),
@@ -293,6 +322,17 @@ async def get_ohlcv(
                     }
             except Exception:
                 pass
+
+        # FX / metals / indices are never listed on a crypto exchange, so do not
+        # fall through to the Bitget connector below — that only yields a
+        # misleading "bitget does not have market symbol CADJPY". Return an
+        # honest empty result the chart can surface instead.
+        if _is_fx_metal:
+            return {
+                "exchange": "swissquote", "symbol": symbol,
+                "timeframe": timeframe, "data": [], "count": 0,
+                "error": f"No OHLCV data for {symbol} ({timeframe}) — MT5/Swissquote feed unavailable.",
+            }
 
     cache_key = f"{exchange.value}:{symbol}:{timeframe}:{limit}"
     now_ts = time.time()

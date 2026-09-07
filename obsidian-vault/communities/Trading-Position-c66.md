@@ -2,7 +2,7 @@
 type: community
 name: Trading & Position (c66)
 node_count: 19
-synced: 2026-09-04
+synced: 2026-09-07
 tags:
   - community
   - Trading-Position-c66
@@ -10,7 +10,7 @@ tags:
 
             # Trading & Position (c66)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-04.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-07.
 
 
             ## Key Nodes (19 total)

@@ -2,7 +2,7 @@
 type: community
 name: Monitor & Pump Monitor (c149)
 node_count: 4
-synced: 2026-09-04
+synced: 2026-09-07
 tags:
   - community
   - Monitor-Pump-Monitor-c149
@@ -10,7 +10,7 @@ tags:
 
             # Monitor & Pump Monitor (c149)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-04.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-07.
 
 
             ## Key Nodes (4 total)

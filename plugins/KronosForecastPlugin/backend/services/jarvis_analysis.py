@@ -156,6 +156,7 @@ def _build_user_prompt(
     resp: ForecastResponse,
     market: Optional[MarketCapInfo],
     position: Optional[PositionInfo] = None,
+    drawings_note: Optional[str] = None,
 ) -> str:
     sig = resp.signal
     band_lo = resp.lower_band[-1].value if resp.lower_band else None
@@ -231,6 +232,8 @@ def _build_user_prompt(
                 else ""
             ),
         ]
+    if drawings_note:
+        lines += ["", drawings_note]
     lines.append("\nWrite the analysis now.")
     return "\n".join(lines)
 
@@ -659,7 +662,18 @@ async def analyze_forecast(
             ),
         )
 
-    analysis, provider, err = await _run_llm(_build_user_prompt(resp, market, position))
+    # The trader's own chart drawings become context the analyst respects.
+    try:
+        from plugins.KronosForecastPlugin.backend.services import drawings_service
+        drawings_note = await drawings_service.drawings_context(
+            resp.exchange, resp.symbol, resp.timeframe,
+        )
+    except Exception:
+        drawings_note = ""
+
+    analysis, provider, err = await _run_llm(
+        _build_user_prompt(resp, market, position, drawings_note or None)
+    )
 
     note: Optional[str] = None
     if analysis is None:

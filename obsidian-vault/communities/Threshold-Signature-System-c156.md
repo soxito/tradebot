@@ -2,7 +2,7 @@
 type: community
 name: Threshold Signature System (c156)
 node_count: 4
-synced: 2026-09-04
+synced: 2026-09-07
 tags:
   - community
   - Threshold-Signature-System-c156
@@ -10,7 +10,7 @@ tags:
 
             # Threshold Signature System (c156)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-04.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-07.
 
 
             ## Key Nodes (4 total)

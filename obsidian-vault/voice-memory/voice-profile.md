@@ -1,7 +1,7 @@
 ---
 type: voice-identity
-updated: 2026-09-04T19:04:43.427864+00:00
-sessions: 4
+updated: 2026-09-07T14:15:36.859885+00:00
+sessions: 66
 words_learned: 474
 tags:
   - jarvis
@@ -13,80 +13,80 @@ tags:
 
 > This note is the permanent voice memory for JARVIS.  It is **never deleted** — only improved over time as you speak.
 
-Updated: 2026-09-04 19:04 UTC  | Words learned: **474**  | Voice sessions: **4**
+Updated: 2026-09-07 14:15 UTC  | Words learned: **474**  | Voice sessions: **66**
 
 ## Voice Frequency Fingerprint
 | Band | Mean Energy | Std Dev |
 | ---- | ----------- | ------- |
 | <80Hz | 1.0000 | 0.0300 |
-| 80-160 | 0.3544 | 0.0743 |
-| 160-320 | 0.0751 | 0.0598 |
-| 320-640 | 0.0164 | 0.0344 |
-| 640Hz-1.3k | 0.0053 | 0.0312 |
-| 1.3-2.5k | 0.0004 | 0.0300 |
-| 2.5-5k | 0.0000 | 0.0300 |
+| 80-160 | 0.2206 | 0.0869 |
+| 160-320 | 0.0543 | 0.0482 |
+| 320-640 | 0.0158 | 0.0313 |
+| 640Hz-1.3k | 0.0074 | 0.0310 |
+| 1.3-2.5k | 0.0005 | 0.0300 |
+| 2.5-5k | 0.0001 | 0.0300 |
 | 5-10k | 0.0000 | 0.0300 |
 | 10-16k | 0.0000 | 0.0300 |
 | 16-20k | 0.0000 | 0.0300 |
 | 20k+ | 0.0000 | 0.0300 |
 | ultra | 0.0000 | 0.0300 |
 
-Spectral centroid: **0.0330**  Sessions: **4**
+Spectral centroid: **0.0228**  Sessions: **66**
 
 ## Top Learned Words (speech vocabulary)
 
 | Word | Times Spoken |
 | ---- | ------------ |
-| jarvis | 423 |
-| analyze | 415 |
-| gold | 414 |
-| live | 414 |
-| open | 410 |
-| market | 404 |
-| symbol | 402 |
-| analysis | 399 |
-| take | 399 |
-| navigate | 398 |
-| dashboard | 398 |
-| confirm | 397 |
-| entry | 397 |
-| setups | 397 |
-| volume | 397 |
-| bullish | 397 |
-| setup | 396 |
-| risk | 396 |
-| sell | 395 |
-| position | 395 |
-| account | 395 |
-| bitcoin | 395 |
-| bias | 395 |
-| execute | 394 |
-| close | 394 |
-| limit | 394 |
-| orders | 394 |
-| stop | 394 |
-| signal | 394 |
-| bearish | 394 |
-| momentum | 394 |
-| scroll | 394 |
-| chart | 394 |
-| trade | 394 |
-| cancel | 393 |
-| buy | 393 |
-| analyse | 393 |
-| sniper | 393 |
-| order | 393 |
-| positions | 393 |
-| entries | 393 |
-| loss | 393 |
-| profit | 393 |
-| signals | 393 |
-| lot | 393 |
-| lots | 393 |
-| pips | 393 |
-| balance | 393 |
-| equity | 393 |
-| margin | 393 |
+| jarvis | 429 |
+| analyze | 421 |
+| gold | 420 |
+| live | 420 |
+| open | 416 |
+| market | 410 |
+| symbol | 408 |
+| analysis | 405 |
+| take | 405 |
+| navigate | 404 |
+| dashboard | 404 |
+| confirm | 403 |
+| entry | 403 |
+| setups | 403 |
+| volume | 403 |
+| bullish | 403 |
+| setup | 402 |
+| risk | 402 |
+| sell | 401 |
+| position | 401 |
+| account | 401 |
+| bitcoin | 401 |
+| bias | 401 |
+| execute | 400 |
+| close | 400 |
+| limit | 400 |
+| orders | 400 |
+| stop | 400 |
+| signal | 400 |
+| bearish | 400 |
+| momentum | 400 |
+| scroll | 400 |
+| chart | 400 |
+| trade | 400 |
+| cancel | 399 |
+| buy | 399 |
+| analyse | 399 |
+| sniper | 399 |
+| order | 399 |
+| positions | 399 |
+| entries | 399 |
+| loss | 399 |
+| profit | 399 |
+| signals | 399 |
+| lot | 399 |
+| lots | 399 |
+| pips | 399 |
+| balance | 399 |
+| equity | 399 |
+| margin | 399 |
 
 ## How This Works
 

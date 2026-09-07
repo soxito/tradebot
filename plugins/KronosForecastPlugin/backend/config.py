@@ -122,5 +122,21 @@ class KronosConfig:
     # 180s is safe for 1h/4h charts — prices don't shift meaningfully in 3 min.
     cache_ttl_s: int = int(os.getenv("KRONOS_CACHE_TTL_S", "180"))
 
+    # ── HLC3/Kaufman adaptive MA overlay (PineScript v2 port) ────────────────
+    # Toggle the whole indicator off with KRONOS_HLC3_KAUFMAN_ENABLED=false.
+    hlc3_kaufman_enabled: bool = os.getenv(
+        "KRONOS_HLC3_KAUFMAN_ENABLED", "true"
+    ).strip().lower() not in ("0", "false", "no", "off")
+    hlc3_kaufman_length: int = int(os.getenv("KRONOS_HLC3_KAUFMAN_LENGTH", "5"))
+    hlc3_kaufman_slow_period: int = int(os.getenv("KRONOS_HLC3_KAUFMAN_SLOW_PERIOD", "20"))
+
+    # ── LuxAlgo Support & Resistance Signals MTF overlay (v5 port) ───────────
+    # Toggle the whole indicator off with KRONOS_SR_SIGNALS_ENABLED=false.
+    sr_signals_enabled: bool = os.getenv(
+        "KRONOS_SR_SIGNALS_ENABLED", "true"
+    ).strip().lower() not in ("0", "false", "no", "off")
+    sr_signals_length: int = int(os.getenv("KRONOS_SR_SIGNALS_LENGTH", "15"))
+    sr_signals_margin: float = float(os.getenv("KRONOS_SR_SIGNALS_MARGIN", "2.0"))
+
 
 kronos_config = KronosConfig()

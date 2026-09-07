@@ -6,6 +6,7 @@ import type { CycleWindowBox, ZonesData } from '@/utils/zonesOverlay';
 import { apiClient } from '@/services/api';
 import { calcMinMove, calcChartPrecision } from '@/utils/price';
 import { formatTimeZA } from '@/utils/datetime';
+import ChartDrawingLayer from '@/components/ChartDrawingLayer';
 
 interface PriceLine {
   price: number;
@@ -87,8 +88,17 @@ interface TradingViewChartProps {
   showZones?: boolean;
   /** Bitcoin 1064-day cycle boxes (green bull / red bear) behind the candles. */
   cycleWindows?: CycleWindowBox[];
-  /** Fit mode for the time scale: genesis fits all candles, recent shows last 2 cycles */
-  fitMode?: 'genesis' | 'recent';
+  /** Fit mode for the time scale: genesis fits all candles, recent shows last 2
+   *  cycles, forecast zooms tight on the current bar with room on the right for
+   *  the projection. */
+  fitMode?: 'genesis' | 'recent' | 'forecast';
+  /** Enable the TradingView-style drawing toolbox (fullscreen + auto-saved shapes
+   *  the trading-room agents read and refine). Opt-in so other charts are untouched. */
+  enableDrawings?: boolean;
+  /** Drawing identity overrides (default to this chart's exchange/symbol/timeframe). */
+  drawingsExchange?: string;
+  drawingsSymbol?: string;
+  drawingsTimeframe?: string;
 }
 
 /**
@@ -136,8 +146,13 @@ export default function TradingViewChart({
   showZones = false,
   cycleWindows,
   fitMode = 'genesis',
+  enableDrawings = false,
+  drawingsExchange,
+  drawingsSymbol,
+  drawingsTimeframe,
 }: TradingViewChartProps) {
   const chartContainerRef = useRef<HTMLDivElement>(null);
+  const chartWrapRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candlestickSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const zonesOverlayRef = useRef<ZonesOverlay | null>(null);
@@ -165,6 +180,47 @@ export default function TradingViewChart({
   // Incremented each time the chart/series is (re)created so the overlay effect
   // re-runs even when overlays/markers props haven't changed.
   const [chartInitCount, setChartInitCount] = useState(0);
+
+  // True browser fullscreen for the chart (drawing toolbox uses this).
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const isFullscreenRef = useRef(false);
+  isFullscreenRef.current = isFullscreen;
+  const toggleFullscreen = useCallback(() => {
+    const el = chartWrapRef.current;
+    if (!el) return;
+    if (document.fullscreenElement === el) {
+      document.exitFullscreen().catch(() => {});
+    } else {
+      el.requestFullscreen?.().catch(() => {});
+    }
+  }, []);
+  useEffect(() => {
+    const onFsChange = () => setIsFullscreen(document.fullscreenElement === chartWrapRef.current);
+    document.addEventListener('fullscreenchange', onFsChange);
+    return () => document.removeEventListener('fullscreenchange', onFsChange);
+  }, []);
+  // Resize the chart to fill the screen while fullscreen; restore on exit.
+  useEffect(() => {
+    const chart = chartRef.current;
+    const wrap = chartWrapRef.current;
+    if (!chart || !wrap) return;
+    const apply = () => {
+      const el = chartContainerRef.current;
+      const width = el?.clientWidth || wrap.clientWidth || 600;
+      // In fullscreen the container is flex-1, so its own height is the screen
+      // minus the toolbar — use that so the chart truly fills the display.
+      const height = isFullscreen
+        ? (el?.clientHeight || window.innerHeight)
+        : (maximized ? window.innerHeight - 120 : 400);
+      try { chart.applyOptions({ width, height }); } catch {}
+    };
+    // Two passes: one after the fullscreen transition settles, one on the next
+    // frame so the flex layout has committed the container's final height.
+    const id1 = setTimeout(apply, 80);
+    const id2 = requestAnimationFrame(() => requestAnimationFrame(apply));
+    return () => { clearTimeout(id1); cancelAnimationFrame(id2); };
+  }, [isFullscreen, maximized, chartInitCount]);
+
 
   // Drag state for SL/TP editing
   const [editingSl, setEditingSl] = useState<number | null>(null);
@@ -402,12 +458,13 @@ export default function TradingViewChart({
     // responsive grid reflow, or the container gaining width after mount).
     const handleResize = () => {
       if (chartContainerRef.current && chartRef.current) {
-        const width = chartContainerRef.current.clientWidth;
+        const el = chartContainerRef.current;
+        const width = el.clientWidth;
         if (width > 0) {
-          chartRef.current.applyOptions({
-            width,
-            height: maximized ? window.innerHeight - 120 : 400,
-          });
+          const height = isFullscreenRef.current
+            ? (el.clientHeight || window.innerHeight)
+            : (maximized ? window.innerHeight - 120 : 400);
+          chartRef.current.applyOptions({ width, height });
         }
       }
     };
@@ -586,6 +643,15 @@ export default function TradingViewChart({
       try {
         if (fitMode === 'genesis') {
           chart.timeScale().fitContent();
+        } else if (fitMode === 'forecast') {
+          // Zoom tight on the current bar. Use a logical range so the right edge
+          // extends past the last candle into whitespace — that reserved space
+          // is where the Kronos forecast projection is drawn.
+          const endIdx = initialCandles.length - 1;
+          chart.timeScale().setVisibleLogicalRange({
+            from: Math.max(0, endIdx - 150),
+            to: endIdx + 40,
+          });
         } else {
           const tfUpper = (timeframe || 'D1').toUpperCase();
           const endIdx = initialCandles.length - 1;
@@ -917,7 +983,30 @@ export default function TradingViewChart({
           )}
         </div>
       </div>
-      <div ref={chartContainerRef} className="rounded-lg overflow-hidden border border-gray-700" />
+      <div
+        ref={chartWrapRef}
+        className={`relative ${isFullscreen ? 'bg-[#0a0e27] w-screen h-screen flex flex-col' : ''}`}
+      >
+        {enableDrawings && (
+          <ChartDrawingLayer
+            chartApiRef={chartRef}
+            seriesApiRef={candlestickSeriesRef}
+            containerRef={chartContainerRef}
+            chartInitCount={chartInitCount}
+            exchange={drawingsExchange ?? exchange}
+            symbol={drawingsSymbol ?? symbol}
+            timeframe={drawingsTimeframe ?? toApiTimeframe(timeframe)}
+            onToggleFullscreen={toggleFullscreen}
+            isFullscreen={isFullscreen}
+          />
+        )}
+        <div
+          ref={chartContainerRef}
+          className={`relative overflow-hidden border border-gray-700 ${
+            isFullscreen ? 'flex-1 min-h-0 w-full rounded-none' : 'rounded-lg'
+          }`}
+        />
+      </div>
 
       {/* SL/TP Edit Bar — shows when actively editing */}
       {onSlTpChange && (editingSl !== null || editingTp !== null) && editingPosition && (

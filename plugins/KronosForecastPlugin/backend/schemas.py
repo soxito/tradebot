@@ -105,6 +105,54 @@ class ForecastSignal(BaseModel):
     rationale: List[str] = Field(default_factory=list)   # why this direction
 
 
+class HLC3KaufmanSignal(BaseModel):
+    """HLC3/Kaufman adaptive MA state (PineScript v2 port). Toggleable."""
+    enabled: bool = True
+    signal: Literal["buy", "sell", "neutral"] = "neutral"
+    bfma_current: Optional[float] = None      # daily HTF reference (cyan)
+    bsma_current: Optional[float] = None      # KAMA EMA fast line (orange)
+    bfma_prev: Optional[float] = None
+    bsma_prev: Optional[float] = None
+    crossover: bool = False                   # BUY cross on the latest bar
+    crossunder: bool = False                  # SELL cross on the latest bar
+    bars_since_cross: Optional[int] = None
+    summary: str = ""
+    error: Optional[str] = None
+
+
+class SRZoneSchema(BaseModel):
+    level: float
+    zone_top: float
+    zone_bottom: float
+    kind: Literal["support", "resistance"]
+    formed_unix: int
+    broken: bool = False
+    tested: bool = False
+    retested: bool = False
+    manipulated: bool = False
+
+
+class SRSignalEventSchema(BaseModel):
+    unix_time: int
+    event_type: str
+    price: float
+    level_price: float
+    zone_kind: Literal["support", "resistance"]
+
+
+class SRSignalsSchema(BaseModel):
+    """LuxAlgo Support & Resistance Signals MTF state (v5 port). Toggleable."""
+    enabled: bool = True
+    support_zones: List[SRZoneSchema] = Field(default_factory=list)
+    resistance_zones: List[SRZoneSchema] = Field(default_factory=list)
+    recent_events: List[SRSignalEventSchema] = Field(default_factory=list)
+    current_event: Optional[SRSignalEventSchema] = None
+    nearest_support: Optional[float] = None
+    nearest_resistance: Optional[float] = None
+    summary: str = ""
+    error: Optional[str] = None
+
+
 class ForecastResponse(BaseModel):
     exchange: str
     symbol: str
@@ -127,6 +175,10 @@ class ForecastResponse(BaseModel):
     # Ready-to-render overlays + markers for any chart in the app
     overlays: List[OverlaySeries] = Field(default_factory=list)
     markers: List[OverlayMarker] = Field(default_factory=list)
+
+    # HLC3/Kaufman adaptive MA + LuxAlgo S&R Signals MTF (both toggleable).
+    hlc3_kaufman: Optional[HLC3KaufmanSignal] = None
+    sr_signals: Optional[SRSignalsSchema] = None
 
     # Historical candles used to run this forecast (lightweight-charts format).
     # Populated for forex/metals where the exchange has no data; empty for crypto
@@ -195,6 +247,8 @@ class ForecastStatus(BaseModel):
     device: str
     max_context: int
     detail: str
+    display_name: str = ""                        # short label for the engine chip
+    finetuned_job_id: Optional[int] = None       # set when a finetuned model is loaded
 
 
 class BatchForecastRequest(BaseModel):
@@ -259,6 +313,7 @@ class FinetuneStartRequest(BaseModel):
     symbol: str
     exchange: str = "bitget"
     timeframe: str = "1h"
+    model_name: Optional[str] = None            # user label e.g. "super-base"
     limit: int = Field(5000, ge=256, le=100000, description="Candles to export for training")
     lookback: int = Field(512, ge=64, le=2048)
     pred_len: int = Field(48, ge=1, le=512)
@@ -293,6 +348,7 @@ class FinetuneJobResponse(BaseModel):
     exchange: str
     timeframe: str
     status: FinetuneStatusT
+    model_name: Optional[str] = None            # user label e.g. "super-base"
     lookback: int
     pred_len: int
     tokenizer_epochs: int
@@ -309,6 +365,15 @@ class FinetuneJobResponse(BaseModel):
     finished_at: Optional[str] = None
     created_at: Optional[str] = None
     log_tail: Optional[str] = None              # last N lines of the training log
+    disk_size_mb: float = 0.0                   # size of the checkpoint dir on disk
+
+
+class FinetuneCombineResponse(BaseModel):
+    ok: bool
+    job_id: Optional[int] = None
+    symbols_combined: List[str] = Field(default_factory=list)
+    rows_merged: int = 0
+    error: Optional[str] = None
 
 
 class FinetuneSetupStatus(BaseModel):
@@ -316,4 +381,56 @@ class FinetuneSetupStatus(BaseModel):
     model_vendored: bool                        # base model/ package present?
     setup_command: str                          # how to vendor it if missing
     finetune_dir: str
+
+
+# ── Chart drawings (user overlays reused + refined by agents) ─────────────────
+
+DrawingTypeT = Literal[
+    "trendline", "ray", "hline", "vline", "rectangle", "fib", "text",
+]
+DrawingSourceT = Literal["user", "agent"]
+
+
+class DrawingPoint(BaseModel):
+    """A single anchor. ``time`` is unix seconds (lightweight-charts UTCTimestamp);
+    ``price`` is on the instrument's price scale."""
+    time: float
+    price: float
+
+
+class ChartDrawing(BaseModel):
+    """One shape on the chart. Kept deliberately generic so new tools can be
+    added on the client without a schema change."""
+    id: str
+    type: DrawingTypeT
+    points: List[DrawingPoint] = Field(default_factory=list)
+    color: str = "#22d3ee"
+    width: int = 2
+    text: Optional[str] = None
+    source: DrawingSourceT = "user"
+    locked: bool = False
+    agent_note: Optional[str] = None            # why the agent drew/adjusted it
+    refined_from: Optional[str] = None          # id of the user shape it sharpens
+
+
+class DrawingsDoc(BaseModel):
+    exchange: str
+    symbol: str
+    timeframe: str
+    drawings: List[ChartDrawing] = Field(default_factory=list)
+    updated_at: Optional[str] = None
+
+
+class SaveDrawingsRequest(BaseModel):
+    timeframe: str = "1h"
+    drawings: List[ChartDrawing] = Field(default_factory=list)
+
+
+class RefineDrawingsResponse(BaseModel):
+    exchange: str
+    symbol: str
+    timeframe: str
+    refined: List[ChartDrawing] = Field(default_factory=list)   # new agent shapes
+    drawings: List[ChartDrawing] = Field(default_factory=list)  # full merged doc
+    note: Optional[str] = None
 

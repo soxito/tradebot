@@ -123,6 +123,11 @@ async def parse_and_execute(
                     sub[1].strip() if len(sub) > 1 else "", chat_id
                 )
             return _start_room(args.strip(), token, chat_id)
+        # /forecast is handled here too: it delivers a zoomed chart (HLC3/Kaufman
+        # + S&R) alongside the text, which needs the token + chat_id to send a
+        # photo — the same reason /room is special-cased.
+        if cmd == "forecast" and args.strip():
+            return _start_forecast(args.strip(), token, chat_id, db)
         return await _dispatch(cmd, args.strip(), db)
 
     # ── "Yes" to a command the last reply offered ─────────────────────────────
@@ -668,6 +673,34 @@ def _fmt_sniper_analysis(resp: Any) -> str:
             lines.append(f"   <i>{_esc(_clip(k['summary'], 180))}</i>")
     else:
         lines.append("🔮 <b>Kronos</b> — no forecast available")
+
+    # ── HLC3/Kaufman + S&R (rendered when the fused Kronos payload carries them;
+    # a no-op otherwise, so this degrades cleanly for responses without them) ──
+    hk = k.get("hlc3_kaufman") if isinstance(k, dict) else None
+    if not hk:
+        _hk_obj = g("hlc3_kaufman")
+        hk = _hk_obj if isinstance(_hk_obj, dict) else (
+            getattr(_hk_obj, "__dict__", None) if _hk_obj is not None else None
+        )
+    if isinstance(hk, dict) and hk.get("enabled") and not hk.get("error") \
+            and hk.get("signal") and hk.get("signal") != "neutral":
+        sig_word = {"buy": "🟢 BUY", "sell": "🔴 SELL"}.get(hk.get("signal"), "⚪")
+        lines.append(f"   📐 HLC3/Kaufman: {sig_word}")
+
+    sr = k.get("sr_signals") if isinstance(k, dict) else None
+    if not sr:
+        _sr_obj = g("sr_signals")
+        sr = _sr_obj if isinstance(_sr_obj, dict) else (
+            getattr(_sr_obj, "__dict__", None) if _sr_obj is not None else None
+        )
+    if isinstance(sr, dict) and sr.get("enabled") and not sr.get("error"):
+        sr_bits: list[str] = []
+        if sr.get("nearest_resistance") is not None:
+            sr_bits.append(f"R {_fmt_p(sr['nearest_resistance'])}")
+        if sr.get("nearest_support") is not None:
+            sr_bits.append(f"S {_fmt_p(sr['nearest_support'])}")
+        if sr_bits:
+            lines.append("   🏛 S&amp;R: " + " | ".join(sr_bits))
 
     # ── AI review ─────────────────────────────────────────────────────────────
     ai = g("ai")
@@ -1772,6 +1805,65 @@ def _start_room(
     )
 
 
+def _start_forecast(
+    args: str, token: str, chat_id: str, db: AsyncSession,
+) -> tuple[str, str, dict | None]:
+    """Run /forecast and, after replying, send a zoomed chart with the new
+    indicators drawn (HLC3/Kaufman + S&R), matching how /room delivers a chart.
+
+    The text reply and the chart are both produced in a background task because
+    rendering fetches candles; an acknowledgement returns immediately.
+    """
+    async def _run() -> None:
+        from plugins.TelegramSignalNewsPlugin.backend.services import bot_service, room_bridge
+        from app.core.database import AsyncSessionLocal
+
+        # Text first — always, even if the chart later fails. Open a *fresh*
+        # session: the request-scoped `db` passed in is already closed by the
+        # time this background task runs (the ack returned long ago), so reusing
+        # it made every /forecast silently fail. Each /room job opens its own
+        # session for exactly this reason.
+        try:
+            async with AsyncSessionLocal() as _fdb:
+                text, mode, markup = await _handle_forecast(args, _fdb)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[ForecastCmd] /forecast failed: {}", exc)
+            await bot_service.send_message(token, chat_id, f"❌ Forecast failed: {exc}")
+            return
+        if text:
+            await bot_service.send_message(token, chat_id, text, mode, markup)
+
+        # Chart second — best-effort, off the same cached forecast.
+        try:
+            tokens = args.split()
+            if not tokens:
+                return
+            symbol = _norm_sym(tokens[0])
+            exchange, timeframe = _parse_exchange_timeframe(tokens[1:])
+            from plugins.KronosForecastPlugin.backend.services.forecast_service import (
+                run_forecast_cached,
+            )
+            resp = await run_forecast_cached(exchange, symbol, timeframe)
+            chart = await room_bridge.build_forecast_chart(symbol, timeframe, resp)
+            if chart:
+                sig = getattr(resp, "signal", None)
+                direction = (getattr(sig, "direction", "") or "").upper() if sig else ""
+                await bot_service.send_photo(
+                    token, chat_id, chart,
+                    caption=f"🔮 {symbol} {timeframe} {direction} — Kronos forecast",
+                )
+        except Exception as exc:  # noqa: BLE001 — chart is a bonus, never a gate
+            logger.debug("[ForecastCmd] forecast chart skipped: {}", exc)
+
+    from plugins.TelegramSignalNewsPlugin.backend.services import room_bridge
+
+    room_bridge.spawn(_run(), chat_id, token)
+    return (
+        "🔮 Running the Kronos forecast — I'll send the read and a chart in a moment.",
+        "HTML", None,
+    )
+
+
 async def _handle_photo(
     file_id: str,
     mime: str,
@@ -2216,6 +2308,38 @@ async def _handle_forecast(args: str, db: AsyncSession) -> tuple[str, str, dict 
         lines.append("🌍 <b>Macro</b>")
         for line in macro_lines[:3]:
             lines.append(f"   <i>{_esc(_clip(line, 180))}</i>")
+
+    # ── HLC3/Kaufman adaptive MA (toggleable indicator) ───────────────────────
+    hk = getattr(forecast_resp, "hlc3_kaufman", None)
+    if hk is not None and getattr(hk, "enabled", False) and not getattr(hk, "error", None):
+        sig_word = {"buy": "🟢 BUY", "sell": "🔴 SELL"}.get(hk.signal, "⚪ NEUTRAL")
+        cross_note = ""
+        if hk.crossover or hk.crossunder:
+            cross_note = " — fresh cross"
+        elif hk.bars_since_cross is not None:
+            cross_note = f" — {hk.bars_since_cross} bars since cross"
+        lines.append("")
+        lines.append(f"📐 <b>HLC3/Kaufman</b>: {sig_word}{cross_note}")
+        if hk.bfma_current is not None and hk.bsma_current is not None:
+            lines.append(
+                f"   <i>Daily HTF {_fmt_p(hk.bfma_current)} vs KAMA {_fmt_p(hk.bsma_current)}</i>"
+            )
+
+    # ── LuxAlgo Support & Resistance Signals MTF (toggleable indicator) ───────
+    sr = getattr(forecast_resp, "sr_signals", None)
+    if sr is not None and getattr(sr, "enabled", False) and not getattr(sr, "error", None):
+        lines.append("")
+        lines.append("🏛 <b>S&amp;R Zones</b>")
+        sr_bits: list[str] = []
+        if sr.nearest_resistance is not None:
+            sr_bits.append(f"R <code>{_fmt_p(sr.nearest_resistance)}</code>")
+        if sr.nearest_support is not None:
+            sr_bits.append(f"S <code>{_fmt_p(sr.nearest_support)}</code>")
+        if sr_bits:
+            lines.append("   " + "  |  ".join(sr_bits))
+        if sr.current_event is not None:
+            ev = _esc(sr.current_event.event_type.replace("_", " ").upper())
+            lines.append(f"   <i>Latest bar: {ev}</i>")
 
     # ── Jarvis AI narrative (best-effort — never blocks the forecast) ──────────
     jarvis = None

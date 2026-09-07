@@ -276,6 +276,7 @@ class FinetuneManager:
         async with AsyncSessionLocal() as db:
             job = KronosFinetuneJob(
                 exchange=req.exchange, symbol=symbol, timeframe=req.timeframe,
+                model_name=(req.model_name or None),
                 status="pending", lookback=req.lookback, pred_len=req.pred_len,
                 tokenizer_epochs=req.tokenizer_epochs, predictor_epochs=req.predictor_epochs,
                 batch_size=req.batch_size, base_model=req.base_model,
@@ -346,6 +347,16 @@ class FinetuneManager:
         )
         if not ok:
             raise RuntimeError(f"Engine failed to load finetuned model: {kronos_engine.load_error}")
+        # Mark the engine as running a finetuned model so the UI shows it as a
+        # first-class model + persist the selection so it survives restarts.
+        display_name = job.get("model_name") or f"Custom·{job['symbol']}·{job['timeframe']}"
+        kronos_engine._active_finetuned_job_id = job_id
+        kronos_engine._active_finetuned_display_name = display_name
+        kronos_engine._write_selected(
+            "__finetuned__", str(tok_dir), int(job["lookback"]),
+            finetuned_job_id=job_id, finetuned_pred_dir=str(pred_dir),
+            finetuned_display_name=display_name,
+        )
         # Drop cached forecasts so the new model is used immediately.
         try:
             from plugins.KronosForecastPlugin.backend.services import forecast_service
@@ -361,9 +372,75 @@ class FinetuneManager:
         )
         return {"ok": True, "job_id": job_id, "model_dir": str(pred_dir), "tokenizer_dir": str(tok_dir)}
 
+    async def combine_jobs(self, model_name: Optional[str] = None) -> Dict:
+        """Merge every completed job's training CSV into one and fine-tune a new
+        combined model on the union. Returns the new job dict.
+        """
+        if not is_vendored():
+            raise RuntimeError(
+                "Kronos fine-tuning pipeline is not installed. Run: "
+                + finetune_setup_command()
+            )
+        import pandas as pd
+        from app.core.database import AsyncSessionLocal
+        from plugins.KronosForecastPlugin.backend.models import KronosFinetuneJob
+
+        completed = [j for j in await self.list(limit=200) if j["status"] == "completed" and j.get("data_path")]
+        usable = [j for j in completed if Path(j["data_path"]).exists()]
+        if len(usable) < 2:
+            raise RuntimeError("Need at least two completed fine-tune jobs with data to combine.")
+
+        # Merge + dedupe by timestamp column (first column, Kronos CSV format).
+        frames = []
+        for j in usable:
+            try:
+                frames.append(pd.read_csv(j["data_path"]))
+            except Exception as exc:
+                logger.warning(f"[Kronos-finetune] combine: skip job {j['id']} CSV ({exc})")
+        if not frames:
+            raise RuntimeError("No readable training CSVs to combine.")
+        merged = pd.concat(frames, ignore_index=True)
+        ts_col = merged.columns[0]
+        merged = merged.drop_duplicates(subset=[ts_col]).sort_values(ts_col).reset_index(drop=True)
+
+        combined_dir = _WORK_DIR / "combined"
+        combined_dir.mkdir(parents=True, exist_ok=True)
+        combined_csv = combined_dir / "combined.csv"
+        merged.to_csv(combined_csv, index=False)
+
+        # Inherit the strongest hyper-params from the source jobs.
+        look = max(int(j["lookback"]) for j in usable)
+        pred = max(int(j["pred_len"]) for j in usable)
+        tok_ep = max(int(j["tokenizer_epochs"]) for j in usable)
+        pred_ep = max(int(j["predictor_epochs"]) for j in usable)
+        batch = max(int(j["batch_size"]) for j in usable)
+        base = usable[0].get("base_model")
+        tfs = ",".join(sorted({j["timeframe"] for j in usable}))
+
+        async with AsyncSessionLocal() as db:
+            job = KronosFinetuneJob(
+                exchange="combined", symbol="COMBINED", timeframe=tfs[:8],
+                model_name=(model_name or "combined"),
+                status="pending", lookback=look, pred_len=pred,
+                tokenizer_epochs=tok_ep, predictor_epochs=pred_ep,
+                batch_size=batch, base_model=base,
+            )
+            db.add(job)
+            await db.commit()
+            await db.refresh(job)
+            job_id = job.id
+
+        task = asyncio.create_task(self._run_pipeline(job_id, 0, prebuilt_csv=combined_csv))
+        self._tasks[job_id] = task
+        return {
+            "ok": True, "job_id": job_id,
+            "symbols_combined": [j["symbol"] for j in usable],
+            "rows_merged": int(len(merged)),
+        }
+
     # ── pipeline ─────────────────────────────────────────────────
 
-    async def _run_pipeline(self, job_id: int, limit: int) -> None:
+    async def _run_pipeline(self, job_id: int, limit: int, prebuilt_csv: Optional[Path] = None) -> None:
         from plugins.KronosForecastPlugin.backend.models import KronosFinetuneJob
         from app.core.database import AsyncSessionLocal
 
@@ -373,13 +450,20 @@ class FinetuneManager:
         data_path = base_dir / "train_data.csv"
         log_path = base_dir / "train.log"
 
-        # 1) Export data
+        # 1) Export data (or reuse a pre-built CSV, e.g. from a combine job)
         await self._update(job_id, status="exporting")
         async with AsyncSessionLocal() as db:
             job = await db.get(KronosFinetuneJob, job_id)
             exchange, symbol, timeframe = job.exchange, job.symbol, job.timeframe
         try:
-            summary = await exporter.export_training_data(exchange, symbol, timeframe, limit, data_path)
+            if prebuilt_csv is not None:
+                import shutil
+                shutil.copyfile(prebuilt_csv, data_path)
+                import csv as _csv
+                with data_path.open() as fh:
+                    summary = {"rows": max(0, sum(1 for _ in _csv.reader(fh)) - 1)}
+            else:
+                summary = await exporter.export_training_data(exchange, symbol, timeframe, limit, data_path)
         except Exception as exc:
             await self._update(job_id, status="failed", error=f"export: {exc}", finished_at=_now())
             return
@@ -486,10 +570,25 @@ class FinetuneManager:
         except OSError:
             return ""
 
+    @staticmethod
+    def _dir_size_mb(path: Optional[str]) -> float:
+        """Total size (MB) of a checkpoint directory, 0.0 if missing."""
+        if not path:
+            return 0.0
+        root = Path(path)
+        if not root.exists():
+            return 0.0
+        try:
+            total = sum(f.stat().st_size for f in root.rglob("*") if f.is_file())
+            return round(total / 1_000_000, 2)
+        except OSError:
+            return 0.0
+
     def _to_dict(self, job, log_lines: int) -> Dict:
         d = {
             "id": job.id, "symbol": job.symbol, "exchange": job.exchange,
             "timeframe": job.timeframe, "status": job.status,
+            "model_name": job.model_name,
             "lookback": job.lookback, "pred_len": job.pred_len,
             "tokenizer_epochs": job.tokenizer_epochs, "predictor_epochs": job.predictor_epochs,
             "batch_size": job.batch_size, "base_model": job.base_model,
@@ -500,6 +599,7 @@ class FinetuneManager:
             "finished_at": job.finished_at.isoformat() if job.finished_at else None,
             "created_at": job.created_at.isoformat() if job.created_at else None,
             "log_tail": None,
+            "disk_size_mb": self._dir_size_mb(job.output_dir) if job.status == "completed" else 0.0,
         }
         if log_lines and job.log_path:
             d["log_tail"] = self._read_tail(Path(job.log_path), log_lines)

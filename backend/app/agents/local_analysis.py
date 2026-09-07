@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional
 # Each evaluator contributes a signed score in [-1, 1]; the weights say how much
 # a given read is worth. Trend and momentum dominate, volume only confirms.
 WEIGHTS: Dict[str, float] = {
+    "kronos": 0.95,     # the /forecast model's own directional call — the desk fetched it, the local read must use it
     "trend": 1.00,      # EMA50 vs EMA200
     "macd": 0.85,       # histogram sign and slope
     "adx": 0.90,        # directional movement — raised after 2026-08-28 miss where -DI> +DI was ignored and a BUY fired into a heavy sell-off
@@ -279,6 +280,35 @@ _READERS = {
 }
 
 
+def _read_kronos(fc: Dict[str, Any]) -> Optional[tuple[float, str]]:
+    """The Kronos forecast as a signed conviction score.
+
+    Reads the model's own ``direction``, ``pct_change`` and calibrated
+    ``confidence`` from the forecast block the orchestrator already put in
+    context, so a no-LLM fallback reasons from the desk's forecast rather than
+    price alone. A flat or unscored forecast returns 0 — genuine 'no edge'.
+    """
+    if not isinstance(fc, dict) or not fc:
+        return None
+    direction = str(fc.get("direction") or "").lower()
+    sign = {"up": 1.0, "long": 1.0, "down": -1.0, "short": -1.0}.get(direction, 0.0)
+    conf = _num(fc.get("confidence"))
+    pct = _num(fc.get("pct_change"))
+    if sign == 0.0 or conf is None:
+        return 0.0, f"Kronos forecast flat ({direction or 'n/a'})"
+    conf = conf if conf <= 1 else conf / 100.0
+    magnitude = min(1.0, conf)
+    if pct is not None:
+        # A larger projected move firms the score, capped so it never saturates alone.
+        magnitude = min(1.0, magnitude + min(0.35, abs(pct) / 3.0))
+    horizon = fc.get("horizon") or "the projected path"
+    pct_txt = f" {pct:+.2f}%" if pct is not None else ""
+    return sign * magnitude, (
+        f"Kronos forecasts {direction}{pct_txt} over {horizon} "
+        f"(confidence {conf * 100:.0f}%)"
+    )
+
+
 # ── Memory vocabulary ───────────────────────────────────────────────────────
 
 #: Phrases the desk already uses, harvested from the memory prompt so the local
@@ -342,6 +372,19 @@ def analyze_locally(
         score, note = got
         scored[key] = score
         notes.append(note)
+
+    # Kronos lives on the context, not the indicator block, so it is read here
+    # rather than through _READERS — but it scores and weights exactly like any
+    # other evaluator, so the forecast drives the composite the desk votes on.
+    kfc = context.get("kronos_forecast")
+    if isinstance(kfc, dict) and kfc:
+        try:
+            got = _read_kronos(kfc)
+        except Exception:  # noqa: BLE001 — a bad forecast must not kill the read
+            got = None
+        if got is not None:
+            scored["kronos"], note = got
+            notes.append(note)
 
     if not scored:
         # Genuinely nothing to analyse — say so honestly rather than guess.

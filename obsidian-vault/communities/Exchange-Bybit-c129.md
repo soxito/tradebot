@@ -2,7 +2,7 @@
 type: community
 name: Exchange & Bybit (c129)
 node_count: 7
-synced: 2026-09-04
+synced: 2026-09-07
 tags:
   - community
   - Exchange-Bybit-c129
@@ -10,7 +10,7 @@ tags:
 
             # Exchange & Bybit (c129)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-04.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-07.
 
 
             ## Key Nodes (7 total)

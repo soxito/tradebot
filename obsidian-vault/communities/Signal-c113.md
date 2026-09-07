@@ -2,7 +2,7 @@
 type: community
 name: Signal (c113)
 node_count: 9
-synced: 2026-09-04
+synced: 2026-09-07
 tags:
   - community
   - Signal-c113
@@ -10,7 +10,7 @@ tags:
 
             # Signal (c113)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-04.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-07.
 
 
             ## Key Nodes (9 total)

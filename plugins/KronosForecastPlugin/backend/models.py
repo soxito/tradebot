@@ -69,6 +69,9 @@ class KronosFinetuneJob(KronosBase):
     symbol = Column(String(64), nullable=False, index=True)
     timeframe = Column(String(8), nullable=False)
 
+    # Optional user label for the produced model, e.g. "super-base".
+    model_name = Column(String(128), nullable=True)
+
     # pending | exporting | running | completed | failed | cancelled
     status = Column(String(16), nullable=False, default="pending", index=True)
 
@@ -93,4 +96,31 @@ class KronosFinetuneJob(KronosBase):
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+
+class KronosChartDrawing(KronosBase):
+    """User-authored (and agent-refined) chart drawings for a chart tab.
+
+    One row per (exchange, symbol, timeframe). ``drawings`` holds the full list
+    of shapes — both ``source='user'`` shapes the trader draws and
+    ``source='agent'`` shapes the analysis pipeline refines — as a JSON array so
+    the trading-room agents can read them as context and write back sharper
+    levels. Standalone table; no cross-plugin foreign keys.
+    """
+
+    __tablename__ = "kronos_chart_drawings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    exchange = Column(String(32), nullable=False, index=True)
+    symbol = Column(String(64), nullable=False, index=True)
+    timeframe = Column(String(8), nullable=False, index=True)
+
+    # Full list of shapes (user + agent). Each item is a dict:
+    # {id, type, points:[{time,price}], color, width, text?, source, locked?,
+    #  agent_note?, refined_from?}
+    drawings = Column(JSON, nullable=False, default=list)
+
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 

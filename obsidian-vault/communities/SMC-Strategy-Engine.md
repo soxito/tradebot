@@ -2,7 +2,7 @@
 type: community
 name: SMC Strategy Engine
 node_count: 62
-synced: 2026-09-04
+synced: 2026-09-07
 tags:
   - community
   - SMC-Strategy-Engine
@@ -10,7 +10,7 @@ tags:
 
             # SMC Strategy Engine
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-04.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-07.
 
 
             ## Key Nodes (62 total)

@@ -1251,6 +1251,25 @@ export const apiClient = {
     batch: (data: { exchange?: string; timeframe?: string; symbols: string[]; lookback?: number; pred_len?: number; samples?: number }) =>
       api.post('/plugins/kronos/batch', data),
 
+    // ── Chart drawings: auto-saved, removable, shared with + refined by agents ──
+    drawings: {
+      /** Load the trader's saved drawings (user + agent shapes) for a chart tab. */
+      get: (exchange: string, symbol: string, timeframe = '1h') =>
+        api.get(`/plugins/kronos/drawings/${exchange}/${symbol.replace('/', '')}`, { params: { timeframe }, timeout: 15000 }),
+      /** Persist the full drawing list (auto-save). */
+      save: (exchange: string, symbol: string, data: { timeframe: string; drawings: any[] }) =>
+        api.put(`/plugins/kronos/drawings/${exchange}/${symbol.replace('/', '')}`, data, { timeout: 15000 }),
+      /** Remove one shape (and any agent shape refined from it). */
+      remove: (exchange: string, symbol: string, drawingId: string, timeframe = '1h') =>
+        api.delete(`/plugins/kronos/drawings/${exchange}/${symbol.replace('/', '')}/${encodeURIComponent(drawingId)}`, { params: { timeframe }, timeout: 15000 }),
+      /** Clear every shape on the chart tab. */
+      clear: (exchange: string, symbol: string, timeframe = '1h') =>
+        api.delete(`/plugins/kronos/drawings/${exchange}/${symbol.replace('/', '')}`, { params: { timeframe }, timeout: 15000 }),
+      /** Ask the agents to sharpen the trader's drawings onto real swing structure. */
+      refine: (exchange: string, symbol: string, timeframe = '1h') =>
+        api.post(`/plugins/kronos/drawings/${exchange}/${symbol.replace('/', '')}/refine`, null, { params: { timeframe }, timeout: 60000 }),
+    },
+
     // ── Fine-tuning on your own data (tokenizer → predictor) ──────────────
     finetune: {
       /** Is the finetune_csv pipeline vendored + how to install it. */
@@ -1261,6 +1280,7 @@ export const apiClient = {
       /** Start a fine-tune job (export → tokenizer → predictor). */
       start: (data: {
         exchange?: string; symbol: string; timeframe?: string; limit?: number;
+        model_name?: string;
         lookback?: number; pred_len?: number; tokenizer_epochs?: number;
         predictor_epochs?: number; batch_size?: number; base_model?: string;
       }) => api.post('/plugins/kronos/finetune/start', data, { timeout: 30000 }),
@@ -1272,6 +1292,9 @@ export const apiClient = {
       cancel: (jobId: number) => api.delete(`/plugins/kronos/finetune/jobs/${jobId}`),
       /** Hot-swap the engine to a completed job's model. */
       load: (jobId: number) => api.post(`/plugins/kronos/finetune/load/${jobId}`, null, { timeout: 60000 }),
+      /** Merge all completed datasets into one and train a combined model. */
+      combine: (modelName?: string) =>
+        api.post('/plugins/kronos/finetune/combine', null, { params: modelName ? { model_name: modelName } : {}, timeout: 60000 }),
     },
   },
 

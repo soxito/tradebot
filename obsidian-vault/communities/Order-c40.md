@@ -2,7 +2,7 @@
 type: community
 name: Order (c40)
 node_count: 28
-synced: 2026-09-04
+synced: 2026-09-07
 tags:
   - community
   - Order-c40
@@ -10,7 +10,7 @@ tags:
 
             # Order (c40)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-04.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-07.
 
 
             ## Key Nodes (28 total)

@@ -2,7 +2,7 @@
 type: community
 name: AI Trade Settings & API
 node_count: 68
-synced: 2026-09-04
+synced: 2026-09-07
 tags:
   - community
   - AI-Trade-Settings-API
@@ -10,7 +10,7 @@ tags:
 
             # AI Trade Settings & API
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-04.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-07.
 
 
             ## Key Nodes (68 total)

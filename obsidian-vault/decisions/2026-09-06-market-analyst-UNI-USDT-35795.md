@@ -1,0 +1,29 @@
+---
+type: decision
+agent: market_analyst
+symbol: UNI/USDT
+action: hold
+confidence: 0.15
+ai_called: True
+date: 2026-09-06
+tags:
+  - decision
+  - UNI-USDT
+  - market_analyst
+  - hold
+---
+
+            # Decision: market_analyst → UNI/USDT — HOLD @ 2026-09-06
+
+            ## Summary
+            **Agent**: `market_analyst` | **Action**: `HOLD` | **Confidence**: 15%
+            **AI Called**: Yes
+
+            ## Reasoning
+            Exchange data feed unavailable (Bitget not initialized) preventing candle structure and indicator
+analysis. Only reference levels are the existing short position's stop-loss at 3.1837 and take-
+profit at 3.0788. Without price action context, no directional bias can be formed.
+
+            ## Related
+            - [[_daily/2026-09-06]]
+            - [[signals/UNI-USDT]] ← Recent signals for this symbol

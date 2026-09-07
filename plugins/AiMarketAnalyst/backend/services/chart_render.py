@@ -66,6 +66,10 @@ class PlanOverlay:
     #: {"low": float, "high": float} bands from support_resistance_mtf.
     support_zones: list[dict[str, Any]] = field(default_factory=list)
     resistance_zones: list[dict[str, Any]] = field(default_factory=list)
+    #: Arbitrary indicator lines aligned to the candle list, e.g. the HLC3/Kaufman
+    #: bfma/bsma. Each: {"values": [float|None...], "color": (r,g,b),
+    #: "label": str, "dashed": bool, "width": int}.
+    custom_lines: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _load_font(size: int):
@@ -96,10 +100,17 @@ def render_plan_chart(
     timeframe: str,
     overlay: PlanOverlay | None = None,
     subtitle: str = "",
+    candle_count: int | None = None,
+    zoom_to_levels: bool = False,
 ) -> bytes | None:
     """Draw ``candles`` with ``overlay`` on top. Returns PNG bytes, or None.
 
     ``candles`` are ccxt-style ``[ts, open, high, low, close, volume]``.
+
+    ``candle_count`` — when set, only the last N candles are drawn (the overlay's
+    per-candle ``ema`` and ``custom_lines`` series are trimmed to match).
+    ``zoom_to_levels`` — when set and entry+SL are present, the price axis is
+    tightened around entry/SL/TP levels so the plan fills the frame.
     """
     rows = [c for c in (candles or []) if c and len(c) >= 5]
     if len(rows) < 5:
@@ -107,6 +118,20 @@ def render_plan_chart(
         return None
 
     overlay = overlay or PlanOverlay()
+
+    # ── Trim to the most recent window, keeping overlay series aligned ───────
+    if candle_count and candle_count > 0 and len(rows) > candle_count:
+        trim = len(rows) - candle_count
+        rows = rows[trim:]
+        if overlay.ema:
+            overlay.ema = {
+                p: series[trim:] for p, series in overlay.ema.items()
+            }
+        if overlay.custom_lines:
+            for line in overlay.custom_lines:
+                vals = line.get("values")
+                if isinstance(vals, list) and len(vals) > candle_count:
+                    line["values"] = vals[trim:]
 
     try:
         from PIL import Image, ImageDraw
@@ -144,18 +169,42 @@ def render_plan_chart(
                 + zone_bounds
                 + [lv.get("price") for lv in overlay.fib_levels]
                 + [v for series in overlay.ema.values() for v in series]
+                + [v for line in overlay.custom_lines for v in line.get("values", [])]
             ) if isinstance(v, (int, float))
         ]
         lo, hi = min(lows + extra), max(highs + extra)
         if hi <= lo:
             hi = lo + max(abs(lo) * 0.001, 1e-8)
+
+        # ── Optional zoom: tighten the axis around the plan levels so entry/SL/TP
+        # fill the frame instead of being a thin band amid full history.
+        if zoom_to_levels and isinstance(overlay.entry, (int, float)) \
+                and isinstance(overlay.stop_loss, (int, float)):
+            entry = float(overlay.entry)
+            sl = float(overlay.stop_loss)
+            stop_dist = abs(entry - sl)
+            level_vals = [entry, sl] + [
+                float(tp) for tp in overlay.take_profits
+                if isinstance(tp, (int, float))
+            ]
+            recent = rows[-20:] if len(rows) >= 20 else rows
+            level_vals += [float(c[2]) for c in recent] + [float(c[3]) for c in recent]
+            level_vals += [float(p) for p in overlay.projection if isinstance(p, (int, float))]
+            z_lo = min(level_vals) - stop_dist * 0.5
+            z_hi = max(level_vals) + stop_dist * 0.5
+            if z_hi > z_lo:
+                lo, hi = z_lo, z_hi
+
         span = hi - lo
         lo -= span * 0.06
         hi += span * 0.06
         span = hi - lo
 
         def y_of(price: float) -> int:
-            return int(plot_b - (price - lo) / span * (plot_b - plot_t))
+            # Clamp to the plot area so a candle or level outside a zoomed band
+            # is pinned to the edge rather than drawn over the header/footer.
+            y = plot_b - (price - lo) / span * (plot_b - plot_t)
+            return int(max(plot_t, min(plot_b, y)))
 
         step = (candle_r - plot_l) / max(1, len(rows))
         body_w = max(1, int(step * 0.62))
@@ -229,6 +278,36 @@ def render_plan_chart(
             text = f"EMA{period}"
             draw.text((legend_x, plot_t + 4), text, fill=colour, font=f_sm)
             legend_x += draw.textbbox((0, 0), text, font=f_sm)[2] + 12
+
+        # ── Custom indicator lines (e.g. HLC3/Kaufman bfma & bsma) ───────────
+        for line in overlay.custom_lines:
+            vals = line.get("values") or []
+            colour = line.get("color", _MUTED)
+            width = int(line.get("width", 2))
+            dashed = bool(line.get("dashed", False))
+            pts = [
+                (int(plot_l + i * step + step / 2), y_of(float(v)))
+                for i, v in enumerate(vals[:len(rows)])
+                if isinstance(v, (int, float))
+            ]
+            if len(pts) < 2:
+                continue
+            if dashed:
+                for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+                    segments = max(1, int(abs(x2 - x1) / 9)) or 1
+                    for s in range(0, segments, 2):
+                        t1, t2 = s / segments, min((s + 1) / segments, 1.0)
+                        draw.line(
+                            [(x1 + (x2 - x1) * t1, y1 + (y2 - y1) * t1),
+                             (x1 + (x2 - x1) * t2, y1 + (y2 - y1) * t2)],
+                            fill=colour, width=width,
+                        )
+            else:
+                draw.line(pts, fill=colour, width=width)
+            text = str(line.get("label") or "")
+            if text:
+                draw.text((legend_x, plot_t + 4), text, fill=colour, font=f_sm)
+                legend_x += draw.textbbox((0, 0), text, font=f_sm)[2] + 12
 
         # ── Fib retracement levels ───────────────────────────────────────────
         for lv in overlay.fib_levels:

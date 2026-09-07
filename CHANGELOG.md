@@ -8,6 +8,38 @@ entries are grouped under `[Unreleased]` and dated milestone headings.
 
 ## [Unreleased]
 
+### Added — 2026-09-07
+
+#### Kronos forecast — every asset class (forex, futures/indices, and shares)
+- **All forex pairs and crosses forecast off Swissquote.** The chart OHLCV
+  endpoint (`GET /exchanges/{exchange}/ohlcv/{symbol}`) now classifies FX /
+  metals / indices by the **symbol**, not the exchange dropdown, so a pair like
+  CADJPY selected under a crypto venue (Bitget) routes to MT5/Yahoo and is
+  anchored to the Swissquote BBO price scale instead of erroring on the crypto
+  exchange. Forex/metals never fall through to a crypto connector — they return
+  an honest empty result rather than a misleading "does not have market symbol".
+- **Stock-exchange equities, ETFs and shares.** `yahoo_provider` now resolves
+  equity tickers (a curated set of ~250 US large/mega-caps + popular ETFs) and
+  any exchange-suffixed listing (`VOD.L`, `BMW.DE`, `RELIANCE.NS`), so
+  `/forecast AAPL`, `TSLA`, `NVDA`, `SPY` — and free-text entry of any ticker —
+  produce a full Kronos forecast with real share volume. Equities forecast on
+  price/structure (volume `NOT_APPLICABLE`, like cash indices) because a rolling
+  24-clock-hour volume gate does not fit a ~6.5h/day trading session.
+- **Forecast page discoverability.** `/kronos-forecast` search now lists forex
+  majors + crosses, indices (US30, US500, NAS100, GER40, UK100, JPN225), energy,
+  and a stocks/ETFs group alongside the live crypto catalog.
+
+### Fixed — 2026-09-07
+- **`/forecast <fx-cross>` crash.** `unsupported format string passed to
+  NoneType.__format__` — the volume-evidence line formatted a `None` volume
+  slope when the divergence window's borrowed CME volume averaged zero
+  (classified `UNKNOWN`, which the guard only excluded for `NEUTRAL`). The line
+  now renders only when both the price move and the volume slope are present.
+- **Forex/metals/index charts on the Kronos page.** Symbols such as CADJPY,
+  EURUSD, XAUUSD and US30 no longer 500/`does not have market symbol` on the
+  crypto exchange; they resolve via MT5/Yahoo and quote Swissquote. Gold now
+  prints spot (~Swissquote) rather than the COMEX-future premium.
+
 ### Added — 2026-09-02 / 2026-09-04
 
 #### Kronos — auto-update, paper-aware agents & fine-tuning

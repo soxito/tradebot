@@ -1,5 +1,6 @@
 import Head from 'next/head';
 import dynamic from 'next/dynamic';
+import Link from 'next/link';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Telescope, RefreshCw, TrendingUp, TrendingDown, Minus,
@@ -27,7 +28,9 @@ const EXCHANGES = ['bitget', 'binance', 'bybit', 'okx', 'kucoin'];
 const FOREX_METALS: { symbol: string; name: string; category: string }[] = [
   { symbol: 'XAU/USD',   name: 'Gold (Spot)',        category: 'Metals'   },
   { symbol: 'XAG/USD',   name: 'Silver (Spot)',       category: 'Metals'   },
-  { symbol: 'XAU/USDT',  name: 'Gold / Tether',       category: 'Metals'   },
+  { symbol: 'XPT/USD',   name: 'Platinum (Spot)',     category: 'Metals'   },
+  { symbol: 'XPD/USD',   name: 'Palladium (Spot)',    category: 'Metals'   },
+  // Forex majors
   { symbol: 'EUR/USD',   name: 'Euro / US Dollar',    category: 'Forex'    },
   { symbol: 'GBP/USD',   name: 'British Pound / USD', category: 'Forex'    },
   { symbol: 'USD/JPY',   name: 'US Dollar / Yen',     category: 'Forex'    },
@@ -35,6 +38,64 @@ const FOREX_METALS: { symbol: string; name: string; category: string }[] = [
   { symbol: 'AUD/USD',   name: 'Australian Dollar',   category: 'Forex'    },
   { symbol: 'NZD/USD',   name: 'New Zealand Dollar',  category: 'Forex'    },
   { symbol: 'USD/CAD',   name: 'Canadian Dollar',     category: 'Forex'    },
+  // Forex crosses
+  { symbol: 'EUR/GBP',   name: 'Euro / Pound',        category: 'Forex'    },
+  { symbol: 'EUR/JPY',   name: 'Euro / Yen',          category: 'Forex'    },
+  { symbol: 'GBP/JPY',   name: 'Pound / Yen',         category: 'Forex'    },
+  { symbol: 'AUD/JPY',   name: 'Aussie / Yen',        category: 'Forex'    },
+  { symbol: 'CAD/JPY',   name: 'Loonie / Yen',        category: 'Forex'    },
+  { symbol: 'CHF/JPY',   name: 'Franc / Yen',         category: 'Forex'    },
+  { symbol: 'NZD/JPY',   name: 'Kiwi / Yen',          category: 'Forex'    },
+  { symbol: 'EUR/AUD',   name: 'Euro / Aussie',       category: 'Forex'    },
+  { symbol: 'EUR/CHF',   name: 'Euro / Franc',        category: 'Forex'    },
+  { symbol: 'GBP/CHF',   name: 'Pound / Franc',       category: 'Forex'    },
+  { symbol: 'AUD/NZD',   name: 'Aussie / Kiwi',       category: 'Forex'    },
+  { symbol: 'USD/ZAR',   name: 'US Dollar / Rand',    category: 'Forex'    },
+  { symbol: 'USD/MXN',   name: 'US Dollar / Peso',    category: 'Forex'    },
+  { symbol: 'USD/SGD',   name: 'US Dollar / SGD',     category: 'Forex'    },
+  // Indices (futures-backed)
+  { symbol: 'US30',      name: 'Dow Jones 30',        category: 'Indices'  },
+  { symbol: 'US500',     name: 'S&P 500',             category: 'Indices'  },
+  { symbol: 'NAS100',    name: 'Nasdaq 100',          category: 'Indices'  },
+  { symbol: 'US2000',    name: 'Russell 2000',        category: 'Indices'  },
+  { symbol: 'GER40',     name: 'DAX 40',              category: 'Indices'  },
+  { symbol: 'UK100',     name: 'FTSE 100',            category: 'Indices'  },
+  { symbol: 'JPN225',    name: 'Nikkei 225',          category: 'Indices'  },
+  // Energy
+  { symbol: 'USOIL',     name: 'WTI Crude Oil',       category: 'Energy'   },
+  { symbol: 'UKOIL',     name: 'Brent Crude Oil',     category: 'Energy'   },
+  { symbol: 'NGAS',      name: 'Natural Gas',         category: 'Energy'   },
+];
+
+// Stock-exchange equities & ETFs — routed to Yahoo by the backend. Free-text
+// entry accepts any ticker (US bare, or suffixed like VOD.L); this list only
+// powers search discoverability.
+const STOCKS: { symbol: string; name: string; category: string }[] = [
+  { symbol: 'AAPL', name: 'Apple',            category: 'Stocks' },
+  { symbol: 'MSFT', name: 'Microsoft',        category: 'Stocks' },
+  { symbol: 'NVDA', name: 'NVIDIA',           category: 'Stocks' },
+  { symbol: 'GOOGL', name: 'Alphabet',        category: 'Stocks' },
+  { symbol: 'AMZN', name: 'Amazon',           category: 'Stocks' },
+  { symbol: 'META', name: 'Meta Platforms',   category: 'Stocks' },
+  { symbol: 'TSLA', name: 'Tesla',            category: 'Stocks' },
+  { symbol: 'AVGO', name: 'Broadcom',         category: 'Stocks' },
+  { symbol: 'AMD',  name: 'AMD',              category: 'Stocks' },
+  { symbol: 'NFLX', name: 'Netflix',          category: 'Stocks' },
+  { symbol: 'JPM',  name: 'JPMorgan Chase',   category: 'Stocks' },
+  { symbol: 'V',    name: 'Visa',             category: 'Stocks' },
+  { symbol: 'WMT',  name: 'Walmart',          category: 'Stocks' },
+  { symbol: 'COIN', name: 'Coinbase',         category: 'Stocks' },
+  { symbol: 'PLTR', name: 'Palantir',         category: 'Stocks' },
+  { symbol: 'HOOD', name: 'Robinhood',        category: 'Stocks' },
+  { symbol: 'UBER', name: 'Uber',             category: 'Stocks' },
+  { symbol: 'DIS',  name: 'Disney',           category: 'Stocks' },
+  { symbol: 'BA',   name: 'Boeing',           category: 'Stocks' },
+  { symbol: 'XOM',  name: 'Exxon Mobil',      category: 'Stocks' },
+  { symbol: 'SPY',  name: 'S&P 500 ETF',      category: 'ETF'    },
+  { symbol: 'QQQ',  name: 'Nasdaq 100 ETF',   category: 'ETF'    },
+  { symbol: 'IWM',  name: 'Russell 2000 ETF', category: 'ETF'    },
+  { symbol: 'GLD',  name: 'Gold ETF',         category: 'ETF'    },
+  { symbol: 'TLT',  name: '20Y Treasury ETF', category: 'ETF'    },
 ];
 
 interface PairOption {
@@ -61,6 +122,8 @@ interface KronosStatus {
   model_name: string;
   device: string;
   detail: string;
+  display_name?: string;
+  finetuned_job_id?: number | null;
 }
 
 interface MarketCapInfo {
@@ -301,6 +364,14 @@ export default function KronosForecastPage() {
             f.category.toLowerCase().includes(q),
         ).map<PairOption>((f) => ({ symbol: f.symbol, name: f.name, category: f.category }));
 
+        // Stocks / ETFs — static list (backend routes any ticker to Yahoo).
+        const stockMatches = STOCKS.filter(
+          (s) =>
+            s.symbol.toLowerCase().includes(q) ||
+            s.name.toLowerCase().includes(q) ||
+            s.category.toLowerCase().includes(q),
+        ).map<PairOption>((s) => ({ symbol: s.symbol, name: s.name, category: s.category }));
+
         // Crypto catalog — live search.
         const res = await apiClient.jarvis.pairs(val.trim(), 28);
         const crypto: PairOption[] = (res.data?.pairs || []).map((p: any) => ({
@@ -312,7 +383,7 @@ export default function KronosForecastPage() {
           market_cap_rank: p.market_cap_rank,
         }));
 
-        setSearchResults([...fxMatches, ...crypto]);
+        setSearchResults([...fxMatches, ...stockMatches, ...crypto]);
       } catch {
         setSearchResults([]);
       } finally {
@@ -372,7 +443,7 @@ export default function KronosForecastPage() {
   const { data, loading, error, refetch } = useKronosForecast(exchange, symbol, params);
 
   // ── Model selector ───────────────────────────────────────────────────────
-  interface KronosModelEntry { id: string; label: string; params_m: number; max_context: number; installed?: boolean; }
+  interface KronosModelEntry { id: string; label: string; params_m: number; max_context: number; installed?: boolean; is_finetuned?: boolean; job_id?: number; }
   const [modelCatalog, setModelCatalog] = useState<KronosModelEntry[]>([]);
   const [activeModel, setActiveModel] = useState<string>('');
   const [switching, setSwitching] = useState(false);
@@ -384,7 +455,12 @@ export default function KronosForecastPage() {
       setModelCatalog(r.data?.models ?? []);
       // Always sync the highlighted model to the server's real current model so
       // the selector reflects what's actually loaded (reflects hot-swaps).
-      if (r.data?.current) setActiveModel(r.data.current);
+      // A loaded finetuned model wins over the base model id.
+      if (r.data?.current_finetuned_job_id != null) {
+        setActiveModel(`finetuned:${r.data.current_finetuned_job_id}`);
+      } else if (r.data?.current) {
+        setActiveModel(r.data.current);
+      }
       return r.data?.models ?? [];
     } catch {
       return [];
@@ -413,24 +489,27 @@ export default function KronosForecastPage() {
   const switchKronosModel = async (modelId: string) => {
     if (modelId === activeModel || switching) return;
     setSwitching(true);
+    const isFt = modelId.startsWith('finetuned:');
+    const expectedJobId = isFt ? parseInt(modelId.split(':')[1], 10) : null;
     try {
       await apiClient.kronos.switchModel(modelId);
-      // Poll status until the model name changes (background load on server).
-      // Larger variants (Kronos-base) may download weights on first use, so
-      // allow a generous window before giving up.
+      // Poll status until the model actually loads (background load on server).
+      // Finetuned checkpoints and larger variants may take a while.
       let confirmed = false;
       for (let i = 0; i < 120; i++) {
         await new Promise((r) => setTimeout(r, 2000));
         const s = await apiClient.kronos.status().catch(() => null);
-        if (s?.data?.model_name === modelId && s?.data?.available) {
+        const ok = isFt
+          ? s?.data?.finetuned_job_id === expectedJobId && s?.data?.available
+          : s?.data?.model_name === modelId && s?.data?.available;
+        if (ok) {
           setActiveModel(modelId);
           setStatus(s.data);
           confirmed = true;
           break;
         }
       }
-      // Reconcile the selector with the server's real current model either way
-      // (covers slow loads that finish just after the poll window).
+      // Reconcile the selector with the server's real current model either way.
       await refreshModels();
       if (!confirmed) {
         const s = await apiClient.kronos.status().catch(() => null);
@@ -751,7 +830,7 @@ export default function KronosForecastPage() {
             >
               <Cpu className="w-4 h-4" />
               {status.engine === 'kronos'
-                ? `${status.model_name} · ${status.device}`
+                ? `${status.display_name || status.model_name} · ${status.device}`
                 : 'Heuristic fallback — run setup_kronos.sh for the real model'}
             </div>
           )}
@@ -766,7 +845,9 @@ export default function KronosForecastPage() {
                     key={m.id}
                     disabled={switching || installingAll}
                     onClick={() => switchKronosModel(m.id)}
-                    title={`${m.label}${m.installed ? ' — installed' : ' — downloads on first use'}`}
+                    title={m.is_finetuned
+                      ? `${m.label} — custom fine-tuned model`
+                      : `${m.label}${m.installed ? ' — installed' : ' — downloads on first use'}`}
                     className={`px-2.5 py-1 rounded-lg text-xs font-medium transition-all inline-flex items-center gap-1 ${
                       activeModel === m.id
                         ? 'bg-purple-600 text-white'
@@ -775,13 +856,15 @@ export default function KronosForecastPage() {
                   >
                     {switching && activeModel !== m.id ? (
                       <Loader2 className="w-3 h-3 animate-spin inline" />
+                    ) : m.is_finetuned ? (
+                      <span className="text-[10px] leading-none text-amber-300" aria-hidden>✦</span>
                     ) : (
                       <span
                         className={`w-1.5 h-1.5 rounded-full ${m.installed ? 'bg-green-400' : 'bg-gray-500'}`}
                         aria-hidden
                       />
                     )}
-                    {m.id.split('/')[1]}
+                    {m.is_finetuned ? m.label : m.id.split('/')[1]}
                   </button>
                 ))}
               </div>
@@ -980,6 +1063,12 @@ export default function KronosForecastPage() {
                 strategyAction={sig?.direction}
                 strategyScore={sig ? sig.confidence : undefined}
                 initialCandles={data?.candles?.length ? data.candles : undefined}
+                // Zoom the viewport onto the current/live bar (with room on the
+                // right for the forecast projection) instead of fitting all history.
+                fitMode="forecast"
+                // TradingView-style drawing tools: fullscreen, auto-saved, and the
+                // trading-room agents read + refine whatever you draw here.
+                enableDrawings
                 // Backend only returns `candles` for FX / metals, and those bars
                 // are anchored to Swissquote — naming the crypto exchange there
                 // would credit the wrong feed.
@@ -1234,8 +1323,26 @@ export default function KronosForecastPage() {
           </div>
         </div>
 
-        {/* Fine-tune Kronos on your own data (tokenizer → predictor) */}
-        <FinetunePanel symbol={symbol} exchange={exchange} timeframe={timeframe} />
+        {/* Fine-tune Kronos on your own data — dedicated lab */}
+        <Link
+          href="/kronos-finetune"
+          className="flex items-center justify-between px-4 py-3 bg-gray-900/60 border border-gray-700/50 rounded-xl hover:border-fuchsia-500/50 transition-colors group"
+        >
+          <span className="flex items-center gap-2">
+            <div className="p-1.5 rounded-lg bg-fuchsia-500/15">
+              <Sparkles className="w-5 h-5 text-fuchsia-400" />
+            </div>
+            <span>
+              <span className="block text-sm font-semibold text-white">Fine-tune on your own data</span>
+              <span className="block text-[11px] text-gray-500">
+                Train custom models (e.g. super-base), view every run &amp; size, combine into one
+              </span>
+            </span>
+          </span>
+          <span className="flex items-center gap-1 text-xs text-fuchsia-300 group-hover:text-fuchsia-200">
+            Open fine-tune lab <ChevronRight className="w-4 h-4" />
+          </span>
+        </Link>
       </div>
     </>
   );
@@ -1780,317 +1887,4 @@ function Level({ label, value, tone }: { label: string; value: string; tone: 'up
   );
 }
 
-// ── Fine-tune Kronos on your own data ────────────────────────────────────────
 
-interface FinetuneJob {
-  id: number;
-  exchange: string;
-  symbol: string;
-  timeframe: string;
-  status: 'pending' | 'exporting' | 'running' | 'completed' | 'failed' | 'cancelled';
-  rows_exported?: number | null;
-  error?: string | null;
-  output_dir?: string | null;
-  log_tail?: string | null;
-}
-
-const FT_STATUS_STYLE: Record<string, string> = {
-  pending: 'bg-gray-500/15 text-gray-300',
-  exporting: 'bg-blue-500/15 text-blue-300',
-  running: 'bg-amber-500/15 text-amber-300',
-  completed: 'bg-green-500/15 text-green-300',
-  failed: 'bg-red-500/15 text-red-300',
-  cancelled: 'bg-gray-500/15 text-gray-400',
-};
-
-function FinetunePanel({ symbol, exchange, timeframe }: { symbol: string; exchange: string; timeframe: string }) {
-  const [open, setOpen] = useState(false);
-  const [setup, setSetup] = useState<{ vendored: boolean; setup_command?: string } | null>(null);
-
-  // Data-source form (seeded from the page's current pair).
-  const [ftSymbol, setFtSymbol] = useState(symbol);
-  const [ftExchange, setFtExchange] = useState(exchange);
-  const [ftTimeframe, setFtTimeframe] = useState(timeframe);
-  const [limit, setLimit] = useState(4000);
-
-  // Training hyper-params.
-  const [lookback, setLookback] = useState(512);
-  const [predLen, setPredLen] = useState(120);
-  const [tokEpochs, setTokEpochs] = useState(10);
-  const [predEpochs, setPredEpochs] = useState(20);
-  const [batchSize, setBatchSize] = useState(16);
-
-  const [exporting, setExporting] = useState(false);
-  const [exportResult, setExportResult] = useState<{ ok: boolean; msg: string } | null>(null);
-  const [starting, setStarting] = useState(false);
-  const [startErr, setStartErr] = useState<string | null>(null);
-  const [jobs, setJobs] = useState<FinetuneJob[]>([]);
-  const [selected, setSelected] = useState<FinetuneJob | null>(null);
-  const [loadingId, setLoadingId] = useState<number | null>(null);
-
-  const inputCls = 'bg-gray-800 border border-gray-700 rounded-lg px-2 py-1.5 text-xs text-white focus:outline-none focus:border-fuchsia-500';
-
-  // Keep the form seeded from the page pair until the user opens the panel.
-  useEffect(() => {
-    if (!open) { setFtSymbol(symbol); setFtExchange(exchange); setFtTimeframe(timeframe); }
-  }, [symbol, exchange, timeframe, open]);
-
-  const refreshSetup = async () => {
-    try { const r = await apiClient.kronos.finetune.setupStatus(); setSetup(r.data); }
-    catch { setSetup(null); }
-  };
-  const refreshJobs = async () => {
-    try { const r = await apiClient.kronos.finetune.list(); setJobs(r.data?.jobs ?? []); }
-    catch { /* keep last */ }
-  };
-
-  // Load setup + jobs on first open, then poll the list while the panel is open.
-  useEffect(() => {
-    if (!open) return;
-    refreshSetup();
-    refreshJobs();
-    const id = setInterval(refreshJobs, 5000);
-    return () => clearInterval(id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
-
-  // While a job is selected and still running, poll its live log every 3s.
-  useEffect(() => {
-    if (!selected) return;
-    const active = selected.status === 'running' || selected.status === 'exporting' || selected.status === 'pending';
-    if (!active) return;
-    const id = setInterval(async () => {
-      try {
-        const r = await apiClient.kronos.finetune.job(selected.id);
-        setSelected(r.data);
-      } catch { /* ignore */ }
-    }, 3000);
-    return () => clearInterval(id);
-  }, [selected?.id, selected?.status]);
-
-  const doExport = async () => {
-    setExporting(true);
-    setExportResult(null);
-    try {
-      const r = await apiClient.kronos.finetune.export({
-        exchange: ftExchange, symbol: ftSymbol, timeframe: ftTimeframe, limit,
-      });
-      const d = r.data;
-      setExportResult(d?.ok
-        ? { ok: true, msg: `Exported ${d.rows ?? '?'} rows → ${d.path ?? 'CSV'}` }
-        : { ok: false, msg: d?.error || 'Export failed' });
-    } catch (e: any) {
-      setExportResult({ ok: false, msg: e?.response?.data?.detail || e?.message || 'Export failed' });
-    } finally {
-      setExporting(false);
-    }
-  };
-
-  const doStart = async () => {
-    setStarting(true);
-    setStartErr(null);
-    try {
-      const r = await apiClient.kronos.finetune.start({
-        exchange: ftExchange, symbol: ftSymbol, timeframe: ftTimeframe, limit,
-        lookback, pred_len: predLen, tokenizer_epochs: tokEpochs,
-        predictor_epochs: predEpochs, batch_size: batchSize,
-      });
-      setSelected(r.data);
-      refreshJobs();
-    } catch (e: any) {
-      setStartErr(e?.response?.data?.detail || e?.message || 'Could not start fine-tune');
-    } finally {
-      setStarting(false);
-    }
-  };
-
-  const doLoad = async (id: number) => {
-    setLoadingId(id);
-    try {
-      await apiClient.kronos.finetune.load(id);
-      refreshJobs();
-    } catch (e: any) {
-      setStartErr(e?.response?.data?.detail || e?.message || 'Load failed');
-    } finally {
-      setLoadingId(null);
-    }
-  };
-
-  const doCancel = async (id: number) => {
-    try { await apiClient.kronos.finetune.cancel(id); refreshJobs(); } catch { /* ignore */ }
-  };
-
-  return (
-    <div className="bg-gray-900/60 border border-gray-700/50 rounded-xl">
-      {/* Collapsible header */}
-      <button
-        onClick={() => setOpen((v) => !v)}
-        className="w-full flex items-center justify-between px-4 py-3 text-left"
-      >
-        <span className="flex items-center gap-2">
-          <div className="p-1.5 rounded-lg bg-fuchsia-500/15">
-            <Sparkles className="w-5 h-5 text-fuchsia-400" />
-          </div>
-          <span>
-            <span className="block text-sm font-semibold text-white">Fine-tune on your own data</span>
-            <span className="block text-[11px] text-gray-500">
-              Tokenizer → predictor, exactly like the share-market example in the Kronos repo
-            </span>
-          </span>
-        </span>
-        <ChevronDown className={`w-4 h-4 text-gray-500 transition-transform ${open ? 'rotate-180' : ''}`} />
-      </button>
-
-      {open && (
-        <div className="px-4 pb-4 space-y-4">
-          {/* Setup banner */}
-          {setup && !setup.vendored && (
-            <div className="flex items-start gap-2 bg-amber-500/10 border border-amber-500/30 rounded-lg px-3 py-2 text-xs text-amber-200">
-              <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
-              <div>
-                <p className="font-medium">Training pipeline not installed yet.</p>
-                <p className="mt-1">Run this once on the server, then reopen this panel:</p>
-                <code className="mt-1 block bg-black/40 rounded px-2 py-1 text-amber-100 break-all">
-                  {setup.setup_command || 'bash plugins/KronosForecastPlugin/scripts/setup_kronos_finetune.sh'}
-                </code>
-              </div>
-            </div>
-          )}
-
-          {/* Data source */}
-          <div>
-            <p className="text-[11px] font-semibold text-gray-400 uppercase tracking-wide mb-2">1 · Data source</p>
-            <div className="flex flex-wrap items-end gap-3">
-              <FtField label="Symbol"><input value={ftSymbol} onChange={(e) => setFtSymbol(e.target.value)} className={`${inputCls} w-32`} /></FtField>
-              <FtField label="Exchange"><input value={ftExchange} onChange={(e) => setFtExchange(e.target.value)} className={`${inputCls} w-28`} /></FtField>
-              <FtField label="Timeframe"><input value={ftTimeframe} onChange={(e) => setFtTimeframe(e.target.value)} className={`${inputCls} w-20`} /></FtField>
-              <FtField label="Candles"><input type="number" min={256} value={limit} onChange={(e) => setLimit(Math.max(256, Number(e.target.value) || 0))} className={`${inputCls} w-24`} /></FtField>
-              <button
-                onClick={doExport}
-                disabled={exporting}
-                className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-200 text-xs font-medium disabled:opacity-50"
-              >
-                {exporting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
-                Export &amp; preview
-              </button>
-            </div>
-            {exportResult && (
-              <p className={`mt-2 text-[11px] ${exportResult.ok ? 'text-green-300' : 'text-red-300'}`}>
-                {exportResult.msg}
-              </p>
-            )}
-          </div>
-
-          {/* Training config */}
-          <div>
-            <p className="text-[11px] font-semibold text-gray-400 uppercase tracking-wide mb-2">2 · Training</p>
-            <div className="flex flex-wrap items-end gap-3">
-              <FtField label="Lookback"><input type="number" min={64} value={lookback} onChange={(e) => setLookback(Math.max(64, Number(e.target.value) || 0))} className={`${inputCls} w-20`} /></FtField>
-              <FtField label="Pred len"><input type="number" min={1} value={predLen} onChange={(e) => setPredLen(Math.max(1, Number(e.target.value) || 0))} className={`${inputCls} w-20`} /></FtField>
-              <FtField label="Tok epochs"><input type="number" min={1} value={tokEpochs} onChange={(e) => setTokEpochs(Math.max(1, Number(e.target.value) || 0))} className={`${inputCls} w-16`} /></FtField>
-              <FtField label="Pred epochs"><input type="number" min={1} value={predEpochs} onChange={(e) => setPredEpochs(Math.max(1, Number(e.target.value) || 0))} className={`${inputCls} w-16`} /></FtField>
-              <FtField label="Batch"><input type="number" min={1} value={batchSize} onChange={(e) => setBatchSize(Math.max(1, Number(e.target.value) || 0))} className={`${inputCls} w-16`} /></FtField>
-              <button
-                onClick={doStart}
-                disabled={starting || (setup !== null && !setup.vendored)}
-                className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-fuchsia-600 hover:bg-fuchsia-500 text-white text-xs font-semibold disabled:opacity-50"
-              >
-                {starting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Zap className="w-3.5 h-3.5" />}
-                Start fine-tune
-              </button>
-            </div>
-            {startErr && (
-              <p className="mt-2 text-[11px] text-red-300 flex items-center gap-1">
-                <AlertTriangle className="w-3.5 h-3.5" /> {startErr}
-              </p>
-            )}
-          </div>
-
-          {/* Jobs + live log */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            {/* Job history */}
-            <div>
-              <div className="flex items-center justify-between mb-2">
-                <p className="text-[11px] font-semibold text-gray-400 uppercase tracking-wide">Jobs</p>
-                <button onClick={refreshJobs} className="text-gray-500 hover:text-gray-300"><RefreshCw className="w-3.5 h-3.5" /></button>
-              </div>
-              {jobs.length === 0 ? (
-                <p className="text-xs text-gray-600">No fine-tune jobs yet.</p>
-              ) : (
-                <div className="space-y-1.5 max-h-56 overflow-y-auto pr-1">
-                  {jobs.map((j) => (
-                    <div
-                      key={j.id}
-                      onClick={() => setSelected(j)}
-                      className={`flex items-center justify-between gap-2 rounded-lg px-2.5 py-1.5 text-xs cursor-pointer border ${
-                        selected?.id === j.id ? 'border-fuchsia-600/60 bg-fuchsia-500/[0.06]' : 'border-gray-800 bg-gray-800/40 hover:bg-gray-800/70'
-                      }`}
-                    >
-                      <span className="flex items-center gap-2 min-w-0">
-                        <span className="text-gray-500">#{j.id}</span>
-                        <span className="text-white truncate">{j.symbol}</span>
-                        <span className="text-gray-500">{j.timeframe}</span>
-                      </span>
-                      <span className="flex items-center gap-1.5 shrink-0">
-                        <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-semibold uppercase ${FT_STATUS_STYLE[j.status] || ''}`}>
-                          {j.status}
-                        </span>
-                        {j.status === 'completed' && (
-                          <button
-                            onClick={(e) => { e.stopPropagation(); doLoad(j.id); }}
-                            disabled={loadingId === j.id}
-                            title="Load this fine-tuned model for forecasts"
-                            className="p-1 rounded bg-green-600/80 hover:bg-green-500 text-white disabled:opacity-50"
-                          >
-                            {loadingId === j.id ? <Loader2 className="w-3 h-3 animate-spin" /> : <Check className="w-3 h-3" />}
-                          </button>
-                        )}
-                        {(j.status === 'running' || j.status === 'exporting' || j.status === 'pending') && (
-                          <button
-                            onClick={(e) => { e.stopPropagation(); doCancel(j.id); }}
-                            title="Cancel this job"
-                            className="p-1 rounded bg-red-600/70 hover:bg-red-500 text-white"
-                          >
-                            <X className="w-3 h-3" />
-                          </button>
-                        )}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            {/* Live training log */}
-            <div>
-              <p className="text-[11px] font-semibold text-gray-400 uppercase tracking-wide mb-2">
-                {selected ? `Log — job #${selected.id} (${selected.status})` : 'Log'}
-              </p>
-              {selected ? (
-                <>
-                  {selected.error && (
-                    <p className="mb-1 text-[11px] text-red-300">{selected.error}</p>
-                  )}
-                  <pre className="bg-black/50 border border-gray-800 rounded-lg p-2 text-[10px] leading-relaxed text-gray-300 h-52 overflow-auto whitespace-pre-wrap">
-                    {selected.log_tail || '(no log output yet)'}
-                  </pre>
-                </>
-              ) : (
-                <p className="text-xs text-gray-600">Select a job to watch its training log.</p>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function FtField({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div>
-      <label className="block text-[10px] text-gray-500 mb-1 uppercase tracking-wide">{label}</label>
-      {children}
-    </div>
-  );
-}

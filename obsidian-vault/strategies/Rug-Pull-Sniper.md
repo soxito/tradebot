@@ -1,7 +1,7 @@
 ---
 type: strategy
 name: Rug Pull Sniper
-updated: 2026-09-04
+updated: 2026-09-07
 tags:
   - strategy
   - Rug-Pull-Sniper

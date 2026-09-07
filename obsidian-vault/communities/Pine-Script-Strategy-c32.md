@@ -2,7 +2,7 @@
 type: community
 name: Pine Script & Strategy (c32)
 node_count: 30
-synced: 2026-09-04
+synced: 2026-09-07
 tags:
   - community
   - Pine-Script-Strategy-c32
@@ -10,7 +10,7 @@ tags:
 
             # Pine Script & Strategy (c32)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-04.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-07.
 
 
             ## Key Nodes (30 total)

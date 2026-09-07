@@ -12,9 +12,10 @@ from plugins.KronosForecastPlugin.backend.schemas import (
     ForecastResponse, ForecastStatus, BatchForecastRequest, JarvisAnalysisResponse,
     SniperSignalsResponse,
     FinetuneStartRequest, FinetuneExportRequest, FinetuneExportResponse,
-    FinetuneJobResponse, FinetuneSetupStatus,
+    FinetuneJobResponse, FinetuneSetupStatus, FinetuneCombineResponse,
+    DrawingsDoc, SaveDrawingsRequest, RefineDrawingsResponse,
 )
-from plugins.KronosForecastPlugin.backend.services import forecast_service, jarvis_analysis
+from plugins.KronosForecastPlugin.backend.services import forecast_service, jarvis_analysis, drawings_service
 from plugins.KronosForecastPlugin.backend.config import KRONOS_MODELS
 
 router = APIRouter(prefix="/plugins/kronos", tags=["Kronos Forecast"])
@@ -41,16 +42,38 @@ async def get_status() -> ForecastStatus:
 async def list_models():
     """Return the full published Kronos model catalogue, annotated with whether
     each variant's weights are already downloaded locally (so the UI can show
-    which models are installed vs. will download on first use)."""
+    which models are installed vs. will download on first use). Completed
+    fine-tune jobs are appended as first-class, always-installed models."""
     from plugins.KronosForecastPlugin.backend.services.kronos_engine import kronos_engine
+    from plugins.KronosForecastPlugin.backend.services import finetune_service
     cached = kronos_engine._cached_repos()
     models = [
         {**m, "installed": (m["id"] in cached and m["tokenizer"] in cached)}
         for m in KRONOS_MODELS
     ]
+    # Append completed fine-tuned models as selectable variants.
+    try:
+        jobs = await finetune_service.finetune_manager.list()
+        for j in jobs:
+            if j.get("status") != "completed":
+                continue
+            label = j.get("model_name") or f"Custom · {j['symbol']} {j['timeframe']}"
+            models.append({
+                "id": f"finetuned:{j['id']}",
+                "label": label,
+                "params_m": 0,
+                "max_context": int(j.get("lookback") or 0),
+                "installed": True,
+                "is_finetuned": True,
+                "job_id": j["id"],
+            })
+    except Exception as exc:
+        logger.debug(f"[Kronos] could not list finetuned models: {exc}")
+    status = forecast_service.get_status()
     return {
         "models": models,
-        "current": forecast_service.get_status().model_name,
+        "current": status.model_name,
+        "current_finetuned_job_id": status.finetuned_job_id,
         "installed_count": sum(1 for m in models if m["installed"]),
         "total": len(models),
     }
@@ -93,12 +116,31 @@ async def install_all_models():
 
 
 @router.post("/model/switch")
-async def switch_model(model_id: str = Query(..., description="HF model ID e.g. NeoQuasar/Kronos-base")):
+async def switch_model(model_id: str = Query(..., description="HF model ID e.g. NeoQuasar/Kronos-base, or finetuned:<jobId>")):
     """Hot-swap the loaded Kronos model variant.
     Loads in the background so large models (Kronos-base ~400MB) don't time out.
     Poll /plugins/kronos/status to confirm when the switch completes."""
     from plugins.KronosForecastPlugin.backend.services.kronos_engine import kronos_engine
     import asyncio
+
+    # Finetuned model — load a completed job's checkpoints in the background.
+    if model_id.startswith("finetuned:"):
+        from fastapi import HTTPException
+        from plugins.KronosForecastPlugin.backend.services import finetune_service
+        try:
+            job_id = int(model_id.split(":", 1)[1])
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Bad finetuned model id: {model_id}")
+
+        async def _do_finetuned_switch():
+            try:
+                await finetune_service.finetune_manager.load_finetuned(job_id)
+            except Exception as exc:
+                logger.warning(f"[Kronos] finetuned switch failed: {exc}")
+
+        asyncio.create_task(_do_finetuned_switch())
+        return {"ok": True, "model": model_id, "status": "loading", "message": "Switching to finetuned model — poll /plugins/kronos/status to confirm"}
+
     # Find matching entry in catalogue
     entry = next((m for m in KRONOS_MODELS if m["id"] == model_id), None)
     if entry is None:
@@ -618,3 +660,70 @@ async def finetune_load(job_id: int):
         return await finetune_service.finetune_manager.load_finetuned(job_id)
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/finetune/combine", response_model=FinetuneCombineResponse)
+async def finetune_combine(model_name: Optional[str] = Query(None, description="Name for the combined model, e.g. super-base")):
+    """Merge all completed fine-tune datasets and train one combined model."""
+    from plugins.KronosForecastPlugin.backend.services import finetune_service
+    try:
+        out = await finetune_service.finetune_manager.combine_jobs(model_name=model_name)
+        return FinetuneCombineResponse(**out)
+    except (ValueError, RuntimeError) as exc:
+        return FinetuneCombineResponse(ok=False, error=str(exc))
+
+
+# ── Chart drawings (auto-saved, removable, shared with + refined by agents) ────
+
+@router.get("/drawings/{exchange}/{symbol}", response_model=DrawingsDoc)
+async def get_drawings(exchange: str, symbol: str, timeframe: str = Query("1h")) -> DrawingsDoc:
+    """Load the trader's saved drawings for a chart tab (user + agent shapes)."""
+    sym = _normalize_symbol(symbol)
+    shapes = await drawings_service.get_drawings(exchange, sym, timeframe)
+    return DrawingsDoc(exchange=exchange, symbol=sym, timeframe=timeframe, drawings=shapes)
+
+
+@router.put("/drawings/{exchange}/{symbol}", response_model=DrawingsDoc)
+async def save_drawings(exchange: str, symbol: str, req: SaveDrawingsRequest) -> DrawingsDoc:
+    """Persist the full drawing list (auto-save). Client sends user + agent shapes."""
+    sym = _normalize_symbol(symbol)
+    payload = [d.model_dump() for d in req.drawings]
+    saved = await drawings_service.save_drawings(exchange, sym, req.timeframe, payload)
+    return DrawingsDoc(exchange=exchange, symbol=sym, timeframe=req.timeframe, drawings=saved)
+
+
+@router.delete("/drawings/{exchange}/{symbol}/{drawing_id}", response_model=DrawingsDoc)
+async def delete_drawing(
+    exchange: str, symbol: str, drawing_id: str, timeframe: str = Query("1h")
+) -> DrawingsDoc:
+    """Remove one shape (and any agent shape refined from it)."""
+    sym = _normalize_symbol(symbol)
+    kept = await drawings_service.delete_drawing(exchange, sym, timeframe, drawing_id)
+    return DrawingsDoc(exchange=exchange, symbol=sym, timeframe=timeframe, drawings=kept)
+
+
+@router.delete("/drawings/{exchange}/{symbol}", response_model=DrawingsDoc)
+async def clear_drawings(exchange: str, symbol: str, timeframe: str = Query("1h")) -> DrawingsDoc:
+    """Clear every shape on a chart tab."""
+    sym = _normalize_symbol(symbol)
+    await drawings_service.clear_drawings(exchange, sym, timeframe)
+    return DrawingsDoc(exchange=exchange, symbol=sym, timeframe=timeframe, drawings=[])
+
+
+@router.post("/drawings/{exchange}/{symbol}/refine", response_model=RefineDrawingsResponse)
+async def refine_drawings(
+    exchange: str, symbol: str, timeframe: str = Query("1h")
+) -> RefineDrawingsResponse:
+    """Let the agents sharpen the trader's drawings onto real swing structure.
+
+    Snaps horizontal levels to pivots, anchors trendline ends to swing highs/lows,
+    tightens zones to structure and re-anchors fibs to the latest swing — then
+    persists the sharper ``source='agent'`` copies alongside the originals so the
+    human and the trading-room agents share one annotated canvas.
+    """
+    sym = _normalize_symbol(symbol)
+    refined, merged, note = await drawings_service.refine_drawings(exchange, sym, timeframe)
+    return RefineDrawingsResponse(
+        exchange=exchange, symbol=sym, timeframe=timeframe,
+        refined=refined, drawings=merged, note=note,
+    )

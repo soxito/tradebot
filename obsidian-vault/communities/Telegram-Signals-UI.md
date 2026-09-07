@@ -2,7 +2,7 @@
 type: community
 name: Telegram Signals UI
 node_count: 42
-synced: 2026-09-04
+synced: 2026-09-07
 tags:
   - community
   - Telegram-Signals-UI
@@ -10,7 +10,7 @@ tags:
 
             # Telegram Signals UI
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-04.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-07.
 
 
             ## Key Nodes (42 total)

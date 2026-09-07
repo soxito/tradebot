@@ -1239,23 +1239,27 @@ class AgentOrchestrator:
             return context
 
         # ── Branch: Crypto symbols via Bitget ─────────────────────────────────
+        # A configured venue is preferred but never required: the public keyless
+        # resolver (Yahoo / public CCXT / kronos) can chart any crypto, so a
+        # missing Bitget key must fall through to it rather than fail the whole
+        # meeting with "Exchange bitget not initialized".
         connector = exchange_manager.get_exchange(exchange)
-        if not connector:
-            return {"error": f"Exchange {exchange.value} not initialized", "symbol": symbol}
 
         # OHLCV + TA
         try:
-            try:
-                ohlcv = await connector.get_ohlcv(
-                    symbol=symbol, timeframe=timeframe, limit=max(200, window)
-                )
-            except Exception as exc:  # noqa: BLE001 — one venue, not the market
-                logger.debug(f"[Orchestrator] {symbol} venue OHLCV failed: {exc}")
-                ohlcv = []
+            ohlcv = []
+            if connector:
+                try:
+                    ohlcv = await connector.get_ohlcv(
+                        symbol=symbol, timeframe=timeframe, limit=max(200, window)
+                    )
+                except Exception as exc:  # noqa: BLE001 — one venue, not the market
+                    logger.debug(f"[Orchestrator] {symbol} venue OHLCV failed: {exc}")
+                    ohlcv = []
             if not ohlcv:
-                # The configured venue may not list this spelling. Public
-                # keyless exchanges usually do, and an empty chart is the one
-                # input that guarantees a neutral read.
+                # No venue, or the configured one does not list this spelling.
+                # Public keyless exchanges usually do, and an empty chart is the
+                # one input that guarantees a neutral read.
                 ohlcv = await AgentOrchestrator._resolve_ohlcv(
                     symbol, timeframe, max(200, window)
                 )
@@ -1996,9 +2000,15 @@ class AgentOrchestrator:
                 "decisions": [],
             }
 
-        # ── Guard: Circuit breaker — skip entire pipeline if OpenAI is down ──
+        # ── Guard: Circuit breaker — skip the pipeline only for background work ──
+        # A person who typed /room is watching for an answer; bailing here is
+        # what gave them "Agents: 0 · AI calls: 0". The live triggers run the
+        # meeting anyway — each seat bypasses the breaker for connected providers
+        # (bypass_circuits=live) or falls back to a local read — so they get a
+        # complete verdict instead of an empty stub. Only the automated triggers,
+        # which will come round again once the breaker resets, skip.
         from app.agents.base import _circuit_is_open, _circuit_reason
-        if _circuit_is_open():
+        if _circuit_is_open() and trigger not in LIVE_TRIGGERS:
             logger.debug(f"[Orchestrator] Skipping {symbol} — AI circuit breaker open: {_circuit_reason}")
             return {
                 "error": f"AI circuit breaker open: {_circuit_reason}",
@@ -2009,7 +2019,13 @@ class AgentOrchestrator:
                 "final_confidence": 0,
                 "final_reasoning": "AI unavailable — circuit breaker tripped",
                 "ai_calls": 0,
+                "decisions": [],
             }
+        if _circuit_is_open():
+            logger.info(
+                f"[Orchestrator] {symbol} — circuit breaker open but {trigger} is live; "
+                "running with connected-provider bypass and local fallback"
+            )
 
         session_id = str(uuid.uuid4())[:12]
         logger.info(f"[Orchestrator:{session_id}] Starting analysis for {symbol} ({timeframe})")

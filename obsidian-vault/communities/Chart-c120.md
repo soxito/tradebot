@@ -2,7 +2,7 @@
 type: community
 name: Chart (c120)
 node_count: 8
-synced: 2026-09-04
+synced: 2026-09-07
 tags:
   - community
   - Chart-c120
@@ -10,7 +10,7 @@ tags:
 
             # Chart (c120)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-04.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-07.
 
 
             ## Key Nodes (8 total)

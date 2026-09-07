@@ -2,7 +2,7 @@
 type: community
 name: Find Signals (c141)
 node_count: 5
-synced: 2026-09-04
+synced: 2026-09-07
 tags:
   - community
   - Find-Signals-c141
@@ -10,7 +10,7 @@ tags:
 
             # Find Signals (c141)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-04.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-07.
 
 
             ## Key Nodes (5 total)

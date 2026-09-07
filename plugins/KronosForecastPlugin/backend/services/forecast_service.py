@@ -668,6 +668,13 @@ def _volume_unit(exchange: str, symbol: str = "") -> str:
     """
     if (exchange or "").strip().lower() == "mt5":
         return "tick"
+    # Equities carry Yahoo's own real share volume — not a borrowed CME contract.
+    try:
+        from app.exchanges.yahoo_provider import is_equity as _is_equity
+        if symbol and _is_equity(symbol):
+            return "base"
+    except Exception:
+        pass
     if symbol and _is_forex(symbol):
         return "futures"
     return "base"
@@ -811,6 +818,138 @@ def _build_overlays(
     return [forecast_line, upper_line, lower_line], markers
 
 
+def _attach_hlc3_kaufman_overlays(
+    rows: List[list], timeframe: str,
+) -> Tuple[Optional["HLC3KaufmanSignal"], List[OverlaySeries], List[OverlayMarker]]:
+    """Compute the HLC3/Kaufman indicator and turn it into chart overlays.
+
+    Returns ``(schema, overlays, markers)``; ``schema`` is None when the
+    indicator is toggled off. Never raises — an indicator failure degrades to
+    an empty overlay set.
+    """
+    from plugins.KronosForecastPlugin.backend.schemas import HLC3KaufmanSignal
+    from plugins.KronosForecastPlugin.backend.services import hlc3_kaufman as hk
+
+    if not kronos_config.hlc3_kaufman_enabled or not hk.is_enabled():
+        return None, [], []
+
+    res = hk.compute_hlc3_kaufman(
+        rows, timeframe,
+        length=kronos_config.hlc3_kaufman_length,
+        slow_ma_period=kronos_config.hlc3_kaufman_slow_period,
+    )
+    schema = HLC3KaufmanSignal(
+        enabled=res.enabled, signal=res.signal,
+        bfma_current=res.bfma_current, bsma_current=res.bsma_current,
+        bfma_prev=res.bfma_prev, bsma_prev=res.bsma_prev,
+        crossover=res.crossover, crossunder=res.crossunder,
+        bars_since_cross=res.bars_since_cross, summary=res.summary, error=res.error,
+    )
+    overlays: List[OverlaySeries] = []
+    markers: List[OverlayMarker] = []
+    if res.error or not res.bfma_series:
+        return schema, overlays, markers
+
+    overlays.append(OverlaySeries(
+        name="HLC3 Daily HTF", color="#22d3ee", lineWidth=2, lineStyle=0,
+        data=[OverlayLinePoint(time=t, value=v) for t, v in res.bfma_series],
+    ))
+    overlays.append(OverlaySeries(
+        name="HLC3 KAMA", color="#f97316", lineWidth=2, lineStyle=0,
+        data=[OverlayLinePoint(time=t, value=v) for t, v in res.bsma_series],
+    ))
+    if (res.crossover or res.crossunder) and res.bsma_series:
+        last_t = res.bsma_series[-1][0]
+        markers.append(OverlayMarker(
+            time=last_t,
+            position="belowBar" if res.crossover else "aboveBar",
+            color="#22c55e" if res.crossover else "#ef4444",
+            shape="arrowUp" if res.crossover else "arrowDown",
+            text="HLC3 BUY" if res.crossover else "HLC3 SELL",
+        ))
+    return schema, overlays, markers
+
+
+def _attach_sr_overlays(
+    rows: List[list],
+) -> Tuple[Optional["SRSignalsSchema"], List[OverlaySeries], List[OverlayMarker]]:
+    """Compute LuxAlgo S&R zones and turn them into chart overlays + markers.
+
+    Returns ``(schema, overlays, markers)``; ``schema`` is None when the
+    indicator is toggled off. Never raises.
+    """
+    from plugins.KronosForecastPlugin.backend.schemas import (
+        SRSignalsSchema, SRZoneSchema, SRSignalEventSchema,
+    )
+    from plugins.KronosForecastPlugin.backend.services import sr_signals as sr
+
+    if not kronos_config.sr_signals_enabled or not sr.is_enabled():
+        return None, [], []
+
+    res = sr.compute_sr_signals(
+        rows,
+        length=kronos_config.sr_signals_length,
+        sr_margin=kronos_config.sr_signals_margin,
+    )
+
+    def _zone_schema(z) -> SRZoneSchema:
+        return SRZoneSchema(
+            level=z.level, zone_top=z.zone_top, zone_bottom=z.zone_bottom,
+            kind=z.kind, formed_unix=z.formed_unix, broken=z.broken,
+            tested=z.tested, retested=z.retested, manipulated=z.manipulated,
+        )
+
+    def _event_schema(e) -> SRSignalEventSchema:
+        return SRSignalEventSchema(
+            unix_time=e.unix_time, event_type=e.event_type, price=e.price,
+            level_price=e.level_price, zone_kind=e.zone_kind,
+        )
+
+    schema = SRSignalsSchema(
+        enabled=res.enabled,
+        support_zones=[_zone_schema(z) for z in res.support_zones],
+        resistance_zones=[_zone_schema(z) for z in res.resistance_zones],
+        recent_events=[_event_schema(e) for e in res.recent_events],
+        current_event=_event_schema(res.current_event) if res.current_event else None,
+        nearest_support=res.nearest_support, nearest_resistance=res.nearest_resistance,
+        summary=res.summary, error=res.error,
+    )
+    overlays: List[OverlaySeries] = []
+    markers: List[OverlayMarker] = []
+    if res.error:
+        return schema, overlays, markers
+
+    if not rows:
+        return schema, overlays, markers
+    first_t = int(rows[0][0]) // 1000
+    last_t = int(rows[-1][0]) // 1000
+
+    def _level_line(level: float, color: str, name: str) -> OverlaySeries:
+        return OverlaySeries(
+            name=name, color=color, lineWidth=1, lineStyle=2,
+            data=[OverlayLinePoint(time=first_t, value=level),
+                  OverlayLinePoint(time=last_t, value=level)],
+        )
+
+    for i, z in enumerate(res.support_zones):
+        overlays.append(_level_line(z.level, "#089981", f"Support {i + 1}"))
+    for i, z in enumerate(res.resistance_zones):
+        overlays.append(_level_line(z.level, "#f23645", f"Resistance {i + 1}"))
+
+    ev = res.current_event
+    if ev:
+        bull = ev.event_type.endswith("_bull")
+        markers.append(OverlayMarker(
+            time=ev.unix_time,
+            position="belowBar" if bull else "aboveBar",
+            color="#089981" if bull else "#f23645",
+            shape="arrowUp" if bull else "arrowDown",
+            text=ev.event_type.replace("_", " ").upper(),
+        ))
+    return schema, overlays, markers
+
+
+
 # ── public API ──────────────────────────────────────────────────
 
 def get_status() -> ForecastStatus:
@@ -827,6 +966,13 @@ def get_status() -> ForecastStatus:
         detail = f"Kronos model warming up ({model_name})…"
     else:
         detail = kronos_engine.load_error or "heuristic fallback"
+    # Short label for the engine chip: the custom name for a finetuned model,
+    # else the trailing part of the HF id (e.g. "Kronos-base").
+    ft_job_id = kronos_engine.active_finetuned_job_id
+    if ft_job_id is not None:
+        display_name = kronos_engine.active_finetuned_display_name or f"Custom #{ft_job_id}"
+    else:
+        display_name = model_name.split("/")[-1]
     return ForecastStatus(
         available=True,  # the endpoint always works (heuristic fallback)
         # Report kronos while warming up too — forecasts wait for the load and
@@ -837,6 +983,8 @@ def get_status() -> ForecastStatus:
         device=kronos_config.device,
         max_context=max_context,
         detail=detail,
+        display_name=display_name,
+        finetuned_job_id=ft_job_id,
     )
 
 
@@ -938,6 +1086,12 @@ async def run_forecast(
     overlays, markers = _build_overlays(
         forecast, upper, lower, anchor_unix, anchor_price, signal.direction
     )
+    hlc3_schema, hlc3_overlays, hlc3_markers = _attach_hlc3_kaufman_overlays(rows, timeframe)
+    sr_schema, sr_overlays, sr_markers = _attach_sr_overlays(rows)
+    overlays.extend(hlc3_overlays)
+    overlays.extend(sr_overlays)
+    markers.extend(hlc3_markers)
+    markers.extend(sr_markers)
 
     resp = ForecastResponse(
         exchange=exchange, symbol=symbol, timeframe=timeframe, engine=engine,
@@ -945,6 +1099,7 @@ async def run_forecast(
         samples=samples, anchor_time=anchor_unix, anchor_price=anchor_price,
         forecast=forecast, upper_band=upper, lower_band=lower, signal=signal,
         overlays=overlays, markers=markers, candles=_historical_candles(rows, symbol),
+        hlc3_kaufman=hlc3_schema, sr_signals=sr_schema,
         volume=vol_ctx, decision=signal.decision,
         note=None if engine == "kronos" else _heuristic_note(heuristic_reason),
     )
@@ -1082,12 +1237,19 @@ async def forecast_from_rows(
     overlays, markers = _build_overlays(
         forecast, upper, lower, anchor_unix, anchor_price, signal.direction
     )
+    hlc3_schema, hlc3_overlays, hlc3_markers = _attach_hlc3_kaufman_overlays(rows, timeframe)
+    sr_schema, sr_overlays, sr_markers = _attach_sr_overlays(rows)
+    overlays.extend(hlc3_overlays)
+    overlays.extend(sr_overlays)
+    markers.extend(hlc3_markers)
+    markers.extend(sr_markers)
     return ForecastResponse(
         exchange=exchange, symbol=symbol, timeframe=timeframe, engine=engine,
         model_name=kronos_config.model_name, lookback=len(rows), pred_len=pred_len,
         samples=samples, anchor_time=anchor_unix, anchor_price=anchor_price,
         forecast=forecast, upper_band=upper, lower_band=lower, signal=signal,
         overlays=overlays, markers=markers,
+        hlc3_kaufman=hlc3_schema, sr_signals=sr_schema,
         volume=vol_ctx, decision=signal.decision,
         note=None if engine == "kronos" else _heuristic_note(),
     )
@@ -1337,6 +1499,78 @@ async def get_pair_tradability(exchange: str, symbol: str) -> dict:
     return result
 
 
+def _sniper_indicator_reasons(resp: ForecastResponse, direction: str) -> List[str]:
+    """Human-readable HLC3/Kaufman + S&R context lines for a sniper entry.
+
+    Confirms or warns about the Kronos direction using the two toggleable
+    indicators. Returns an empty list when both are disabled/unavailable.
+    """
+    lines: List[str] = []
+
+    hk = resp.hlc3_kaufman
+    if hk is not None and hk.enabled and not hk.error and hk.signal != "neutral":
+        agree = hk.signal == ("buy" if direction == "up" else "sell")
+        verb = "confirms" if agree else "opposes"
+        cross = ""
+        if hk.crossover or hk.crossunder:
+            cross = " (fresh cross)"
+        elif hk.bars_since_cross is not None:
+            cross = f" ({hk.bars_since_cross} bars since cross)"
+        lines.append(
+            f"HLC3/Kaufman {hk.signal.upper()}{cross} {verb} the Kronos {direction} bias."
+        )
+
+    sr = resp.sr_signals
+    if sr is not None and sr.enabled and not sr.error:
+        if direction == "up" and sr.nearest_resistance is not None:
+            lines.append(
+                f"Nearest S&R resistance at {_fmt_price(sr.nearest_resistance)} — watch as the first TP ceiling."
+            )
+        elif direction == "down" and sr.nearest_support is not None:
+            lines.append(
+                f"Nearest S&R support at {_fmt_price(sr.nearest_support)} — watch as the first TP floor."
+            )
+        if sr.current_event is not None:
+            ev = sr.current_event.event_type.replace("_", " ")
+            lines.append(f"LuxAlgo S&R just printed a {ev} signal on the latest bar.")
+    return lines
+
+
+def _sniper_indicator_adjustments(
+    resp: ForecastResponse, direction: str
+) -> Tuple[float, Optional[float], Optional[float]]:
+    """Numeric refinements to sniper levels/confidence from HLC3/Kaufman + S&R.
+
+    Returns ``(conf_mult, sr_tp, sr_sl_guard)``:
+    * ``conf_mult`` scales the Kronos path confidence up when HLC3/Kaufman
+      confirms the direction and down when it opposes (drives leverage too).
+    * ``sr_tp`` is the nearest S&R wall in the trade direction used to cap the
+      take-profits (resistance for longs, support for shorts).
+    * ``sr_sl_guard`` is the opposite S&R structure level used to tighten the
+      stop (support for longs, resistance for shorts).
+    """
+    conf_mult = 1.0
+    hk = resp.hlc3_kaufman
+    if hk is not None and hk.enabled and not hk.error and hk.signal != "neutral":
+        agree = hk.signal == ("buy" if direction == "up" else "sell")
+        fresh = bool(hk.crossover or hk.crossunder)
+        if agree:
+            conf_mult *= 1.12 if fresh else 1.06
+        else:
+            conf_mult *= 0.82 if fresh else 0.90
+
+    sr_tp: Optional[float] = None
+    sr_sl_guard: Optional[float] = None
+    sr = resp.sr_signals
+    if sr is not None and sr.enabled and not sr.error:
+        if direction == "up":
+            sr_tp = sr.nearest_resistance
+            sr_sl_guard = sr.nearest_support
+        elif direction == "down":
+            sr_tp = sr.nearest_support
+            sr_sl_guard = sr.nearest_resistance
+    return conf_mult, sr_tp, sr_sl_guard
+
 
 def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = None) -> List[SniperSignal]:
     """Turn a Kronos forecast into concrete, executable sniper entries.
@@ -1371,7 +1605,8 @@ def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = N
     if anchor <= 0:
         return []
     direction = sig.direction
-    conf = float(sig.confidence)
+    path_conf = float(sig.confidence)
+    conf = path_conf
     volume_reasons = volctx.volume_evidence_lines(vol)
     volume_fields = dict(
         volume_24h=vol.volume_24h,
@@ -1380,6 +1615,12 @@ def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = N
         volume_regime=vol.regime,
         volume_divergence=vol.divergence,
     )
+
+    # HLC3/Kaufman + S&R agreement notes appended to every emitted entry, plus
+    # the numeric refinements those same overlays apply to the levels below.
+    indicator_reasons = _sniper_indicator_reasons(resp, direction)
+    conf_mult, sr_tp, sr_sl_guard = _sniper_indicator_adjustments(resp, direction)
+    conf = max(0.0, min(0.99, path_conf * conf_mult))
 
     lows = [b.value for b in resp.lower_band] or [c.low for c in resp.forecast]
     highs = [b.value for b in resp.upper_band] or [c.high for c in resp.forecast]
@@ -1410,6 +1651,16 @@ def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = N
         sl = band_low * (1 - buf)
         tp1 = max(target, anchor)
         tp2 = band_high
+        # Cap take-profits at the nearest S&R resistance and tighten the stop
+        # to just below the nearest support when that keeps every entry valid.
+        if sr_tp is not None and sr_tp > anchor:
+            tp2 = min(tp2, sr_tp)
+            if sr_tp < tp1:
+                tp1 = sr_tp
+        if sr_sl_guard is not None and sr_sl_guard < anchor:
+            structure_sl = sr_sl_guard * (1 - buf)
+            if structure_sl < min(anchor, near_low):
+                sl = max(sl, structure_sl)
         entries = [
             ("market", "Market entry", anchor),
             ("limit", "Limit — buy the dip", min(near_low, anchor)),
@@ -1420,7 +1671,7 @@ def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = N
             rr = _rr(entry, sl, tp1)
             reasons = [
                 f"Kronos projects {resp.symbol} UP {sig.pct_change:+.2f}% over {horizon} "
-                f"({int(conf * 100)}% path agreement).",
+                f"({int(path_conf * 100)}% path agreement).",
                 f"Predicted mean target {_fmt_price(target)} sits above current {_fmt_price(anchor)} — bullish drift.",
                 f"Stop {_fmt_price(sl)} is placed below the p10 floor ({_fmt_price(band_low)}), "
                 f"so a break there invalidates the up-thesis.",
@@ -1432,6 +1683,7 @@ def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = N
                 )
             reasons.extend(volume_reasons)
             reasons.extend(sig.rationale)
+            reasons.extend(indicator_reasons)
             signals.append(SniperSignal(
                 id=f"{resp.symbol}-long-{kind}", side="long", order_kind=kind, label=label,
                 entry=round(entry, 8), stop_loss=round(sl, 8), take_profit_1=round(tp1, 8),
@@ -1443,6 +1695,16 @@ def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = N
         sl = band_high * (1 + buf)
         tp1 = min(target, anchor)
         tp2 = band_low
+        # Cap take-profits at the nearest S&R support and tighten the stop to
+        # just above the nearest resistance when that keeps every entry valid.
+        if sr_tp is not None and sr_tp < anchor:
+            tp2 = max(tp2, sr_tp)
+            if sr_tp > tp1:
+                tp1 = sr_tp
+        if sr_sl_guard is not None and sr_sl_guard > anchor:
+            structure_sl = sr_sl_guard * (1 + buf)
+            if structure_sl > max(anchor, near_high):
+                sl = min(sl, structure_sl)
         entries = [
             ("market", "Market entry", anchor),
             ("limit", "Limit — sell the bounce", max(near_high, anchor)),
@@ -1453,7 +1715,7 @@ def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = N
             rr = _rr(entry, sl, tp1)
             reasons = [
                 f"Kronos projects {resp.symbol} DOWN {sig.pct_change:+.2f}% over {horizon} "
-                f"({int(conf * 100)}% path agreement).",
+                f"({int(path_conf * 100)}% path agreement).",
                 f"Predicted mean target {_fmt_price(target)} sits below current {_fmt_price(anchor)} — bearish drift.",
                 f"Stop {_fmt_price(sl)} is placed above the p90 ceiling ({_fmt_price(band_high)}), "
                 f"so a break there invalidates the down-thesis.",
@@ -1465,6 +1727,7 @@ def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = N
                 )
             reasons.extend(volume_reasons)
             reasons.extend(sig.rationale)
+            reasons.extend(indicator_reasons)
             signals.append(SniperSignal(
                 id=f"{resp.symbol}-short-{kind}", side="short", order_kind=kind, label=label,
                 entry=round(entry, 8), stop_loss=round(sl, 8), take_profit_1=round(tp1, 8),
