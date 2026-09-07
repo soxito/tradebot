@@ -172,7 +172,8 @@ The sidebar (`frontend/src/components/Layout.tsx`) contains every page below. A 
 - ✅ Crypto sniper: rug-pull and pump/pullback detection with optional auto-trade loop
 - ✅ Realtime dashboard with SSE stream, charts, balances and trade history
 - ✅ Dedicated spot metals provider (XAUUSD/XAGUSD/XPTUSD/XPDUSD): Swissquote + gold-api cascade
-- ✅ Yahoo Finance OHLCV universal fallback for FX/indices/commodities
+- ✅ Yahoo Finance OHLCV universal fallback for FX/indices/commodities **and stock-exchange equities/ETFs/shares** (US bare tickers + suffixed global listings like `VOD.L`, `BMW.DE`)
+- ✅ Symbol-based routing: forex, metals, indices (US30/US500/NAS100…) and shares price off MT5/Yahoo anchored to Swissquote regardless of the selected exchange, never a crypto venue
 - ✅ Universal market-data service resolving any symbol to a live price
 - ✅ Macro context engine: DXY + VIX regime classification feeding every trade proposal
 - ✅ Analysis journal: self-calibrating accuracy track-record of every AI proposal
@@ -184,7 +185,7 @@ The sidebar (`frontend/src/components/Layout.tsx`) contains every page below. A 
 | --- | --- |
 | `MT5TradingPlugin` | MetaTrader 5 REST bridge: multi-account management, SMC sniper charting, autonomous scalp bot (multi-timeframe SMC + Kronos ML + AI gate, SMC-guided recovery legs, hot-config updates), copy-trading simulation and backtesting bridge |
 | `AiMarketAnalyst` | Multi-provider LLM router (Groq, OpenRouter, Gemini, Mistral, Cerebras, DeepSeek, Together, OpenAI, custom) with failover, agent profiles, smart limit-order proposals and a risk policy engine |
-| `KronosForecastPlugin` | Kronos ML candle forecasting (mini/small/base) with heuristic fallback, rendered as chart overlays |
+| `KronosForecastPlugin` | Kronos ML candle forecasting (mini/small/base + fine-tuning) with heuristic fallback, rendered as chart overlays. Forecasts every asset class — crypto, all forex pairs/crosses, metals, indices (US30, US500, NAS100…), energy, and stock-exchange equities/ETFs/shares — with FX/metals anchored to Swissquote |
 | `TelegramSignalNewsPlugin` | Telegram channel ingestion for trading signals and news, with sniper auto-trade |
 | `WhatsAppSignalNewsPlugin` | WhatsApp channel ingestion (via an OpenWA gateway) for trading signals and news, with sniper auto-trade |
 | `ObsidianKnowledgePlugin` | Syncs signals, agent decisions, strategy notes and code-community graphs into a local Obsidian vault |
