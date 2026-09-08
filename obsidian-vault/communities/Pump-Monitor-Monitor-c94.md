@@ -2,7 +2,7 @@
 type: community
 name: Pump Monitor & Monitor (c94)
 node_count: 13
-synced: 2026-09-07
+synced: 2026-09-08
 tags:
   - community
   - Pump-Monitor-Monitor-c94
@@ -10,7 +10,7 @@ tags:
 
             # Pump Monitor & Monitor (c94)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-07.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-08.
 
 
             ## Key Nodes (13 total)

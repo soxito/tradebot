@@ -2,7 +2,7 @@
 type: community
 name: Order (c123)
 node_count: 8
-synced: 2026-09-07
+synced: 2026-09-08
 tags:
   - community
   - Order-c123
@@ -10,7 +10,7 @@ tags:
 
             # Order (c123)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-07.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-08.
 
 
             ## Key Nodes (8 total)

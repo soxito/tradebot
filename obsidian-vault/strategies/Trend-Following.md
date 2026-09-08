@@ -1,7 +1,7 @@
 ---
 type: strategy
 name: Trend Following
-updated: 2026-09-07
+updated: 2026-09-08
 tags:
   - strategy
   - Trend-Following

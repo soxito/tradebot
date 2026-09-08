@@ -2,7 +2,7 @@
 type: community
 name: Telegram & Signal (c63)
 node_count: 20
-synced: 2026-09-07
+synced: 2026-09-08
 tags:
   - community
   - Telegram-Signal-c63
@@ -10,7 +10,7 @@ tags:
 
             # Telegram & Signal (c63)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-07.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-08.
 
 
             ## Key Nodes (20 total)

@@ -2,7 +2,7 @@
 type: community
 name: Sniper & Rug Pull (c62)
 node_count: 20
-synced: 2026-09-07
+synced: 2026-09-08
 tags:
   - community
   - Sniper-Rug-Pull-c62
@@ -10,7 +10,7 @@ tags:
 
             # Sniper & Rug Pull (c62)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-07.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-08.
 
 
             ## Key Nodes (20 total)

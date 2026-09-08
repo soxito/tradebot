@@ -2,7 +2,7 @@
 type: community
 name: Bitget & Rug Pull (c106)
 node_count: 12
-synced: 2026-09-07
+synced: 2026-09-08
 tags:
   - community
   - Bitget-Rug-Pull-c106
@@ -10,7 +10,7 @@ tags:
 
             # Bitget & Rug Pull (c106)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-07.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-08.
 
 
             ## Key Nodes (12 total)
