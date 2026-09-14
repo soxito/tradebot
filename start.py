@@ -660,8 +660,12 @@ def get_resources() -> Dict[str, object]:
 
 def _ollama_model_for_tier(tier: str, ram_gb: float) -> str:
     """Best Ollama model for this tier/RAM (mirrors ollama_service catalogue)."""
-    if OLLAMA_MODEL_ENV:
-        return OLLAMA_MODEL_ENV
+    # Honour an explicit OLLAMA_MODEL from the shell env OR the .env file — the
+    # module constant is read at import (before .env is parsed), so fall back to
+    # _DOTENV so a user-pinned model (e.g. qwen2.5:0.5b) is respected.
+    forced = OLLAMA_MODEL_ENV or _DOTENV.get("OLLAMA_MODEL", "").split("#")[0].strip()
+    if forced:
+        return forced
     # Effective RAM with small VRAM bump — mirrors backend tier_for_ram()
     vram = _ollama_detect_vram_gb()
     effective = ram_gb + min(vram * 0.5, 8)

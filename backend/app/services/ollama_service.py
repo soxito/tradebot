@@ -37,6 +37,40 @@ OLLAMA_ENABLED = os.getenv("OLLAMA_ENABLED", "1").strip().lower() not in ("0", "
 OLLAMA_AUTO_PULL = os.getenv("OLLAMA_AUTO_PULL", "1").strip().lower() not in ("0", "false", "no", "off")
 OLLAMA_MANAGED = os.getenv("OLLAMA_MANAGED", "0").strip().lower() in ("1", "true", "yes", "on")
 
+# ── Lightweight runtime knobs (keep the laptop responsive under Docker) ─────
+# num_ctx caps the KV-cache: the model default (131072) alone reserves ~18 GB on
+# a 3B model and swaps a 16 GB machine to a freeze. 4096 is plenty for a fallback.
+# keep_alive unloads the model quickly after a (rare) fallback call to free RAM.
+# num_thread caps CPU cores so Docker + other services keep headroom (0 = auto).
+def ollama_num_ctx() -> int:
+    try:
+        return max(512, int(os.getenv("OLLAMA_NUM_CTX", "4096")))
+    except Exception:
+        return 4096
+
+
+def ollama_keep_alive() -> str:
+    return (os.getenv("OLLAMA_KEEP_ALIVE", "30s") or "30s").strip()
+
+
+def ollama_num_thread() -> int:
+    try:
+        return max(0, int(os.getenv("OLLAMA_NUM_THREAD", "0")))  # 0 = Ollama auto
+    except Exception:
+        return 0
+
+
+def _chat_options(temperature: float, max_tokens: int) -> Dict[str, Any]:
+    opts: Dict[str, Any] = {
+        "temperature": temperature,
+        "num_predict": max_tokens,
+        "num_ctx": ollama_num_ctx(),
+    }
+    nt = ollama_num_thread()
+    if nt > 0:
+        opts["num_thread"] = nt
+    return opts
+
 # ── Tier → model catalogue (RAM-aware) ─────────────────────────────────────
 # Smallest that still works well for trading reasoning; Q4_K_M is default quant.
 # Keep tags exactly as ollama library expects (name:tag).
@@ -61,6 +95,49 @@ RAM_TIER_THRESHOLDS: List[Tuple[float, str]] = [
 # Training artefact tag pushed into Ollama after Soup fine-tune
 TRADEBOT_LOCAL_MODEL = "tradebot-local:latest"
 TRADEBOT_LOCAL_MODEL_ALT = "tradebot-local"
+
+# ── Ollama tag → HuggingFace instruct base (what Soup fine-tunes from) ──────
+# Soup trains from a HF id, not an Ollama tag. This maps the served fallback
+# model back to its HF base so a fine-tune produces a tradebot-local that is
+# architecturally identical to the model Ollama serves.
+OLLAMA_TO_HF: Dict[str, str] = {
+    "qwen2.5:14b": "Qwen/Qwen2.5-14B-Instruct",
+    "qwen2.5:7b": "Qwen/Qwen2.5-7B-Instruct",
+    "qwen2.5:3b": "Qwen/Qwen2.5-3B-Instruct",
+    "qwen2.5:1.5b": "Qwen/Qwen2.5-1.5B-Instruct",
+    "qwen2.5:0.5b": "Qwen/Qwen2.5-0.5B-Instruct",
+    "llama3.1:8b": "meta-llama/Llama-3.1-8B-Instruct",
+    "llama3.2:3b": "meta-llama/Llama-3.2-3B-Instruct",
+    "llama3.2:1b": "meta-llama/Llama-3.2-1B-Instruct",
+    "gemma2:9b": "google/gemma-2-9b-it",
+    "mistral:7b": "mistralai/Mistral-7B-Instruct-v0.3",
+    "phi3:mini": "microsoft/Phi-3-mini-4k-instruct",
+}
+SOUP_FALLBACK_BASE = "Qwen/Qwen2.5-0.5B-Instruct"
+
+
+def hf_base_for_ollama(tag: str) -> str:
+    """Map an Ollama model tag to its HuggingFace instruct base id."""
+    t = (tag or "").strip().lower().split("#")[0].strip()
+    if t.startswith("tradebot-local"):  # already fine-tuned → retrain from its base
+        return SOUP_FALLBACK_BASE
+    return OLLAMA_TO_HF.get(t, SOUP_FALLBACK_BASE)
+
+
+def default_soup_base_hf() -> str:
+    """HF base id Soup should fine-tune so the result matches the Ollama fallback.
+
+    Priority: SOUP_DEFAULT_BASE (explicit HF override) > OLLAMA_MODEL (tag→HF) >
+    tier auto-pick (tag→HF) > SOUP_FALLBACK_BASE.
+    """
+    explicit = os.getenv("SOUP_DEFAULT_BASE", "").strip()
+    if explicit:
+        return explicit
+    try:
+        tag = resolve_model()
+    except Exception:
+        tag = os.getenv("OLLAMA_MODEL", "").strip()
+    return hf_base_for_ollama(tag) if tag else SOUP_FALLBACK_BASE
 
 
 def ollama_url() -> str:
@@ -312,10 +389,8 @@ async def ollama_chat(
         "model": mdl,
         "messages": messages,
         "stream": False,
-        "options": {
-            "temperature": temperature,
-            "num_predict": max_tokens,
-        },
+        "keep_alive": ollama_keep_alive(),
+        "options": _chat_options(temperature, max_tokens),
     }
     if json_mode:
         payload["format"] = "json"
@@ -350,7 +425,8 @@ def ollama_chat_sync(
         "model": mdl,
         "messages": messages,
         "stream": False,
-        "options": {"temperature": temperature, "num_predict": max_tokens},
+        "keep_alive": ollama_keep_alive(),
+        "options": _chat_options(temperature, max_tokens),
     }
     if json_mode:
         payload["format"] = "json"
