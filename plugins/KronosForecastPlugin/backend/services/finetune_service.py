@@ -17,7 +17,9 @@ caller (UI / Telegram) is expected to warn on weak hardware.
 from __future__ import annotations
 
 import asyncio
+import gc
 import os
+import platform
 import signal
 import sys
 from datetime import datetime, timezone
@@ -133,6 +135,27 @@ def _fit_window(
     }
 
 
+def _safe_num_workers(use_cuda: bool) -> int:
+    """Return leak-free num_workers for the current platform.
+
+    On macOS ``DataLoader(num_workers>0)`` leaves POSIX semaphores tracked by
+    ``multiprocessing.resource_tracker`` which are reported at shutdown as:
+      UserWarning: resource_tracker: There appear to be N leaked semaphore objects
+    The warning is harmless but indicates workers weren't cleanly joined. The
+    simplest leak-free policy on Darwin+CPU is num_workers=0. Linux/Windows keep
+    a small default (2). Set KRONOS_ALLOW_WORKERS=1 to force a non-zero value
+    on macOS if you have verified shutdown cleanup.
+    """
+    if platform.system() == "Darwin":
+        allow = os.environ.get("KRONOS_ALLOW_WORKERS", "").strip().lower() in ("1", "true", "yes")
+        if not allow:
+            return 0
+        # even when allowed, keep it small to limit semaphore count
+        return 2
+    # cap to a small value so we never create 6 workers * 2 loaders = 12 semaphores
+    return 2
+
+
 def _write_config(
     job_row, data_path: Path, exp_name: str, base_dir: Path, rows: int = 0
 ) -> tuple[Path, Dict]:
@@ -147,6 +170,7 @@ def _write_config(
 
     tok, pred = _pretrained_paths(job_row.base_model)
     use_cuda = _torch_has_cuda()
+    safe_workers = _safe_num_workers(use_cuda)
 
     fitted = _fit_window(
         rows or int(job_row.rows_exported or 0) or (int(job_row.lookback) + int(job_row.pred_len) + 100),
@@ -175,7 +199,7 @@ def _write_config(
             "basemodel_epochs": int(job_row.predictor_epochs),
             "batch_size": int(fitted["batch_size"]),
             "log_interval": 50,
-            "num_workers": 2,
+            "num_workers": int(safe_workers),
             "seed": 42,
             "tokenizer_learning_rate": 0.0002,
             "predictor_learning_rate": 0.000001,
@@ -341,6 +365,7 @@ class FinetuneManager:
         from plugins.KronosForecastPlugin.backend.models import KronosFinetuneJob
 
         symbol = req.symbol.upper()
+        use_patterns = bool(getattr(req, 'use_pattern_features', True))
         async with AsyncSessionLocal() as db:
             job = KronosFinetuneJob(
                 exchange=req.exchange, symbol=symbol, timeframe=req.timeframe,
@@ -354,7 +379,7 @@ class FinetuneManager:
             await db.refresh(job)
             job_id = job.id
 
-        task = asyncio.create_task(self._run_pipeline(job_id, req.limit))
+        task = asyncio.create_task(self._run_pipeline(job_id, req.limit, use_pattern_features=use_patterns))
         self._tasks[job_id] = task
         return await self.get(job_id)
 
@@ -639,6 +664,7 @@ class FinetuneManager:
     async def _run_pipeline(
         self, job_id: int, limit: int,
         prebuilt_csv: Optional[Path] = None, auto_load: bool = False,
+        use_pattern_features: bool = True,
     ) -> None:
         from plugins.KronosForecastPlugin.backend.models import KronosFinetuneJob
         from app.core.database import AsyncSessionLocal
@@ -679,7 +705,7 @@ class FinetuneManager:
                 with data_path.open() as fh:
                     summary = {"rows": max(0, sum(1 for _ in _csv.reader(fh)) - 1)}
             else:
-                summary = await exporter.export_training_data(exchange, symbol, timeframe, limit, data_path)
+                summary = await exporter.export_training_data(exchange, symbol, timeframe, limit, data_path, use_pattern_features=use_pattern_features)
         except Exception as exc:
             await self._update(job_id, status="failed", error=f"export: {exc}", finished_at=_now())
             return

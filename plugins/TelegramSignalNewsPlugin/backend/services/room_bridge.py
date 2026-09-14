@@ -271,6 +271,29 @@ def technical_context(candles: list[list]) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         logger.debug("[Room] ATR skipped: {}", exc)
 
+    try:
+        from app.signals.chart_patterns import analyze_chart_patterns
+        from app.signals.candle_patterns import detect_patterns
+        # chart patterns (flags, triangles, H&S, island, etc.)
+        cp = analyze_chart_patterns(df)
+        if cp.get("patterns"):
+            out["chart_patterns"] = cp["patterns"][:3]
+            out["chart_pattern_best"] = cp.get("best")
+            out["chart_pattern_score"] = cp.get("score")
+        # candle patterns last 20 bars summary for the chart subtitle
+        rows = [[int(ts.timestamp()*1000) if hasattr(ts, 'timestamp') else int(ts), float(o), float(h), float(l), float(c), float(v)]
+                for ts, o, h, l, c, v in zip(df["timestamp"], df["open"], df["high"], df["low"], df["close"], df["volume"])]
+        evts = detect_patterns(rows)
+        recent = [e for e in evts if e.get("index", 0) >= len(rows) - 20]
+        if recent:
+            counts: dict[str, int] = {}
+            for e in recent:
+                counts[e["name"]] = counts.get(e["name"], 0) + 1
+            out["candle_patterns"] = recent[-5:]
+            out["candle_summary"] = ", ".join(f"{k} x{v}" if v>1 else k for k, v in counts.items())
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[Room] chart/candle patterns skipped: {}", exc)
+
     return out
 
 
@@ -420,6 +443,80 @@ def overlay_from_result(
         final = targets[-1]
         projection = [entry + (final - entry) * f for f in (0.3, 0.62, 0.85, 1.0)]
 
+    # ── Cheat-sheet pattern overlay: candle + chart ────────────────────────
+    candle_pats = []
+    chart_pats = []
+    pattern_note = None
+    pattern_reasons: list[str] = []
+    try:
+        # candle patterns from technical_context (last 20 bars, up to 5)
+        for cp in (context.get("candle_patterns") or [])[:5]:
+            idx = None
+            # context may store original index vs trimmed rows; keep as is
+            try:
+                idx = int(cp.get("index", cp.get("idx", 0)))
+            except Exception:
+                idx = 0
+            candle_pats.append({"index": idx, "name": cp.get("name", "pattern"), "direction": cp.get("direction", "")})
+        # chart patterns (top 3)
+        for pat in (context.get("chart_patterns") or [])[:3]:
+            chart_pats.append(dict(pat))
+        # build human note naming the cheat sheets
+        names = []
+        for cp in candle_pats[:2]:
+            names.append(cp.get("name", ""))
+        for pat in chart_pats[:2]:
+            kind = str(pat.get("kind", "")).replace("_", " ")
+            brk = " breakout" if pat.get("broken") else " pending"
+            names.append(f"{kind}{brk}")
+        if names:
+            pattern_note = " + ".join(n for n in names if n)[:140]
+        # build why explanations (volume-aware)
+        for cp in candle_pats[:2]:
+            direction = cp.get("direction", "")
+            n = cp.get("name", "pattern")
+            # generic why per pattern family
+            why = ""
+            low = n.lower()
+            if "hammer" in low:
+                why = f"{n}: long lower wick ≥2×body at reaction level, rejection of lower prices"
+            elif "engulfing" in low:
+                why = f"{n}: body engulfs prior body, momentum flip with volume confirmation"
+            elif "morning" in low or "evening" in low:
+                why = f"{n}: 3-bar reversal, star gaps and closes beyond midpoint, volume confirms"
+            elif "doji" in low:
+                why = f"{n}: indecision at key level, buyers/sellers balanced"
+            elif "harami" in low:
+                why = f"{n}: small body inside prior large body, momentum stall"
+            elif "pin" in low:
+                why = f"{n}: pin rejection wick, price snapped back"
+            else:
+                why = f"{n}: {direction} reversal signal at structure"
+            # volume check
+            try:
+                from app.signals.technical import atr as _atr
+                # placeholder volume note — context doesn't carry vol ratio per pattern, add generic
+                why += " — confirm with volume & price action (cheat-sheet rule)"
+            except Exception:
+                pass
+            pattern_reasons.append(why)
+        for pat in chart_pats[:2]:
+            kind = str(pat.get("kind", "pattern")).replace("_", " ")
+            sig = pat.get("signal", "")
+            conf = pat.get("confidence")
+            broken = pat.get("broken")
+            neck = pat.get("neckline")
+            tgt = pat.get("target")
+            conf_s = f" (conf {float(conf):.0%})" if isinstance(conf, (int, float)) else ""
+            extra = f" neckline {_fmt_level(float(neck))}" if isinstance(neck, (int, float)) else ""
+            if pat.get("top") and pat.get("bottom"):
+                if isinstance(pat['top'], (int,float)) and isinstance(pat['bottom'], (int,float)):
+                    extra = f" range {_fmt_level(float(pat['bottom']))}-{_fmt_level(float(pat['top']))}"
+            tgt_s = f" → target {_fmt_level(float(tgt))}" if isinstance(tgt, (int,float)) else ""
+            pattern_reasons.append(f"{kind} {sig} {'broken' if broken else 'pending'}{conf_s}{extra}{tgt_s} — cheat-sheet breakout level")
+    except Exception as exc:
+        logger.debug(f"[Room] pattern overlay build skipped: {exc}")
+
     return PlanOverlay(
         direction="long" if is_long else "short" if action == "sell" else None,
         entry=entry, stop_loss=stop, take_profits=targets,
@@ -429,6 +526,10 @@ def overlay_from_result(
         fib_golden_zone=context.get("fib_golden_zone"),
         support_zones=context.get("support_zones") or [],
         resistance_zones=context.get("resistance_zones") or [],
+        candle_patterns=candle_pats,
+        chart_patterns=chart_pats,
+        pattern_note=pattern_note,
+        pattern_reasons=pattern_reasons,
     )
 
 
@@ -810,6 +911,11 @@ def plan_levels_text(overlay: PlanOverlay | None) -> str:
     if overlay.resistance_zones:
         r = overlay.resistance_zones[0]
         out += f"\nNearest resistance {r['low']:.6g} – {r['high']:.6g}"
+    if getattr(overlay, 'pattern_note', None):
+        out += f"\n📚 <b>Cheat-sheet:</b> {html.escape(overlay.pattern_note)}"
+    if getattr(overlay, 'pattern_reasons', None):
+        for reason in (overlay.pattern_reasons or [])[:2]:
+            out += f"\n• {html.escape(reason)}"
     return out
 
 

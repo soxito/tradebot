@@ -70,7 +70,7 @@ Network: **Bitcoin mainnet**
 - **Backend:** Python 3.13, FastAPI, `ccxt` + native Bitget v2 SDK, SQLAlchemy (async) + asyncpg, Redis
 - **Frontend:** Next.js 16, React 19, TypeScript, Tailwind, TradingView Lightweight Charts, Three.js, react-force-graph-3d/2d
 - **Exchanges:** Binance, Bitget (spot + futures), Bybit, OKX, KuCoin, Coinbase — plus MetaTrader 5 (forex/metals/indices) via the `MT5TradingPlugin`
-- **AI agents:** multi-agent orchestrator (Market+Sentiment → Signal → Risk → Executor pipeline) with per-agent decision memory to skip redundant LLM calls, backed by OpenAI and a multi-provider LLM router (`AiMarketAnalyst`)
+- **AI agents:** multi-agent orchestrator (Market+Sentiment → Signal → Risk → Executor pipeline) with per-agent decision memory to skip redundant LLM calls, backed by OpenAI and a multi-provider LLM router (`AiMarketAnalyst`) — with an **Ollama local-LLM fallback** that keeps the agents running offline when every cloud provider is down, self-trained on your Brain + trade history via Soup
 - **Sentiment & news:** CryptoPanic, RSS feeds, Reddit, Telegram and WhatsApp channels → VADER + TextBlob scoring; **X (Twitter) whale monitor** (OAuth 1.0a home-timeline polling, 19 accounts, free tier)
 - **Realtime:** Server-Sent Events over a Redis pub/sub `EventBus` (in-memory fallback)
 - **Assistant:** JARVIS / Paul / S.O.X — global voice + chat widget, 3D robot avatar, WebGL command room, and live face-vision
@@ -167,7 +167,8 @@ The sidebar (`frontend/src/components/Layout.tsx`) contains every page below. A 
 - ✅ **X (Twitter) whale monitor** — tracks 19 market-moving accounts, OAuth 1.0a free-tier home-timeline polling, Breaking tweets injected into sentiment pipeline in real time
 - ✅ **X AI Scraper** — extracts social media links from whale profiles (basic stdlib mode always active; ScrapeGraphAI AI mode optional upgrade)
 - ✅ Multi-agent AI orchestrator: Market+Sentiment → Signal → Risk → Executor pipeline with persisted decision history and per-agent learning stats
-- ✅ Signal & strategy engine: technical signals, Pine Script strategies, Smart Money Concepts (order blocks, FVGs, premium/discount zones), Strategy Lab
+- ✅ **Local LLM fallback (Ollama)** — when all configured cloud AI providers fail, agents fall back to a tier-appropriate local model served by Ollama; `start.py` auto-installs Ollama and pulls the best model for the machine (0.5B → 14B by resource tier), and a scheduler periodically fine-tunes `tradebot-local` from Brain data + executed trades via Soup
+- ✅ Signal & strategy engine: technical signals, Pine Script strategies, Smart Money Concepts (order blocks, FVGs, premium/discount zones), classic chart-pattern detectors (double/triple tops & bottoms, head & shoulders, wedges, flags, pennants, triangles), Strategy Lab
 - ✅ Risk management (position sizing, SL/TP, exposure limits) across simulated (paper) and live engines
 - ✅ Crypto sniper: rug-pull and pump/pullback detection with optional auto-trade loop
 - ✅ Realtime dashboard with SSE stream, charts, balances and trade history
@@ -184,8 +185,9 @@ The sidebar (`frontend/src/components/Layout.tsx`) contains every page below. A 
 | Plugin | Description |
 | --- | --- |
 | `MT5TradingPlugin` | MetaTrader 5 REST bridge: multi-account management, SMC sniper charting, autonomous scalp bot (multi-timeframe SMC + Kronos ML + AI gate, SMC-guided recovery legs, hot-config updates), copy-trading simulation and backtesting bridge |
-| `AiMarketAnalyst` | Multi-provider LLM router (Groq, OpenRouter, Gemini, Mistral, Cerebras, DeepSeek, Together, OpenAI, custom) with failover, agent profiles, smart limit-order proposals and a risk policy engine |
+| `AiMarketAnalyst` | Multi-provider LLM router (Groq, OpenRouter, Gemini, Mistral, Cerebras, DeepSeek, Together, OpenAI, custom) with failover, agent profiles, smart limit-order proposals and a risk policy engine — plus an Ollama local-model fallback after all cloud providers are exhausted |
 | `KronosForecastPlugin` | Kronos ML candle forecasting (mini/small/base + fine-tuning) with heuristic fallback, rendered as chart overlays. Forecasts every asset class — crypto, all forex pairs/crosses, metals, indices (US30, US500, NAS100…), energy, and stock-exchange equities/ETFs/shares — with FX/metals anchored to Swissquote |
+| `SoupPlugin` | LLM fine-tuning lab (via [Soup](https://github.com/MakazhanAlpamys/Soup)) in an isolated venv — hardware-adaptive SFT/LoRA/QLoRA, unified model catalogue, dataset upload, OHLCV→JSONL bridge, embedded Soup UI, and a GGUF export → `ollama create tradebot-local` pipeline that powers the local-LLM fallback |
 | `TelegramSignalNewsPlugin` | Telegram channel ingestion for trading signals and news, with sniper auto-trade |
 | `WhatsAppSignalNewsPlugin` | WhatsApp channel ingestion (via an OpenWA gateway) for trading signals and news, with sniper auto-trade |
 | `ObsidianKnowledgePlugin` | Syncs signals, agent decisions, strategy notes and code-community graphs into a local Obsidian vault |

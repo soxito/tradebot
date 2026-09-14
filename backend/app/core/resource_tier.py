@@ -96,6 +96,8 @@ TASK_TIER_POLICY: Dict[str, Dict[str, object]] = {
     "paul_subconscious": {"min_tier": "low", "critical": False, "category": "learning"},
     "hermes_memory": {"min_tier": "minimal", "critical": False, "category": "learning"},
     "hermes_gateway": {"min_tier": "low", "critical": False, "category": "learning"},
+    "ollama_train": {"min_tier": "medium", "critical": False, "category": "learning"},
+    "ollama_serve": {"min_tier": "minimal", "critical": False, "category": "learning"},
 }
 
 

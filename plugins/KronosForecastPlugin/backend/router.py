@@ -604,7 +604,7 @@ async def finetune_export(req: FinetuneExportRequest) -> FinetuneExportResponse:
     sym = _normalize_symbol(req.symbol)
     out = Path(finetune_service._WORK_DIR) / "preview" / f"{sym.replace('/', '')}_{req.timeframe}.csv"
     try:
-        summary = await exporter.export_training_data(req.exchange, sym, req.timeframe, req.limit, out)
+        summary = await exporter.export_training_data(req.exchange, sym, req.timeframe, req.limit, out, use_pattern_features=req.use_pattern_features)
         return FinetuneExportResponse(ok=True, **summary)
     except Exception as exc:
         return FinetuneExportResponse(

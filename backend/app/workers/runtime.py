@@ -19,6 +19,7 @@ from app.core.scheduler import (
     start_signal_research_queue,
     start_vault_sync_loop,
     start_sniper_loop,
+    start_ollama_train_loop,
     stop_auto_trade_loop,
     stop_live_auto_trade_loop,
     stop_pair_catalog_sync_loop,
@@ -31,6 +32,7 @@ from app.core.scheduler import (
     stop_signal_research_queue,
     stop_vault_sync_loop,
     stop_sniper_loop,
+    stop_ollama_train_loop,
 )
 from app.workers.room_worker import arm_from_settings, start_room_worker, stop_room_worker
 from app.workers.copy_worker import start_copy_worker, stop_copy_worker
@@ -134,6 +136,14 @@ def start_background_workers(allow_in_api: bool = False) -> dict[str, bool]:
     else:
         started["decision_learning_loop"] = False
 
+    # Ollama fine-tune scheduler: retrains tradebot-local from Brain+trades on a
+    # cadence (tier-gated to medium+ inside the loop). Idles cheaply when Ollama
+    # or Soup is absent.
+    if getattr(settings, "AUTO_START_OLLAMA_TRAIN_LOOP", True):
+        started["ollama_train_loop"] = start_ollama_train_loop()
+    else:
+        started["ollama_train_loop"] = False
+
     # The room worker arms itself from the saved room settings rather than the
     # env flag alone, so "keep meeting 24/7" survives a restart. Reading that
     # row needs the DB, so it is deferred onto the loop instead of blocking
@@ -177,5 +187,6 @@ def stop_background_workers() -> None:
     stop_vault_sync_loop()
     stop_jarvis_learning_loop()
     stop_decision_learning_loop()
+    stop_ollama_train_loop()
     stop_room_worker()
     stop_copy_worker()

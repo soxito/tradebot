@@ -70,6 +70,16 @@ class PlanOverlay:
     #: bfma/bsma. Each: {"values": [float|None...], "color": (r,g,b),
     #: "label": str, "dashed": bool, "width": int}.
     custom_lines: list[dict[str, Any]] = field(default_factory=list)
+    #: Cheat-sheet patterns used for this plan — rendered as a legend and as chart annotations.
+    #: candle_patterns: [{"index": int, "name": str, "direction": str}] (index into candle list)
+    candle_patterns: list[dict[str, Any]] = field(default_factory=list)
+    #: chart_patterns: [{"kind": str, "signal": str, "confidence": float, "broken": bool,
+    #: "neckline": float|None, "top": float|None, "bottom": float|None, ...}]
+    chart_patterns: list[dict[str, Any]] = field(default_factory=list)
+    #: Human sentence naming the cheat sheets, e.g. "Bullish Engulfing at demand + Ascending Triangle breakout"
+    pattern_note: str | None = None
+    #: Per-pattern why explanations, e.g. ["Hammer: long lower wick 2.6×body at demand with volume 1.4× avg"]
+    pattern_reasons: list[str] = field(default_factory=list)
 
 
 def _load_font(size: int):
@@ -322,6 +332,68 @@ def render_plan_chart(
                 tw = draw.textbbox((0, 0), label, font=f_sm)[2]
                 draw.text((plot_r - tw - 4, y - 15), label, fill=(*_FIB_COLOUR, 220), font=f_sm)
 
+        # ── Cheat-sheet chart patterns (necklines, rectangle edges, flag rails) ──
+        for pat in (overlay.chart_patterns or [])[:3]:
+            kind = str(pat.get("kind", "pattern"))
+            signal = str(pat.get("signal", ""))
+            broken = bool(pat.get("broken"))
+            conf = pat.get("confidence")
+            conf_s = f" {float(conf):.0%}" if isinstance(conf, (int, float)) else ""
+            # choose colour by signal
+            col = _TARGET if signal == "bullish" else _STOP if signal == "bearish" else _MUTED
+            # collect levels that define the pattern
+            levels = []
+            for key in ("neckline", "top", "bottom", "flag_high", "flag_low", "upper_now", "lower_now"):
+                v = pat.get(key)
+                if isinstance(v, (int, float)):
+                    levels.append((key, float(v)))
+            for key, price in levels:
+                y = y_of(price)
+                # dashed if pending, solid if broken
+                if broken:
+                    draw.line([(plot_l, y), (plot_r, y)], fill=col, width=2)
+                else:
+                    for x in range(plot_l, plot_r, 10):
+                        draw.line([(x, y), (min(x + 5, plot_r), y)], fill=col, width=2)
+                label = f"{kind} {key}{conf_s}"
+                tw = draw.textbbox((0, 0), label, font=f_sm)[2]
+                draw.rectangle([plot_r - tw - 8, y - 18, plot_r - 2, y - 2], fill=(*col, 210))
+                draw.text((plot_r - tw - 5, y - 17), label, fill=(11, 15, 25), font=f_sm)
+            # island markers
+            for k in ("island_high", "island_low"):
+                v = pat.get(k)
+                if isinstance(v, (int, float)):
+                    y = y_of(float(v))
+                    draw.line([(plot_l, y), (plot_r, y)], fill=col, width=1)
+
+        # ── Candle pattern markers (text above/below the bar that printed it) ──
+        for cp in (overlay.candle_patterns or [])[:6]:
+            idx = cp.get("index")
+            name = str(cp.get("name", "pattern"))
+            direction = str(cp.get("direction", ""))
+            if not isinstance(idx, int) or idx < 0 or idx >= len(rows):
+                continue
+            # x of the bar
+            x = int(plot_l + idx * step + step / 2)
+            if x < plot_l or x > candle_r:
+                continue
+            # y just above high for bear, below low for bull
+            c = rows[idx]
+            h, l = float(c[2]), float(c[3])
+            y_ref = y_of(h) - 14 if direction == "bear" else y_of(l) + 10
+            # clamp
+            y_ref = int(max(plot_t + 12, min(plot_b - 10, y_ref)))
+            col = _TARGET if direction == "bull" else _STOP if direction == "bear" else _MUTED
+            # tiny arrow + label
+            arr = "▲" if direction == "bull" else "▼" if direction == "bear" else "◆"
+            label = f"{arr} {name}"
+            # background pill
+            tw = draw.textbbox((0, 0), label, font=f_sm)[2]
+            # clamp horizontally
+            tx = max(plot_l, min(x - tw // 2, plot_r - tw - 4))
+            draw.rectangle([tx - 3, y_ref - 11, tx + tw + 3, y_ref + 3], fill=(*col, 180))
+            draw.text((tx, y_ref - 10), label, fill=(11, 15, 25), font=f_sm)
+
         last_close = float(rows[-1][4])
 
         # ── Projection: dashed, only in the empty space to the right ─────────
@@ -367,6 +439,17 @@ def render_plan_chart(
         if subtitle:
             draw.text((_PAD_L + draw.textbbox((0, 0), head, font=f_lg)[2] + 18, 16),
                       subtitle[:90], fill=_MUTED, font=f_md)
+        # cheat-sheet legend (just under header, so it is visible on the Telegram thumbnail)
+        if overlay.pattern_note or overlay.pattern_reasons:
+            legend_y = 30
+            if overlay.pattern_note:
+                legend = f"📚 {overlay.pattern_note[:120]}"
+                draw.text((_PAD_L, legend_y), legend, fill=(250, 204, 21), font=f_sm)
+                legend_y += 16
+            for reason in (overlay.pattern_reasons or [])[:2]:
+                line = f"• {reason[:110]}"
+                draw.text((_PAD_L, legend_y), line, fill=_MUTED, font=f_sm)
+                legend_y += 14
         draw.text((_PAD_L, _H - 22),
                   "Generated by the trading room — levels are the agents' plan, not advice. "
                   "Verify before trading.", fill=_MUTED, font=f_sm)

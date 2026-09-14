@@ -48,12 +48,35 @@ export interface ChannelLine {
   breakout?: string | null;
 }
 
+export interface ChartPatternOverlay {
+  kind: string;
+  category: string;
+  signal: string;
+  confidence: number;
+  broken?: boolean;
+  breakout?: string | null;
+  neckline?: number | null;
+  top?: number | null;
+  bottom?: number | null;
+  upper_now?: number | null;
+  lower_now?: number | null;
+  upper?: { m: number; b: number } | null;
+  lower?: { m: number; b: number } | null;
+  flag_high?: number | null;
+  flag_low?: number | null;
+  flag_start?: number;
+  flag_end?: number;
+  target?: number | null;
+  invalidation?: number | null;
+}
+
 export interface ZonesData {
   supply_zones: ZoneRect[];
   demand_zones: ZoneRect[];
   channels?: ChannelLine[];
   s_r_levels?: { price: number; type: string; touches: number }[];
   fib?: FibPayload;
+  chart_patterns?: ChartPatternOverlay[];
   /**
    * Bitcoin 1064-day cycle boxes — full-height green (bull) / red (bear)
    * ranges across [startMs, endMs], the way the cycle chart draws them.
@@ -85,6 +108,12 @@ const COLORS = {
   cycleBear: 'rgba(239, 68, 68, 0.10)',
   cycleBearProjected: 'rgba(239, 68, 68, 0.05)',
   cycleEdge: 'rgba(148, 163, 184, 0.5)',
+  chartBull: 'rgba(34, 197, 94, 0.70)',
+  chartBear: 'rgba(239, 68, 68, 0.70)',
+  chartNeutral: 'rgba(148, 163, 184, 0.65)',
+  chartBroken: 'rgba(250, 204, 21, 0.70)',
+  chartFillBull: 'rgba(34, 197, 94, 0.06)',
+  chartFillBear: 'rgba(239, 68, 68, 0.06)',
 };
 
 /** Horizontal band: filled strip between two y values across [x0, x1].
@@ -189,7 +218,8 @@ export class ZonesOverlay implements ISeriesPrimitive {
         !!data.demand_zones?.length ||
         !!data.channels?.length ||
         !!data.cycle_windows?.length ||
-        !!data.fib?.bands?.length);
+        !!data.fib?.bands?.length ||
+        !!(data.chart_patterns && data.chart_patterns.length));
     if (!p || !hasAny) {
       this._view._bands = bands;
       this._view._segments = segments;
@@ -287,6 +317,50 @@ export class ZonesOverlay implements ISeriesPrimitive {
         if (yA === null || yB === null) continue;
         segments.push({ x0: 0, x1: width, y0: yA, y1: yB, stroke: COLORS.channel });
       }
+    }
+
+    // ── Chart patterns ──────────────────────────────────────────
+    for (const pat of (data.chart_patterns ?? []).slice(0, 3)) {
+      const stroke = pat.broken
+        ? COLORS.chartBroken
+        : pat.signal === 'bullish'
+          ? COLORS.chartBull
+          : pat.signal === 'bearish'
+            ? COLORS.chartBear
+            : COLORS.chartNeutral;
+      const dash = pat.broken ? [] : [6, 4];
+      // For now segments are solid (fancy-canvas doesn't expose setLineDash per segment easily) — width varies.
+      // Neckline / rectangle edges
+      const levels: Array<{ price: number | null | undefined; width: number }> = [];
+      if (pat.neckline != null) levels.push({ price: pat.neckline, width: pat.broken ? 2 : 1.5 });
+      if (pat.top != null && pat.bottom != null) {
+        levels.push({ price: pat.top, width: 1.2 });
+        levels.push({ price: pat.bottom, width: 1.2 });
+        // fill rectangle faintly
+        const yTop = yOf(pat.top!);
+        const yBot = yOf(pat.bottom!);
+        if (yTop !== null && yBot !== null) {
+          const fill = pat.signal === 'bullish' ? COLORS.chartFillBull : pat.signal === 'bearish' ? COLORS.chartFillBear : 'rgba(148,163,184,0.04)';
+          bands.push({ x0: 0, x1: width, yTop, yBot, fill });
+        }
+      } else if (pat.top != null) levels.push({ price: pat.top, width: 1.2 });
+      else if (pat.bottom != null) levels.push({ price: pat.bottom, width: 1.2 });
+      if (pat.flag_high != null) levels.push({ price: pat.flag_high, width: 1.2 });
+      if (pat.flag_low != null) levels.push({ price: pat.flag_low, width: 1.2 });
+      if (pat.upper_now != null) levels.push({ price: pat.upper_now, width: 1.2 });
+      if (pat.lower_now != null) levels.push({ price: pat.lower_now, width: 1.2 });
+      for (const lv of levels) {
+        if (lv.price == null) continue;
+        const y = yOf(lv.price as number);
+        if (y === null) continue;
+        segments.push({ x0: 0, x1: width, y0: y, y1: y, stroke });
+      }
+      // wedge rails if present as line objects
+      for (const rail of [pat.upper, pat.lower]) {
+        if (!rail || typeof rail.m !== 'number' || typeof rail.b !== 'number') continue;
+        // draw short segment across middle of pane using x->price mapping approximation: just draw horizontal levels above already covers main use; skip precise rail projection for now
+      }
+      void dash; // keep until dashed rendering wired
     }
 
     this._view._bands = bands;

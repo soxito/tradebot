@@ -1,0 +1,25 @@
+{
+  "name": "Soup LLM Finetuning",
+  "slug": "soup",
+  "version": "1.0.0",
+  "description": "Fine-tune and post-train any HF LLM in one command via MakazhanAlpamys/Soup (trysoup.dev) — LoRA/QLoRA, SFT/DPO/GRPO, layer-streaming on 4GB. Proxied UI on :7860 and OpenAI-compatible serve on :8012, auto-cloned/pulled by start.py, isolated venv at ~/.tradebot/soup-venv. Experimental OHLCV→LLM bridge.",
+  "author": "TradeBot",
+  "requires": { "python": ">=3.10", "tradebot": ">=0.1.0" },
+  "service_provider": "backend.router",
+  "provides": {
+    "routes": ["backend/router.py"],
+    "models": ["backend/models.py"],
+    "pages": ["frontend/pages/"],
+    "overlays": false
+  },
+  "permissions": ["ai.finetune.view", "ai.finetune.manage"],
+  "settings_keys": [
+    "soup.enabled",
+    "soup.repo_url",
+    "soup.venv_dir",
+    "soup.ui_port",
+    "soup.port",
+    "soup.service_url",
+    "soup.default_base"
+  ]
+}

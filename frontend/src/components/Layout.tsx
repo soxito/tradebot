@@ -81,8 +81,10 @@ const navItems: NavItem[] = [
   { href: '/smart-money-concepts', label: 'Smart Money Concepts', icon: CandlestickChart },
   { href: '/kronos-forecast', label: 'Kronos Forecast', icon: Telescope, children: [
     { href: '/kronos-finetune', label: 'Fine-tune Lab', icon: Sparkles },
+    { href: '/soup-finetune', label: 'Soup Lab', icon: FlaskConical },
   ],
   },
+  { href: '/soup-finetune', label: 'Soup Lab', icon: FlaskConical },
   { href: '/delistings', label: 'Delistings', icon: AlertTriangle },
   { href: '/trading-room', label: 'Trading Room', icon: Users, children: [
     { href: '/trading-room-settings', label: 'Room Settings', icon: Settings },

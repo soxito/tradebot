@@ -321,6 +321,7 @@ class FinetuneStartRequest(BaseModel):
     predictor_epochs: int = Field(20, ge=1, le=200)
     batch_size: int = Field(32, ge=1, le=256)
     base_model: Optional[str] = None            # HF id/local path to start from
+    use_pattern_features: bool = Field(True, description="Enrich training data with previous-candle pattern signals")
 
 
 class FinetuneExportRequest(BaseModel):
@@ -328,6 +329,7 @@ class FinetuneExportRequest(BaseModel):
     exchange: str = "bitget"
     timeframe: str = "1h"
     limit: int = Field(3000, ge=256, le=100000)
+    use_pattern_features: bool = Field(True, description="Enrich exported CSV with pattern features")
 
 
 class FinetuneExportResponse(BaseModel):
@@ -339,6 +341,8 @@ class FinetuneExportResponse(BaseModel):
     timeframe: str
     first_ts: Optional[str] = None
     last_ts: Optional[str] = None
+    enriched: bool = False
+    pattern_coverage: Optional[dict] = None
     error: Optional[str] = None
 
 

@@ -1,0 +1,11 @@
+{
+  "cloned": true,
+  "commit": "4d98b6ad9895",
+  "branch": "main",
+  "remote": "https://github.com/MakazhanAlpamys/Soup.git",
+  "last_pull": "2026-09-14T20:42:56Z",
+  "pkg_version": "0.75.0",
+  "soup_bin": "/Users/sakhilematsimela/.tradebot/soup-venv/bin/soup",
+  "path": "/Users/sakhilematsimela/Sites/tradebot/integrations/soup",
+  "venv": "/Users/sakhilematsimela/.tradebot/soup-venv"
+}

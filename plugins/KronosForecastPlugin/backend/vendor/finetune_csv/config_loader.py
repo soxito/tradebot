@@ -1,6 +1,46 @@
 import os
+import platform
+import warnings
 import yaml
 from typing import Dict, Any
+
+
+def _sanitize_num_workers(raw: int, use_cuda: bool = True) -> int:
+    """Return a safe num_workers that never leaks semaphores on macOS / CPU."""
+    try:
+        raw = int(raw)
+    except Exception:
+        raw = 0
+    if raw < 0:
+        raw = 0
+    # On macOS the default multiprocessing start method is 'spawn' and
+    # DataLoader workers easily leave semaphores tracked by
+    # multiprocessing.resource_tracker, which surfaces at interpreter shutdown as
+    #   UserWarning: resource_tracker: There appear to be N leaked semaphore objects
+    # The leak is harmless but noisy and indicates workers weren't joined.
+    # On CPU-only macOS the simplest leak-free policy is num_workers=0.
+    # Allow an explicit escape hatch for power users who have proven cleanup.
+    if platform.system() == "Darwin":
+        allow = os.environ.get("KRONOS_ALLOW_WORKERS", "").strip().lower() in ("1", "true", "yes")
+        if raw != 0 and not allow:
+            # Only warn once; sanitize to 0 so the warning can never re-appear.
+            warnings.warn(
+                f"config_loader: clamping num_workers {raw} -> 0 on macOS to avoid "
+                "multiprocessing.resource_tracker leaked semaphore warnings "
+                "(set KRONOS_ALLOW_WORKERS=1 to override)",
+                UserWarning,
+                stacklevel=3,
+            )
+            print(f"[config] num_workers {raw} -> 0 on macOS (avoid leaked semaphores; set KRONOS_ALLOW_WORKERS=1 to keep {raw})")
+            return 0
+    # On Linux/Windows also cap to cpu count to avoid oversubscription warnings.
+    try:
+        cpu = os.cpu_count() or 4
+        if raw > max(2, cpu):
+            raw = max(2, cpu)
+    except Exception:
+        pass
+    return raw
 
 
 class ConfigLoader:
@@ -141,7 +181,9 @@ class CustomFinetuneConfig:
         
         self.batch_size = training_config.get('batch_size', 160)
         self.log_interval = training_config.get('log_interval', 50)
-        self.num_workers = training_config.get('num_workers', 6)
+        _raw_workers = training_config.get('num_workers', 6)
+        # sanitize after device_config is known below; temporarily store raw
+        self.num_workers = _raw_workers  # will be sanitized after device_config load
         self.seed = training_config.get('seed', 100)
         self.tokenizer_learning_rate = training_config.get('tokenizer_learning_rate', 2e-4)
         self.predictor_learning_rate = training_config.get('predictor_learning_rate', 4e-5)
@@ -174,6 +216,8 @@ class CustomFinetuneConfig:
         device_config = self.loader.get_device_config()
         self.use_cuda = device_config.get('use_cuda', True)
         self.device_id = device_config.get('device_id', 0)
+        # sanitize num_workers now that we know use_cuda / platform
+        self.num_workers = _sanitize_num_workers(self.num_workers, self.use_cuda)
         
         distributed_config = self.loader.get_distributed_config()
         self.use_ddp = distributed_config.get('use_ddp', False)

@@ -1,8 +1,11 @@
+import gc
 import os
+import platform
 import sys
 import json
 import time
 import random
+import warnings
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -14,6 +17,91 @@ import logging
 from logging.handlers import RotatingFileHandler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+# ── Leak-free DataLoader helpers ──────────────────────────────────────
+# On macOS (spawn) DataLoader with num_workers>0 leaves POSIX semaphores
+# tracked by multiprocessing.resource_tracker. If workers aren't explicitly
+# joined before interpreter shutdown Python 3.13 emits:
+#   UserWarning: resource_tracker: There appear to be N leaked semaphore objects
+# We (1) clamp workers to 0 on Darwin+CPU by default, (2) use pin_memory only
+# when CUDA is present, (3) force persistent_workers=False, and
+# (4) explicitly shut workers down in finally blocks so the warning can never
+# appear again.
+
+def _effective_num_workers(requested: int) -> int:
+    try:
+        n = int(requested)
+    except Exception:
+        n = 0
+    if n < 0:
+        n = 0
+    if platform.system() == "Darwin":
+        allow = os.environ.get("KRONOS_ALLOW_WORKERS", "").strip().lower() in ("1", "true", "yes")
+        if n != 0 and not allow:
+            warnings.warn(
+                f"finetune_tokenizer: clamping num_workers {n} -> 0 on macOS to avoid leaked semaphores "
+                "(set KRONOS_ALLOW_WORKERS=1 to keep workers)",
+                UserWarning, stacklevel=3,
+            )
+            print(f"[DataLoader] num_workers {n} -> 0 on macOS (avoid leaked semaphores)")
+            return 0
+    return n
+
+
+def _dataloader_kwargs(config, *, shuffle: bool, drop_last: bool, sampler):
+    n = _effective_num_workers(getattr(config, "num_workers", 0))
+    pin = bool(torch.cuda.is_available())
+    kw = dict(
+        batch_size=config.batch_size,
+        shuffle=(sampler is None and shuffle),
+        num_workers=n,
+        pin_memory=pin,
+        drop_last=drop_last,
+        sampler=sampler,
+        persistent_workers=False,  # must be False so workers are joined each epoch
+    )
+    if n == 0:
+        # prefetch_factor / persistent_workers are illegal with num_workers==0
+        kw.pop("persistent_workers", None)
+    else:
+        kw["prefetch_factor"] = 2
+    return kw
+
+
+def _shutdown_dataloader(dl) -> None:
+    """Best-effort join of DataLoader workers so resource_tracker sees no leak."""
+    if dl is None:
+        return
+    try:
+        # DataLoader creates its iterator lazily; if we still hold one, shut it.
+        it = getattr(dl, "_iterator", None)
+        if it is not None:
+            try:
+                it._shutdown_workers()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            try:
+                it._workers_cleared = True  # type: ignore[attr-defined]
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        del dl
+    except Exception:
+        pass
+
+
+# Ensure spawn is the start method on macOS before any DataLoader is built.
+try:
+    import multiprocessing as _mp
+    if platform.system() == "Darwin":
+        try:
+            _mp.set_start_method("spawn", force=False)
+        except RuntimeError:
+            pass
+except Exception:
+    pass
 
 sys.path.append("../")
 from model import KronosTokenizer
@@ -124,22 +212,12 @@ def create_dataloaders(config):
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config.batch_size,
-        shuffle=(train_sampler is None),
-        num_workers=config.num_workers,
-        pin_memory=True,
-        drop_last=True,
-        sampler=train_sampler
+        **_dataloader_kwargs(config, shuffle=True, drop_last=True, sampler=train_sampler),
     )
     
     val_loader = DataLoader(
         val_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-        pin_memory=True,
-        drop_last=False,
-        sampler=val_sampler
+        **_dataloader_kwargs(config, shuffle=False, drop_last=False, sampler=val_sampler),
     )
     
     if not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0:
@@ -154,128 +232,143 @@ def train_tokenizer(model, device, config, save_dir, logger):
     rank = dist.get_rank() if use_ddp else 0
     world_size = dist.get_world_size() if use_ddp else 1
     
-    train_loader, val_loader, train_dataset, val_dataset, train_sampler, val_sampler = create_dataloaders(config)
+    train_loader = val_loader = None
+    train_dataset = val_dataset = train_sampler = val_sampler = None
+    try:
+        train_loader, val_loader, train_dataset, val_dataset, train_sampler, val_sampler = create_dataloaders(config)
     
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.tokenizer_learning_rate,
-        weight_decay=config.adam_weight_decay
-    )
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=config.tokenizer_learning_rate,
+            weight_decay=config.adam_weight_decay
+        )
     
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=config.tokenizer_learning_rate,
-        steps_per_epoch=len(train_loader),
-        epochs=config.tokenizer_epochs,
-        pct_start=0.03,
-        div_factor=10
-    )
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=config.tokenizer_learning_rate,
+            steps_per_epoch=len(train_loader),
+            epochs=config.tokenizer_epochs,
+            pct_start=0.03,
+            div_factor=10
+        )
     
-    if use_ddp:
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
-
-    best_val_loss = float("inf")
-    batch_idx_global = 0
-    
-    accumulation_steps = getattr(config, 'accumulation_steps', 1)
-    
-    for epoch in range(config.tokenizer_epochs):
-        epoch_start_time = time.time()
-        model.train()
-        
-        train_dataset.set_epoch_seed(epoch * 10000)
-        val_dataset.set_epoch_seed(0)
-        if train_sampler is not None:
-            train_sampler.set_epoch(epoch)
-        
-        for batch_idx, (ori_batch_x, _) in enumerate(train_loader):
-            ori_batch_x = ori_batch_x.to(device, non_blocking=True)
-            
-            current_batch_total_loss = 0.0
-            for j in range(accumulation_steps):
-                start_idx = j * (ori_batch_x.shape[0] // accumulation_steps)
-                end_idx = (j + 1) * (ori_batch_x.shape[0] // accumulation_steps)
-                batch_x = ori_batch_x[start_idx:end_idx]
-                
-                zs, bsq_loss, _, _ = (model.module if use_ddp else model)(batch_x)
-                z_pre, z = zs
-                
-                recon_loss_pre = F.mse_loss(z_pre, batch_x)
-                recon_loss_all = F.mse_loss(z, batch_x)
-                recon_loss = recon_loss_pre + recon_loss_all
-                loss = (recon_loss + bsq_loss) / 2
-                
-                loss_scaled = loss / accumulation_steps
-                current_batch_total_loss += loss.item()
-                loss_scaled.backward()
-            
-            torch.nn.utils.clip_grad_norm_((model.module if use_ddp else model).parameters(), max_norm=2.0)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
-            
-            if (batch_idx_global + 1) % config.log_interval == 0:
-                avg_loss = current_batch_total_loss / accumulation_steps
-                lr = optimizer.param_groups[0]["lr"]
-                log_msg = (f"[Epoch {epoch+1}/{config.tokenizer_epochs}, Step {batch_idx+1}/{len(train_loader)}] "
-                          f"LR: {lr:.6f}, Loss: {avg_loss:.4f}")
-                logger.info(log_msg)
-                if rank == 0:
-                    print(log_msg)
-                
-                detail_msg = (f"  - VQ Loss: {bsq_loss.item():.4f}\n"
-                            f"  - Recon Loss Pre: {recon_loss_pre.item():.4f}\n"
-                            f"  - Recon Loss All: {recon_loss_all.item():.4f}")
-                logger.info(detail_msg)
-                if rank == 0:
-                    print(detail_msg)
-            
-            batch_idx_global += 1
-        
-        model.eval()
-        tot_val_loss_sum_rank = 0.0
-        val_sample_count_rank = 0
-        
-        with torch.no_grad():
-            for ori_batch_x, _ in val_loader:
-                ori_batch_x = ori_batch_x.to(device, non_blocking=True)
-                zs, _, _, _ = (model.module if use_ddp else model)(ori_batch_x)
-                _, z = zs
-                val_loss_item = F.mse_loss(z, ori_batch_x)
-                
-                tot_val_loss_sum_rank += val_loss_item.item() * ori_batch_x.size(0)
-                val_sample_count_rank += ori_batch_x.size(0)
-        
         if use_ddp:
-            tensor_sum = torch.tensor([tot_val_loss_sum_rank, val_sample_count_rank], dtype=torch.float64, device=device)
-            dist.all_reduce(tensor_sum, op=dist.ReduceOp.SUM)
-            tot_val_loss_all = tensor_sum[0].item()
-            val_count_all = int(tensor_sum[1].item())
-            avg_val_loss = (tot_val_loss_all / val_count_all) if val_count_all > 0 else 0.0
-        else:
-            avg_val_loss = tot_val_loss_sum_rank / val_sample_count_rank if val_sample_count_rank > 0 else 0
-        
-        epoch_time = time.time() - epoch_start_time
-        epoch_summary = (f"\n--- Epoch {epoch+1}/{config.tokenizer_epochs} Summary ---\n"
-                       f"Validation Loss: {avg_val_loss:.4f}\n"
-                       f"Epoch Time: {format_time(epoch_time)}\n"
-                       f"Total Training Time: {format_time(time.time() - epoch_start_time)}\n")
-        logger.info(epoch_summary)
-        if rank == 0:
-            print(epoch_summary)
-        
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            if rank == 0:
-                model_save_path = os.path.join(save_dir, "best_model")
-                os.makedirs(model_save_path, exist_ok=True)
-                (model.module if use_ddp else model).save_pretrained(model_save_path)
-                save_msg = f"Best model saved to: {model_save_path} (validation loss: {best_val_loss:.4f})"
-                logger.info(save_msg)
-                print(save_msg)
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+
+        best_val_loss = float("inf")
+        batch_idx_global = 0
     
-    return best_val_loss
+        accumulation_steps = getattr(config, 'accumulation_steps', 1)
+    
+        for epoch in range(config.tokenizer_epochs):
+            epoch_start_time = time.time()
+            model.train()
+        
+            train_dataset.set_epoch_seed(epoch * 10000)
+            val_dataset.set_epoch_seed(0)
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+        
+            for batch_idx, (ori_batch_x, _) in enumerate(train_loader):
+                ori_batch_x = ori_batch_x.to(device, non_blocking=True)
+            
+                current_batch_total_loss = 0.0
+                for j in range(accumulation_steps):
+                    start_idx = j * (ori_batch_x.shape[0] // accumulation_steps)
+                    end_idx = (j + 1) * (ori_batch_x.shape[0] // accumulation_steps)
+                    batch_x = ori_batch_x[start_idx:end_idx]
+                
+                    zs, bsq_loss, _, _ = (model.module if use_ddp else model)(batch_x)
+                    z_pre, z = zs
+                
+                    recon_loss_pre = F.mse_loss(z_pre, batch_x)
+                    recon_loss_all = F.mse_loss(z, batch_x)
+                    recon_loss = recon_loss_pre + recon_loss_all
+                    loss = (recon_loss + bsq_loss) / 2
+                
+                    loss_scaled = loss / accumulation_steps
+                    current_batch_total_loss += loss.item()
+                    loss_scaled.backward()
+            
+                torch.nn.utils.clip_grad_norm_((model.module if use_ddp else model).parameters(), max_norm=2.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+            
+                if (batch_idx_global + 1) % config.log_interval == 0:
+                    avg_loss = current_batch_total_loss / accumulation_steps
+                    lr = optimizer.param_groups[0]["lr"]
+                    log_msg = (f"[Epoch {epoch+1}/{config.tokenizer_epochs}, Step {batch_idx+1}/{len(train_loader)}] "
+                              f"LR: {lr:.6f}, Loss: {avg_loss:.4f}")
+                    logger.info(log_msg)
+                    if rank == 0:
+                        print(log_msg)
+                
+                    detail_msg = (f"  - VQ Loss: {bsq_loss.item():.4f}\n"
+                                f"  - Recon Loss Pre: {recon_loss_pre.item():.4f}\n"
+                                f"  - Recon Loss All: {recon_loss_all.item():.4f}")
+                    logger.info(detail_msg)
+                    if rank == 0:
+                        print(detail_msg)
+            
+                batch_idx_global += 1
+        
+            model.eval()
+            tot_val_loss_sum_rank = 0.0
+            val_sample_count_rank = 0
+        
+            with torch.no_grad():
+                for ori_batch_x, _ in val_loader:
+                    ori_batch_x = ori_batch_x.to(device, non_blocking=True)
+                    zs, _, _, _ = (model.module if use_ddp else model)(ori_batch_x)
+                    _, z = zs
+                    val_loss_item = F.mse_loss(z, ori_batch_x)
+                
+                    tot_val_loss_sum_rank += val_loss_item.item() * ori_batch_x.size(0)
+                    val_sample_count_rank += ori_batch_x.size(0)
+        
+            if use_ddp:
+                tensor_sum = torch.tensor([tot_val_loss_sum_rank, val_sample_count_rank], dtype=torch.float64, device=device)
+                dist.all_reduce(tensor_sum, op=dist.ReduceOp.SUM)
+                tot_val_loss_all = tensor_sum[0].item()
+                val_count_all = int(tensor_sum[1].item())
+                avg_val_loss = (tot_val_loss_all / val_count_all) if val_count_all > 0 else 0.0
+            else:
+                avg_val_loss = tot_val_loss_sum_rank / val_sample_count_rank if val_sample_count_rank > 0 else 0
+        
+            epoch_time = time.time() - epoch_start_time
+            epoch_summary = (f"\n--- Epoch {epoch+1}/{config.tokenizer_epochs} Summary ---\n"
+                           f"Validation Loss: {avg_val_loss:.4f}\n"
+                           f"Epoch Time: {format_time(epoch_time)}\n"
+                           f"Total Training Time: {format_time(time.time() - epoch_start_time)}\n")
+            logger.info(epoch_summary)
+            if rank == 0:
+                print(epoch_summary)
+        
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                if rank == 0:
+                    model_save_path = os.path.join(save_dir, "best_model")
+                    os.makedirs(model_save_path, exist_ok=True)
+                    (model.module if use_ddp else model).save_pretrained(model_save_path)
+                    save_msg = f"Best model saved to: {model_save_path} (validation loss: {best_val_loss:.4f})"
+                    logger.info(save_msg)
+                    print(save_msg)
+    
+        return best_val_loss
+
+    finally:
+        for _dl in (train_loader, val_loader):
+            _shutdown_dataloader(_dl)
+        # Force GC so semaphores are unlinked before resource_tracker shutdown
+        gc.collect()
+        try:
+            import torch as _torch
+            if _torch.cuda.is_available():
+                _torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 
 def main():

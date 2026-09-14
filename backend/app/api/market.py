@@ -618,8 +618,8 @@ async def pattern_overlay(
     timeframe: str = Query(default="1d"),
     limit: int = Query(default=400, ge=30, le=10000),
     patterns: str = Query(
-        default="morning_star,evening_star,inverted_hammer,hammer,shooting_star,engulfing",
-        description="Comma set of candlestick patterns to flag",
+        default="",
+        description="Comma set of candlestick patterns to flag (empty = all)",
     ),
     fisher: bool = Query(default=True, description="Include the Fisher transform pane"),
 ):
@@ -664,7 +664,11 @@ async def pattern_overlay(
             return empty
 
         wanted = [p.strip().lower() for p in (patterns or "").split(",") if p.strip()]
+        # empty means all patterns; limit marker spam by keeping last 40 events (triple patterns span 60 bars)
         events = detect_patterns(rows, patterns=wanted or None)
+        # throttling for chart markers: keep most recent 40 to avoid clutter
+        if len(events) > 40:
+            events = events[-40:]
         markers = [
             {
                 "time": int(ev["time"]) // 1000 if int(ev["time"]) > 10**12 else int(ev["time"]),
@@ -709,14 +713,28 @@ async def pattern_overlay(
                     ],
                 })
 
+        # Chart patterns for the same window — overlay geometry for triangles/flags/H&S etc.
+        chart_patterns = None
+        try:
+            from app.signals.chart_patterns import analyze_chart_patterns as _cp
+            from app.signals.technical import ohlcv_to_dataframe as _cdf
+            df = _cdf(rows)
+            if len(df) >= 40:
+                chart_patterns = _cp(df)
+        except Exception:
+            pass
+
         return {
             "symbol": symbol,
             "timeframe": timeframe,
             "overlays": overlays,
             "markers": markers,
+            "chart_patterns": chart_patterns,
             "signal": {
                 "patterns_found": len(events),
                 "last_pattern": events[-1]["name"] if events else None,
+                "chart_patterns_found": (chart_patterns or {}).get("count", 0) if chart_patterns else 0,
+                "best_chart_pattern": (chart_patterns or {}).get("best", {}).get("kind") if chart_patterns else None,
             },
         }
     except Exception as e:  # noqa: BLE001 - an overlay must never break the chart

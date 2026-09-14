@@ -959,6 +959,91 @@ async def _fib_context(symbols: list[str]) -> str | None:
     return "## Fibonacci Confluence\n" + "\n\n".join(blocks)
 
 
+async def _candle_pattern_context(symbols: list[str]) -> str | None:
+    """Recent candlestick patterns per symbol — 50-pattern taxonomy."""
+    if not symbols:
+        return None
+    try:
+        from app.signals.candle_patterns import detect_patterns
+        from app.services import market_data
+        from app.services import candles as candle_source
+    except Exception:
+        return None
+    blocks: list[str] = []
+    for sym in symbols[:2]:
+        try:
+            ohlcv, _ = await market_data.fetch_ohlcv_universal(sym, timeframe="1h", limit=200)
+            if not ohlcv or len(ohlcv) < 5:
+                ohlcv = await candle_source.fetch(sym, "1h", 200) or []
+            if not ohlcv or len(ohlcv) < 5:
+                continue
+            events = detect_patterns(ohlcv)
+            if not events:
+                continue
+            recent = [e for e in events if e.get("index", 0) >= len(ohlcv) - 20]
+            if not recent:
+                recent = events[-3:]
+            counts: dict[str, int] = {}
+            for e in recent:
+                counts[e["name"]] = counts.get(e["name"], 0) + 1
+            summary = ", ".join(f"{k} x{v}" if v > 1 else k for k, v in counts.items())
+            last = recent[-1]
+            blocks.append(
+                f"### Candle patterns — {sym} (last 20 bars): {summary} | last: {last['name']} ({last['direction']})"
+            )
+        except Exception as exc:
+            from loguru import logger
+            logger.debug("[AI] candle context skipped for {}: {}", sym, exc)
+    if not blocks:
+        return None
+    return "## Candlestick Patterns (confirm with volume)\n" + "\n".join(blocks)
+
+
+async def _chart_pattern_context(symbols: list[str]) -> str | None:
+    """Chart patterns per symbol — flags, wedges, triangles, double top, H&S, island, cup & handle."""
+    if not symbols:
+        return None
+    try:
+        from app.signals.chart_patterns import analyze_chart_patterns
+        from app.signals.technical import ohlcv_to_dataframe
+        from app.services import market_data
+        from app.services import candles as candle_source
+    except Exception:
+        return None
+    blocks: list[str] = []
+    for sym in symbols[:2]:
+        try:
+            ohlcv, _ = await market_data.fetch_ohlcv_universal(sym, timeframe="1h", limit=200)
+            if not ohlcv or len(ohlcv) < 40:
+                ohlcv = await candle_source.fetch(sym, "1h", 200) or []
+            if not ohlcv or len(ohlcv) < 40:
+                continue
+            df = ohlcv_to_dataframe(ohlcv)
+            res = analyze_chart_patterns(df)
+            if not res.get("patterns"):
+                continue
+            lines = []
+            for pat in res["patterns"][:3]:
+                kind = pat.get("kind", "?")
+                sig = pat.get("signal", "?")
+                conf = pat.get("confidence", 0)
+                broken = "broken" if pat.get("broken") else "pending"
+                neck = pat.get("neckline")
+                tgt = pat.get("target")
+                extra = f" neckline {neck:.4g}" if neck else ""
+                if pat.get("top") and pat.get("bottom"):
+                    extra = f" range {pat['bottom']:.4g}-{pat['top']:.4g}"
+                tgt_s = f" → target {tgt:.4g}" if tgt else ""
+                lines.append(f"  - {kind} {sig} {broken} (conf {conf:.2f}){extra}{tgt_s}")
+            blocks.append(f"### Chart patterns — {sym}:\n" + "\n".join(lines))
+        except Exception as exc:
+            from loguru import logger
+            logger.debug("[AI] chart context skipped for {}: {}", sym, exc)
+    if not blocks:
+        return None
+    return "## Chart Patterns\n" + "\n".join(blocks)
+
+
 async def _learned_context(db: AsyncSession, symbols: list[str]) -> str | None:
     """What past calls on these instruments actually did — win rate, realised R.
 
@@ -997,6 +1082,8 @@ def _jarvis_system_prompt(
     news_block: str | None = None,
     learned: str | None = None,
     fib_block: str | None = None,
+    candle_block: str | None = None,
+    chart_block: str | None = None,
 ) -> str:
     """System prompt giving the LLM the Jarvis persona and its real capabilities.
 
@@ -1136,6 +1223,10 @@ def _jarvis_system_prompt(
         base += f"\n\n{learned}"
     if fib_block:
         base += f"\n\n{fib_block}"
+    if candle_block:
+        base += f"\n\n{candle_block}"
+    if chart_block:
+        base += f"\n\n{chart_block}"
     if live_data:
         base += f"\n\n## Live Portfolio Snapshot (fetched moments ago)\n{live_data}"
     return base
@@ -2246,15 +2337,19 @@ async def _ai_fallback(
         news_blk: str | None = None
         learned: str | None = None
         fib_blk: str | None = None
+        candle_blk: str | None = None
+        chart_blk: str | None = None
         try:
             from app.services import market_data
 
             symbols = market_data.extract_symbols(text)
-            price_blk, news_blk, learned, fib_blk = await asyncio.gather(
+            price_blk, news_blk, learned, fib_blk, candle_blk, chart_blk = await asyncio.gather(
                 market_data.price_block(symbols, db=db, max_lines=25),
                 _news_context(text, symbols),
                 _learned_context(db, symbols),
                 _fib_context(symbols),
+                _candle_pattern_context(symbols),
+                _chart_pattern_context(symbols),
                 return_exceptions=False,
             )
         except Exception as exc:  # noqa: BLE001 — context is a bonus, not a gate
@@ -2263,7 +2358,7 @@ async def _ai_fallback(
         history = _get_history(chat_id) if chat_id else []
         system = _jarvis_system_prompt(
             live_data, price_block=price_blk, news_block=news_blk, learned=learned,
-            fib_block=fib_blk,
+            fib_block=fib_blk, candle_block=candle_blk, chart_block=chart_blk,
         )
         if hint:
             system += (

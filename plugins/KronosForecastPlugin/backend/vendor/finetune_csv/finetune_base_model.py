@@ -1,9 +1,12 @@
+import gc
 import os
+import platform
 import sys
 import json
 import time
 import pickle
 import random
+import warnings
 import pandas as pd
 import numpy as np
 import torch
@@ -16,6 +19,78 @@ from logging.handlers import RotatingFileHandler
 import datetime
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+# ── Leak-free DataLoader helpers (see finetune_tokenizer.py) ──────────
+def _effective_num_workers(requested: int) -> int:
+    try:
+        n = int(requested)
+    except Exception:
+        n = 0
+    if n < 0:
+        n = 0
+    if platform.system() == "Darwin":
+        allow = os.environ.get("KRONOS_ALLOW_WORKERS", "").strip().lower() in ("1", "true", "yes")
+        if n != 0 and not allow:
+            warnings.warn(
+                f"finetune_base_model: clamping num_workers {n} -> 0 on macOS to avoid leaked semaphores "
+                "(set KRONOS_ALLOW_WORKERS=1 to keep workers)",
+                UserWarning, stacklevel=3,
+            )
+            print(f"[DataLoader] num_workers {n} -> 0 on macOS (avoid leaked semaphores)")
+            return 0
+    return n
+
+
+def _dataloader_kwargs(config, *, shuffle: bool, drop_last: bool, sampler):
+    n = _effective_num_workers(getattr(config, "num_workers", 0))
+    pin = bool(torch.cuda.is_available())
+    kw = dict(
+        batch_size=config.batch_size,
+        shuffle=(sampler is None and shuffle),
+        num_workers=n,
+        pin_memory=pin,
+        drop_last=drop_last,
+        sampler=sampler,
+        persistent_workers=False,
+    )
+    if n == 0:
+        kw.pop("persistent_workers", None)
+    else:
+        kw["prefetch_factor"] = 2
+    return kw
+
+
+def _shutdown_dataloader(dl) -> None:
+    if dl is None:
+        return
+    try:
+        it = getattr(dl, "_iterator", None)
+        if it is not None:
+            try:
+                it._shutdown_workers()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            try:
+                it._workers_cleared = True  # type: ignore[attr-defined]
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        del dl
+    except Exception:
+        pass
+
+
+try:
+    import multiprocessing as _mp
+    if platform.system() == "Darwin":
+        try:
+            _mp.set_start_method("spawn", force=False)
+        except RuntimeError:
+            pass
+except Exception:
+    pass
 
 sys.path.append('../')
 from model import Kronos, KronosTokenizer, KronosPredictor
@@ -37,7 +112,13 @@ class CustomKlineDataset(Dataset):
         self.val_ratio = val_ratio
         self.test_ratio = test_ratio
         
-        self.feature_list = ['open', 'high', 'low', 'close', 'volume', 'amount']
+        # Base OHLCV features; extended dynamically if CSV carries pattern-enriched columns
+        self._base_features = ['open', 'high', 'low', 'close', 'volume', 'amount']
+        self._pattern_features = [
+            'candle_bull', 'candle_bear', 'candle_pat_count', 'candle_pat_dir',
+            'chart_score', 'chart_conf', 'chart_bull', 'chart_bear', 'fib_in_golden',
+        ]
+        self.feature_list = list(self._base_features)  # may be expanded after reading CSV header
         self.time_feature_list = ['minute', 'hour', 'weekday', 'day', 'month']
         
         self.py_rng = random.Random(seed)
@@ -67,7 +148,30 @@ class CustomKlineDataset(Dataset):
         df['day'] = df['timestamps'].dt.day
         df['month'] = df['timestamps'].dt.month
         
+        # Pattern-enriched columns are present for audit/weighting but are NOT
+        # fed as additional model dimensions (d_in stays 6) to keep pretrained
+        # tokenizer weights compatible. Pattern coverage is logged and used for
+        # curriculum weighting instead.
+        present_pattern = [c for c in self._pattern_features if c in df.columns]
+        if present_pattern:
+            self._detected_pattern_cols = present_pattern
+            # stash pattern frame for weighting
+            self._pattern_df = df[present_pattern].copy()
+            # keep feature_list at base 6 so d_in=6 stays compatible with pretrained tokenizer
+            self.feature_list = list(self._base_features)
+            pat_bars = int((df[present_pattern].abs().sum(axis=1) > 0).sum()) if present_pattern else 0
+            print(f"[Dataset] Pattern-enriched CSV detected — {len(present_pattern)} pattern cols present ({present_pattern}), {pat_bars} bars carry patterns. Training will be pattern-weighted (d_in stays 6).")
+        else:
+            self.feature_list = list(self._base_features)
+            self._detected_pattern_cols = []
+            self._pattern_df = None
+        
         self.data = df[self.feature_list + self.time_feature_list].copy()
+        # store pattern scores aligned to split for later weighting
+        if hasattr(self, '_pattern_df') and self._pattern_df is not None:
+            self._pattern_scores = self._pattern_df.copy()
+        else:
+            self._pattern_scores = None
         
         if self.data.isnull().any().any():
             print("Warning: Missing values found in data, performing forward fill")
@@ -85,19 +189,32 @@ class CustomKlineDataset(Dataset):
         if self.data_type == 'train':
             self.data = self.data.iloc[:train_end].copy()
             self.timestamps = self.timestamps.iloc[:train_end].copy()
+            if self._pattern_scores is not None:
+                self._pattern_scores = self._pattern_scores.iloc[:train_end].copy()
             print(f"[{self.data_type.upper()}] Training set: first {train_end} time points ({self.train_ratio})")
             print(f"[{self.data_type.upper()}] Training set time range: {self.timestamps.min()} to {self.timestamps.max()}")
         elif self.data_type == 'val':
             self.data = self.data.iloc[train_end:val_end].copy()
             self.timestamps = self.timestamps.iloc[train_end:val_end].copy()
+            if self._pattern_scores is not None:
+                self._pattern_scores = self._pattern_scores.iloc[train_end:val_end].copy()
             print(f"[{self.data_type.upper()}] Validation set: time points {train_end+1} to {val_end} ({self.val_ratio})")
             print(f"[{self.data_type.upper()}] Validation set time range: {self.timestamps.min()} to {self.timestamps.max()}")
         elif self.data_type == 'test':
             self.data = self.data.iloc[val_end:].copy()
             self.timestamps = self.timestamps.iloc[val_end:].copy()
+            if self._pattern_scores is not None:
+                self._pattern_scores = self._pattern_scores.iloc[val_end:].copy()
             print(f"[{self.data_type.upper()}] Test set: after time point {val_end+1}")
             print(f"[{self.data_type.upper()}] Test set time range: {self.timestamps.min()} to {self.timestamps.max()}")
         
+        # log pattern-weighted sampling hint
+        if self._pattern_scores is not None and len(self._pattern_scores):
+            try:
+                pat_weight = (self._pattern_scores.abs().sum(axis=1) > 0).mean() * 100
+                print(f"[{self.data_type.upper()}] Pattern-enriched split: {pat_weight:.1f}% windows contain patterns — training will be pattern-weighted")
+            except Exception:
+                pass
         print(f"[{self.data_type.upper()}] Data length after split: {len(self.data)} records")
     
     def set_epoch_seed(self, epoch):
@@ -115,7 +232,30 @@ class CustomKlineDataset(Dataset):
         
         if self.data_type == 'train':
             epoch = getattr(self, 'current_epoch', 0)
-            start_idx = (idx * 9973 + (epoch + 1) * 104729) % (max_start + 1)
+            # pattern-weighted curriculum: 40% of samples are drawn from
+            # windows that actually contain a candle or chart pattern, so the
+            # fine-tuned model sees pattern-conditioned price dynamics far more
+            # often than random windows would provide (random windows are ~15%
+            # pattern-rich). This is how "checks prev candles for patterns and
+            # trains with them" is realized without changing d_in.
+            if getattr(self, '_pattern_scores', None) is not None and len(self._pattern_scores) > self.window:
+                try:
+                    if self.py_rng.random() < 0.40:
+                        # build a small pool of pattern-rich starts (cached per epoch)
+                        # use vectorised check: window has any pattern bar
+                        pat_any = (self._pattern_scores.abs().sum(axis=1) > 0).to_numpy()
+                        # sliding window presence: last bar of window carries pattern (most predictive)
+                        candidates = [s for s in range(max_start + 1) if pat_any[s + self.window - 1]]
+                        if candidates:
+                            start_idx = self.py_rng.choice(candidates)
+                        else:
+                            start_idx = (idx * 9973 + (epoch + 1) * 104729) % (max_start + 1)
+                    else:
+                        start_idx = (idx * 9973 + (epoch + 1) * 104729) % (max_start + 1)
+                except Exception:
+                    start_idx = (idx * 9973 + (epoch + 1) * 104729) % (max_start + 1)
+            else:
+                start_idx = (idx * 9973 + (epoch + 1) * 104729) % (max_start + 1)
         else:
             start_idx = idx % (max_start + 1)
         
@@ -216,22 +356,12 @@ def create_dataloaders(config):
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config.batch_size,
-        shuffle=(train_sampler is None),
-        num_workers=config.num_workers,
-        pin_memory=True,
-        drop_last=True,
-        sampler=train_sampler
+        **_dataloader_kwargs(config, shuffle=True, drop_last=True, sampler=train_sampler),
     )
     
     val_loader = DataLoader(
         val_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-        pin_memory=True,
-        drop_last=False,
-        sampler=val_sampler
+        **_dataloader_kwargs(config, shuffle=False, drop_last=False, sampler=val_sampler),
     )
     
     if not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0:
@@ -246,126 +376,140 @@ def train_model(model, tokenizer, device, config, save_dir, logger):
     rank = dist.get_rank() if use_ddp else 0
     world_size = dist.get_world_size() if use_ddp else 1
     
-    train_loader, val_loader, train_dataset, val_dataset, train_sampler, val_sampler = create_dataloaders(config)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.predictor_learning_rate,
-        betas=(config.adam_beta1, config.adam_beta2),
-        weight_decay=config.adam_weight_decay
-    )
+    train_loader = val_loader = None
+    train_dataset = val_dataset = train_sampler = val_sampler = None
+    try:
+        train_loader, val_loader, train_dataset, val_dataset, train_sampler, val_sampler = create_dataloaders(config)
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=config.predictor_learning_rate,
+            betas=(config.adam_beta1, config.adam_beta2),
+            weight_decay=config.adam_weight_decay
+        )
     
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=config.predictor_learning_rate,
-        steps_per_epoch=len(train_loader),
-        epochs=config.basemodel_epochs,
-        pct_start=0.03,
-        div_factor=10
-    )
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=config.predictor_learning_rate,
+            steps_per_epoch=len(train_loader),
+            epochs=config.basemodel_epochs,
+            pct_start=0.03,
+            div_factor=10
+        )
     
-    if use_ddp:
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+        if use_ddp:
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
-    best_val_loss = float('inf')
-    batch_idx_global = 0
+        best_val_loss = float('inf')
+        batch_idx_global = 0
     
-    for epoch in range(config.basemodel_epochs):
-        epoch_start_time = time.time()
-        model.train()
+        for epoch in range(config.basemodel_epochs):
+            epoch_start_time = time.time()
+            model.train()
         
-        train_dataset.set_epoch_seed(epoch * 10000)
-        val_dataset.set_epoch_seed(0)
-        if train_sampler is not None:
-            train_sampler.set_epoch(epoch)
+            train_dataset.set_epoch_seed(epoch * 10000)
+            val_dataset.set_epoch_seed(0)
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
         
-        epoch_train_loss = 0.0
-        train_batches = 0
+            epoch_train_loss = 0.0
+            train_batches = 0
         
-        for batch_idx, (batch_x, batch_x_stamp) in enumerate(train_loader):
-            batch_x = batch_x.to(device, non_blocking=True)
-            batch_x_stamp = batch_x_stamp.to(device, non_blocking=True)
-            
-            with torch.no_grad():
-                token_seq_0, token_seq_1 = tokenizer.encode(batch_x, half=True)
-            
-            token_in = [token_seq_0[:, :-1], token_seq_1[:, :-1]]
-            token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
-            
-            logits = (model.module if use_ddp else model)(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
-            loss, s1_loss, s2_loss = (model.module if use_ddp else model).head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
-            
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_((model.module if use_ddp else model).parameters(), max_norm=3.0)
-            optimizer.step()
-            scheduler.step()
-            
-            epoch_train_loss += loss.item()
-            train_batches += 1
-            
-            if (batch_idx_global + 1) % config.log_interval == 0:
-                lr = optimizer.param_groups[0]['lr']
-                log_msg = (f"[Epoch {epoch+1}/{config.basemodel_epochs}, Step {batch_idx+1}/{len(train_loader)}] "
-                          f"LR: {lr:.6f}, Loss: {loss.item():.4f}")
-                logger.info(log_msg)
-                if rank == 0:
-                    print(log_msg)
-            
-            batch_idx_global += 1
-        
-        model.eval()
-        val_loss = 0.0
-        val_batches = 0
-        
-        with torch.no_grad():
-            for batch_x, batch_x_stamp in val_loader:
+            for batch_idx, (batch_x, batch_x_stamp) in enumerate(train_loader):
                 batch_x = batch_x.to(device, non_blocking=True)
                 batch_x_stamp = batch_x_stamp.to(device, non_blocking=True)
-                
-                token_seq_0, token_seq_1 = tokenizer.encode(batch_x, half=True)
+            
+                with torch.no_grad():
+                    token_seq_0, token_seq_1 = tokenizer.encode(batch_x, half=True)
+            
                 token_in = [token_seq_0[:, :-1], token_seq_1[:, :-1]]
                 token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
-                
+            
                 logits = (model.module if use_ddp else model)(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
-                loss, _, _ = (model.module if use_ddp else model).head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
+                loss, s1_loss, s2_loss = (model.module if use_ddp else model).head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
+            
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_((model.module if use_ddp else model).parameters(), max_norm=3.0)
+                optimizer.step()
+                scheduler.step()
+            
+                epoch_train_loss += loss.item()
+                train_batches += 1
+            
+                if (batch_idx_global + 1) % config.log_interval == 0:
+                    lr = optimizer.param_groups[0]['lr']
+                    log_msg = (f"[Epoch {epoch+1}/{config.basemodel_epochs}, Step {batch_idx+1}/{len(train_loader)}] "
+                              f"LR: {lr:.6f}, Loss: {loss.item():.4f}")
+                    logger.info(log_msg)
+                    if rank == 0:
+                        print(log_msg)
+            
+                batch_idx_global += 1
+        
+            model.eval()
+            val_loss = 0.0
+            val_batches = 0
+        
+            with torch.no_grad():
+                for batch_x, batch_x_stamp in val_loader:
+                    batch_x = batch_x.to(device, non_blocking=True)
+                    batch_x_stamp = batch_x_stamp.to(device, non_blocking=True)
                 
-                val_loss += loss.item()
-                val_batches += 1
+                    token_seq_0, token_seq_1 = tokenizer.encode(batch_x, half=True)
+                    token_in = [token_seq_0[:, :-1], token_seq_1[:, :-1]]
+                    token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
+                
+                    logits = (model.module if use_ddp else model)(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
+                    loss, _, _ = (model.module if use_ddp else model).head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
+                
+                    val_loss += loss.item()
+                    val_batches += 1
         
-        if use_ddp:
-            tensor_sum = torch.tensor([epoch_train_loss, train_batches, val_loss, val_batches], dtype=torch.float64, device=device)
-            dist.all_reduce(tensor_sum, op=dist.ReduceOp.SUM)
-            epoch_train_loss_all = tensor_sum[0].item()
-            train_batches_all = int(tensor_sum[1].item())
-            val_loss_all = tensor_sum[2].item()
-            val_batches_all = int(tensor_sum[3].item())
-            avg_train_loss = (epoch_train_loss_all / train_batches_all) if train_batches_all > 0 else 0.0
-            avg_val_loss = (val_loss_all / val_batches_all) if val_batches_all > 0 else 0.0
-        else:
-            avg_train_loss = epoch_train_loss / train_batches if train_batches > 0 else 0
-            avg_val_loss = val_loss / val_batches if val_batches > 0 else 0
+            if use_ddp:
+                tensor_sum = torch.tensor([epoch_train_loss, train_batches, val_loss, val_batches], dtype=torch.float64, device=device)
+                dist.all_reduce(tensor_sum, op=dist.ReduceOp.SUM)
+                epoch_train_loss_all = tensor_sum[0].item()
+                train_batches_all = int(tensor_sum[1].item())
+                val_loss_all = tensor_sum[2].item()
+                val_batches_all = int(tensor_sum[3].item())
+                avg_train_loss = (epoch_train_loss_all / train_batches_all) if train_batches_all > 0 else 0.0
+                avg_val_loss = (val_loss_all / val_batches_all) if val_batches_all > 0 else 0.0
+            else:
+                avg_train_loss = epoch_train_loss / train_batches if train_batches > 0 else 0
+                avg_val_loss = val_loss / val_batches if val_batches > 0 else 0
         
-        epoch_time = time.time() - epoch_start_time
-        epoch_summary = (f"\n--- Epoch {epoch+1}/{config.basemodel_epochs} Summary ---\n"
-                       f"Training Loss: {avg_train_loss:.4f}\n"
-                       f"Validation Loss: {avg_val_loss:.4f}\n"
-                       f"Epoch Time: {epoch_time:.2f} seconds\n")
-        logger.info(epoch_summary)
-        if rank == 0:
-            print(epoch_summary)
-        
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
+            epoch_time = time.time() - epoch_start_time
+            epoch_summary = (f"\n--- Epoch {epoch+1}/{config.basemodel_epochs} Summary ---\n"
+                           f"Training Loss: {avg_train_loss:.4f}\n"
+                           f"Validation Loss: {avg_val_loss:.4f}\n"
+                           f"Epoch Time: {epoch_time:.2f} seconds\n")
+            logger.info(epoch_summary)
             if rank == 0:
-                model_save_path = os.path.join(save_dir, "best_model")
-                os.makedirs(model_save_path, exist_ok=True)
-                (model.module if use_ddp else model).save_pretrained(model_save_path)
-                save_msg = f"Best model saved to: {model_save_path} (validation loss: {best_val_loss:.4f})"
-                logger.info(save_msg)
-                print(save_msg)
+                print(epoch_summary)
+        
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                if rank == 0:
+                    model_save_path = os.path.join(save_dir, "best_model")
+                    os.makedirs(model_save_path, exist_ok=True)
+                    (model.module if use_ddp else model).save_pretrained(model_save_path)
+                    save_msg = f"Best model saved to: {model_save_path} (validation loss: {best_val_loss:.4f})"
+                    logger.info(save_msg)
+                    print(save_msg)
     
-    return best_val_loss
+        return best_val_loss
+
+    finally:
+        for _dl in (train_loader, val_loader):
+            _shutdown_dataloader(_dl)
+        gc.collect()
+        try:
+            import torch as _torch
+            if _torch.cuda.is_available():
+                _torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 
 def main():

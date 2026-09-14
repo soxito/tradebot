@@ -8,7 +8,57 @@ entries are grouped under `[Unreleased]` and dated milestone headings.
 
 ## [Unreleased]
 
-### Added — 2026-09-07
+### Added — 2026-09-14
+
+#### Local LLM fallback + self-training (Ollama × Soup)
+- **Offline AI resilience.** When every configured cloud provider is down, the
+  agent router (`AiMarketAnalyst` `db_chat`) now falls back to a local model
+  served by [Ollama](https://ollama.com) instead of degrading straight to the
+  heuristic analyser. New `backend/app/services/ollama_service.py` is the single
+  import site: a tier→model catalogue (`qwen2.5:0.5b` on minimal … `qwen2.5:14b`
+  on ultra), resource-aware model picker, chat (sync/async), model-pull, and a
+  `ollama create` bridge for imported GGUFs.
+- **Zero-touch setup in `start.py`.** `ensure_ollama()` (mirrors the Kronos/Soup
+  bootstrap pattern) auto-installs the Ollama binary (Homebrew / `install.sh` /
+  winget), runs an update check, ensures `ollama serve` is reachable, and pulls
+  the best model for the detected resource tier — walking the catalogue to a
+  smaller candidate if a pull fails. Every failure degrades gracefully and never
+  blocks startup. Opt-outs: `TRADEBOT_SKIP_OLLAMA_SETUP=1`,
+  `TRADEBOT_SKIP_OLLAMA_UPDATE=1`, `OLLAMA_MANAGED=1` to have start.py own serve.
+- **Scheduled self-training on your own data.** A new background loop
+  (`start_ollama_train_loop` in the scheduler, wired into
+  `workers/runtime.py` and registered with the task supervisor) periodically
+  fine-tunes `tradebot-local` from Brain episodes + executed trades. The
+  `SoupPlugin` bridge (`soup_ollama_bridge.py`) builds a ShareGPT dataset,
+  runs `soup train` → `soup export --gguf`, then `ollama create
+  tradebot-local:latest`, pruning old datasets. Tier-gated (medium+ by default;
+  `TRADEBOT_FORCE_OLLAMA_TRAIN=1` overrides), interval-scaled per hardware tier.
+- **Config + env.** New `OLLAMA_*` settings in `config.py`
+  (`OLLAMA_ENABLED`, `OLLAMA_URL`, `OLLAMA_MODEL`, `OLLAMA_FALLBACK_ENABLED`,
+  `OLLAMA_AUTO_PULL`, `OLLAMA_MANAGED`, `OLLAMA_TIMEOUT_MS`,
+  `AUTO_START_OLLAMA_TRAIN_LOOP`, `OLLAMA_TRAIN_INTERVAL_HOURS`,
+  `OLLAMA_MIN_SAMPLES_FOR_TRAIN`, `OLLAMA_KEEP_LAST_N`) documented in
+  `.env.example`; `resource_tier.py` gains `ollama_train`/`ollama_serve` task
+  policies.
+
+#### Soup LLM fine-tuning plugin
+- **`SoupPlugin` (`/api/v1/plugins/soup/*`, `/soup-finetune`).** Fine-tune any
+  Hugging Face causal LM in an isolated venv (`~/.tradebot/soup-venv`, never the
+  backend venv), auto-updated on each `start.py` like Kronos. Hardware-adaptive
+  recipe selection (4-bit + layer streaming on weak hosts, bf16 on 16GB+ VRAM),
+  a unified model catalogue, dataset upload, an experimental OHLCV→ShareGPT-JSONL
+  bridge, and the embedded Soup web UI proxied with auth so the token never
+  leaks. Optional Docker sidecar (`docker/Dockerfile.soup`, `soup_sidecar.py`).
+
+#### Chart-pattern detectors
+- **Classic price patterns** (`backend/app/signals/chart_patterns.py`): double /
+  triple tops & bottoms, head & shoulders (and inverse), rising/falling &
+  expanding wedges, flags, pennants, rectangles, and ascending/descending/
+  symmetrical/expanding triangles — each with volume confirmation and measured
+  targets, and each returning `None` unless criteria are cleanly met (an unnamed
+  pattern beats a wrong one).
+
+
 
 #### Kronos forecast — every asset class (forex, futures/indices, and shares)
 - **All forex pairs and crosses forecast off Swissquote.** The chart OHLCV

@@ -423,6 +423,23 @@ class BaseAgent:
                     _store_cached_decision(self.role, _sym, provider_decision)
                 return provider_decision
 
+        # ── Option B½: Ollama local LLM fallback (when providers are down/absent) ──
+        # Sits between the pool and the raw OPENAI_API_KEY / local hold so a
+        # machine with a pulled Ollama model keeps making model-backed decisions
+        # even with no cloud provider configured or when all are backing off.
+        if not pool_active or True:  # always try Ollama before raw key when enabled
+            try:
+                from app.services.ollama_service import is_fallback_enabled as _ollama_fallback
+
+                if _ollama_fallback():
+                    ollama_decision = await self._try_ollama_chat(context, memory_prompt)
+                    if ollama_decision is not None:
+                        if _sym:
+                            _store_cached_decision(self.role, _sym, ollama_decision)
+                        return ollama_decision
+            except Exception as _e:
+                logger.debug(f"[Agent:{self.name}] ollama fallback skipped: {_e}")
+
         # ── Option C: Fall back to the local OpenAI key ──
         # Only when the user has no connected providers at all. If the pool is
         # configured and simply didn't answer this turn, the raw key is not a
@@ -629,6 +646,63 @@ class BaseAgent:
         except Exception as e:
             logger.warning(f"[Agent:{self.name}] provider chat failed: {e}")
             return None, True
+
+    async def _try_ollama_chat(
+        self, context: Dict[str, Any], memory_prompt: str = ""
+    ) -> Optional[Dict[str, Any]]:
+        """Try the local Ollama model (single call, no pool)."""
+        try:
+            from app.services.ollama_service import ollama_available as _ollama_avail
+            from app.services.ollama_service import ollama_chat as _ollama_chat
+            from app.services.ollama_service import resolve_model as _ollama_model
+            from app.utils.headroom_compress import compress_messages as _compress
+        except Exception:
+            return None
+        if not await _ollama_avail(timeout=2.0):
+            return None
+        model = _ollama_model()
+        user_msg = self.build_user_prompt(context)
+        if memory_prompt:
+            user_msg += memory_prompt
+        # Reuse same budget floor as hosted calls so JSON doesn't truncate
+        budget = _budget_for(model, self.max_tokens)
+        try:
+            msgs = _compress(
+                [
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": user_msg},
+                ],
+                caller=self.name,
+            )
+        except Exception:
+            msgs = [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": user_msg},
+            ]
+        try:
+            res = await _ollama_chat(
+                messages=list(msgs),  # type: ignore[arg-type]
+                model=model,
+                temperature=self.temperature,
+                max_tokens=budget,
+                json_mode=True,
+            )
+            raw = res.get("content") or ""
+            decision = self.parse_response(raw)
+            decision.setdefault("agent_name", self.name)
+            decision.setdefault("agent_role", self.role)
+            decision["ai_called"] = True
+            decision["provider"] = "ollama"
+            decision["model_used"] = res.get("model") or model
+            decision["ollama"] = True
+            logger.info(
+                f"[Agent:{self.name}] (ollama={model}) → "
+                f"{decision.get('action', '?')} (confidence={decision.get('confidence', '?')})"
+            )
+            return decision
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[Agent:{self.name}] ollama chat failed: {exc}")
+            return None
 
     def _safe_hold(
         self,

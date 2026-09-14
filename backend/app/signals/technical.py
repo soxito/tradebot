@@ -1207,6 +1207,26 @@ def analyze(ohlcv: List[List], timeframe: str = "1h") -> Dict[str, Any]:
         logger.debug(f"zone_reaction evaluator skipped: {exc}")
         evaluators["zone_reaction"] = 0.0
 
+    # --- 14. Chart pattern confluence (flags, triangles, H&S, wedges, double top/bottom etc.) ---
+    # Uses the full chart_patterns engine; score in [-1,1] with volume/level awareness.
+    # Pending (unbroken) patterns contribute half weight — confirmed breakouts full.
+    chart_patterns_payload: Optional[Dict[str, Any]] = None
+    try:
+        from app.signals.chart_patterns import analyze_chart_patterns as _chart_pat
+        chart_patterns_payload = _chart_pat(df)
+        cp_score = float(chart_patterns_payload.get("score", 0.0))
+        evaluators["chart_pattern"] = max(-1.0, min(1.0, cp_score))
+        # surface top pattern names into reasons (limit 2 to keep reads concise)
+        for _pat in chart_patterns_payload.get("patterns", [])[:2]:
+            _kind = _pat.get("kind", "?")
+            _sig = _pat.get("signal", "?")
+            _conf = _pat.get("confidence", 0)
+            _brk = "broken" if _pat.get("broken") else "pending"
+            reasons.append(f"Chart { _kind } { _sig } { _brk } (conf { _conf:.2f})")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"chart_pattern evaluator skipped: {exc}")
+        evaluators["chart_pattern"] = 0.0
+
     # ── Weighted combination (direct convention: positive=buy) ───
     # Divergence signals get highest weights (most predictive for reversals).
     # Trend structure provides directional foundation.
@@ -1216,14 +1236,15 @@ def analyze(ohlcv: List[List], timeframe: str = "1h") -> Dict[str, Any]:
         "macd_divergence": 0.12,
         "macd": 0.08,
         "rsi": 0.08,
-        "bb": 0.07,
+        "bb": 0.05,
         "ma_cross": 0.08,
         "ema_cross": 0.06,
         "obv_trend": 0.08,
         "volume": 0.05,
         "adx": 0.07,
-        "stoch_rsi": 0.05,
+        "stoch_rsi": 0.03,
         "zone_reaction": 0.08,
+        "chart_pattern": 0.10,
     }
 
     weighted_sum = 0.0
@@ -1425,6 +1446,7 @@ def analyze(ohlcv: List[List], timeframe: str = "1h") -> Dict[str, Any]:
         "indicators": indicators,
         "evaluators": {k: round(v, 4) for k, v in evaluators.items()},
         "fib": fib,
+        "chart_patterns": chart_patterns_payload,
         "timeframe": timeframe,
         "candles_analyzed": len(df),
     }

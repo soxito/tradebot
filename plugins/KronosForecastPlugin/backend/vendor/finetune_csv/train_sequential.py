@@ -1,11 +1,59 @@
+import gc
 import os
+import platform
 import sys
 import time
+import atexit
+import warnings
 import argparse
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import torch.distributed as dist
+
+# ── Global leak-prevention: ensure spawn on macOS and final GC ───────
+# The 14 leaked semaphores come from DataLoader workers that weren't joined.
+# We enforce spawn (the only safe method on macOS) early, before any
+# DataLoader is instantiated, and register an atexit that forces a GC
+# collection so semaphores are unlinked before resource_tracker shuts down.
+try:
+    import multiprocessing as _mp
+    if platform.system() == "Darwin":
+        try:
+            _mp.set_start_method("spawn", force=False)
+        except RuntimeError:
+            pass
+except Exception:
+    pass
+
+def _final_cleanup():
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    try:
+        # Close any lingering log handlers so they don't keep refs to DataLoaders
+        import logging
+        for h in logging.getLogger().handlers[:]:
+            try:
+                h.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+atexit.register(_final_cleanup)
+
+# Make PyTorch sharing strategy less semaphore-hungry on macOS CPU
+try:
+    import torch.multiprocessing as _tmp
+    if platform.system() == "Darwin" and not torch.cuda.is_available():
+        try:
+            _tmp.set_sharing_strategy("file_system")
+        except Exception:
+            pass
+except Exception:
+    pass
 
 sys.path.append('../')
 from model import Kronos, KronosTokenizer, KronosPredictor
@@ -24,6 +72,12 @@ class SequentialTrainer:
         self.local_rank = int(os.environ.get("LOCAL_RANK", str(self.config.device_id if hasattr(self.config, 'device_id') else 0)))
         self.device = self._setup_device()
         
+        # Log the sanitized num_workers so the user sees the leak-free value
+        if self.rank == 0:
+            try:
+                print(f"[config] effective num_workers={self.config.num_workers} (sanitized for {platform.system()})")
+            except Exception:
+                pass
         self.config.print_config_summary()
     
     def _setup_device(self):
@@ -313,7 +367,19 @@ class SequentialTrainer:
             return False
         
         finally:
-            pass
+            # All DataLoader workers are already shut down inside
+            # train_tokenizer()/train_model() finally blocks; this is the
+            # last-chance GC so resource_tracker sees zero leaked semaphores
+            # even if a phase raised.
+            try:
+                gc.collect()
+            except Exception:
+                pass
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
 
 
 def main():

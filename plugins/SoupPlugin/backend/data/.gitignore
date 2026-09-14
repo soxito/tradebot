@@ -1,0 +1,8 @@
+# Soup training artefacts (never commit)
+soup/
+*.jsonl
+*.csv
+*.yaml
+*.log
+job*/
+output/

@@ -1,7 +1,7 @@
 ---
 type: voice-identity
-updated: 2026-09-14T08:01:22.076465+00:00
-sessions: 127
+updated: 2026-09-14T20:42:03.769271+00:00
+sessions: 164
 words_learned: 474
 tags:
   - jarvis
@@ -13,25 +13,25 @@ tags:
 
 > This note is the permanent voice memory for JARVIS.  It is **never deleted** — only improved over time as you speak.
 
-Updated: 2026-09-14 08:01 UTC  | Words learned: **474**  | Voice sessions: **127**
+Updated: 2026-09-14 20:42 UTC  | Words learned: **474**  | Voice sessions: **164**
 
 ## Voice Frequency Fingerprint
 | Band | Mean Energy | Std Dev |
 | ---- | ----------- | ------- |
-| <80Hz | 0.9998 | 0.0300 |
-| 80-160 | 0.1830 | 0.0530 |
-| 160-320 | 0.0725 | 0.0510 |
-| 320-640 | 0.0166 | 0.0360 |
-| 640Hz-1.3k | 0.0038 | 0.0304 |
-| 1.3-2.5k | 0.0004 | 0.0301 |
-| 2.5-5k | 0.0001 | 0.0300 |
+| <80Hz | 0.9990 | 0.0311 |
+| 80-160 | 0.3241 | 0.0726 |
+| 160-320 | 0.1246 | 0.0619 |
+| 320-640 | 0.0567 | 0.0500 |
+| 640Hz-1.3k | 0.0129 | 0.0325 |
+| 1.3-2.5k | 0.0020 | 0.0300 |
+| 2.5-5k | 0.0000 | 0.0300 |
 | 5-10k | 0.0000 | 0.0300 |
 | 10-16k | 0.0000 | 0.0300 |
 | 16-20k | 0.0000 | 0.0300 |
 | 20k+ | 0.0000 | 0.0300 |
 | ultra | 0.0000 | 0.0300 |
 
-Spectral centroid: **0.0179**  Sessions: **127**
+Spectral centroid: **0.0391**  Sessions: **164**
 
 ## Top Learned Words (speech vocabulary)
 

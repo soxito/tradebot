@@ -779,12 +779,52 @@ class AgentOrchestrator:
             logger.debug(f"[Orchestrator] cycle_analogs skipped for {symbol}: {exc}")
 
     @staticmethod
+    async def _add_chart_patterns(context: Dict[str, Any], symbol: str, timeframe: str, ohlcv: Optional[Sequence[Sequence[Any]]] = None) -> None:
+        """Chart patterns (flags, wedges, H&S, triangles, rectangles) as board evidence.
+
+        Uses chart_patterns.analyze_chart_patterns on the same window the board
+        draws (60-200 bars). Provides named levels + breakout state for the signal
+        seat's 'at a level' requirement.
+        """
+        try:
+            from app.signals.chart_patterns import analyze_chart_patterns
+            from app.signals.technical import ohlcv_to_dataframe
+            rows: Optional[Sequence[Any]] = ohlcv
+            if rows is None:
+                from app.services import candles as candle_resolver
+                rows = await candle_resolver.fetch(symbol, timeframe, limit=200)
+            if not rows or len(rows) < 40:
+                return
+            df = ohlcv_to_dataframe(list(rows))
+            if df.empty or len(df) < 40:
+                return
+            res = analyze_chart_patterns(df)
+            if not res.get("patterns"):
+                return
+            context["chart_patterns"] = res
+            # lean summary for prompts that cannot fit full pattern objects
+            best = res.get("best") or {}
+            context["chart_patterns_summary"] = {
+                "count": res.get("count", 0),
+                "best_kind": best.get("kind"),
+                "best_signal": best.get("signal"),
+                "best_confidence": best.get("confidence"),
+                "best_broken": best.get("broken"),
+                "has_bullish": res.get("has_bullish"),
+                "has_bearish": res.get("has_bearish"),
+                "score": res.get("score"),
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[Orchestrator] chart_patterns skipped for {symbol} {timeframe}: {exc}")
+
+    @staticmethod
     async def _add_pattern_signal(context: Dict[str, Any], symbol: str, timeframe: str) -> None:
         """Hammer / engulfing / morning_star etc as board evidence for signal focus.
 
         Runs candle_patterns.detect_patterns on the same window the desk sees
         (200 bars via market_data/candle_resolver). Counts drive signal_generator
-        to focus on that movement.
+        to focus on that movement. Covers the full expanded taxonomy (harami,
+        piercing, doji variants, three soldiers etc.).
         """
         try:
             from app.services import candles as candle_resolver
@@ -798,16 +838,23 @@ class AgentOrchestrator:
                 return
             # Last 20 bars are what matters for "now"
             recent = [e for e in events if e.get("index", 0) >= len(rows) - 20]
+            # also keep last 60 for triple patterns that span wider
+            recent60 = [e for e in events if e.get("index", 0) >= len(rows) - 60]
             counts: Dict[str, int] = {}
             for e in recent:
                 counts[e["name"]] = counts.get(e["name"], 0) + 1
+            # build a compact narrative sentence for prompts
+            recent_names = ", ".join(f"{k} x{v}" if v > 1 else k for k, v in counts.items()) or "none"
+            dir_hint = recent[-1]["direction"] if recent else "neutral"
             context["pattern_signal"] = {
                 "timeframe": timeframe,
                 "recent_count": len(recent),
+                "recent60_count": len(recent60),
                 "counts": counts,
                 "last": recent[-1]["name"] if recent else None,
-                "last_direction": recent[-1]["direction"] if recent else None,
-                "note": "Recent hammer/engulfing/morning_star on this TF — focus signal on this movement",
+                "last_direction": dir_hint,
+                "recent_summary": f"{recent_names} ({dir_hint}) on {timeframe} last 20 bars — 60-bar window {len(recent60)} patterns",
+                "note": f"Candle patterns {recent_names} ({dir_hint}) on {timeframe} — confirm with volume & price action before entry",
             }
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"[Orchestrator] pattern_signal skipped for {symbol} {timeframe}: {exc}")
@@ -1094,6 +1141,45 @@ class AgentOrchestrator:
                                 break
                 except Exception:
                     pass
+            # 3b) chart pattern levels (neckline, rectangle edges, flag/ wedge rails)
+            if not has_level and price is not None:
+                try:
+                    cpe = context.get("chart_patterns") or {}
+                    for pat in (cpe.get("patterns") or [])[:3]:
+                        for key in ("neckline", "top", "bottom", "flag_high", "flag_low", "upper_now", "lower_now"):
+                            lv = pat.get(key)
+                            try:
+                                lv_f = float(lv) if lv is not None else None
+                                if lv_f and abs(price - lv_f) <= tol:
+                                    has_level = True
+                                    level_desc = f"chart {pat.get('kind','?')} {key} {lv_f:.2f}"
+                                    level_price = lv_f
+                                    break
+                            except Exception:
+                                continue
+                        if has_level:
+                            break
+                        for pts_key in ("neckline_points", "peaks", "troughs"):
+                            pts = pat.get(pts_key)
+                            if isinstance(pts, list):
+                                for pt in pts:
+                                    if isinstance(pt, dict):
+                                        lv = pt.get("price")
+                                        try:
+                                            lv_f = float(lv) if lv is not None else None
+                                            if lv_f and abs(price - lv_f) <= tol:
+                                                has_level = True
+                                                level_desc = f"chart {pat.get('kind','?')} point {lv_f:.2f}"
+                                                level_price = lv_f
+                                                break
+                                        except Exception:
+                                            continue
+                                if has_level:
+                                    break
+                        if has_level:
+                            break
+                except Exception:
+                    pass
 
             # mid-range?
             bb = None
@@ -1200,6 +1286,7 @@ class AgentOrchestrator:
                     )
                     await AgentOrchestrator._add_structure(context, symbol, ohlcv, db)
                     AgentOrchestrator._add_momentum(context, ohlcv)
+                    await AgentOrchestrator._add_chart_patterns(context, symbol, timeframe, ohlcv)
                     AgentOrchestrator._label_technical(context)
                 else:
                     logger.warning(
@@ -1217,6 +1304,8 @@ class AgentOrchestrator:
             await AgentOrchestrator._add_cycle(context, symbol)
             await AgentOrchestrator._add_cycle_analogs(context, symbol)
             await AgentOrchestrator._add_pattern_signal(context, symbol, timeframe)
+            if "chart_patterns" not in context:
+                await AgentOrchestrator._add_chart_patterns(context, symbol, timeframe)
             await AgentOrchestrator._add_whales(context, symbol)
 
             # Sentiment stub (no exchange needed)
@@ -1273,6 +1362,7 @@ class AgentOrchestrator:
                 context["current_price"] = ohlcv[-1][4]
                 await AgentOrchestrator._add_structure(context, symbol, ohlcv, db)
                 AgentOrchestrator._add_momentum(context, ohlcv)
+                await AgentOrchestrator._add_chart_patterns(context, symbol, timeframe, ohlcv)
                 AgentOrchestrator._label_technical(context)
             else:
                 logger.warning(
@@ -1287,6 +1377,8 @@ class AgentOrchestrator:
         await AgentOrchestrator._add_cycle(context, symbol)
         await AgentOrchestrator._add_cycle_analogs(context, symbol)
         await AgentOrchestrator._add_pattern_signal(context, symbol, timeframe)
+        if "chart_patterns" not in context:
+            await AgentOrchestrator._add_chart_patterns(context, symbol, timeframe)
         await AgentOrchestrator._add_whales(context, symbol)
 
         # Sentiment (basic — detailed sentiment comes from the pipeline context)

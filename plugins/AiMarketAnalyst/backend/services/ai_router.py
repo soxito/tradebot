@@ -1363,6 +1363,35 @@ async def db_chat(
             )
             continue
 
+    # ── Ollama local fallback (after provider pool, before giving up) ──────────
+    # When every configured cloud provider is capped/backing-off, the Ollama
+    # local LLM is the next rung on the ladder rather than a blank hold.
+    # It is up to the caller to treat a hold from here as a real local read —
+    # the fallback is still a model, just not a hosted one.
+    if errors:
+        try:
+            from app.services.ollama_service import is_fallback_enabled as _ollama_fallback
+
+            if _ollama_fallback():
+                ollama_res = await _try_ollama_chat(
+                    messages=send_messages,
+                    temperature=temperature,
+                    max_tokens=call_max_tokens if json_mode and source == "agent" else max_tokens,
+                    json_mode=json_mode,
+                    orig_chars=orig_chars,
+                    comp_chars=comp_chars,
+                    agent_name=agent_name,
+                    agent_role=agent_role,
+                    source=source,
+                )
+                if ollama_res.get("ok"):
+                    return ollama_res
+                # keep provider errors + ollama error for final message
+                if ollama_res.get("error"):
+                    errors.append(f"ollama: {ollama_res['error']}")
+        except Exception as _e:
+            logger.debug(f"[ai_router] ollama fallback skipped: {_e}")
+
     return {"ok": False, "error": " | ".join(errors) or "All providers failed", "content": None}
 
 
@@ -1636,6 +1665,61 @@ def timeout_for_model(model: str | None, requested: float | None = None) -> floa
     if is_reasoning_model(model):
         return _SLOW_MODEL_TIMEOUT
     return _TIMEOUT
+
+
+# ── Ollama local fallback helper (used after provider pool exhausts) ─────────
+async def _try_ollama_chat(
+    *,
+    messages: list[dict[str, str]],
+    temperature: float,
+    max_tokens: int,
+    json_mode: bool,
+    orig_chars: int,
+    comp_chars: int,
+    agent_name: str | None,
+    agent_role: str | None,
+    source: str,
+) -> dict[str, Any]:
+    """Try the local Ollama model as fallback. Returns ai_router-shaped dict."""
+    try:
+        from app.services.ollama_service import ollama_chat as _ollama_chat
+        from app.services.ollama_service import ollama_available as _ollama_avail
+        from app.services.ollama_service import resolve_model as _ollama_model
+    except Exception as exc:  # pragma: no cover — import never fails in normal run
+        return {"ok": False, "error": f"ollama import failed: {exc}", "content": None}
+    if not await _ollama_avail(timeout=2.0):
+        return {"ok": False, "error": "ollama not reachable at OLLAMA_URL", "content": None}
+    model = _ollama_model()
+    try:
+        res = await _ollama_chat(
+            messages=messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            json_mode=json_mode,
+        )
+        content = res.get("content") or ""
+        if not content.strip():
+            return {"ok": False, "error": "ollama returned empty content", "content": None}
+        # Keep usage shape compatible (ollama doesn't report tokens the same way)
+        usage = {
+            "prompt_tokens": res.get("prompt_eval_count") or max(1, sum(len(m.get("content","")) for m in messages)//4),
+            "completion_tokens": res.get("eval_count") or max(1, len(content)//4),
+            "total_tokens": (res.get("prompt_eval_count") or 0) + (res.get("eval_count") or 0) or max(1, len(content)//4),
+        }
+        return {
+            "ok": True,
+            "content": content,
+            "provider": "ollama",
+            "model": model,
+            "routed_via": model,
+            "usage": usage,
+            "message": {"role": "assistant", "content": content},
+            "tool_calls": [],
+            "route_source": "ollama",
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)[:300], "content": None}
 
 
 # ── Conversational latency routing ───────────────────────────────────────────

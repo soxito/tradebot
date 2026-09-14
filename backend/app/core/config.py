@@ -325,6 +325,19 @@ class Settings(BaseSettings):
     # on a fast clock. Individual profiles are gated by their own enabled flag.
     COPY_WORKER_INTERVAL_SECONDS: int = 30
 
+    # ── Ollama local LLM (tier-aware, fallback for agents) ───────────────────
+    OLLAMA_ENABLED: bool = True
+    OLLAMA_URL: str = "http://127.0.0.1:11434"
+    OLLAMA_MODEL: str = ""  # empty = auto-pick by tier/RAM
+    OLLAMA_FALLBACK_ENABLED: bool = True
+    OLLAMA_AUTO_PULL: bool = True
+    OLLAMA_MANAGED: bool = False  # start.py spawns `ollama serve` if true
+    OLLAMA_TIMEOUT_MS: int = 15000
+    AUTO_START_OLLAMA_TRAIN_LOOP: bool = True
+    OLLAMA_TRAIN_INTERVAL_HOURS: int = 24
+    OLLAMA_MIN_SAMPLES_FOR_TRAIN: int = 200
+    OLLAMA_KEEP_LAST_N: int = 2
+
     # ── Resource tiering (env contract from start.py; .env still wins) ─────────
     # start.py derives these from the machine and injects them via setdefault, so
     # explicit .env values always take precedence. PERF_TIER is the resolved

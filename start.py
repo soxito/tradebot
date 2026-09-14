@@ -104,6 +104,29 @@ KRONOS_SETUP_ENABLED = os.environ.get("TRADEBOT_SKIP_KRONOS_SETUP", "").strip().
 # Opt-out of the per-run upstream update check with TRADEBOT_SKIP_KRONOS_UPDATE=1.
 KRONOS_UPDATE_ENABLED = os.environ.get("TRADEBOT_SKIP_KRONOS_UPDATE", "").strip().lower() not in ("1", "true", "yes", "on")
 
+# ── Soup LLM finetuning (MakazhanAlpamys/Soup) ──────────────────────────
+# Fine-tune & post-train LLMs in one command. Installed as isolated venv
+# at ~/.tradebot/soup-venv + repo clone at integrations/soup so it never
+# touches backend requirements. Auto-updates on every start like Kronos.
+SOUP_REPO_URL    = os.environ.get("SOUP_REPO_URL", "https://github.com/MakazhanAlpamys/Soup.git")
+SOUP_REPO_DIR    = (ROOT / "integrations" / "soup").resolve()
+SOUP_VERSION_FILE = (ROOT / "integrations" / "soup.version.json").resolve()
+SOUP_VENV_DIR    = Path(os.environ.get("SOUP_VENV_DIR", str(Path.home() / ".tradebot" / "soup-venv"))).expanduser().resolve()
+SOUP_VENV_BIN    = SOUP_VENV_DIR / _VENV_BIN
+SOUP_PY_BIN      = SOUP_VENV_BIN / f"python{_EXE}"
+SOUP_PIP_BIN     = SOUP_VENV_BIN / f"pip{_EXE}"
+SOUP_BIN         = SOUP_VENV_BIN / f"soup{_EXE}"
+# Soup UI (Gradio on 7860) + API/OpenAI-compatible serve (8012) — proxied by backend
+SOUP_UI_PORT     = int(os.environ.get("SOUP_UI_PORT", "7860"))
+SOUP_PORT        = int(os.environ.get("SOUP_PORT", "8012"))
+SOUP_PLUGIN_DIR  = (ROOT / "plugins" / "SoupPlugin").resolve()
+SOUP_SCRIPTS_DIR = SOUP_PLUGIN_DIR / "scripts"
+SOUP_SETUP_SH    = SOUP_SCRIPTS_DIR / "setup_soup.sh"
+SOUP_SETUP_PS1   = SOUP_SCRIPTS_DIR / "setup_soup.ps1"
+SOUP_SETUP_ENABLED = os.environ.get("TRADEBOT_SKIP_SOUP_SETUP", "").strip().lower() not in ("1", "true", "yes", "on")
+SOUP_UPDATE_ENABLED = os.environ.get("TRADEBOT_SKIP_SOUP_UPDATE", "").strip().lower() not in ("1", "true", "yes", "on")
+SOUP_MIN_PYTHON  = (3, 10)  # soup requires 3.10–3.12
+
 # ── Vibe-Trading plugin setup ─────────────────────────────────────────────────
 # HKUDS/Vibe-Trading — personal trading agent with backtesting, alpha zoo,
 # multi-agent swarms, and crypto data.  Installed as a PyPI package into the
@@ -177,6 +200,29 @@ NEURO_REPO_VERSION_FILE = (ROOT / "integrations" / "neuroglancer.version.json")
 NEURO_SETUP_ENABLED = os.environ.get("TRADEBOT_SKIP_NEURO_SETUP", "").strip().lower() not in ("1", "true", "yes", "on")
 NEURO_BRANCH = os.environ.get("NEURO_BRANCH", "master")
 
+# ── Ollama local LLM (tier-aware, fallback for agents + Soup training) ───────
+# Installed as system binary (brew/curl/winget) + models under ~/.ollama.
+# start.py ensures: binary present → service reachable → tier-appropriate model
+# pulled → auto-updates checked. Opt-out: TRADEBOT_SKIP_OLLAMA_SETUP=1.
+OLLAMA_PORT          = int(os.environ.get("OLLAMA_PORT", "11434"))
+OLLAMA_HOST          = os.environ.get("OLLAMA_HOST", "127.0.0.1")
+OLLAMA_URL           = os.environ.get("OLLAMA_URL", f"http://{OLLAMA_HOST}:{OLLAMA_PORT}").rstrip("/")
+OLLAMA_MODEL_ENV    = os.environ.get("OLLAMA_MODEL", "").strip()
+OLLAMA_SETUP_ENABLED = os.environ.get("TRADEBOT_SKIP_OLLAMA_SETUP", "").strip().lower() not in ("1", "true", "yes", "on")
+OLLAMA_UPDATE_ENABLED = os.environ.get("TRADEBOT_SKIP_OLLAMA_UPDATE", "").strip().lower() not in ("1", "true", "yes", "on")
+OLLAMA_AUTO_PULL     = os.environ.get("OLLAMA_AUTO_PULL", "1").strip().lower() not in ("0", "false", "no", "off")
+OLLAMA_MANAGED       = os.environ.get("OLLAMA_MANAGED", "0").strip().lower() in ("1", "true", "yes", "on")
+OLLAMA_FALLBACK_ENABLED = os.environ.get("OLLAMA_FALLBACK_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+# Catalogue must mirror backend/app/services/ollama_service.py:TIER_MODEL_CATALOGUE
+_OLLAMA_CATALOGUE: Dict[str, List[str]] = {
+    "ultra":  ["qwen2.5:14b", "llama3.1:8b", "gemma2:9b", "mistral:7b"],
+    "high":   ["llama3.1:8b", "qwen2.5:7b", "mistral:7b", "gemma2:9b"],
+    "medium": ["llama3.2:3b", "qwen2.5:3b", "phi3:mini", "qwen2.5:1.5b"],
+    "low":    ["qwen2.5:1.5b", "phi3:mini", "llama3.2:1b", "qwen2.5:0.5b"],
+    "minimal":["qwen2.5:0.5b", "llama3.2:1b", "phi3:mini"],
+}
+_TRADEBOT_LOCAL_MODEL = "tradebot-local:latest"
+
 # ── Ports ─────────────────────────────────────────────────────────────────────
 BACKEND_PORT       = int(os.environ.get("BACKEND_PORT", "1448"))
 FRONTEND_PORT      = int(os.environ.get("FRONTEND_PORT", "3000"))
@@ -202,6 +248,8 @@ SIDECARS: List[Dict[str, object]] = [
     {"key": "headroom",      "label": "Headroom proxy",     "port": HEADROOM_PORT,           "kind": "process", "tool": True,  "markers": ["headroom"]},
     {"key": "obsidian",      "label": "Obsidian app",       "port": None,                    "kind": "app",     "tool": True,  "markers": ["obsidian"]},
     {"key": "hermes",        "label": "Hermes gateway",     "port": HERMES_PORT,             "kind": "process", "tool": False, "markers": ["hermes_sidecar", "hermes-gateway"]},
+    {"key": "soup_ui",       "label": "Soup UI",            "port": SOUP_UI_PORT,            "kind": "process", "tool": False, "markers": ["soup", "gradio"]},
+    {"key": "soup",          "label": "Soup API",           "port": SOUP_PORT,               "kind": "process", "tool": False, "markers": ["soup.*serve", "soup-api"]},
     {"key": "speech_engine", "label": "Speech engine",      "port": SPEECH_ENGINE_PORT,      "kind": "process", "tool": False, "markers": ["speech_engine"]},
     {"key": "vibe_trading",  "label": "Vibe-Trading sidecar","port": VIBE_TRADING_SERVE_PORT, "kind": "process", "tool": False, "markers": ["vibe-trading", "vibe_trading"]},
     {"key": "agentmemory",   "label": "agentmemory server", "port": AGENTMEMORY_PORT,        "kind": "process", "tool": False, "markers": ["agentmemory"]},
@@ -610,6 +658,49 @@ def get_resources() -> Dict[str, object]:
     return _RESOURCES
 
 
+def _ollama_model_for_tier(tier: str, ram_gb: float) -> str:
+    """Best Ollama model for this tier/RAM (mirrors ollama_service catalogue)."""
+    if OLLAMA_MODEL_ENV:
+        return OLLAMA_MODEL_ENV
+    # Effective RAM with small VRAM bump — mirrors backend tier_for_ram()
+    vram = _ollama_detect_vram_gb()
+    effective = ram_gb + min(vram * 0.5, 8)
+    # Stricter thresholds than UI tier so a 16G machine doesn't get 14b
+    if effective >= 48:
+        tier_key = "ultra"
+    elif effective >= 24:
+        tier_key = "high"
+    elif effective >= 12:
+        tier_key = "medium"
+    elif effective >= 6:
+        tier_key = "low"
+    else:
+        tier_key = "minimal"
+    # If explicit UI tier is weaker than RAM tier, respect the weaker (user forced minimal)
+    ui_tier = str(tier).lower()
+    order = ["minimal", "low", "medium", "high", "ultra"]
+    try:
+        if order.index(ui_tier) < order.index(tier_key):
+            tier_key = ui_tier
+    except ValueError:
+        pass
+    cands = _OLLAMA_CATALOGUE.get(tier_key, _OLLAMA_CATALOGUE["medium"])
+    return cands[0]
+
+
+def _ollama_detect_vram_gb() -> float:
+    if shutil.which("nvidia-smi"):
+        try:
+            r = run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"])
+            if r.returncode == 0:
+                vals = [float(x.strip()) for x in r.stdout.splitlines() if x.strip().replace(".", "", 1).isdigit()]
+                if vals:
+                    return max(vals) / 1024.0
+        except Exception:
+            pass
+    return 0.0
+
+
 def print_resources() -> None:
     r = get_resources()
     header("System resources")
@@ -617,6 +708,14 @@ def print_resources() -> None:
     ok(f"RAM: {r['ram_gb']} GB")
     ok(f"Node heap: {r['node_heap_mb']} MB  ·  ML threads: {r['ml_threads']}  ·  UI tier: {str(r['ui_tier']).upper()}")
     ok(f"Backend workers: {r['backend_workers']}  ·  DB pool: {r['db_pool_size']}  ·  Poll×{r['poll_multiplier']}")
+    # Ollama tier model recommendation
+    try:
+        _olm = _ollama_model_for_tier(str(r.get("ui_tier", "high")), float(r.get("ram_gb", 8)))
+        info(f"Ollama model for this tier: {_olm}  (override with OLLAMA_MODEL=...)")
+        if OLLAMA_MANAGED:
+            info("Ollama managed mode: start.py will spawn `ollama serve`")
+    except Exception:
+        pass
     if r.get("disable_3d"):
         info("Low-power GPU profile: 3D/WebGL effects disabled (robot · orb · 3D graph)")
     if not r.get("enable_charts"):
@@ -674,6 +773,11 @@ def simulate_pc_models() -> None:
     sep()
     print(f"\n  {C.CYAN}Override:  TRADEBOT_PROFILE=minimal|low|medium|high|ultra{C.RESET}")
     print(f"  {C.CYAN}Example:   TRADEBOT_PROFILE=low python3 start.py{C.RESET}")
+    # append Ollama column
+    try:
+        _olm_all = {k: v[0] for k, v in _OLLAMA_CATALOGUE.items()}
+    except Exception:
+        _olm_all = {}
     detected = detect_resources()
     print()
     info(f"This machine → {detected['physical']}c/{detected['ram_gb']}GB → "
@@ -682,6 +786,17 @@ def simulate_pc_models() -> None:
          f"threads {detected['ml_threads']}, "
          f"poll×{detected['poll_multiplier']}, "
          f"workers {detected['backend_workers']}")
+    # also show Ollama recommended model in simulate table header footer
+    try:
+        header("Ollama tier → model (Q4 default, ⊆ catalogue)")
+        for tk in ["minimal", "low", "medium", "high", "ultra"]:
+            cand = _OLLAMA_CATALOGUE.get(tk, ["?"])[0]
+            print(f"  {tk:<8} → {cand}")
+        print(f"  Override: OLLAMA_MODEL=qwen2.5:7b  (takes precedence)")
+        print(f"  Fallback: OLLAMA_FALLBACK_ENABLED=1 (agents use Ollama when providers down)")
+        print(f"  Training: via Soup (schedule {int(os.environ.get('OLLAMA_TRAIN_INTERVAL_HOURS', '24'))}h) → tradebot-local:latest")
+    except Exception:
+        pass
 
 _MT5_URL_RAW = _DOTENV.get("MT5_API_URL", os.environ.get("MT5_API_URL", "")) or ""
 # Guard: an empty / schemeless MT5_API_URL (e.g. MT5_API_URL= in .env) causes
@@ -1024,7 +1139,7 @@ def free_ports_for_startup(
     # ── Pass 2: free every required port by owner ────────────────────────────
     if ports is None:
         ports = [
-            HEADROOM_PORT, HERMES_PORT, SPEECH_ENGINE_PORT, VIBE_TRADING_SERVE_PORT,
+            HEADROOM_PORT, HERMES_PORT, SOUP_UI_PORT, SOUP_PORT, SPEECH_ENGINE_PORT, VIBE_TRADING_SERVE_PORT,
             AGENTMEMORY_PORT, OPENMANUS_MCP_PORT, OPENWA_API_PORT,
             OPENWA_DASHBOARD_PORT, BACKEND_PORT, FRONTEND_PORT,
         ]
@@ -3912,6 +4027,578 @@ def ensure_kronos_finetune() -> bool:
     return True
 
 
+def _soup_repo_version() -> Dict[str, object]:
+    """Best-effort Soup repo version from integrations/soup git metadata."""
+    if not SOUP_REPO_DIR.exists():
+        return {"cloned": False, "commit": None, "branch": None, "remote": SOUP_REPO_URL, "last_pull": None, "version_file": str(SOUP_VERSION_FILE)}
+    try:
+        r = subprocess.run(["git", "-C", str(SOUP_REPO_DIR), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5)
+        commit = r.stdout.strip()[:12] if r.returncode == 0 else None
+        r2 = subprocess.run(["git", "-C", str(SOUP_REPO_DIR), "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, timeout=5)
+        branch = r2.stdout.strip() if r2.returncode == 0 else None
+        last_pull: Optional[str] = None
+        if SOUP_VERSION_FILE.exists():
+            try:
+                last_pull = json.loads(SOUP_VERSION_FILE.read_text()).get("last_pull") or json.loads(SOUP_VERSION_FILE.read_text()).get("installed_at")
+            except Exception:
+                pass
+        # pip version if installed
+        pkg_version: Optional[str] = None
+        try:
+            if SOUP_PIP_BIN.exists():
+                rr = subprocess.run([str(SOUP_PY_BIN), "-c", "import importlib.metadata as m; print(m.version('soup-cli'))"], capture_output=True, text=True, timeout=5)
+                if rr.returncode == 0:
+                    pkg_version = rr.stdout.strip()
+        except Exception:
+            pass
+        soup_bin_exists = SOUP_BIN.exists() or (SOUP_VENV_BIN / "soup").exists()
+        return {"cloned": True, "commit": commit, "branch": branch, "remote": SOUP_REPO_URL, "last_pull": last_pull, "pkg_version": pkg_version, "soup_bin": str(SOUP_BIN) if soup_bin_exists else None, "path": str(SOUP_REPO_DIR), "venv": str(SOUP_VENV_DIR)}
+    except Exception:
+        return {"cloned": True, "commit": None, "branch": None, "remote": SOUP_REPO_URL, "last_pull": None, "path": str(SOUP_REPO_DIR)}
+
+def _soup_recommend_resources() -> Dict[str, object]:
+    """Hardware-aware Soup training recommendation (best quality for this RAM/VRAM).
+    Uses get_resources() + VRAM probe via torch/nvidia-smi. Returns dict with
+    quantization, stream_layers, batch_size, lora_r, use_mlx, reason."""
+    r = get_resources()
+    ram_gb = float(r.get("ram_gb", 8) or 8)
+    # VRAM probe: prefer torch.cuda, fallback to nvidia-smi, fallback to RAM heuristic
+    vram_gb: Optional[float] = None
+    try:
+        import subprocess as _sp
+        # Try via soup venv python if available
+        if SOUP_PY_BIN.exists():
+            rr = _sp.run([str(SOUP_PY_BIN), "-c", "import torch; print(torch.cuda.get_device_properties(0).total_memory // 1024 // 1024 // 1024) if torch.cuda.is_available() else print('')"], capture_output=True, text=True, timeout=5)
+            if rr.returncode == 0 and rr.stdout.strip().isdigit():
+                vram_gb = float(rr.stdout.strip())
+        # fallback: backend venv torch
+        if vram_gb is None and PY_BIN.exists():
+            rr2 = _sp.run([str(PY_BIN), "-c", "import torch; print(torch.cuda.get_device_properties(0).total_memory // 1024 // 1024 // 1024) if torch.cuda.is_available() else print('')"], capture_output=True, text=True, timeout=5)
+            if rr2.returncode == 0 and rr2.stdout.strip().isdigit():
+                vram_gb = float(rr2.stdout.strip())
+        # fallback: nvidia-smi
+        if vram_gb is None and shutil.which("nvidia-smi"):
+            rr3 = _sp.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5)
+            if rr3.returncode == 0:
+                try:
+                    vram_gb = float(rr3.stdout.splitlines()[0].strip()) / 1024
+                except Exception:
+                    pass
+        # Apple unified memory: treat as <= RAM, prefer mlx path
+    except Exception:
+        vram_gb = None
+    # Decision matrix — whatever makes finetune BEST for this hardware
+    # (see plan 6.4: auto tune)
+    is_apple_silicon = platform.system().lower() == "darwin" and platform.machine().lower() in ("arm64", "aarch64")
+    if vram_gb is not None and vram_gb < 6:
+        rec = {"quantization": "4bit", "stream_layers": True, "batch_size": "auto", "lora_r": 64, "use_mlx": False, "reason": f"low VRAM {vram_gb:.0f}GB → QLoRA+stream_layers (8B on 4GB path)"}
+    elif vram_gb is not None and vram_gb < 16:
+        rec = {"quantization": "4bit", "stream_layers": False, "batch_size": "auto", "lora_r": 64, "use_mlx": False, "reason": f"{vram_gb:.0f}GB VRAM → QLoRA"}
+    elif vram_gb is not None and vram_gb >= 16:
+        rec = {"quantization": None, "stream_layers": False, "batch_size": 8, "lora_r": 64, "use_mlx": False, "reason": f"{vram_gb:.0f}GB VRAM → bf16 full"}
+    elif is_apple_silicon:
+        # Unified memory path: if RAM >=32 use mlx acceleration, else quantized
+        if ram_gb >= 32:
+            rec = {"quantization": None, "stream_layers": False, "batch_size": 4, "lora_r": 32, "use_mlx": True, "reason": f"Apple Silicon {ram_gb:.0f}GB → MLX accelerated"}
+        elif ram_gb >= 16:
+            rec = {"quantization": "4bit", "stream_layers": True, "batch_size": "auto", "lora_r": 32, "use_mlx": True, "reason": f"Apple Silicon {ram_gb:.0f}GB → QLoRA+MLX+stream_layers"}
+        else:
+            rec = {"quantization": "4bit", "stream_layers": True, "batch_size": "auto", "lora_r": 32, "use_mlx": True, "reason": f"Apple Silicon {ram_gb:.0f}GB → QLoRA+stream_layers"}
+    else:
+        # Generic RAM-based heuristic
+        if ram_gb <= 8:
+            rec = {"quantization": "4bit", "stream_layers": True, "batch_size": "auto", "lora_r": 32, "use_mlx": False, "reason": f"{ram_gb:.0f}GB RAM → QLoRA+stream_layers (best for weak host)"}
+        elif ram_gb <= 16:
+            rec = {"quantization": "4bit", "stream_layers": False, "batch_size": "auto", "lora_r": 64, "use_mlx": False, "reason": f"{ram_gb:.0f}GB RAM → QLoRA"}
+        else:
+            rec = {"quantization": None, "stream_layers": False, "batch_size": 8, "lora_r": 64, "use_mlx": False, "reason": f"{ram_gb:.0f}GB RAM → bf16"}
+    rec["vram_gb"] = vram_gb
+    rec["ram_gb"] = ram_gb
+    return rec
+
+def _soup_ensure_repo() -> bool:
+    """Ensure integrations/soup exists and is up-to-date. Always best-effort."""
+    if not shutil.which("git"):
+        warn("Soup: git not found — cannot clone/update Soup repo (manual: git clone https://github.com/MakazhanAlpamys/Soup.git integrations/soup)")
+        return False
+    if not SOUP_REPO_DIR.exists():
+        SOUP_REPO_DIR.parent.mkdir(parents=True, exist_ok=True)
+        info(f"Cloning Soup repo → {SOUP_REPO_DIR} …")
+        clone_cmd = ["git", "clone", "--depth=1", SOUP_REPO_URL, str(SOUP_REPO_DIR)]
+        ok_run, err = _spinner_run(clone_cmd, "Soup clone", cwd=str(ROOT), timeout=120)
+        if not ok_run or not (SOUP_REPO_DIR / ".git").exists():
+            warn(f"Soup clone failed ({(err or '')[:160]}). Backend will use stub.")
+            return False
+        try:
+            v = _soup_repo_version()
+            SOUP_VERSION_FILE.write_text(json.dumps({**v, "last_pull": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, indent=2))
+        except Exception:
+            pass
+        ok(f"Soup repo cloned ✓  ({SOUP_REPO_URL})")
+        return True
+    # Already cloned → pull updates (best-effort, never blocks startup long)
+    try:
+        info("Checking Soup repo for updates …")
+        fetch = subprocess.run(["git", "-C", str(SOUP_REPO_DIR), "fetch", "--depth=1", "origin"], capture_output=True, text=True, timeout=30)
+        if fetch.returncode == 0:
+            behind = subprocess.run(["git", "-C", str(SOUP_REPO_DIR), "rev-list", "HEAD..FETCH_HEAD", "--count"], capture_output=True, text=True, timeout=10)
+            count = int(behind.stdout.strip()) if behind.returncode == 0 and behind.stdout.strip().isdigit() else 0
+            if count > 0:
+                info(f"Soup repo has {count} new commit(s) — pulling …")
+                # Shallow clone (depth 1) can't fast-forward via pull; reset to FETCH_HEAD instead
+                pull = subprocess.run(["git", "-C", str(SOUP_REPO_DIR), "reset", "--hard", "FETCH_HEAD"], capture_output=True, text=True, timeout=60)
+                if pull.returncode == 0:
+                    ok(f"Soup repo updated ✓  ({count} commit(s) pulled)")
+                else:
+                    # fallback to pull --ff-only for non-shallow
+                    pull2 = subprocess.run(["git", "-C", str(SOUP_REPO_DIR), "pull", "--ff-only"], capture_output=True, text=True, timeout=60)
+                    if pull2.returncode == 0:
+                        ok(f"Soup repo updated ✓  ({count} commit(s) pulled)")
+                    else:
+                        warn(f"Soup pull failed ({(pull.stderr or pull2.stderr or '')[:120]}). Using existing checkout.")
+            else:
+                ok("Soup repo up-to-date ✓")
+        else:
+            info("Soup repo: offline or fetch skipped — using existing checkout")
+    except Exception as ex:
+        warn(f"Soup repo update check skipped ({ex}) — using existing checkout")
+    try:
+        v = _soup_repo_version()
+        SOUP_VERSION_FILE.write_text(json.dumps({**v, "last_pull": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, indent=2))
+    except Exception:
+        pass
+    return True
+
+def _soup_ensure_venv() -> bool:
+    """Ensure Soup isolated venv + soup-cli installed. Best-effort."""
+    # Check Python version constraint (3.10–3.12)
+    is_ok = sys.version_info.minor >= 10 and sys.version_info.minor <= 12
+    # Use dedicated venv python if exists, else pick best python
+    venv_py = SOUP_PY_BIN
+    venv_exists = venv_py.exists()
+    if venv_exists:
+        # Check installed
+        check = subprocess.run([str(venv_py), "-c", "import importlib.metadata as m; m.version('soup-cli'); print('ok')"], capture_output=True, text=True, timeout=8)
+        if check.returncode == 0:
+            return True
+        # pip drift → reinstall
+    # Need to run setup script
+    if not SOUP_SCRIPTS_DIR.exists():
+        warn("Soup scripts not found — skipping venv ensure")
+        return False
+    if IS_WINDOWS:
+        if not SOUP_SETUP_PS1.exists():
+            warn("setup_soup.ps1 not found — skipping Soup venv setup")
+            return False
+        pwsh = shutil.which("pwsh") or shutil.which("powershell")
+        if not pwsh:
+            warn("PowerShell not found — run setup_soup.ps1 manually")
+            return False
+        cmd = [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SOUP_SETUP_PS1)]
+    else:
+        if not SOUP_SETUP_SH.exists():
+            warn("setup_soup.sh not found — skipping Soup venv setup")
+            return False
+        bash = shutil.which("bash") or "/bin/bash"
+        cmd = [bash, str(SOUP_SETUP_SH)]
+    info("Setting up Soup (one-time: isolates venv + installs soup-cli) — may take minutes …")
+    ok_run, err = _spinner_run(cmd, "Soup setup", cwd=str(ROOT), timeout=1800)
+    # Verify
+    if SOUP_BIN.exists() or (SOUP_VENV_BIN / "soup").exists():
+        ok("Soup installed ✓  (soup-cli ready)")
+        return True
+    if ok_run:
+        # Script succeeded but binary alternative name?
+        if (SOUP_VENV_BIN / "soup-cli").exists():
+            ok("Soup installed ✓  (soup-cli)")
+            return True
+    if err:
+        warn(f"Soup setup output: {err[:200]}")
+    warn("Soup setup did not complete — Soup Lab will show install banner (run plugins/SoupPlugin/scripts/setup_soup.sh)")
+    return False
+
+def _soup_ensure_ui_token() -> str:
+    """Return stable SOUP_UI_TOKEN, generating and persisting it if missing."""
+    import secrets
+    # Prefer env, then .env file, then generate
+    tok = (_DOTENV.get("SOUP_UI_TOKEN", "").strip() or os.environ.get("SOUP_UI_TOKEN", "").strip())
+    if tok and len(tok) >= 16:
+        return tok
+    # Check .env file directly (may have been written after _DOTENV load)
+    try:
+        env_path = ROOT / ".env"
+        if env_path.exists():
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                if line.strip().startswith("SOUP_UI_TOKEN="):
+                    v = line.strip().partition("=")[2].strip()
+                    if v and len(v) >= 16:
+                        return v
+    except Exception:
+        pass
+    tok = secrets.token_urlsafe(32)
+    try:
+        wrote = _write_env_var("SOUP_UI_TOKEN", tok)
+        if wrote:
+            _DOTENV["SOUP_UI_TOKEN"] = tok
+            os.environ["SOUP_UI_TOKEN"] = tok
+            ok("Soup .env ← SOUP_UI_TOKEN generated (stable proxy token)")
+    except Exception:
+        pass
+    return tok
+
+def _soup_start_ui() -> bool:
+    """Start Soup UI on SOUP_UI_PORT as detached daemon (proxied auth). Best-effort."""
+    # Already running?
+    if port_open("127.0.0.1", SOUP_UI_PORT, 0.5):
+        ok(f"Soup UI already running on :{SOUP_UI_PORT} ✓  (http://127.0.0.1:{SOUP_UI_PORT} → proxied at /api/v1/plugins/soup/ui/proxy)")
+        return True
+    # Resolve soup binary (mirrors soup_utils.soup_bin_path but without import cycle)
+    _soup_bin = None
+    for _cand in (SOUP_BIN, SOUP_VENV_BIN / "soup", SOUP_VENV_BIN / "soup-cli"):
+        if _cand.exists():
+            _soup_bin = str(_cand)
+            break
+    if not _soup_bin:
+        _soup_bin = shutil.which("soup")
+    soup_bin = _soup_bin
+    if not soup_bin or not Path(soup_bin).exists():
+        warn("Soup UI not started — soup binary not found (run setup_soup.sh)")
+        return False
+    # Also need venv python to be 3.11/3.12; but soup_bin already validates
+    tok = _soup_ensure_ui_token()
+    log_path = ROOT / "soup-ui.log"
+    # Build command with stable token so proxy can forward Bearer header
+    cmd = [str(soup_bin), "ui", "--host", "127.0.0.1", "--port", str(SOUP_UI_PORT), "--no-browser", "--auth-token", tok]
+    info(f"Starting Soup UI on :{SOUP_UI_PORT} (proxied at /api/v1/plugins/soup/ui/proxy) …")
+    try:
+        with open(log_path, "ab") as lf:
+            if IS_WINDOWS:
+                DETACHED = 0x00000008
+                CREATE_NEW_PROCESS_GROUP = 0x00000200
+                subprocess.Popen(cmd, env={**os.environ, "SOUP_UI_TOKEN": tok}, stdout=lf, stderr=subprocess.STDOUT, creationflags=DETACHED | CREATE_NEW_PROCESS_GROUP, cwd=str(ROOT))
+            else:
+                subprocess.Popen(cmd, env={**os.environ, "SOUP_UI_TOKEN": tok}, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True, cwd=str(ROOT))
+    except Exception as ex:
+        warn(f"Soup UI failed to launch: {ex} — see {log_path.name}")
+        return False
+    # Wait up to 20s for port to open (UI takes ~3-6s)
+    for _ in range(20):
+        time.sleep(1)
+        if port_open("127.0.0.1", SOUP_UI_PORT, 0.5):
+            ok(f"Soup UI ready on :{SOUP_UI_PORT} ✓  (token proxied, dashboard at http://127.0.0.1:{SOUP_UI_PORT} + /soup-finetune)")
+            # Also confirm proxy health is now reachable (best-effort)
+            time.sleep(1)
+            ph = http_json(f"http://127.0.0.1:{SOUP_UI_PORT}/", timeout=3)
+            # Even if ph is None (HTML not JSON), port_open success is enough
+            return True
+    warn(f"Soup UI didn't bind to :{SOUP_UI_PORT} within 20s — check {log_path.name} (may still be booting; proxy will return 502 until ready)")
+    return False
+
+def _soup_start_api_health() -> bool:
+    """Ensure :8012 health shim is running (so /health never 502 when no model is serving).
+    Uses the lightweight docker/soup_sidecar.py shim if soup serve is not active."""
+    if port_open("127.0.0.1", SOUP_PORT, 0.5):
+        ok(f"Soup API already running on :{SOUP_PORT} ✓")
+        return True
+    # If a real `soup serve` is already handling :8012, port would be open. Otherwise start shim.
+    sidecar = ROOT / "docker" / "soup_sidecar.py"
+    if not sidecar.exists():
+        info("Soup API shim not found — skipping :8012 health (serve will bind it when needed)")
+        return True
+    # Prefer soup venv python, else backend venv
+    py = str(SOUP_PY_BIN) if SOUP_PY_BIN.exists() else (str(PY_BIN) if PY_BIN.exists() else "python3")
+    log_path = ROOT / "soup-api.log"
+    info(f"Starting Soup API health shim on :{SOUP_PORT} …")
+    try:
+        with open(log_path, "ab") as lf:
+            cmd = [py, str(sidecar)]
+            env = {**os.environ, "SOUP_PORT": str(SOUP_PORT), "SOUP_UI_PORT": str(SOUP_UI_PORT), "SOUP_REPO_DIR": str(SOUP_REPO_DIR)}
+            if IS_WINDOWS:
+                DETACHED = 0x00000008
+                CREATE_NEW_PROCESS_GROUP = 0x00000200
+                subprocess.Popen(cmd, env=env, stdout=lf, stderr=subprocess.STDOUT, creationflags=DETACHED | CREATE_NEW_PROCESS_GROUP, cwd=str(ROOT))
+            else:
+                subprocess.Popen(cmd, env=env, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True, cwd=str(ROOT))
+    except Exception as ex:
+        warn(f"Soup API shim failed to launch: {ex}")
+        return False
+    for _ in range(10):
+        time.sleep(1)
+        if port_open("127.0.0.1", SOUP_PORT, 0.5):
+            ok(f"Soup API health shim ready on :{SOUP_PORT} ✓  (real `soup serve` will take over when training serves)")
+            return True
+    warn(f"Soup API shim didn't bind to :{SOUP_PORT} within 10s — check {log_path.name}")
+    return False
+
+def ensure_soup() -> bool:
+    """Ensure Soup repo + venv are ready and auto-updated. Best-effort, never blocks startup.
+    Mirrors ensure_kronos_model() pattern: clone → venv → update-check → record version → start UI/API."""
+    if not SOUP_SETUP_ENABLED:
+        warn("Soup setup skipped (TRADEBOT_SKIP_SOUP_SETUP set) — Soup Lab uses stub")
+        return True
+    # 1) Repo: clone if missing, auto-pull every start if enabled
+    if SOUP_UPDATE_ENABLED:
+        _soup_ensure_repo()
+    else:
+        if not SOUP_REPO_DIR.exists():
+            _soup_ensure_repo()
+        else:
+            ok("Soup repo already cloned — update check skipped (TRADEBOT_SKIP_SOUP_UPDATE=1)")
+    # 2) Venv + pip
+    _soup_ensure_venv()
+    # 3) Ensure .env defaults (only add missing)
+    env_path = ROOT / ".env"
+    if env_path.exists():
+        try:
+            txt = env_path.read_text(encoding="utf-8")
+            missing: List[str] = []
+            if "SOUP_ENABLED" not in txt:
+                missing.append("SOUP_ENABLED=true")
+            if "SOUP_UI_PORT" not in txt:
+                missing.append(f"SOUP_UI_PORT={SOUP_UI_PORT}")
+            if "SOUP_PORT" not in txt:
+                missing.append(f"SOUP_PORT={SOUP_PORT}")
+            if "SOUP_SERVICE_URL" not in txt:
+                missing.append(f"SOUP_SERVICE_URL=http://127.0.0.1:{SOUP_PORT}")
+            if "SOUP_VENV_DIR" not in txt:
+                missing.append(f"SOUP_VENV_DIR={SOUP_VENV_DIR}")
+            if missing:
+                with open(env_path, "a", encoding="utf-8") as f:
+                    f.write("\n# Soup auto-configured by start.py\n" + "\n".join(missing) + "\n")
+                ok(f"Soup .env configured ✓  (added {', '.join(k.split('=')[0] for k in missing)})")
+        except Exception:
+            pass
+    # Ensure stable UI token exists for proxied auth
+    _soup_ensure_ui_token()
+    # 4) Report version
+    ver = _soup_repo_version()
+    if ver.get("cloned"):
+        commit = ver.get("commit") or "unknown"
+        branch = ver.get("branch") or "main"
+        pkg = ver.get("pkg_version") or "?"
+        rec = _soup_recommend_resources()
+        ok(f"Soup ready ✓  {commit} on {branch}  (soup-cli {pkg}) — {rec.get('reason')}")
+    else:
+        info("Soup repo not cloned — run plugins/SoupPlugin/scripts/setup_soup.sh")
+    # 5) Report resource-adaptive config
+    try:
+        rec = _soup_recommend_resources()
+        info(f"Soup training recommendation: {rec.get('reason')} → quantization={rec.get('quantization') or 'bf16'}, stream_layers={rec.get('stream_layers')}, batch={rec.get('batch_size')}")
+    except Exception:
+        pass
+    # 6) Start UI + API health shim (so proxy never 502 after boot)
+    _soup_start_ui()
+    _soup_start_api_health()
+    return True
+
+def _ollama_binary() -> Optional[str]:
+    return shutil.which("ollama")
+
+
+def _ollama_is_running() -> bool:
+    return port_open(OLLAMA_HOST, OLLAMA_PORT, timeout=1.0)
+
+
+def _ollama_tags() -> List[str]:
+    try:
+        url = f"{OLLAMA_URL}/api/tags"
+        with urllib.request.urlopen(url, timeout=3) as resp:  # noqa: S310 — localhost only
+            data = json.loads(resp.read().decode())
+            return [m.get("name", "") for m in (data.get("models") or []) if m.get("name")]
+    except Exception:
+        return []
+
+
+def _ollama_pull_model(model: str) -> bool:
+    ollama_bin = _ollama_binary()
+    if not ollama_bin:
+        warn(f"Ollama binary not found — cannot pull {model}")
+        return False
+    # Prefer CLI pull (handles streaming + progress) over HTTP
+    info(f"Pulling Ollama model {model} … (this may take a few minutes on first run)")
+    try:
+        r = subprocess.run([ollama_bin, "pull", model], timeout=1800)
+        ok_pull = r.returncode == 0
+        if ok_pull:
+            ok(f"Ollama model {model} ready ✓")
+        else:
+            warn(f"ollama pull {model} failed (exit {r.returncode}) — agents will fall back to next candidate")
+        return ok_pull
+    except subprocess.TimeoutExpired:
+        warn(f"ollama pull {model} timed out after 30m — check network and `ollama list`")
+        return False
+    except Exception as exc:
+        warn(f"ollama pull {model} exception: {exc}")
+        return False
+
+
+def _ollama_ensure_serve() -> bool:
+    """Ensure `ollama serve` is reachable. If OLLAMA_MANAGED, spawn it detached."""
+    if _ollama_is_running():
+        ok(f"Ollama reachable on {OLLAMA_HOST}:{OLLAMA_PORT} ✓")
+        return True
+    if not OLLAMA_MANAGED:
+        info(f"Ollama not reachable at {OLLAMA_URL} — OLLAMA_MANAGED=0 so not auto-starting "
+             "(start it with `ollama serve` or set OLLAMA_MANAGED=1)")
+        return False
+    ollama_bin = _ollama_binary()
+    if not ollama_bin:
+        warn("OLLAMA_MANAGED=1 but ollama binary not found — cannot start serve")
+        return False
+    log_path = ROOT / "ollama.log"
+    info(f"Starting `ollama serve` in background (log: {log_path.name}) …")
+    try:
+        kwargs: Dict[str, object] = {
+            "cwd": str(ROOT),
+            "stdout": open(log_path, "a"),
+            "stderr": subprocess.STDOUT,
+        }
+        if IS_WINDOWS:
+            kwargs["creationflags"] = 0x00000008 | 0x00000200  # type: ignore
+            subprocess.Popen([ollama_bin, "serve"], **kwargs)  # type: ignore[arg-type]
+        else:
+            subprocess.Popen([ollama_bin, "serve"], start_new_session=True, **kwargs)  # type: ignore[arg-type]
+    except Exception as exc:
+        warn(f"Could not start ollama serve: {exc}")
+        return False
+    # Wait briefly for it to bind
+    for _ in range(12):
+        time.sleep(1)
+        if _ollama_is_running():
+            ok("Ollama `serve` started and reachable ✓")
+            return True
+    warn(f"Ollama serve didn't bind to :{OLLAMA_PORT} within 12s — check {log_path}")
+    return False
+
+
+def _ollama_install_if_missing() -> bool:
+    """Best-effort install of the ollama binary (brew/curl/winget). Returns True if present afterwards."""
+    if _ollama_binary():
+        return True
+    info("Ollama not found — attempting to install …")
+    system = platform.system().lower()
+    try:
+        if system == "darwin" and shutil.which("brew"):
+            r = subprocess.run([shutil.which("brew"), "install", "ollama"], timeout=600)  # type: ignore
+            if r.returncode == 0 and _ollama_binary():
+                ok("Ollama installed via Homebrew ✓")
+                return True
+            warn("brew install ollama did not yield a binary — try `brew install ollama` manually")
+        elif system == "linux":
+            # Official install script (POSIX)
+            r = subprocess.run(["sh", "-c", "curl -fsSL https://ollama.com/install.sh | sh"], timeout=600)
+            if r.returncode == 0 and _ollama_binary():
+                ok("Ollama installed via install.sh ✓")
+                return True
+            warn("ollama install.sh failed — see https://ollama.com for manual install")
+        elif system == "windows":
+            if shutil.which("winget"):
+                r = subprocess.run(["winget", "install", "-e", "--id", "Ollama.Ollama", "--silent", "--accept-package-agreements"], timeout=600)
+                if r.returncode == 0:
+                    ok("Ollama installed via winget ✓ (may need new shell for PATH)")
+                    _augment_path()
+                    return bool(_ollama_binary())
+            warn("Install Ollama manually on Windows: https://ollama.com/download → OllamaSetup.exe")
+        else:
+            warn(f"Don't know how to auto-install Ollama on {system} — see https://ollama.com")
+    except subprocess.TimeoutExpired:
+        warn("Ollama install timed out — install manually: https://ollama.com")
+    except Exception as exc:
+        warn(f"Ollama install exception: {exc}")
+    return bool(_ollama_binary())
+
+
+def _ollama_update_check() -> None:
+    """If OLLAMA_UPDATE_ENABLED, check `ollama --version` and brew upgrade when stale (macOS). Best-effort only."""
+    if not OLLAMA_UPDATE_ENABLED:
+        return
+    ollama_bin = _ollama_binary()
+    if not ollama_bin:
+        return
+    try:
+        r = subprocess.run([ollama_bin, "--version"], capture_output=True, text=True, timeout=5)
+        ver = (r.stdout or r.stderr or "").strip()
+        if ver:
+            info(f"Ollama version: {ver}")
+    except Exception:
+        pass
+    # On macOS with brew, try `brew upgrade ollama` as background best-effort so users stay current
+    if platform.system().lower() == "darwin" and shutil.which("brew"):
+        try:
+            # Don't block: spawn detached upgrade, but log outcome when it finishes is not needed
+            subprocess.Popen(
+                [shutil.which("brew"), "upgrade", "ollama"],  # type: ignore
+                stdout=open(ROOT / "ollama.log", "a"),
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            info("Ollama update check: `brew upgrade ollama` running in background")
+        except Exception:
+            pass
+
+
+def ensure_ollama() -> bool:
+    """Ensure Ollama is installed, reachable, and a tier-appropriate model is pulled.
+
+    Mirrors ensure_kronos_model / ensure_soup pattern: clone/pull analogue for LLMs.
+    Never blocks startup — every failure degrades to providers/local_analysis fallback.
+    Opt-out: TRADEBOT_SKIP_OLLAMA_SETUP=1.
+    """
+    if not OLLAMA_SETUP_ENABLED:
+        warn("Ollama setup skipped (TRADEBOT_SKIP_OLLAMA_SETUP set) — fallback to providers only")
+        return True
+    # 1) Binary present?
+    if not _ollama_install_if_missing():
+        warn("Ollama not installed — agents will use providers first, then local heuristic (install: https://ollama.com)")
+        return True
+    # 2) Update check
+    _ollama_update_check()
+    # 3) Check disk headroom before pulling large models (warn if <10 GB free on ROOT)
+    try:
+        import shutil as _sh
+        free_gb = _sh.disk_usage(ROOT).free / (1024**3)
+        if free_gb < 10:
+            warn(f"Low disk space ({free_gb:.1f} GB free) — Ollama model pull may fail; free space or set OLLAMA_MODEL to a smaller tag")
+    except Exception:
+        pass
+    # 4) Serve reachable?
+    _ollama_ensure_serve()
+    if not _ollama_is_running():
+        warn(f"Ollama not reachable at {OLLAMA_URL} — pull skipped (agents fall back to providers)")
+        return True
+    # 5) Preferred model (tier-aware, plus tradebot-local if fine-tuned)
+    res = get_resources()
+    preferred = _ollama_model_for_tier(str(res.get("ui_tier", "high")), float(res.get("ram_gb", 8)))
+    models = _ollama_tags()
+    if any(m.startswith("tradebot-local") for m in models):
+        ok("Fine-tuned tradebot-local model present — agents will prefer it when providers are down")
+        # Still ensure catalogue base is present as fallback for fresh cache
+    # 6) Ensure catalogue / preferred model present (auto-pull)
+    if not OLLAMA_AUTO_PULL:
+        info(f"Ollama auto-pull disabled (OLLAMA_AUTO_PULL=0) — preferred {preferred} will be pulled on first agent fallback if missing")
+        return True
+    # If tradebot-local exists, prefer it as default; else preferred catalogue
+    default_model = _TRADEBOT_LOCAL_MODEL if any(m.startswith("tradebot-local") for m in models) else preferred
+    # If already cached, nothing to do
+    if default_model in models or any(default_model.split(":")[0] == m.split(":")[0] for m in models):
+        ok(f"Ollama model {default_model} cached ✓ (fallback ready)")
+        return True
+    # Need to pull — walk catalogue for tier until one succeeds (weak machines avoid 14b retry)
+    tier_key = str(res.get("ui_tier", "high")).lower()
+    cands = _OLLAMA_CATALOGUE.get(tier_key, _OLLAMA_CATALOGUE["medium"])
+    # Start with preferred, then fall back through tier candidates
+    to_try = [preferred] + [c for c in cands if c != preferred]
+    for cand in to_try:
+        if cand in models:
+            ok(f"Ollama model {cand} already cached ✓")
+            return True
+        if _ollama_pull_model(cand):
+            return True
+        # pull failed — try next smaller candidate
+    warn("No Ollama model could be pulled — agents fall back to providers → local heuristic until network recovers")
+    return True
+
+
 def ensure_vibe_trading() -> bool:
     """Install vibe-trading-ai into the backend venv (one-time, cross-platform),
     then start `vibe-trading serve --port VIBE_TRADING_SERVE_PORT` as a
@@ -5223,6 +5910,24 @@ def warmup_kronos_and_openhuman() -> None:
     else:
         info("Vibe-Trading plugin loaded — sidecar starts on first request")
 
+    # Soup LLM finetuning — report repo + install status
+    sj = http_json(f"{base}/plugins/soup/status", timeout=10)
+    if sj is not None:
+        if sj.get("installed") and sj.get("repo_cloned"):
+            ver = sj.get("version") or {}
+            pkg = ver.get("pkg_version") or "?"
+            commit = (ver.get("commit") or "")[:7]
+            rec = sj.get("recommendation") or {}
+            ok(f"Soup ready — soup-cli {pkg} @ {commit} · {rec.get('reason','')} (trysoup.dev)")
+            if sj.get("update_available"):
+                warn(f"Soup update available: {ver.get('commit','')[:7]} → {sj.get('remote_commit','')[:7]} — restart will pull")
+        elif sj.get("repo_cloned"):
+            warn("Soup repo cloned but venv not ready — run plugins/SoupPlugin/scripts/setup_soup.sh")
+        else:
+            warn("Soup not installed — run plugins/SoupPlugin/scripts/setup_soup.sh (or next start.py will clone)")
+    else:
+        info("Soup plugin loaded — will be available after backend fully warms")
+
 
 def start_backend(pg_port: int, redis_port: int, mode: str) -> bool:
     if port_open("localhost", BACKEND_PORT, 0.5):
@@ -5301,6 +6006,22 @@ def start_backend(pg_port: int, redis_port: int, mode: str) -> bool:
     # autostart flags and concurrency caps all scale together. .env / shell still
     # win via setdefault, and TRADEBOT_PROFILE (if the user pinned one) is passed
     # through so both sides resolve the identical tier.
+    # ── Ollama local LLM contract (backend reads OLLAMA_* for tier fallback + training) ──
+    env.setdefault("OLLAMA_ENABLED", "true" if OLLAMA_SETUP_ENABLED else "false")
+    env.setdefault("OLLAMA_URL", OLLAMA_URL)
+    if OLLAMA_MODEL_ENV:
+        env.setdefault("OLLAMA_MODEL", OLLAMA_MODEL_ENV)
+    else:
+        # tier-aware default so backend falls back to the same model start.py just pulled
+        env.setdefault("OLLAMA_MODEL", _ollama_model_for_tier(str(_res["ui_tier"]), float(_res["ram_gb"])))
+    env.setdefault("OLLAMA_FALLBACK_ENABLED", "true" if OLLAMA_FALLBACK_ENABLED else "false")
+    env.setdefault("OLLAMA_AUTO_PULL", "true" if OLLAMA_AUTO_PULL else "false")
+    env.setdefault("OLLAMA_MANAGED", "true" if OLLAMA_MANAGED else "false")
+    env.setdefault("OLLAMA_TIMEOUT_MS", "15000")
+    env.setdefault("OLLAMA_TRAIN_INTERVAL_HOURS", os.environ.get("OLLAMA_TRAIN_INTERVAL_HOURS", "24"))
+    env.setdefault("OLLAMA_MIN_SAMPLES_FOR_TRAIN", os.environ.get("OLLAMA_MIN_SAMPLES_FOR_TRAIN", "200"))
+    env.setdefault("OLLAMA_KEEP_LAST_N", os.environ.get("OLLAMA_KEEP_LAST_N", "2"))
+
     env.setdefault("TRADEBOT_TIER", str(_res["ui_tier"]))
     _tier_profile = os.environ.get("TRADEBOT_PROFILE", "").strip()
     if _tier_profile:
@@ -5543,7 +6264,7 @@ def stop_all(keep_tools: bool = False, hard: bool = False) -> None:
     if hard:
         warn("--hard: sweeping all known ports")
         _sweep_ports([
-            HEADROOM_PORT, HERMES_PORT, SPEECH_ENGINE_PORT, VIBE_TRADING_SERVE_PORT,
+            HEADROOM_PORT, HERMES_PORT, SOUP_UI_PORT, SOUP_PORT, SPEECH_ENGINE_PORT, VIBE_TRADING_SERVE_PORT,
             AGENTMEMORY_PORT, OPENMANUS_MCP_PORT, OPENWA_API_PORT,
             OPENWA_DASHBOARD_PORT, BACKEND_PORT, FRONTEND_PORT,
         ])
@@ -5559,6 +6280,8 @@ def status() -> None:
     checks = [
         ("Headroom proxy", "127.0.0.1", HEADROOM_PORT),
         ("Hermes gateway", "127.0.0.1", HERMES_PORT),
+        ("Soup UI", "127.0.0.1", SOUP_UI_PORT),
+        ("Soup API", "127.0.0.1", SOUP_PORT),
         ("PostgreSQL (brew)", "localhost", 5434),
         ("PostgreSQL (docker)", "localhost", 5433),
         ("Redis (brew)", "localhost", 6379),
@@ -5601,6 +6324,27 @@ def status() -> None:
     else:
         # Fallback when backend not yet up — already shown via port check above, skip duplicate.
         pass
+
+    # Soup API health (best-effort; backend must be up)
+    sj = http_json(f"http://127.0.0.1:{BACKEND_PORT}/api/v1/plugins/soup/status", timeout=10)
+    if sj is not None:
+        soup_inst = bool(sj.get("installed") or sj.get("repo_cloned"))
+        soup_bin = bool(sj.get("soup_bin_exists") or sj.get("installed"))
+        ver = sj.get("version") or {}
+        commit = (ver.get("commit") or "")[:7]
+        sym2 = f"{C.GREEN}●{C.RESET}" if soup_inst and soup_bin else f"{C.YELLOW}○{C.RESET}"
+        state2 = f"installed {commit} · {sj.get('recommendation',{}).get('reason','')}" if soup_inst else "not installed — run setup_soup.sh"
+        print(f"  {sym2}  {'Soup API':<26}  {'-':>5}  {state2}")
+        # Check for updates
+        remote = sj.get("remote_commit")
+        local = (ver.get("commit") or "")
+        if remote and local and remote[:7] != local[:7]:
+            print(f"  {C.YELLOW}!{C.RESET}  Soup update available: {local[:7]} → {remote[:7]} — restart will pull")
+    else:
+        if not port_open("127.0.0.1", BACKEND_PORT, 0.5):
+            pass
+        else:
+            print(f"  {C.YELLOW}○{C.RESET}  {'Soup API':<26}  {'-':>5}  backend not ready yet")
 
 
 
@@ -5718,6 +6462,7 @@ def print_sox_banner(mode: str, pg_port: int, redis_port: int) -> None:
     print(row("MT5 REST", MT5_API_URL, CY))
     print(row("HEADROOM", f"{HEADROOM_URL}/dashboard", CY))
     print(row("HERMES", f"http://localhost:{HERMES_PORT}  ·  /hermes  ·  SOUL merged", CY))
+    print(row("SOUP UI", f"http://localhost:{SOUP_UI_PORT}  ·  /soup-finetune  ·  API :{SOUP_PORT}", CY))
     print(row("OPENAWA", f"{OPENWA_DASHBOARD_URL}/dashboard", CY))
     print(line("╚", "═", "╝"))
     # ── Hermes explicit started line (requested) ───────────────────────────
@@ -5940,6 +6685,11 @@ def main() -> None:
     ensure_kronos_model()
     # Kronos fine-tuning pipeline — one-time vendoring of finetune_csv/ trainers.
     ensure_kronos_finetune()
+    # Soup LLM fine-tuning — clone + isolated venv + auto-update every start.
+    # Best-effort: never blocks startup; shows banner in Soup Lab if missing.
+    header("3a/6  Soup LLM finetuning")
+    soup_ok = ensure_soup()
+    results["Soup"] = soup_ok
 
     # Vibe-Trading AI — install vibe-trading-ai into backend venv (one-time).
     # Sidecar auto-starts lazily on first API request to /plugins/vibe-trading/*.
@@ -5973,6 +6723,16 @@ def main() -> None:
     else:
         info(f"OpenManus skipped (host RAM < {_SIDECAR_MIN_RAM_GB}GB; "
              "set TRADEBOT_ENABLE_OPENMANUS=1 to force)")
+
+    # Ollama local LLM — install/serve + tier-appropriate model (fallback when providers down)
+    # Best-effort: never blocks startup; agents fall back to providers → heuristic if missing.
+    header("3a½/6  Ollama local LLM")
+    try:
+        ollama_ok = ensure_ollama()
+    except Exception as _e:
+        warn(f"Ollama setup encountered an error (non-blocking): {_e}")
+        ollama_ok = True
+    results["Ollama"] = bool(ollama_ok)
 
     # Neuro core brain — google/neuroglancer, federates every other brain.
     header("3b/6  Neuro core brain")

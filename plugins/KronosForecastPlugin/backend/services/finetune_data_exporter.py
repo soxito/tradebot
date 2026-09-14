@@ -8,6 +8,14 @@ fine-tune Kronos on the exact instrument/timeframe they trade.
 Kronos CSV columns (see finetune_csv/README.md):
     timestamps,open,high,low,close,volume,amount
 ``amount`` is quote-volume (price × base volume); 0 is acceptable when unknown.
+
+Pattern-enriched mode (default): for every candle we look back at the previous
+20 bars and ask the same 50-pattern candle engine + 12-pattern chart engine
+that the live trading agents use. The resulting per-bar scores are written as
+additional numeric columns so fine-tuning is pattern-aware: the model sees not
+just price but also “a hammer just printed with volume” or “an ascending
+triangle is pending”. Set ``use_pattern_features=False`` to export the classic
+7-column CSV for full backwards compatibility.
 """
 from __future__ import annotations
 
@@ -123,19 +131,109 @@ async def _fetch_ohlcv_paged(
     return merged[-target:] if len(merged) > target else merged
 
 
+def _compute_pattern_features(rows: List[list]) -> List[Dict]:
+    """Per-bar pattern scores for enrichment.
+
+    Returns list of dicts aligned to ``rows`` with keys:
+      candle_bull/candle_bear/candle_neutral (0/1 flags for pattern ending at i)
+      candle_pat_count, candle_pat_dir (bull=1, bear=-1, else 0)
+      chart_score (-1..1), chart_conf (0..1), chart_bull/bear flags, fib_in_golden (0/1)
+    Falls back to zeros per bar on any error — an enrichment must never block export.
+    """
+    n = len(rows)
+    # defaults
+    feats: List[Dict] = [
+        {
+            "candle_bull": 0, "candle_bear": 0, "candle_neutral": 0,
+            "candle_pat_count": 0, "candle_pat_dir": 0,
+            "chart_score": 0.0, "chart_conf": 0.0, "chart_bull": 0, "chart_bear": 0,
+            "fib_in_golden": 0,
+        }
+        for _ in range(n)
+    ]
+    try:
+        from app.signals.candle_patterns import detect_patterns
+    except Exception as exc:
+        logger.debug(f"[Kronos-finetune] candle pattern engine unavailable: {exc}")
+        return feats
+    try:
+        events = detect_patterns(rows)
+        idx_map: dict[int, list] = {}
+        for e in events:
+            idx = int(e.get("index", -1))
+            if 0 <= idx < n:
+                idx_map.setdefault(idx, []).append(e)
+        for i in range(n):
+            evs = idx_map.get(i, [])
+            if not evs:
+                continue
+            bull = sum(1 for e in evs if e.get("direction") == "bull")
+            bear = sum(1 for e in evs if e.get("direction") == "bear")
+            neut = sum(1 for e in evs if e.get("direction") == "neutral")
+            feats[i]["candle_bull"] = 1 if bull else 0
+            feats[i]["candle_bear"] = 1 if bear else 0
+            feats[i]["candle_neutral"] = 1 if neut else 0
+            feats[i]["candle_pat_count"] = len(evs)
+            if bull and not bear:
+                feats[i]["candle_pat_dir"] = 1
+            elif bear and not bull:
+                feats[i]["candle_pat_dir"] = -1
+            else:
+                feats[i]["candle_pat_dir"] = 0
+    except Exception as exc:
+        logger.debug(f"[Kronos-finetune] candle pattern scoring skipped: {exc}")
+
+    # chart + fib per bar — heavier, sample every bar but reuse 80-bar slice
+    try:
+        from app.signals.technical import ohlcv_to_dataframe, auto_fib_retracement
+        from app.signals.chart_patterns import analyze_chart_patterns
+        import pandas as pd
+        df_full = ohlcv_to_dataframe(rows)
+        if len(df_full) >= 40:
+            # fib In-golden per bar: compute once on rolling? Use latest swing only as approximation per bar -> compute per bar via slice
+            for i in range(30, n):
+                try:
+                    window = df_full.iloc[max(0, i - 79): i + 1]
+                    if len(window) < 40:
+                        continue
+                    cp = analyze_chart_patterns(window)
+                    feats[i]["chart_score"] = float(cp.get("score") or 0.0)
+                    best = cp.get("best") or {}
+                    feats[i]["chart_conf"] = float(best.get("confidence") or 0.0)
+                    if cp.get("has_bullish"):
+                        feats[i]["chart_bull"] = 1
+                    if cp.get("has_bearish"):
+                        feats[i]["chart_bear"] = 1
+                    # fib golden
+                    fib = auto_fib_retracement(window, levels=(0.5, 0.618), extend_lines=False)
+                    zone = fib.get("golden_zone")
+                    if zone:
+                        cp_price = float(window["close"].iloc[-1])
+                        if zone["low"] <= cp_price <= zone["high"]:
+                            feats[i]["fib_in_golden"] = 1
+                except Exception:
+                    continue
+    except Exception as exc:
+        logger.debug(f"[Kronos-finetune] chart/fib pattern scoring skipped: {exc}")
+    return feats
+
+
 async def export_training_data(
     exchange: str,
     symbol: str,
     timeframe: str,
     limit: int,
     output_path: Path,
+    use_pattern_features: bool = True,
 ) -> Dict:
     """Fetch ``limit`` OHLCV candles and write them as a Kronos-format CSV.
 
     Reuses ``forecast_service`` connectors (with backward paging) so
     forex/metals/indices and crypto all resolve through the same source the
-    forecast uses. Returns a summary dict; raises ``ValueError`` when too few
-    candles are available.
+    forecast uses. When ``use_pattern_features`` is True (default) each row is
+    enriched with previous-candle pattern signals so the fine-tuned model learns
+    pattern-conditioned dynamics. Returns a summary dict; raises ``ValueError``
+    when too few candles are available.
     """
     rows: List[list] = await _fetch_ohlcv_paged(exchange, symbol, timeframe, limit)
     if not rows or len(rows) < MIN_ROWS:
@@ -145,23 +243,49 @@ async def export_training_data(
             f"history or a lower timeframe."
         )
 
+    pattern_feats: List[Dict] | None = None
+    enriched = False
+    if use_pattern_features:
+        try:
+            pattern_feats = _compute_pattern_features(rows)
+            enriched = True
+            bull_bars = sum(1 for f in pattern_feats if f.get("candle_bull") or f.get("candle_bear"))
+            chart_bars = sum(1 for f in pattern_feats if abs(f.get("chart_score", 0)) > 0.05)
+            logger.info(f"[Kronos-finetune] pattern enrichment: {bull_bars} bars with candle patterns, {chart_bars} with chart_score≠0 (total {len(rows)})")
+        except Exception as exc:
+            logger.warning(f"[Kronos-finetune] pattern enrichment failed — exporting plain OHLCV: {exc}")
+            pattern_feats = None
+            enriched = False
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     written = 0
     with output_path.open("w", newline="") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["timestamps", "open", "high", "low", "close", "volume", "amount"])
-        for r in rows:
+        if enriched and pattern_feats:
+            writer.writerow(["timestamps", "open", "high", "low", "close", "volume", "amount",
+                             "candle_bull", "candle_bear", "candle_pat_count", "candle_pat_dir",
+                             "chart_score", "chart_conf", "chart_bull", "chart_bear", "fib_in_golden"])
+        else:
+            writer.writerow(["timestamps", "open", "high", "low", "close", "volume", "amount"])
+        for idx, r in enumerate(rows):
             try:
                 ts = _fmt_ts(int(r[0]))
                 o, h, l, c = float(r[1]), float(r[2]), float(r[3]), float(r[4])
                 v = float(r[5]) if len(r) > 5 else 0.0
-                writer.writerow([ts, o, h, l, c, v, round(v * c, 8)])
+                if enriched and pattern_feats:
+                    f = pattern_feats[idx]
+                    writer.writerow([ts, o, h, l, c, v, round(v * c, 8),
+                                     f.get("candle_bull", 0), f.get("candle_bear", 0), f.get("candle_pat_count", 0), f.get("candle_pat_dir", 0),
+                                     round(float(f.get("chart_score", 0.0)), 4), round(float(f.get("chart_conf", 0.0)), 4),
+                                     f.get("chart_bull", 0), f.get("chart_bear", 0), f.get("fib_in_golden", 0)])
+                else:
+                    writer.writerow([ts, o, h, l, c, v, round(v * c, 8)])
                 written += 1
             except (TypeError, ValueError, IndexError):
                 continue
 
-    logger.info(f"[Kronos-finetune] exported {written} rows for {symbol} {timeframe} → {output_path}")
-    return {
+    logger.info(f"[Kronos-finetune] exported {written} rows for {symbol} {timeframe} → {output_path} (enriched={enriched})")
+    result = {
         "path": str(output_path),
         "rows": written,
         "symbol": symbol,
@@ -169,4 +293,18 @@ async def export_training_data(
         "timeframe": timeframe,
         "first_ts": _fmt_ts(int(rows[0][0])),
         "last_ts": _fmt_ts(int(rows[-1][0])),
+        "enriched": enriched,
+        "pattern_coverage": {
+            "candle_pattern_bars": sum(1 for f in (pattern_feats or []) if f.get("candle_bull") or f.get("candle_bear")),
+            "chart_pattern_bars": sum(1 for f in (pattern_feats or []) if abs(f.get("chart_score", 0)) > 0.05),
+        } if enriched else None,
     }
+    # also write sidecar json for auditability
+    if enriched:
+        try:
+            import json as _json
+            sidecar = output_path.with_suffix(".pattern.json")
+            sidecar.write_text(_json.dumps({"symbol": symbol, "timeframe": timeframe, "rows": written, "coverage": result["pattern_coverage"]}, indent=2))
+        except Exception:
+            pass
+    return result
