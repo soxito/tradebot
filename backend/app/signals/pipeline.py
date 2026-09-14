@@ -184,7 +184,12 @@ async def analyze_multi_timeframe(symbol: str, primary_timeframe: str = "1h") ->
         try:
             limit = 200 if tf in ("5m", "15m") else 200
             ohlcv = await cached_get_ohlcv(symbol=symbol, timeframe=tf, limit=limit)
-            ta = technical_analyze(ohlcv, tf)
+            # Offload pandas/numpy TA off event loop (plan §5)
+            try:
+                from app.core.offload import run_cpu
+                ta = await run_cpu(technical_analyze, ohlcv, tf, name=f"ta:{symbol}:{tf}")
+            except Exception:
+                ta = technical_analyze(ohlcv, tf)
             if "error" in ta:
                 errors.append(f"{tf}: {ta['error']}")
                 return
@@ -345,6 +350,7 @@ def compute_final_signal(
     strategy_scores: Optional[List[Dict]] = None,
     priority_pine_score: Optional[Dict] = None,
     fib_confluence: Optional[Dict] = None,
+    chart_pattern_confluence: Optional[Dict] = None,
 ) -> Dict[str, Any]:
     """
     Combine TA + Sentiment + Strategy scores into final signal decision.
@@ -365,6 +371,9 @@ def compute_final_signal(
     auto_fib_retracement()/fib_confluence_score() (technical.py). Additive and
     conditional — omitting it (default None) leaves this function's behavior
     unchanged for existing callers.
+    chart_pattern_confluence: optional {"score": float (-1..1), "confidence":
+    float, "count": int, "has_bilateral": bool} from chart_patterns
+    analyze_chart_patterns(). Additive ~12% weight when broken, half when pending.
     """
     ta_score = ta_data["ta_score"]
     ta_confidence = ta_data["ta_confidence"]
@@ -447,6 +456,28 @@ def compute_final_signal(
             reasons.append(f"Fib golden-zone confluence conflicts → -{fib_penalty:.3f}")
         else:
             reasons.append("Price outside fib golden zone — no confluence adjustment")
+
+    # ── Chart Pattern Confluence (~12% weight, volume-aware) ──
+    # Pending (unbroken) patterns contribute half; bilateral pending scores 0 until breakout.
+    if chart_pattern_confluence and chart_pattern_confluence.get("score") is not None:
+        cp_score = float(chart_pattern_confluence.get("score") or 0.0)
+        cp_conf = float(chart_pattern_confluence.get("confidence") or 0.5)
+        cp_count = int(chart_pattern_confluence.get("count") or 0)
+        cp_broken = bool(chart_pattern_confluence.get("broken") or chart_pattern_confluence.get("has_broken"))
+        # bilateral pending contributes 0 — wait for break direction
+        if abs(cp_score) < 0.05 and chart_pattern_confluence.get("has_bilateral") and not cp_broken:
+            reasons.append("Chart bilateral triangle pending — no directional bias until breakout")
+        elif abs(cp_score) >= 0.05:
+            aligned = (cp_score > 0 and ta_score > 0) or (cp_score < 0 and ta_score < 0)
+            weight = 0.12 if cp_broken else 0.07
+            if aligned:
+                cp_boost = abs(cp_score) * cp_conf * weight
+                ta_score += cp_boost if ta_score > 0 else -cp_boost
+                reasons.append(f"Chart pattern aligns ({cp_count} pat, broken={cp_broken}) → +{cp_boost:.3f}")
+            elif abs(cp_score) > 0.20:
+                cp_penalty = abs(cp_score) * cp_conf * 0.06
+                ta_score -= cp_penalty if ta_score > 0 else -cp_penalty
+                reasons.append(f"Chart pattern conflicts → -{cp_penalty:.3f}")
 
     # ── Priority Pine Script Integration (50% weight — user's selected script) ──
     pine_boost = 0.0
@@ -1065,6 +1096,29 @@ async def run_signal_pipeline(
             except Exception as e:
                 logger.warning(f"Fib confluence eval failed for {symbol}: {e}")
 
+            # 2.85 Chart pattern confluence — additive, volume-aware
+            chart_pattern_confluence = None
+            try:
+                from app.signals.chart_patterns import analyze_chart_patterns
+                cp_ohlcv = await cached_get_ohlcv(symbol=symbol, timeframe=effective_tf, limit=200)
+                if cp_ohlcv and len(cp_ohlcv) >= 40:
+                    cp_df = ohlcv_to_dataframe(cp_ohlcv)
+                    cp_res = analyze_chart_patterns(cp_df)
+                    if cp_res.get("count", 0) > 0:
+                        # normalise for pipeline: score, confidence, count, broken, has_bilateral
+                        best = cp_res.get("best") or {}
+                        chart_pattern_confluence = {
+                            "score": float(cp_res.get("score", 0.0)),
+                            "confidence": float(best.get("confidence", 0.5)),
+                            "count": int(cp_res.get("count", 0)),
+                            "broken": bool(any(p.get("broken") for p in cp_res.get("patterns", []))),
+                            "has_broken": bool(any(p.get("broken") for p in cp_res.get("patterns", []))),
+                            "has_bilateral": bool(cp_res.get("has_bilateral", False)),
+                            "patterns": cp_res.get("patterns", [])[:2],
+                        }
+            except Exception as e:
+                logger.warning(f"Chart pattern confluence eval failed for {symbol}: {e}")
+
             # 3. Combine TA + sentiment + strategies (baseline decision)
             decision = compute_final_signal(
                 ta_data,
@@ -1073,6 +1127,7 @@ async def run_signal_pipeline(
                 strategy_scores or None,
                 priority_score,
                 fib_confluence,
+                chart_pattern_confluence,
             )
 
             # 3.5. AI Agent Signal Generation — when enabled, AI generates
@@ -1205,6 +1260,8 @@ async def run_signal_pipeline(
                             "agreement_met": ta_data.get("agreement_met", True),
                             "adx_gate": ta_data.get("adx_gate", 1.0),
                             "order_flow_confirmed": decision.get("order_flow_confirmed"),
+                            "chart_patterns": chart_pattern_confluence,
+                            "fib_confluence": fib_confluence,
                             "reasons": decision["reasons"],
                             "agent_validated": agent_validation is not None and agent_validation.get("approved", False),
                             "agent_session_id": agent_validation.get("session_id") if agent_validation else None,

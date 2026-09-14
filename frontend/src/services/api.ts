@@ -242,8 +242,17 @@ export const apiClient = {
     api.get('/signals/', { params }),
   getSignal: (id: number) => api.get(`/signals/${id}`),
   createSignal: (data: any) => api.post('/signals/', data),
-  generateSignals: (data: { symbols: string[]; timeframe?: string; exchange?: string }) =>
-    api.post('/signals/generate', data),
+  generateSignals: (data: { symbols: string[]; timeframe?: string; exchange?: string }) => {
+    // Client-side paginate over 10-symbol server limit (plan §10.4)
+    if (data.symbols.length <= 10) return api.post('/signals/generate', data);
+    const chunks: string[][] = [];
+    for (let i = 0; i < data.symbols.length; i += 10) chunks.push(data.symbols.slice(i, i + 10));
+    return Promise.all(chunks.map((symbols) => api.post('/signals/generate', { ...data, symbols })))
+      .then((ress) => {
+        const merged = ress.flatMap((r: any) => r.data?.signals ?? r.data ?? []);
+        return { data: { signals: merged, paginated: true, chunks: chunks.length } } as any;
+      });
+  },
   generateSmcSignal: (data: {
     symbol: string;
     timeframe?: string;
@@ -1275,7 +1284,7 @@ export const apiClient = {
       /** Is the finetune_csv pipeline vendored + how to install it. */
       setupStatus: () => api.get('/plugins/kronos/finetune/setup-status'),
       /** Export live OHLCV to a Kronos CSV (preview, no training). */
-      export: (data: { exchange?: string; symbol: string; timeframe?: string; limit?: number }) =>
+      export: (data: { exchange?: string; symbol: string; timeframe?: string; limit?: number; use_pattern_features?: boolean }) =>
         api.post('/plugins/kronos/finetune/export', data, { timeout: 120000 }),
       /** Start a fine-tune job (export → tokenizer → predictor). */
       start: (data: {
@@ -1283,6 +1292,7 @@ export const apiClient = {
         model_name?: string;
         lookback?: number; pred_len?: number; tokenizer_epochs?: number;
         predictor_epochs?: number; batch_size?: number; base_model?: string;
+        use_pattern_features?: boolean;
       }) => api.post('/plugins/kronos/finetune/start', data, { timeout: 30000 }),
       /** List recent fine-tune jobs. */
       list: () => api.get('/plugins/kronos/finetune/jobs'),
@@ -1548,6 +1558,37 @@ export const apiClient = {
   getXScraperResults:     () => api.get('/x-scraper/results'),
   scrapeXAccount:         (username: string) => api.post(`/x-scraper/scrape/${encodeURIComponent(username)}`),
   scrapeAllXAccounts:     () => api.post('/x-scraper/scrape-all'),
+
+  // ── Soup LLM Finetuning (MakazhanAlpamys/Soup — trysoup.dev) ──────────────
+  soup: {
+    status: () => api.get('/plugins/soup/status'),
+    health: () => api.get('/plugins/soup/health'),
+    models: () => api.get('/plugins/soup/models'),
+    recipes: () => api.get('/plugins/soup/recipes'),
+    kronosOverview: () => api.get('/plugins/soup/kronos/overview'),
+    checkUpdate: () => api.get('/plugins/soup/check-update'),
+    uiStatus: () => api.get('/plugins/soup/ui/status'),
+    uiProxyUrl: (path?: string) => `${getApiBaseUrl()}/plugins/soup/ui/proxy${path ? `/${path}` : ''}`,
+    start: (data: {
+      base: string; task?: string; template?: string;
+      dataset_path?: string; dataset_format?: string; dataset_inline?: any[];
+      val_split?: number; epochs?: number; learning_rate?: number; batch_size?: string;
+      lora_r?: number; lora_alpha?: number; quantization?: string | null; stream_layers?: boolean;
+      ohlcv_symbol?: string; ohlcv_timeframe?: string; ohlcv_limit?: number; output_name?: string;
+    }) => api.post('/plugins/soup/finetune/start', data, { timeout: 30000 }),
+    jobs: () => api.get('/plugins/soup/finetune/jobs'),
+    job: (id: number, log_lines?: number) => api.get(`/plugins/soup/finetune/jobs/${id}`, { params: log_lines ? { log_lines } : {} }),
+    cancel: (id: number) => api.delete(`/plugins/soup/finetune/jobs/${id}`),
+    delete: (id: number) => api.delete(`/plugins/soup/finetune/jobs/${id}`, { params: { delete: true } }),
+    upload: (file: File) => {
+      const form = new FormData(); form.append('file', file);
+      return api.post('/plugins/soup/data/upload', form, { headers: { 'Content-Type': 'multipart/form-data' }, timeout: 120000 });
+    },
+    uploadJson: (samples: any[]) => api.post('/plugins/soup/data/upload', { samples }, { timeout: 60000 }),
+    ohlcvExport: (data: { symbol: string; timeframe?: string; limit?: number }) => api.post('/plugins/soup/ohlcv/export', data, { timeout: 120000 }),
+    ohlcvPreview: (symbol: string, timeframe?: string, limit?: number) => api.get('/plugins/soup/ohlcv/preview', { params: { symbol, timeframe, limit } }),
+    serveStart: (model: string) => api.post('/plugins/soup/serve/start', { model }, { timeout: 30000 }),
+  },
 };
 
 export default apiClient;

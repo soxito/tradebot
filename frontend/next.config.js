@@ -9,17 +9,26 @@ const isDesktop = process.env.TRADEBOT_DESKTOP === '1'
 
 const nextConfig = {
   pageExtensions: ['ts', 'tsx', 'js', 'jsx', 'md', 'mdx'],
-  // Ignore whatsapp pages and test files
-  ignoreBuildErrors: true,
-  // TypeScript configuration
   typescript: {
     ignoreBuildErrors: false,
+  },
+  compress: true,
+  poweredByHeader: false,
+  // Tree-shake heavy libs — lucide barrel + recharts/three dedup
+  experimental: {
+    optimizePackageImports: ['lucide-react', 'recharts', 'three', 'date-fns'],
+  },
+  async headers() {
+    return [
+      {
+        source: '/_next/static/:path*',
+        headers: [{ key: 'Cache-Control', value: 'public, max-age=31536000, immutable' }],
+      },
+    ];
   },
 
   ...(isDesktop && {
     output: 'export',
-    // Emits `out/<route>/index.html` per page, so a deep link resolves to a real
-    // file rather than needing a server-side rewrite.
     trailingSlash: true,
   }),
 }

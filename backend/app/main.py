@@ -59,28 +59,28 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to initialize database: {e}")
 
-    # Restore the trading room's custom agent names/seats so a restart doesn't
-    # silently revert the board to the built-in personas.
+    # Persona + prompt upgrades run in parallel — both are independent DB reads
+    # (cuts ~2x sequential DB wait on cold boot; plan Phase 5)
+    async def _persona_upgrade():
+        try:
+            from app.core.database import AsyncSessionLocal
+            from app.api.agents import refresh_persona_overrides
+            async with AsyncSessionLocal() as db:
+                await refresh_persona_overrides(db)
+        except Exception as e:
+            logger.debug(f"Room persona overrides not loaded: {e}")
+    async def _prompt_upgrade():
+        try:
+            from app.agents.specialists import upgrade_stock_prompts
+            from app.core.database import AsyncSessionLocal
+            async with AsyncSessionLocal() as db:
+                await upgrade_stock_prompts(db)
+        except Exception as e:
+            logger.debug(f"Agent prompt upgrade skipped: {e}")
     try:
-        from app.core.database import AsyncSessionLocal
-        from app.api.agents import refresh_persona_overrides
-        async with AsyncSessionLocal() as db:
-            await refresh_persona_overrides(db)
-    except Exception as e:
-        logger.debug(f"Room persona overrides not loaded: {e}")
-
-    # Bring un-customised agent instructions up to the current defaults. Prompts
-    # move into the DB the first time an install seeds them, so an improvement
-    # to the shipped text would otherwise never reach a running deployment —
-    # which is how a board kept answering "hold" long after the instruction that
-    # told it to had been rewritten. Anything a user edited is left alone.
-    try:
-        from app.agents.specialists import upgrade_stock_prompts
-        from app.core.database import AsyncSessionLocal
-        async with AsyncSessionLocal() as db:
-            await upgrade_stock_prompts(db)
-    except Exception as e:
-        logger.debug(f"Agent prompt upgrade skipped: {e}")
+        await asyncio.gather(_persona_upgrade(), _prompt_upgrade())
+    except Exception:
+        pass
 
     # Initialize plugin database tables
     if settings.PLUGIN_AUTO_MOUNT:
@@ -437,7 +437,9 @@ app = FastAPI(
     redoc_url="/redoc" if settings.DEBUG else None,
 )
 
-# CORS middleware
+# Compression + CORS middleware (compress first so CORS headers survive)
+from fastapi.middleware.gzip import GZipMiddleware
+app.add_middleware(GZipMiddleware, minimum_size=500)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins_list,

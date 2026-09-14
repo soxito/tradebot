@@ -114,6 +114,8 @@ _STOPWORDS = frozenset({
 # rather than implying tick freshness.
 _TTL = 10.0
 _cache: Dict[str, Tuple[float, "Quote"]] = {}
+# Singleflight: dedup concurrent get_quote for same symbol/basis (thundering herd)
+_inflight: Dict[str, asyncio.Future] = {}
 
 # MT5 symbol lists change rarely; re-asking per quote would cost a round trip
 # for every instrument the broker doesn't list.
@@ -637,42 +639,55 @@ async def get_quote(
     if hit and (time.monotonic() - hit[0]) < _TTL:
         return hit[1]
 
-    cls = classify(s)
-    if cls == CRYPTO:
-        sources = (lambda: _crypto_quote(s),)
-    elif cls == METAL and basis == FUTURES:
-        # Explicitly asked for the contract — do not substitute spot for it.
-        sources = (lambda: _yahoo_quote(s),)
-    elif cls == METAL:
-        # Broker first, then genuine spot. Yahoo's metal tickers are futures and
-        # sit ~1.4% above spot, so they are the last resort here, not the first.
-        sources = (
-            lambda: _mt5_quote(s, db),
-            lambda: _metals_spot_quote(s),
-            lambda: _yahoo_quote(s),
-            lambda: _forex_provider_quote(s),
-        )
-    else:
-        # Broker first: its bid/ask is where this user's orders actually fill.
-        sources = (
-            lambda: _mt5_quote(s, db),
-            lambda: _yahoo_quote(s),
-            lambda: _forex_provider_quote(s),
-        )
-
-    # Built lazily so a source that is never reached is never even constructed.
-    quote: Optional[Quote] = None
-    for make_source in sources:
+    # Singleflight: if already fetching this key, await same future
+    fut = _inflight.get(cache_key)
+    if fut is not None:
         try:
-            quote = await make_source()
-        except Exception:  # noqa: BLE001
-            quote = None
-        if quote is not None:
-            break
+            return await fut  # type: ignore
+        except Exception:
+            pass
+    loop = asyncio.get_running_loop()
+    my_fut: asyncio.Future = loop.create_future()
+    _inflight[cache_key] = my_fut
 
-    if quote is not None:
-        _cache[cache_key] = (time.monotonic(), quote)
-    return quote
+    try:
+        cls = classify(s)
+        if cls == CRYPTO:
+            sources = (lambda: _crypto_quote(s),)
+        elif cls == METAL and basis == FUTURES:
+            sources = (lambda: _yahoo_quote(s),)
+        elif cls == METAL:
+            sources = (
+                lambda: _mt5_quote(s, db),
+                lambda: _metals_spot_quote(s),
+                lambda: _yahoo_quote(s),
+                lambda: _forex_provider_quote(s),
+            )
+        else:
+            sources = (
+                lambda: _mt5_quote(s, db),
+                lambda: _yahoo_quote(s),
+                lambda: _forex_provider_quote(s),
+            )
+        quote: Optional[Quote] = None
+        for make_source in sources:
+            try:
+                quote = await make_source()
+            except Exception:  # noqa: BLE001
+                quote = None
+            if quote is not None:
+                break
+        if quote is not None:
+            _cache[cache_key] = (time.monotonic(), quote)
+        if not my_fut.done():
+            my_fut.set_result(quote)
+        return quote
+    except Exception as e:
+        if not my_fut.done():
+            my_fut.set_exception(e)
+        raise
+    finally:
+        _inflight.pop(cache_key, None)
 
 
 async def live_price(symbol: str, *, db: Any = None) -> Optional[float]:

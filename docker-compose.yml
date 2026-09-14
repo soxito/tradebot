@@ -18,10 +18,11 @@ services:
       timeout: 5s
       retries: 5
 
-  # Redis Cache
+  # Redis Cache — required L2 for market/signal caches (plan §10.3)
   redis:
     image: redis:7-alpine
     container_name: tradebot-redis
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --save "" --appendonly no
     environment:
       TZ: Africa/Johannesburg
     ports:
@@ -59,6 +60,12 @@ services:
         condition: service_healthy
       headroom-proxy:
         condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     restart: unless-stopped
 
   # Dedicated worker runtime (scheduler + trading loops)
@@ -197,9 +204,41 @@ services:
       - ./SOUL.md:/app/SOUL.md:ro
     restart: unless-stopped
 
+  # Soup LLM finetuning (MakazhanAlpamys/Soup) — trysoup.dev
+  # Isolated like hermes; backend proxies at /api/v1/plugins/soup/* and
+  # /api/v1/plugins/soup/ui/proxy. Auto-cloned/pulled by start.py.
+  # Start with: docker compose --profile soup up -d soup
+  soup:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.soup
+    container_name: tradebot-soup
+    profiles: ["soup"]
+    env_file:
+      - .env
+    environment:
+      TZ: Africa/Johannesburg
+      SOUP_PORT: ${SOUP_PORT:-8012}
+      SOUP_UI_PORT: ${SOUP_UI_PORT:-7860}
+      SOUP_REPO_DIR: /app/soup
+    ports:
+      - "${SOUP_PORT:-8012}:8012"
+      - "${SOUP_UI_PORT:-7860}:7860"
+    volumes:
+      - soup_data:/workspace
+      - ./integrations/soup:/app/soup:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8012/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   redis_data:
   openwa_data:
   ta_results:
   hermes_data:
+  soup_data:

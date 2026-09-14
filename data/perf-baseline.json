@@ -1,0 +1,8 @@
+{
+  "date": "2026-09-14T18:31:24Z",
+  "frontend_next_size": "8.0G",
+  "frontend_chunks": "/Users/sakhilematsimela/Sites/tradebot/frontend/.next/static/chunks/0.7-i80f-sfe9.js 15K;/Users/sakhilematsimela/Sites/tradebot/frontend/.next/static/chunks/0.m3_752ff_c6.js 153K;/Users/sakhilematsimela/Sites/tradebot/frontend/.next/static/chunks/0.ymknxqh_-xu.js 20K;/Users/sakhilematsimela/Sites/tradebot/frontend/.next/static/chunks/008jqqpay6z2l.js 88K;/Users/sakhilematsimela/Sites/tradebot/frontend/.next/static/chunks/008p7b.-fi1qe.js 34K;/Users/sakhilematsimela/Sites/tradebot/frontend/.next/static/chunks/00d.8etwkxhgw.js 48K;/Users/sakhilematsimela/Sites/tradebot/frontend/.next/static/chunks/00gir6-kqaetq.js 28K;/Users/sakhilematsimela/Sites/tradebot/frontend/.next/static/chunks/00q30my.1aj2x.js 712K;/Users/sakhilematsimela/Sites/tradebot/frontend/.next/static/chunks/00s7vz_ekms6u.js 34K;/Users/sakhilematsimela/Sites/tradebot/frontend/.next/static/chunks/00xw1sjv9wv0z.js 26K;/Users/sakhilematsimela/Sites/tradebot/frontend/.next/static/chunks/0128dp-oim9pj.js 30K;/Users/sakhilematsimela/Sites/tradebot/frontend/.next/static/chunks/01m5k0y.rc4c2.js 17K;/Users/sakhilematsimela/Sites/tradebot/frontend/.next/static/chunks/02yf679ppf4dz.js 49K;/Users/sakhilematsimela/Sites/tradebot/frontend/.next/static/chunks/03297xg-e2fve.js 315B;/Users/sakhilematsimela/Sites/tradebot/frontend/.next/static/chunks/0344mk0qi.ri8.js 9.1K;",
+  "backend_log_size": "1.3G",
+  "backend_log_lines": 13122244,
+  "docker_stats": "mt5rest 56.04% 1.91GiB / 7.75GiB;"
+}

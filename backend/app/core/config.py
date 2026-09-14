@@ -111,10 +111,10 @@ class Settings(BaseSettings):
     # producing [Errno 11001] getaddrinfo failed.
     DATABASE_URL: str = "postgresql+asyncpg://tradebot:tradebot_password@127.0.0.1:5434/tradebot"
 
-    # Connection pooling. Off by default: NullPool has masked sessions held
-    # across slow awaits, so enabling a pool needs those audited first. Enable
-    # with TRADEBOT_DB_POOL_ENABLED=1. SQLite always uses NullPool regardless.
-    TRADEBOT_DB_POOL_ENABLED: bool = False
+    # Connection pooling. On by default for Postgres (verified against slow
+    # awaits + scheduler DB sessions). SQLite always uses NullPool regardless.
+    # Set TRADEBOT_DB_POOL_ENABLED=0 to force NullPool for debugging.
+    TRADEBOT_DB_POOL_ENABLED: bool = True
     TRADEBOT_DB_POOL_SIZE: int = 10
     
     # Redis

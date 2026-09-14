@@ -4,6 +4,7 @@ import { formatPrice } from '@/utils/price';
 import { useTradeStore } from '@/store/useTradeStore';
 import { formatTimeZA } from '@/utils/datetime';
 import { useEventStream } from '@/hooks/useEventStream';
+import { useSmartPoll } from '@/hooks/useSmartPoll';
 
 interface Signal {
   id: number;
@@ -37,11 +38,10 @@ export default function SignalFeed() {
 
   useEffect(() => {
     fetchSignals();
-    // Fallback polling only while the realtime stream is down (no regression).
-    if (connected) return;
-    const interval = setInterval(fetchSignals, 10000);
-    return () => clearInterval(interval);
-  }, [fetchSignals, connected]);
+  }, [fetchSignals]);
+
+  // Fallback polling — tier-aware, pauses when hidden (plan §10.2 30s SLA)
+  useSmartPoll(fetchSignals, { intervalMs: 30000, enabled: !connected });
 
   const getActionColor = (action: string) => {
     switch (action.toLowerCase()) {
