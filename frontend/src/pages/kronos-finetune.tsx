@@ -13,6 +13,7 @@ interface FinetuneJob {
   symbol: string;
   timeframe: string;
   model_name?: string | null;
+  symbols_combined?: string[] | null;
   status: 'pending' | 'exporting' | 'running' | 'completed' | 'failed' | 'cancelled';
   rows_exported?: number | null;
   disk_size_mb?: number | null;
@@ -79,6 +80,7 @@ export default function KronosFinetunePage() {
   const [combining, setCombining] = useState(false);
   const [combineName, setCombineName] = useState('');
   const [combineMsg, setCombineMsg] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [pruning, setPruning] = useState(false);
 
   const refreshSetup = async () => {
     try { const r = await apiClient.kronos.finetune.setupStatus(); setSetup(r.data); }
@@ -152,6 +154,18 @@ export default function KronosFinetunePage() {
     try { await apiClient.kronos.finetune.cancel(id); refreshJobs(); } catch { /* ignore */ }
   };
 
+  const doDelete = async (id: number, symbol: string) => {
+    const label = symbol ? `${symbol} (#${id})` : `job #${id}`;
+    if (!window.confirm(`Delete trained model ${label} and free its disk space?\n\nThis permanently removes its checkpoints from disk and its row from the DB.`)) return;
+    try {
+      await apiClient.kronos.finetune.delete(id);
+      if (selected?.id === id) setSelected(null);
+      refreshJobs();
+    } catch (e: any) {
+      setStartErr(e?.response?.data?.detail || e?.message || 'Delete failed');
+    }
+  };
+
   const doCombine = async () => {
     setCombining(true);
     setCombineMsg(null);
@@ -159,12 +173,26 @@ export default function KronosFinetunePage() {
       const r = await apiClient.kronos.finetune.combine(combineName.trim() || undefined);
       const d = r.data;
       setCombineMsg(d?.ok
-        ? { ok: true, msg: `Combining ${d.symbols_combined?.length ?? 0} models (${d.rows_merged} rows) → training job #${d.job_id}` }
+        ? { ok: true, msg: `Combining ${d.symbols_combined?.length ?? 0} models (${d.rows_merged} rows) → training job #${d.job_id}. When it finishes, the new major model will auto-load and all source models will be auto-deleted to free space.` }
         : { ok: false, msg: d?.error || 'Combine failed' });
       refreshJobs();
     } catch (e: any) {
       setCombineMsg({ ok: false, msg: e?.response?.data?.detail || e?.message || 'Combine failed' });
     } finally { setCombining(false); }
+  };
+
+  const doPrune = async () => {
+    if (!window.confirm('Delete every non-combined fine-tune model and its files from disk? The combined model is kept.')) return;
+    setPruning(true);
+    setCombineMsg(null);
+    try {
+      const r = await apiClient.kronos.finetune.prune();
+      const d = r.data;
+      setCombineMsg({ ok: true, msg: `Pruned ${d?.removed_job_ids?.length ?? 0} non-combined model(s), freed ~${d?.freed_mb ?? 0} MB` });
+      refreshJobs();
+    } catch (e: any) {
+      setCombineMsg({ ok: false, msg: e?.response?.data?.detail || e?.message || 'Prune failed' });
+    } finally { setPruning(false); }
   };
 
   const setupPending = setup !== null && !setup.vendored;
@@ -263,8 +291,8 @@ export default function KronosFinetunePage() {
                     <th className="text-right py-2 pr-3">Rows</th>
                     <th className="text-right py-2 pr-3">Size</th>
                     <th className="text-left py-2 pr-3">Started</th>
-                    <th className="text-right py-2 pr-3">Duration</th>
-                    <th className="text-right py-2">Actions</th>
+                      <th className="text-right py-2 pr-3">Duration</th>
+                      <th className="text-right py-2">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -276,7 +304,17 @@ export default function KronosFinetunePage() {
                     >
                       <td className="py-2 pr-3 text-gray-500">{j.id}</td>
                       <td className="py-2 pr-3 text-fuchsia-300 font-medium">{j.model_name || '—'}</td>
-                      <td className="py-2 pr-3 text-white">{j.symbol}</td>
+                      <td className="py-2 pr-3 text-white">
+                        {j.symbol}
+                        {j.symbols_combined && j.symbols_combined.length > 0 && (
+                          <span
+                            title={`Trained & improved on: ${j.symbols_combined.join(', ')}`}
+                            className="ml-1.5 inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-fuchsia-500/15 text-fuchsia-300 text-[10px] align-middle"
+                          >
+                            <Layers className="w-2.5 h-2.5" />{j.symbols_combined.length} pairs
+                          </span>
+                        )}
+                      </td>
                       <td className="py-2 pr-3 text-gray-400">{j.timeframe}</td>
                       <td className="py-2 pr-3">
                         <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-semibold uppercase ${FT_STATUS_STYLE[j.status] || ''}`}>{j.status}</span>
@@ -293,7 +331,7 @@ export default function KronosFinetunePage() {
                             <button
                               onClick={(e) => { e.stopPropagation(); doLoad(j.id); }}
                               disabled={loadingId === j.id}
-                              title="Load this model for forecasts"
+                              title="Load this model for forecasts (hot-swap, uses all brains)"
                               className="p-1 rounded bg-green-600/80 hover:bg-green-500 text-white disabled:opacity-50"
                             >
                               {loadingId === j.id ? <Loader2 className="w-3 h-3 animate-spin" /> : <Check className="w-3 h-3" />}
@@ -308,6 +346,15 @@ export default function KronosFinetunePage() {
                               <X className="w-3 h-3" />
                             </button>
                           )}
+                          {/* Per-model delete — frees disk immediately */}
+                          <button
+                            onClick={(e) => { e.stopPropagation(); doDelete(j.id, j.symbol); }}
+                            disabled={j.status === 'running' || j.status === 'exporting'}
+                            title={j.status === 'running' || j.status === 'exporting' ? 'Cancel first, then delete' : `Delete model ${j.model_name || j.symbol} and free ${j.disk_size_mb ?? '?'} MB`}
+                            className="p-1 rounded bg-gray-700 hover:bg-red-600 text-gray-300 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed"
+                          >
+                            <HardDrive className="w-3 h-3" />
+                          </button>
                         </span>
                       </td>
                     </tr>
@@ -325,6 +372,12 @@ export default function KronosFinetunePage() {
           </p>
           {selected ? (
             <>
+              {selected.symbols_combined && selected.symbols_combined.length > 0 && (
+                <div className="mb-2 text-[11px] text-fuchsia-200">
+                  <span className="font-semibold">Trained &amp; improved pairs ({selected.symbols_combined.length}):</span>{' '}
+                  {selected.symbols_combined.join(', ')}
+                </div>
+              )}
               {selected.error && <p className="mb-1 text-[11px] text-red-300">{selected.error}</p>}
               <pre className="bg-black/50 border border-gray-800 rounded-lg p-2 text-[10px] leading-relaxed text-gray-300 h-52 overflow-auto whitespace-pre-wrap">
                 {selected.log_tail || '(no log output yet)'}
@@ -344,8 +397,10 @@ export default function KronosFinetunePage() {
             <div className="flex-1">
               <p className="text-sm font-semibold text-white">Combine into one model</p>
               <p className="text-[11px] text-gray-500 mt-0.5">
-                Merge the datasets of all {completedCount} completed run{completedCount === 1 ? '' : 's'} and train a single combined model.
-                Needs at least 2 completed runs.
+                Merge the datasets of all {completedCount} completed run{completedCount === 1 ? '' : 's'} and train a single combined model
+                that fuses every brain's learned knowledge (Neuro + Hermes + Vault + Journal). After the new
+                major model loads, all source models are automatically deleted to free disk — only the one
+                major model remains. Needs at least 2 completed runs.
               </p>
               <div className="flex flex-wrap items-end gap-3 mt-3">
                 <Field label="Combined name">
@@ -358,6 +413,15 @@ export default function KronosFinetunePage() {
                 >
                   {combining ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <HardDrive className="w-3.5 h-3.5" />}
                   Combine {completedCount} models
+                </button>
+                <button
+                  onClick={doPrune}
+                  disabled={pruning || completedCount < 1}
+                  title="Delete every non-combined model + its files to free disk space (keeps the combined model)"
+                  className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-red-600/80 hover:bg-red-500 text-white text-xs font-semibold disabled:opacity-50"
+                >
+                  {pruning ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <X className="w-3.5 h-3.5" />}
+                  Delete non-combined
                 </button>
               </div>
               {combineMsg && (

@@ -2,7 +2,7 @@
 type: community
 name: Signal (c84)
 node_count: 15
-synced: 2026-09-08
+synced: 2026-09-14
 tags:
   - community
   - Signal-c84
@@ -10,7 +10,7 @@ tags:
 
             # Signal (c84)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-08.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
 
 
             ## Key Nodes (15 total)

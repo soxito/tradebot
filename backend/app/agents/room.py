@@ -395,6 +395,19 @@ async def session_completed(session_id: str, result: Dict[str, Any]) -> None:
             _set_state(role, state=RESTING)
 
     consensus = consensus_from(result.get("decisions", []))
+    # ── Neuro core ingest (federated mirror — fire-and-forget) ──
+    try:
+        from app.neuro_brain.state_store import ingest_local as _neuro_ingest
+        _neuro_ingest(
+            kind="room_session",
+            content=f"[{result.get('symbol')} {str(result.get('final_action') or '').upper()} conf={result.get('final_confidence')}] {str(result.get('final_reasoning') or '')[:600]}",
+            symbol=str(result.get("symbol") or ""),
+            session_id=session_id,
+            source="trading-room",
+            meta={"consensus": consensus, "decisions": result.get("decisions", [])[:4]},
+        )
+    except Exception as _ne:
+        logger.debug(f"[room] neuro ingest skipped: {_ne}")
     await event_bus.publish(
         Topics.SESSION_COMPLETED,
         {

@@ -2,7 +2,7 @@
 type: community
 name: Pine Script (c90)
 node_count: 14
-synced: 2026-09-08
+synced: 2026-09-14
 tags:
   - community
   - Pine-Script-c90
@@ -10,7 +10,7 @@ tags:
 
             # Pine Script (c90)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-08.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
 
 
             ## Key Nodes (14 total)

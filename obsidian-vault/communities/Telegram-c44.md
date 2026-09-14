@@ -2,7 +2,7 @@
 type: community
 name: Telegram (c44)
 node_count: 27
-synced: 2026-09-08
+synced: 2026-09-14
 tags:
   - community
   - Telegram-c44
@@ -10,7 +10,7 @@ tags:
 
             # Telegram (c44)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-08.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
 
 
             ## Key Nodes (27 total)

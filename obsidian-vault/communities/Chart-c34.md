@@ -2,7 +2,7 @@
 type: community
 name: Chart (c34)
 node_count: 30
-synced: 2026-09-08
+synced: 2026-09-14
 tags:
   - community
   - Chart-c34
@@ -10,7 +10,7 @@ tags:
 
             # Chart (c34)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-08.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
 
 
             ## Key Nodes (30 total)

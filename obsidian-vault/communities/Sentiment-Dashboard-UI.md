@@ -2,7 +2,7 @@
 type: community
 name: Sentiment Dashboard UI
 node_count: 38
-synced: 2026-09-08
+synced: 2026-09-14
 tags:
   - community
   - Sentiment-Dashboard-UI
@@ -10,7 +10,7 @@ tags:
 
             # Sentiment Dashboard UI
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-08.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
 
 
             ## Key Nodes (38 total)

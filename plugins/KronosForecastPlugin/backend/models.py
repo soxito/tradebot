@@ -72,6 +72,10 @@ class KronosFinetuneJob(KronosBase):
     # Optional user label for the produced model, e.g. "super-base".
     model_name = Column(String(128), nullable=True)
 
+    # For a COMBINED model: the list of source pairs merged into it, so the
+    # /kronos-forecast details can show which pairs are trained and improved.
+    symbols_combined = Column(JSON, nullable=True)
+
     # pending | exporting | running | completed | failed | cancelled
     status = Column(String(16), nullable=False, default="pending", index=True)
 

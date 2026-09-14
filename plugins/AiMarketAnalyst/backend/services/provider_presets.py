@@ -319,15 +319,6 @@ MODEL_CATALOG: dict[str, dict[str, Any]] = {
                  "takes minutes, at the accuracy these tasks need. Emits "
                  "reasoning_content first, so give it >=2048 max_tokens.",
     },
-    "z-ai/glm-5.2": {
-        "label": "GLM-5.2 (NVIDIA)",
-        "context": 1000000, "params": "753B", "speed": 2,
-        "strengths": ["Long-horizon reasoning", "Agentic workflows", "Coding"],
-        "best_for": "Deep market analysis, strategy synthesis and forecast narration.",
-        "vision": False, "reasoning": True, "json_mode": True, "cost": "free",
-        "notes": "Flagship reasoning model. Slow — allow ~120s — so reserve it "
-                 "for analysis the user is willing to wait for.",
-    },
     "thinkingmachines/inkling": {
         "label": "Inkling 952B (Thinking Machines)",
         "context": 128000, "params": "952B MoE (256 experts)", "speed": 1,
@@ -660,7 +651,6 @@ PROVIDER_PRESETS: list[dict[str, Any]] = [
             # verified serving against a live account on 2026-08-15.
             # Text-only — do not send image blocks to these two.
             "nvidia/nemotron-3.5-lightning-30b-a3b",
-            "z-ai/glm-5.2",
             # Vision-capable (text+image in, text out), verified with a chart
             # image. Both emit `reasoning_content` before `content`, so they
             # need max_tokens >= 2048 or `content` comes back empty.
@@ -672,7 +662,6 @@ PROVIDER_PRESETS: list[dict[str, Any]] = [
             "meta/llama-3.3-70b-instruct",
             "nvidia/llama-3.3-nemotron-super-49b-v1.5",
             "nvidia/llama-3.3-nemotron-super-49b-v1",
-            "nvidia/nemotron-3-nano-30b-a3b",
             "nvidia/nvidia-nemotron-nano-9b-v2",
             "nvidia/nemotron-mini-4b-instruct",
             # Vision — verified serving with an image payload. Of the vision ids

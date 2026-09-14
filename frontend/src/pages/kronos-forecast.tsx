@@ -443,7 +443,7 @@ export default function KronosForecastPage() {
   const { data, loading, error, refetch } = useKronosForecast(exchange, symbol, params);
 
   // ── Model selector ───────────────────────────────────────────────────────
-  interface KronosModelEntry { id: string; label: string; params_m: number; max_context: number; installed?: boolean; is_finetuned?: boolean; job_id?: number; }
+  interface KronosModelEntry { id: string; label: string; params_m: number; max_context: number; installed?: boolean; is_finetuned?: boolean; job_id?: number; symbols_combined?: string[] | null; }
   const [modelCatalog, setModelCatalog] = useState<KronosModelEntry[]>([]);
   const [activeModel, setActiveModel] = useState<string>('');
   const [switching, setSwitching] = useState(false);
@@ -504,7 +504,7 @@ export default function KronosForecastPage() {
           : s?.data?.model_name === modelId && s?.data?.available;
         if (ok) {
           setActiveModel(modelId);
-          setStatus(s.data);
+          setStatus(s!.data);
           confirmed = true;
           break;
         }
@@ -846,7 +846,7 @@ export default function KronosForecastPage() {
                     disabled={switching || installingAll}
                     onClick={() => switchKronosModel(m.id)}
                     title={m.is_finetuned
-                      ? `${m.label} — custom fine-tuned model`
+                      ? `${m.label} — custom fine-tuned model${m.symbols_combined && m.symbols_combined.length ? `\nTrained & improved on ${m.symbols_combined.length} pairs: ${m.symbols_combined.join(', ')}` : ''}`
                       : `${m.label}${m.installed ? ' — installed' : ' — downloads on first use'}`}
                     className={`px-2.5 py-1 rounded-lg text-xs font-medium transition-all inline-flex items-center gap-1 ${
                       activeModel === m.id
@@ -865,6 +865,11 @@ export default function KronosForecastPage() {
                       />
                     )}
                     {m.is_finetuned ? m.label : m.id.split('/')[1]}
+                    {m.is_finetuned && m.symbols_combined && m.symbols_combined.length > 0 && (
+                      <span className="ml-1 px-1 py-0.5 rounded bg-fuchsia-500/20 text-fuchsia-200 text-[9px] leading-none">
+                        {m.symbols_combined.length}p
+                      </span>
+                    )}
                   </button>
                 ))}
               </div>

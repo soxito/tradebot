@@ -2,7 +2,7 @@
 type: community
 name: Telegram Plugin Config & Auth
 node_count: 76
-synced: 2026-09-08
+synced: 2026-09-14
 tags:
   - community
   - Telegram-Plugin-Config-Auth
@@ -10,7 +10,7 @@ tags:
 
             # Telegram Plugin Config & Auth
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-08.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
 
 
             ## Key Nodes (76 total)

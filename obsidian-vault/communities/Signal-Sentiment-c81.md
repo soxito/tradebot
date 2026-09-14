@@ -2,7 +2,7 @@
 type: community
 name: Signal & Sentiment (c81)
 node_count: 15
-synced: 2026-09-08
+synced: 2026-09-14
 tags:
   - community
   - Signal-Sentiment-c81
@@ -10,7 +10,7 @@ tags:
 
             # Signal & Sentiment (c81)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-08.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
 
 
             ## Key Nodes (15 total)

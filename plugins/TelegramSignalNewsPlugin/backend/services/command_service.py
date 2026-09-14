@@ -144,9 +144,42 @@ async def parse_and_execute(
             _record_history(chat_id, "assistant", reply)
         return reply, mode, markup
 
+    # Pasted trade signal → analyse it (Kronos + SMC verdict, then room chart)
+    # before falling through to generic AI chat. This is what makes "when I ask
+    # it anything it must reply based on what I'm sending" work for signals.
+    try:
+        from plugins.TelegramSignalNewsPlugin.backend.services.signal_parser import (
+            parse_entry_signal,
+        )
+        parsed = parse_entry_signal(text)
+    except Exception:  # noqa: BLE001
+        parsed = None
+    if (
+        parsed is not None
+        and getattr(parsed, "symbol", None)
+        and getattr(parsed, "direction", None)
+        and (getattr(parsed, "take_profits", None) or getattr(parsed, "stop_loss", None))
+    ):
+        _record_history(chat_id, "user", text)
+        reply, mode, markup = await _analyze_pasted_signal(parsed, text, token, chat_id, db)
+        if reply:
+            _record_history(chat_id, "assistant", reply)
+        return reply, mode, markup
+
     # Non-command free text → full Jarvis AI chat
     fallback = await _ai_fallback(text, db, chat_id=chat_id)
-    # _ai_fallback now returns 3-tuple; keep keyboard as None for chat replies
+    # _ai_fallback now returns 3-tuple; keep keyboard as None for chat replies.
+    # A None reply means every AI provider failed. Other callers of _ai_fallback
+    # (image, forecast) rely on None to try the next path, so we only convert the
+    # silence into a friendly message here at the final free-text fall-through —
+    # the user must always get *something* back when they just chat.
+    if not (fallback[0] or "").strip():
+        return (
+            "🤖 Jarvis is having trouble reaching the AI right now. "
+            "Please try again in a moment.",
+            "HTML",
+            None,
+        )
     return fallback[0], fallback[1], fallback[2]
 
 
@@ -1750,6 +1783,142 @@ async def _room_focus_reply(args: str, chat_id: str) -> tuple[str, str, dict | N
     return f"📌 Pinned: <b>{shown}</b> — the board will keep returning to these.", "HTML", None
 
 
+async def _analyze_pasted_signal(
+    parsed: Any,
+    raw_text: str,
+    token: str,
+    chat_id: str,
+    db: AsyncSession,
+) -> tuple[str, str, dict | None]:
+    """Analyse a trade signal a user pasted into the bot.
+
+    Gives a fast verdict — echoes the parsed levels, runs the latest trained
+    Kronos model + (for forex) the SMC sniper, compares the signal's direction
+    against the model bias, sanity-checks R:R — then convenes the full trading
+    room so the annotated chart + seven-agent desk follow. Analysis only: it
+    never places an order from a pasted signal.
+    """
+    symbol = str(parsed.symbol).upper()
+    direction = str(parsed.direction).lower()          # long | short
+    want_bull = direction == "long"
+    entry = parsed.entry
+    sl = parsed.stop_loss
+    tps = list(parsed.take_profits or [])
+    tp1 = tps[0] if tps else None
+
+    try:
+        from plugins.TelegramSignalNewsPlugin.backend.services.signal_parser import (
+            classify_market_type,
+        )
+        market = classify_market_type(symbol) or "crypto"
+    except Exception:  # noqa: BLE001
+        market = "crypto"
+
+    # ── Echo the parsed signal ────────────────────────────────────────────
+    side_emoji = "🟢 LONG" if want_bull else "🔴 SHORT"
+    lines = [f"📥 <b>Signal received — {_esc(symbol)}</b>  {side_emoji}"]
+    if parsed.leverage:
+        lines.append(f"⚙️ Leverage: <code>{_esc(parsed.leverage)}</code>")
+    if entry is not None:
+        lines.append(f"🎯 Entry: <code>{entry:g}</code>")
+    elif getattr(parsed, "entry_raw", None):
+        lines.append(f"🎯 Entry: <code>{_esc(parsed.entry_raw)}</code>")
+    if sl is not None:
+        lines.append(f"🛑 Stop: <code>{sl:g}</code>")
+    if tps:
+        lines.append("📈 TPs: " + ", ".join(f"<code>{tp:g}</code>" for tp in tps[:6]))
+
+    # ── R:R sanity (entry vs SL vs TP1) ───────────────────────────────────
+    rr_note = ""
+    if entry and sl and tp1 and entry > 0:
+        if want_bull:
+            risk, reward = entry - sl, tp1 - entry
+        else:
+            risk, reward = sl - entry, entry - tp1
+        if risk > 0 and reward > 0:
+            rr = reward / risk
+            flag = "✅" if rr >= 1.5 else "⚠️"
+            rr_note = f"{flag} R:R to TP1 ≈ <b>{rr:.2f}</b>"
+        else:
+            rr_note = "⚠️ SL/TP look mis-placed for this side — double-check the levels."
+
+    # ── Kronos forecast (latest trained/combined model) ───────────────────
+    kron_line = ""
+    kron_bull: bool | None = None
+    try:
+        from plugins.KronosForecastPlugin.backend.services.forecast_service import (
+            run_forecast_cached,
+        )
+        exch = "bitget" if market == "crypto" else "mt5"
+        fc = await run_forecast_cached(exch, symbol, "1h")
+        sig = getattr(fc, "signal", None)
+        if sig is not None:
+            fdir = (sig.direction or "flat").lower()
+            conf = int((sig.confidence or 0) * 100)
+            pct = float(getattr(sig, "pct_change", 0.0) or 0.0)
+            kron_bull = True if fdir == "up" else (False if fdir == "down" else None)
+            emoji = {"up": "🟢📈", "down": "🔴📉", "flat": "➡️"}.get(fdir, "➡️")
+            kron_line = f"🤖 Kronos: {emoji} <b>{fdir.upper()}</b> ({conf}% conf, {pct:+.2f}%)"
+    except Exception as exc:  # noqa: BLE001
+        kron_line = f"🤖 Kronos: unavailable ({_esc(str(exc)[:80])})"
+
+    # ── SMC bias (forex/metals via MT5) ───────────────────────────────────
+    smc_line = ""
+    smc_bull: bool | None = None
+    if market == "forex":
+        try:
+            smc_text, _ = await _sniper_smc(symbol, db)
+            low = smc_text.lower()
+            if "buy" in low and "sell" not in low:
+                smc_bull = True
+            elif "sell" in low and "buy" not in low:
+                smc_bull = False
+            if smc_bull is not None:
+                smc_line = f"📐 SMC bias: {'🟢 BUY' if smc_bull else '🔴 SELL'}"
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ── Verdict: does the model agree with the signal? ────────────────────
+    agree_bits = []
+    if kron_bull is not None:
+        agree_bits.append(kron_bull == want_bull)
+    if smc_bull is not None:
+        agree_bits.append(smc_bull == want_bull)
+    if agree_bits:
+        agrees = sum(1 for b in agree_bits if b)
+        total = len(agree_bits)
+        if agrees == total:
+            verdict = "✅ <b>Aligned</b> — the model bias agrees with this signal."
+        elif agrees == 0:
+            verdict = "🚫 <b>Conflict</b> — the model bias opposes this signal. Trade with caution."
+        else:
+            verdict = "⚖️ <b>Mixed</b> — model signals are split; wait for confirmation."
+    else:
+        verdict = "ℹ️ No model bias available — sending the full desk read next."
+
+    body = [lines[0], ""]
+    body += lines[1:]
+    body.append("")
+    for extra in (kron_line, smc_line, rr_note):
+        if extra:
+            body.append(extra)
+    body.append("")
+    body.append(verdict)
+    body.append("🏛 Convening the trading room for the annotated chart + desk read…")
+
+    # ── Full trading-room desk + chart follows as its own message ─────────
+    try:
+        from plugins.TelegramSignalNewsPlugin.backend.services import room_bridge
+        if chat_id and not room_bridge.is_busy(chat_id):
+            room_bridge.spawn(
+                room_bridge.run_pair(token, chat_id, symbol, "1h"), chat_id, token
+            )
+    except Exception:  # noqa: BLE001 — verdict still returns even if room can't start
+        pass
+
+    return "\n".join(body), "HTML", None
+
+
 def _start_room(
     args: str,
     token: str,
@@ -2021,7 +2190,18 @@ async def _ai_fallback(
     # ── Step 1: Try structured Jarvis command dispatch ────────────────────────
     try:
         from app.api.jarvis import execute_command, CommandRequest
-        cmd_result = await execute_command(CommandRequest(command=text))
+        # execute_command can dispatch a deep multi-agent analysis — the trading
+        # room seats, per-position review — where every agent carries its own
+        # 120s provider timeout. Chained across several agents (plus 429 back-off
+        # retries) that silently becomes many minutes, and Telegram shows the
+        # user nothing the whole time: this update task just sits awaiting and no
+        # reply is ever sent. Bound it so a slow structured path always yields to
+        # the fast chat below instead of hanging this turn forever. A cancelled
+        # deep analysis is recoverable; a silent bot is not.
+        cmd_result = await asyncio.wait_for(
+            execute_command(CommandRequest(command=text)),
+            timeout=100,
+        )
         if cmd_result.action not in ("unknown", None) and cmd_result.ok:
             # Use full detail for analysis-type actions, speech for everything else
             if cmd_result.action in ("analyze", "news_position_analysis") and cmd_result.detail:
@@ -2035,6 +2215,14 @@ async def _ai_fallback(
                     _record_history(chat_id, "assistant", reply)
                     _remember_offer(chat_id, reply)
                 return reply[:4000], "HTML", None
+    except (asyncio.TimeoutError, TimeoutError):
+        # Deep structured analysis outran its budget — fall through to the fast
+        # AI chat, which still answers grounded in the live position context
+        # fetched below. For the full multi-agent session the user can run
+        # /room <symbol> explicitly, which delivers its result out-of-band.
+        logger.info(
+            "[AI] execute_command exceeded 100s budget — falling back to fast chat"
+        )
     except Exception as exc:  # noqa: BLE001
         logger.debug("[AI] execute_command pre-check failed: {}", exc)
 

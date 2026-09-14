@@ -182,8 +182,8 @@ def jarvis_learn_all_brains(
     importance: float = 0.5,
     kind: str = "insight",
 ) -> None:
-    """Persist any JARVIS event to ALL three knowledge brains:
-    vault (file + DB row), AI Analyst store, and PaulKnowledge.
+    """Persist any JARVIS event to ALL brains: vault, AI Analyst, PaulKnowledge + Neuro core.
+
     Fire-and-forget — never blocks the caller."""
     try:
         loop = asyncio.get_running_loop()
@@ -197,6 +197,19 @@ def jarvis_learn_all_brains(
         loop.create_task(
             _knowledge_capture(action, symbol, summary, detail, importance)
         )
+        # Neuro core — federated mirror (kind includes jarvis- so recall finds it)
+        try:
+            from app.neuro_brain.state_store import ingest_local as _neuro_ingest_local
+            # need sync ingest off loop; schedule via to_thread equivalent
+            async def _neuro_capture():
+                try:
+                    import asyncio as _aio
+                    await _aio.to_thread(_neuro_ingest_local, f"jarvis-{action}", summary + (" — " + detail[:400] if detail else ""), symbol, "", "", source="jarvis", meta={"tags": _tags, "importance": importance})
+                except Exception:
+                    pass
+            loop.create_task(_neuro_capture())
+        except Exception:
+            pass
     except Exception as e:
         logger.debug(f"[JARVIS brain] learn_all_brains scheduling skipped: {e}")
 
@@ -699,14 +712,21 @@ async def _brain_recall_context(symbol: str, max_chars: int = 600) -> str:
             sections.append("LATEST MARKET NEWS (organised by JARVIS brain):\n" + "\n─\n".join(news_parts[:2]))
 
         if not sections:
-            return ""
-
-        joined = "\n\n".join(sections)
-        return (
-            f"\n[JARVIS BRAIN MEMORY — context for {symbol}]\n"
-            f"{joined}\n"
-            f"[END BRAIN MEMORY]\n"
-        )
+            base_mem = ""
+        else:
+            joined = "\n\n".join(sections)
+            base_mem = f"\n[JARVIS BRAIN MEMORY — context for {symbol}]\n{joined}\n[END BRAIN MEMORY]\n"
+        # Append Neuro core federated recall (Hermes + Vault + AiAnalyst + decisions + neuro local)
+        try:
+            from app.neuro_brain.federated_search import brain_recall_context as _neuro_cx
+            neuro_cx = await _neuro_cx(symbol, max_chars=500)
+            if neuro_cx:
+                if base_mem:
+                    return base_mem + "\n" + neuro_cx
+                return neuro_cx
+        except Exception as _ne:
+            logger.debug(f"[JARVIS brain-recall] neuro append skipped for {symbol}: {_ne}")
+        return base_mem
     except Exception as e:
         logger.debug(f"[JARVIS brain-recall] {symbol}: skipped: {e}")
         return ""

@@ -1,0 +1,7 @@
+{
+  "symbol": "XAUUSD",
+  "action": "buy",
+  "agreement": 0.6,
+  "created_at": 1789278391.754925,
+  "source": "hermes_bridge"
+}

@@ -1,14 +1,14 @@
 ---
 type: index
-updated: 2026-09-08
+updated: 2026-09-14
 tags:
   - dashboard
 ---
 
 # TradeBot Brain — Knowledge Dashboard
 
-> Synced from TradeBot on 2026-09-08.
-> Navigate: [[communities]] | [[strategies]] | [[_daily/2026-09-08]]
+> Synced from TradeBot on 2026-09-14.
+> Navigate: [[communities]] | [[strategies]] | [[_daily/2026-09-14]]
 
 ---
 
@@ -16,7 +16,7 @@ tags:
 ```dataview
 TABLE symbol, action, confidence
 FROM "signals"
-WHERE contains(file.name, "2026-09-08")
+WHERE contains(file.name, "2026-09-14")
 SORT confidence DESC
 LIMIT 10
 ```

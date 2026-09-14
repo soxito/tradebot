@@ -1,7 +1,7 @@
 ---
 type: strategy
 name: Pump Monitor
-updated: 2026-09-08
+updated: 2026-09-14
 tags:
   - strategy
   - Pump-Monitor

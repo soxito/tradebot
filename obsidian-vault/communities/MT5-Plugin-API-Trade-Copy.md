@@ -2,7 +2,7 @@
 type: community
 name: MT5 Plugin API (Trade & Copy)
 node_count: 68
-synced: 2026-09-08
+synced: 2026-09-14
 tags:
   - community
   - MT5-Plugin-API-Trade-Copy
@@ -10,7 +10,7 @@ tags:
 
             # MT5 Plugin API (Trade & Copy)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-08.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
 
 
             ## Key Nodes (68 total)

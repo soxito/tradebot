@@ -2,7 +2,7 @@
 type: community
 name: Trading (c86)
 node_count: 14
-synced: 2026-09-08
+synced: 2026-09-14
 tags:
   - community
   - Trading-c86
@@ -10,7 +10,7 @@ tags:
 
             # Trading (c86)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-08.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
 
 
             ## Key Nodes (14 total)

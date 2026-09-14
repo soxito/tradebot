@@ -2,7 +2,7 @@
 type: community
 name: Manager (c163)
 node_count: 3
-synced: 2026-09-08
+synced: 2026-09-14
 tags:
   - community
   - Manager-c163
@@ -10,7 +10,7 @@ tags:
 
             # Manager (c163)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-08.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
 
 
             ## Key Nodes (3 total)

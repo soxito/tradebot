@@ -2,7 +2,7 @@
 type: community
 name: MT5 & Exchange (c75)
 node_count: 17
-synced: 2026-09-08
+synced: 2026-09-14
 tags:
   - community
   - MT5-Exchange-c75
@@ -10,7 +10,7 @@ tags:
 
             # MT5 & Exchange (c75)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-08.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
 
 
             ## Key Nodes (17 total)

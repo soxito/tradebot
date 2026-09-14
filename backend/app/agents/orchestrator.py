@@ -1235,6 +1235,7 @@ class AgentOrchestrator:
             # size against and no calendar to check, so their seats could only
             # describe the chart while a crypto seat could plan a trade.
             await AgentOrchestrator._add_account_and_research(context, symbol, db)
+            await AgentOrchestrator._add_neuro_brain(context, symbol)
             AgentOrchestrator._add_best_trader_skill(context, symbol)
             return context
 
@@ -1339,6 +1340,7 @@ class AgentOrchestrator:
             await safe_rollback(db)
 
         await AgentOrchestrator._add_account_and_research(context, symbol, db)
+        await AgentOrchestrator._add_neuro_brain(context, symbol)
         AgentOrchestrator._add_best_trader_skill(context, symbol)
         return context
 
@@ -1363,6 +1365,31 @@ class AgentOrchestrator:
             except Exception as exc:  # noqa: BLE001 - enrichment only
                 logger.debug(f"[Orchestrator] research context unavailable for {symbol}: {exc}")
                 await safe_rollback(db)
+
+    @staticmethod
+    async def _add_neuro_brain(context: Dict[str, Any], symbol: str) -> None:
+        """Federated Neuro core brain recall — every seat sees the same cross-brain context.
+
+        Queries the neuro federated search (Hermes + Obsidian + AiAnalyst + Paul + decisions)
+        and stores the formatted recall plus a few raw hits. Failure is silent — a missing
+        brain never blocks the meeting.
+        """
+        try:
+            from app.neuro_brain.federated_search import brain_recall_context as _neuro_recall
+            # also pull a couple of raw hits foreskinned into the prompt building stage
+            recall = await _neuro_recall(symbol, max_chars=700)
+            if recall:
+                context["neuro_brain"] = recall
+                # also expose raw hits if any agent wants to quote them
+                try:
+                    from app.neuro_brain.federated_search import federated_search as _fed
+                    hits = await _fed(symbol, symbol, limit=4)
+                    if hits:
+                        context["neuro_hits"] = hits[:3]
+                except Exception:
+                    pass
+        except Exception as exc:  # noqa: BLE001 — enrichment only
+            logger.debug(f"[Orchestrator] neuro brain recall skipped for {symbol}: {exc}")
 
     @staticmethod
     def _add_best_trader_skill(context: Dict[str, Any], symbol: str) -> None:
@@ -2329,6 +2356,52 @@ class AgentOrchestrator:
                     d["skill_asset_class"] = (context.get("hermes_skill") or {}).get("asset_class")
         except Exception:
             pass
+        # ── NEURO CORE — deciding brain gate ─────────────────────────────────
+        # Neuro reviews the tentative verdict before it leaves the room.
+        # This is what makes it the DECIDING brain of everything: every
+        # execution path (room, scanner, JARVIS) passes through here when
+        # federation is on. Veto → HOLD, downgrade → capped confidence.
+        try:
+            from app.neuro_brain.sync import deciding_review as _neuro_decide
+
+            _neuro_out = await _neuro_decide(
+                symbol=symbol,
+                tentative_action=str(result_payload.get("final_action") or "hold"),
+                tentative_confidence=float(result_payload.get("final_confidence") or 0),
+                consensus=room.consensus_from(decisions),
+                timeframe=timeframe,
+                trigger=trigger,
+            )
+            result_payload["neuro_review"] = _neuro_out
+            if _neuro_out.get("veto"):
+                # Neuro veto — force HOLD and annotate reasoning so the UI shows why
+                _orig = result_payload.get("final_action")
+                result_payload["final_action"] = "hold"
+                result_payload["final_confidence"] = 0.0
+                _tag = f"[NEURO CORE VETO — was {_orig} → HOLD] {_neuro_out.get('reason','')}"
+                result_payload["final_reasoning"] = f"{_tag}\n\n{result_payload.get('final_reasoning') or ''}".strip()
+                logger.warning(f"[Orchestrator:{session_id}] Neuro veto for {symbol}: {_orig} → HOLD ({_neuro_out.get('reason','')})")
+            elif _neuro_out.get("confidence") is not None and float(_neuro_out.get("confidence") or 0) < float(result_payload.get("final_confidence") or 0):
+                # Neuro downgrade — keep direction but cap confidence
+                _prev = float(result_payload.get("final_confidence") or 0)
+                _new = float(_neuro_out.get("confidence") or 0)
+                result_payload["final_confidence"] = _new
+                result_payload["final_reasoning"] = f"[NEURO CORE — confidence { _prev:.2f} → { _new:.2f}] {_neuro_out.get('reason','')}\n\n{result_payload.get('final_reasoning') or ''}".strip()
+                logger.info(f"[Orchestrator:{session_id}] Neuro downgrade for {symbol}: {_prev:.2f} → {_new:.2f} ({_neuro_out.get('reason','')})")
+            # Persist the review into decisions so Insights / history shows it
+            decisions.append({
+                "agent_name": "Neuro Core",
+                "agent_role": "neuro_core",
+                "symbol": symbol,
+                "action": _neuro_out.get("action", result_payload.get("final_action")),
+                "confidence": _neuro_out.get("confidence", result_payload.get("final_confidence")),
+                "reasoning": _neuro_out.get("reason", ""),
+                "veto": _neuro_out.get("veto", False),
+                "ai_called": False,
+                "memory_context_used": 0,
+            })
+        except Exception as e:
+            logger.debug(f"[Orchestrator] neuro deciding review skipped for {symbol}: {e}")
         await room.session_completed(session_id, result_payload)
 
         # The chair reads the verdict aloud — the debate view's closing line.

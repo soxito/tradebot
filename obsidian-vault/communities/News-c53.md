@@ -2,7 +2,7 @@
 type: community
 name: News (c53)
 node_count: 24
-synced: 2026-09-08
+synced: 2026-09-14
 tags:
   - community
   - News-c53
@@ -10,7 +10,7 @@ tags:
 
             # News (c53)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-08.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
 
 
             ## Key Nodes (24 total)

@@ -1,0 +1,7 @@
+{
+  "symbol": "NAS100",
+  "action": "buy",
+  "agreement": 0.6,
+  "created_at": 1789252768.728163,
+  "source": "hermes_bridge"
+}

@@ -2,7 +2,7 @@
 type: community
 name: Position (c124)
 node_count: 7
-synced: 2026-09-08
+synced: 2026-09-14
 tags:
   - community
   - Position-c124
@@ -10,7 +10,7 @@ tags:
 
             # Position (c124)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-08.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
 
 
             ## Key Nodes (7 total)

@@ -127,6 +127,31 @@ function toApiTimeframe(tf: string): string {
   return TF_API_MAP[tf] ?? tf;
 }
 
+/** Normalise any timeframe (api '1h' or MT5 'H1') to the MT5 form the
+ *  broker-independent `/market/candles` feed expects. Case-sensitive so the
+ *  1-minute '1m' and 1-month '1M' don't collide. */
+const TF_MT5_MAP: Record<string, string> = {
+  '1m': 'M1', '3m': 'M3', '5m': 'M5', '15m': 'M15', '30m': 'M30',
+  '1h': 'H1', '2h': 'H2', '4h': 'H4', '1d': 'D1', '1w': 'W1', '1M': 'MN1',
+  M1: 'M1', M3: 'M3', M5: 'M5', M15: 'M15', M30: 'M30',
+  H1: 'H1', H2: 'H2', H4: 'H4', H6: 'H6', H12: 'H12', D1: 'D1', W1: 'W1', MN1: 'MN1',
+};
+function toMt5Timeframe(tf: string): string {
+  return TF_MT5_MAP[tf] ?? 'H1';
+}
+
+/** Seconds per bar for any timeframe (api '1h' or MT5 'H1') — used to place the
+ *  live forming bar on the correct candle boundary. */
+const TF_SECONDS_MAP: Record<string, number> = {
+  '1m': 60, '3m': 180, '5m': 300, '15m': 900, '30m': 1800,
+  '1h': 3600, '2h': 7200, '4h': 14400, '1d': 86400, '1w': 604800, '1M': 2592000,
+  M1: 60, M3: 180, M5: 300, M15: 900, M30: 1800,
+  H1: 3600, H2: 7200, H4: 14400, H6: 21600, H12: 43200, D1: 86400, W1: 604800, MN1: 2592000,
+};
+function tfSeconds(tf: string): number {
+  return TF_SECONDS_MAP[tf] ?? 3600;
+}
+
 export default function TradingViewChart({ 
   symbol, 
   exchange = 'bitget',
@@ -172,6 +197,14 @@ export default function TradingViewChart({
   // True until the candles have been fitted once for the current chart instance.
   // Prevents the background refresh from resetting the user's zoom/pan.
   const didFitRef = useRef(false);
+  // Newest bar time currently drawn (seconds). Lets the realtime refresh skip
+  // stale bars — lightweight-charts' update() throws if given a time older than
+  // the last bar, which a briefly-lagging market feed can otherwise trigger.
+  const lastBarTimeRef = useRef(0);
+  // Close of the newest bar + the in-progress live bar, so the live-price poll
+  // can tick the forming candle between REST refreshes (TradingView-style).
+  const lastCloseRef = useRef(0);
+  const liveBarRef = useRef<{ time: number; open: number; high: number; low: number; close: number } | null>(null);
   // Abort controller so in-flight fetch is cancelled when symbol/timeframe changes
   const abortRef = useRef<AbortController | null>(null);
   const [loading, setLoading] = useState(true);
@@ -232,6 +265,14 @@ export default function TradingViewChart({
   const tpLineRef = useRef<any>(null);
 
   // Fetch real market data
+  // Record the newest bar so the live-price poll knows where the forming candle
+  // sits. resetLive drops the in-progress bar after a full series replace.
+  const rememberLastBar = (time?: number, close?: number, resetLive = false) => {
+    if (typeof time === 'number' && time > 0) lastBarTimeRef.current = time;
+    if (typeof close === 'number' && close > 0) lastCloseRef.current = close;
+    if (resetLive) liveBarRef.current = null;
+  };
+
   const fetchChartData = async () => {
     // Capture the series this fetch belongs to. The chart (and this ref) is
     // recreated whenever the symbol/exchange/timeframe changes, so a slow
@@ -262,32 +303,55 @@ export default function TradingViewChart({
 
       // If pre-fetched candles were supplied (e.g. forex/metals from Kronos or BTC cycle),
       // use them directly without hitting the crypto exchange endpoint.
-      // For BTC cycle 1h/4h with 4y window, also poll the latest 2 bars for realtime last-bar updates.
+      // On a background refresh (didFitRef already true) tick the forming bar in
+      // realtime instead of re-drawing the same static snapshot — otherwise the
+      // chart only moved when the user refreshed the page.
       if (initialCandles && initialCandles.length > 0 && targetSeries) {
         const isBtcCycle = symbol.toUpperCase().replace('/','').startsWith('BTC') && initialCandles.length > 500
-        // On refresh (didFitRef already true), only update the last bar for realtime, don't reset whole series
-        if (didFitRef.current && isBtcCycle && isStale() === false) {
-          // Try to fetch just the latest 2 bars for realtime update, fallback to full setData if fails
+        if (didFitRef.current && !isStale()) {
           try {
-            // Use the cycle endpoint's latest 2 for BTC cycle to keep realtime accurate
-            const tfMap: Record<string,string> = { H1:'H1', H4:'H4', D1:'D1', W1:'W1', MN1:'MN1' }
-            const cycleTf = tfMap[timeframe] ?? timeframe
-            if (['H1','H4','D1','W1','MN1'].includes(cycleTf)) {
-              const { data: latestData } = await apiClient.getCycleCandles(cycleTf, 2) as any
-              const latest = latestData?.candles?.slice(-1)[0]
-              if (latest && latest.time && latest.close) {
-                const last = initialCandles[initialCandles.length-1]
-                // If latest is newer or same bar with new close, update
-                if (latest.time >= (last.time as number)) {
-                  targetSeries.update({ time: latest.time as any, open: latest.open, high: latest.high, low: latest.low, close: latest.close } as any)
-                  setLastUpdate(new Date())
-                  setLoading(false)
-                  return
+            if (isBtcCycle) {
+              // BTC cycle: the genesis-aware cycle endpoint keeps the last bar accurate.
+              const tfMap: Record<string,string> = { H1:'H1', H4:'H4', D1:'D1', W1:'W1', MN1:'MN1' }
+              const cycleTf = tfMap[timeframe] ?? timeframe
+              if (['H1','H4','D1','W1','MN1'].includes(cycleTf)) {
+                const { data: latestData } = await apiClient.getCycleCandles(cycleTf, 2) as any
+                const latest = latestData?.candles?.slice(-1)[0]
+                if (latest && latest.time && latest.close && !isStale()) {
+                  const lastTime = Math.max(lastBarTimeRef.current, initialCandles[initialCandles.length-1]?.time as number ?? 0)
+                  if (latest.time >= lastTime) {
+                    targetSeries.update({ time: latest.time as any, open: latest.open, high: latest.high, low: latest.low, close: latest.close } as any)
+                    rememberLastBar(latest.time as number, latest.close as number)
+                    setLastUpdate(new Date())
+                    setLoading(false)
+                    return
+                  }
                 }
+              }
+            } else {
+              // FX / metals / indices / equities: the crypto exchange can't price
+              // these, so poll the broker-independent market feed (same Yahoo/
+              // Swissquote source the Kronos candles came from) and update the
+              // last two bars — a new bar appears and the forming bar ticks live.
+              const { data: fresh } = await apiClient.getMarketCandles(
+                symbol, toMt5Timeframe(timeframe), 10, controller.signal,
+              ) as any
+              const rows: any[] = fresh?.candles ?? []
+              if (rows.length && !isStale()) {
+                for (const c of rows.slice(-2)) {
+                  if (c && c.time != null && c.close != null && (c.time as number) >= lastBarTimeRef.current) {
+                    targetSeries.update({ time: c.time as any, open: c.open, high: c.high, low: c.low, close: c.close } as any)
+                    rememberLastBar(c.time as number, c.close as number)
+                  }
+                }
+                setLastUpdate(new Date())
+                setLoading(false)
+                return
               }
             }
           } catch {}
-          // Fallback: still set full data but don't refit (preserve zoom)
+          // Realtime fetch missed — redraw the snapshot without refitting so a
+          // transient network error can't reset the user's zoom/pan.
           const data = initialCandles.map((c) => ({
             time: c.time as any,
             open: c.open,
@@ -297,6 +361,7 @@ export default function TradingViewChart({
           }));
           if (isStale()) return;
           targetSeries.setData(data);
+          rememberLastBar(data[data.length - 1]?.time as number, data[data.length - 1]?.close as number, true);
           setLastUpdate(new Date());
           setLoading(false);
           return;
@@ -310,6 +375,7 @@ export default function TradingViewChart({
         }));
         if (isStale()) return;
         targetSeries.setData(data);
+        rememberLastBar(data[data.length - 1]?.time as number, data[data.length - 1]?.close as number, true);
         const allPrices = data.flatMap((c) => [c.open, c.high, c.low, c.close]).filter((p) => p > 0);
         if (allPrices.length > 0) {
           const precision = calcChartPrecision(allPrices);
@@ -340,6 +406,7 @@ export default function TradingViewChart({
       const data = response.data?.data;
       if (Array.isArray(data) && data.length > 0) {
         targetSeries.setData(data);
+        rememberLastBar((data[data.length - 1] as any)?.time as number, (data[data.length - 1] as any)?.close as number, true);
 
         // Auto-detect price precision from OHLCV data (handles PEPE, SHIB etc.)
         const allPrices = data.flatMap((c: any) => [c.open, c.high, c.low, c.close]).filter((p: number) => p > 0);
@@ -366,6 +433,8 @@ export default function TradingViewChart({
         // No data for this symbol (e.g. unknown/invalid pair). Clear any stale
         // candles so we never show the previous symbol's chart, and surface why.
         targetSeries.setData([]);
+        rememberLastBar(0, 0, true);
+        lastBarTimeRef.current = 0;
         setError(response.data?.error || `No chart data for ${symbol}`);
         setLoading(false);
       }
@@ -445,8 +514,8 @@ export default function TradingViewChart({
       if (tf === '1m') return 5_000;
       if (tf === '3m' || tf === '5m') return 10_000;
       if (tf === '15m' || tf === '30m') return 15_000;
-      if (tf === 'h1') return 10_000; // 1H realtime: every 10s
-      if (tf === 'h4') return 15_000; // 4H realtime: every 15s
+      if (tf === 'h1' || tf === '1h') return 10_000; // 1H realtime: every 10s
+      if (tf === 'h4' || tf === '4h') return 15_000; // 4H realtime: every 15s
       if (tf === '1d' || tf === 'd1') return 30_000;
       if (tf === '1w' || tf === 'w1' || tf === 'mn1' || tf === '1m') return 60_000;
       return 30_000;
@@ -482,6 +551,64 @@ export default function TradingViewChart({
       chart.remove();
     };
   }, [symbol, exchange, timeframe, maximized, initialCandles]);
+
+  // Live forming-bar poll — ticks the newest candle between REST refreshes so
+  // every chart moves in realtime like TradingView, even on higher timeframes
+  // (H1/H4/D1) where a full new candle only closes once an hour or day. One
+  // universal quote (`/market/price`) covers crypto, FX, metals, indices and
+  // equities, so this works for every symbol the chart can draw.
+  useEffect(() => {
+    const series = candlestickSeriesRef.current;
+    if (!series) return;
+    let cancelled = false;
+    let failStreak = 0;
+    let timer: ReturnType<typeof setTimeout>;
+    const tfSec = tfSeconds(timeframe);
+
+    const poll = async () => {
+      if (cancelled) return;
+      try {
+        // Wait until the historical series has loaded so we know where the
+        // forming bar sits and never write one older than the newest bar.
+        if (lastBarTimeRef.current > 0) {
+          const res = await apiClient.getMarketPrice(symbol);
+          const price = res.data?.price;
+          const s = candlestickSeriesRef.current;
+          if (!cancelled && s === series && typeof price === 'number' && isFinite(price) && price > 0) {
+            failStreak = 0;
+            const barTime = Math.floor(Math.floor(Date.now() / 1000) / tfSec) * tfSec;
+            if (barTime >= lastBarTimeRef.current) {
+              const prev = liveBarRef.current;
+              if (!prev || prev.time !== barTime) {
+                const seed = lastCloseRef.current > 0 ? lastCloseRef.current : price;
+                liveBarRef.current = { time: barTime, open: seed, high: Math.max(seed, price), low: Math.min(seed, price), close: price };
+              } else {
+                liveBarRef.current = { ...prev, high: Math.max(prev.high, price), low: Math.min(prev.low, price), close: price };
+              }
+              const b = liveBarRef.current;
+              try {
+                series.update({ time: b.time as any, open: b.open, high: b.high, low: b.low, close: b.close } as any);
+                lastBarTimeRef.current = b.time;
+                lastCloseRef.current = b.close;
+                setLastUpdate(new Date());
+              } catch { /* series replaced mid-write */ }
+            }
+          } else {
+            failStreak++;
+          }
+        }
+      } catch {
+        failStreak++;
+      }
+      // Back off hard after repeated failures so an unpriceable symbol does not
+      // hammer the endpoint; otherwise tick every ~3s for a smooth live feel.
+      if (!cancelled) timer = setTimeout(poll, failStreak >= 3 ? 30_000 : 3_000);
+    };
+    timer = setTimeout(poll, 2_000);
+
+    return () => { cancelled = true; clearTimeout(timer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [symbol, exchange, timeframe, chartInitCount]);
 
   // Push fresh zone data into the primitive; also re-run when the user
   // toggles visibility or new cycle boxes arrive so a re-attach picks up

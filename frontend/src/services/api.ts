@@ -1290,11 +1290,17 @@ export const apiClient = {
       job: (jobId: number) => api.get(`/plugins/kronos/finetune/jobs/${jobId}`),
       /** Cancel a running fine-tune job. */
       cancel: (jobId: number) => api.delete(`/plugins/kronos/finetune/jobs/${jobId}`),
+      /** Permanently delete a job + its checkpoints from disk to free space. */
+      delete: (jobId: number) => api.delete(`/plugins/kronos/finetune/jobs/${jobId}`, { params: { delete: true } }),
       /** Hot-swap the engine to a completed job's model. */
       load: (jobId: number) => api.post(`/plugins/kronos/finetune/load/${jobId}`, null, { timeout: 60000 }),
       /** Merge all completed datasets into one and train a combined model. */
       combine: (modelName?: string) =>
         api.post('/plugins/kronos/finetune/combine', null, { params: modelName ? { model_name: modelName } : {}, timeout: 60000 }),
+      /** Delete every non-combined job + checkpoints (frees the machine). */
+      prune: () => api.post('/plugins/kronos/finetune/prune', null, { timeout: 60000 }),
+      /** Manually run the weekly combined-model improvement + prune cycle. */
+      weeklyRun: () => api.post('/plugins/kronos/finetune/weekly-run', null, { timeout: 60000 }),
     },
   },
 
@@ -1430,6 +1436,37 @@ export const apiClient = {
     getMcpSchema: () => api.get('/plugins/openhuman/mcp/schema'),
   },
 
+  // ── Neuroglancer Core Brain (google/neuroglancer) — federates all brains ─
+  neuro: {
+    health: () => api.get('/neuro/health'),
+    overview: () => api.get('/neuro/overview'),
+    repo: () => api.get('/neuro/repo'),
+    repoPull: () => api.post('/neuro/repo/pull'),
+    search: (q: string, symbol?: string, limit = 12) =>
+      api.get('/neuro/search', { params: { q, ...(symbol ? { symbol } : {}), limit } }),
+    recall: (symbol: string, max_chars = 700) =>
+      api.get('/neuro/recall', { params: { symbol, max_chars } }),
+    graph: (limit = 80) => api.get('/neuro/graph', { params: { limit } }),
+    trades: (params?: { limit?: number; symbol?: string; outcome?: string; asset_class?: string }) =>
+      api.get('/neuro/trades', { params }),
+    recordTrade: (data: { symbol: string; side: string; entry: number; stop_loss?: number; take_profit?: number; confidence?: number; price_at_signal?: number; timeframe?: string; asset_class?: string; exchange?: string; source?: string; agent_role?: string }) =>
+      api.post('/neuro/trades/record', data),
+    analysis: (limit = 200) => api.get('/neuro/analysis', { params: { limit } }),
+    settle: (limit = 8) => api.post('/neuro/analysis/settle', null, { params: { limit } }),
+    sync: (limit_per_brain = 30) => api.post('/neuro/sync', null, { params: { limit_per_brain } }),
+    decide: (symbol: string, action: string, confidence = 0.5, timeframe = '1h') =>
+      api.post('/neuro/decide', null, { params: { symbol, action, confidence, timeframe } }),
+    viewerState: (limit = 120, include_demo = false, hemibrain = true) => api.get('/neuro/viewer-state', { params: { limit, include_demo, hemibrain } }),
+    viewerUrl: (limit = 120) => `${getApiRootUrl()}/api/v1/neuro/viewer-state?limit=${limit}`,
+    hemibrain: () => api.get('/neuro/hemibrain'),
+    rois: (roi_id?: string) => api.get('/neuro/rois', { params: roi_id ? { roi_id } : {} }),
+    cellTypes: () => api.get('/neuro/cell-types'),
+    pipeline: () => api.get('/neuro/pipeline'),
+    neuprint: (cypher: string, limit = 25) => api.get('/neuro/neuprint/query', { params: { cypher, limit } }),
+    adjacencies: (limit = 100, format: 'json' | 'csv' = 'json') => api.get('/neuro/adjacencies', { params: { limit, format } }),
+    status: () => api.get('/neuro/status'),
+    prune: (days = 90) => api.post('/neuro/prune', null, { params: { days } }),
+  },
   // ── Hermes (NousResearch/hermes-agent sidecar, :8011) ────────────────
   hermes: {
     health: () => api.get('/hermes/health'),

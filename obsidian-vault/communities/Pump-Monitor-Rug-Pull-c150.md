@@ -2,7 +2,7 @@
 type: community
 name: Pump Monitor & Rug Pull (c150)
 node_count: 4
-synced: 2026-09-08
+synced: 2026-09-14
 tags:
   - community
   - Pump-Monitor-Rug-Pull-c150
@@ -10,7 +10,7 @@ tags:
 
             # Pump Monitor & Rug Pull (c150)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-08.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
 
 
             ## Key Nodes (4 total)

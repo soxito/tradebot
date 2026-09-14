@@ -2,7 +2,7 @@
 type: community
 name: Bitget Exchange Connector
 node_count: 58
-synced: 2026-09-08
+synced: 2026-09-14
 tags:
   - community
   - Bitget-Exchange-Connector
@@ -10,7 +10,7 @@ tags:
 
             # Bitget Exchange Connector
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-08.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
 
 
             ## Key Nodes (58 total)

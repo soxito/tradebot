@@ -2,7 +2,7 @@
 type: community
 name: App Layout & Navigation
 node_count: 33
-synced: 2026-09-08
+synced: 2026-09-14
 tags:
   - community
   - App-Layout-Navigation
@@ -10,7 +10,7 @@ tags:
 
             # App Layout & Navigation
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-08.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
 
 
             ## Key Nodes (33 total)

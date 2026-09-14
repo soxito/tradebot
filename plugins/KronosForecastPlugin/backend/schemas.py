@@ -349,6 +349,7 @@ class FinetuneJobResponse(BaseModel):
     timeframe: str
     status: FinetuneStatusT
     model_name: Optional[str] = None            # user label e.g. "super-base"
+    symbols_combined: Optional[List[str]] = None  # for COMBINED models: source pairs
     lookback: int
     pred_len: int
     tokenizer_epochs: int

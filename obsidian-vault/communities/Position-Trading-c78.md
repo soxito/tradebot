@@ -2,7 +2,7 @@
 type: community
 name: Position & Trading (c78)
 node_count: 16
-synced: 2026-09-08
+synced: 2026-09-14
 tags:
   - community
   - Position-Trading-c78
@@ -10,7 +10,7 @@ tags:
 
             # Position & Trading (c78)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-08.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
 
 
             ## Key Nodes (16 total)

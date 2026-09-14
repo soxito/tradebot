@@ -2,7 +2,7 @@
 type: community
 name: Telegram (c31)
 node_count: 31
-synced: 2026-09-08
+synced: 2026-09-14
 tags:
   - community
   - Telegram-c31
@@ -10,7 +10,7 @@ tags:
 
             # Telegram (c31)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-08.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
 
 
             ## Key Nodes (31 total)

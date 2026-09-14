@@ -2,7 +2,7 @@
 type: community
 name: Path (c165)
 node_count: 3
-synced: 2026-09-08
+synced: 2026-09-14
 tags:
   - community
   - Path-c165
@@ -10,7 +10,7 @@ tags:
 
             # Path (c165)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-08.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
 
 
             ## Key Nodes (3 total)

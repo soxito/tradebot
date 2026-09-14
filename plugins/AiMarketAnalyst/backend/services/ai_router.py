@@ -1436,7 +1436,8 @@ TASK_MODEL_CHAINS: dict[str, list[str]] = {
     # Snappy tool-calling turns: bot replies, position checks, quick lookups.
     "fast_agentic": ["nvidia/nemotron-3.5-lightning-30b-a3b"],
     # Strategy synthesis, forecast narration, full market analysis.
-    "deep_reasoning": ["z-ai/glm-5.2", "nvidia/nemotron-3-super-120b-a12b"],
+    # (z-ai/glm-5.2 removed — reached end-of-life 2026-08-21, answers 410 Gone.)
+    "deep_reasoning": ["nvidia/nemotron-3-super-120b-a12b"],
 
     # ── Surfaces ────────────────────────────────────────────────────────────
     # These name a *place the user talks to the system* rather than a kind of
@@ -1501,7 +1502,6 @@ _REASONING_MODELS = {
     "thinkingmachines/inkling",
     "meta/muse-glimmer-30b",
     "nvidia/nemotron-3.5-lightning-30b-a3b",
-    "z-ai/glm-5.2",
 }
 _MIN_REASONING_TOKENS = 2048
 
@@ -1663,8 +1663,8 @@ def timeout_for_model(model: str | None, requested: float | None = None) -> floa
 # Gone, and a 410 is a config fault that sits the whole provider out for half an
 # hour, so heading the list with it would take NVIDIA down on the first chat.
 FAST_CHAT_MODELS: tuple[str, ...] = (
-    # NVIDIA NIM — nano 1.3s, mini 0.9s, nano-9b 4.0s, llama-3.3-70b 15.8s
-    "nvidia/nemotron-3-nano-30b-a3b",
+    # NVIDIA NIM — nano-9b 4.0s, mini 0.9s, llama-3.3-70b 15.8s.
+    # (nemotron-3-nano-30b-a3b removed — retired upstream, answers 410 Gone.)
     "nvidia/nvidia-nemotron-nano-9b-v2",
     "nvidia/nemotron-mini-4b-instruct",
     "meta/llama-3.3-70b-instruct",
@@ -1893,7 +1893,37 @@ async def chat_turn(
         task=route.task,
         **kwargs,
     )
-    if (result.get("ok") and (result.get("content") or "").strip()) or route.task == surface_task:
+    if result.get("ok") and (result.get("content") or "").strip():
+        return result
+
+    # The first attempt produced nothing. A pinned model is the usual culprit:
+    # NVIDIA rotates model ids and retires them, and a 404/410 there dooms every
+    # provider at once because db_chat hands them all the same dead id. So before
+    # giving up, retry once letting each provider serve its OWN default_model —
+    # the id the connection test actually verified — which recovers the turn
+    # whenever a live provider exists even though the pinned model is gone.
+    if route.model is not None:
+        logger.warning(
+            "[AIRouter] pinned model {} failed ({}) — retrying with provider defaults",
+            route.model, str(result.get("error"))[:120],
+        )
+        recovered = await chat_with_tools(
+            db,
+            messages,
+            max_iterations=route.max_iterations,
+            total_budget_s=route.budget_s,
+            temperature=route.temperature,
+            max_tokens=route.max_tokens if max_tokens is None else max_tokens,
+            model_override=None,
+            max_retries=route.max_retries,
+            task=route.task,
+            **kwargs,
+        )
+        if recovered.get("ok") and (recovered.get("content") or "").strip():
+            return recovered
+        result = recovered
+
+    if route.task == surface_task:
         return result
 
     logger.warning(

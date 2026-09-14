@@ -2,7 +2,7 @@
 type: community
 name: Sentiment (c38)
 node_count: 28
-synced: 2026-09-08
+synced: 2026-09-14
 tags:
   - community
   - Sentiment-c38
@@ -10,7 +10,7 @@ tags:
 
             # Sentiment (c38)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-08.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
 
 
             ## Key Nodes (28 total)

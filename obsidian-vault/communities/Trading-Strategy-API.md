@@ -2,7 +2,7 @@
 type: community
 name: Trading Strategy API
 node_count: 37
-synced: 2026-09-08
+synced: 2026-09-14
 tags:
   - community
   - Trading-Strategy-API
@@ -10,7 +10,7 @@ tags:
 
             # Trading Strategy API
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-08.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
 
 
             ## Key Nodes (37 total)

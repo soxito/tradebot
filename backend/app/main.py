@@ -184,13 +184,58 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Cycle detector failed to start: {e}")
 
-    # Whale watch — reads the curated BTC whale registry so the desk sees the
+     # Whale watch — reads the curated BTC whale registry so the desk sees the
     # big money accumulate or distribute before it becomes a candle.
     try:
         from app.core.scheduler import start_whale_watch_loop
         start_whale_watch_loop()
     except Exception as e:
         logger.warning(f"Whale watch failed to start: {e}")
+
+    # Neuroglancer Core Brain — ensure store + start federated trade setter + auto-pull + AUTO-SYNC all brains
+    # This is the CORE brain: it federates Hermes + Vault + AiAnalyst + Decisions + Journal
+    # and auto-syncs them into its FTS so it is ALWAYS in track, even though it was added new.
+    # It is also the DECIDING brain (see orchestrator._apply_neuro_decision) — every verdict
+    # passes through its veto before execution.
+    if getattr(settings, "NEUROGLANCER_ENABLED", True):
+        try:
+            from app.neuro_brain.state_store import ensure_store as _neuro_ensure
+            _neuro_ensure()
+            logger.info("✅ Neuro core brain store ready (CORE — federates all brains)")
+        except Exception as e:
+            logger.warning(f"Neuro store ensure skipped: {e}")
+        try:
+            from app.neuro_brain.repo_sync import start_neuro_trade_loop, start_neuro_pull_loop
+            if getattr(settings, "NEUROGLANCER_AUTO_ANALYSE", True):
+                start_neuro_trade_loop(int(getattr(settings, "NEUROGLANCER_TRADE_LOOP_S", 600) or 600))
+            if getattr(settings, "NEUROGLANCER_AUTO_PULL", True):
+                start_neuro_pull_loop(int(getattr(settings, "NEUROGLANCER_PULL_INTERVAL_S", 21600) or 21600))
+        except Exception as e:
+            logger.warning(f"Neuro loops failed to start: {e}")
+        # Auto-sync loop — mirrors every other brain into Neuro on a 5-min cadence
+        # so Neuro is always the complete track of everything that happened.
+        try:
+            from app.neuro_brain.sync import start_neuro_sync_loop, sync_once
+
+            # Kick one immediate backfill (don't block lifespan)
+            async def _neuro_initial_sync():
+                await asyncio.sleep(6)
+                try:
+                    res = await sync_once(limit_per_brain=40)
+                    logger.info(f"✅ Neuro core auto-sync backfill: {res.get('total',0)} episodes mirrored")
+                except Exception as ee:
+                    logger.debug(f"Neuro initial sync skipped: {ee}")
+
+            try:
+                asyncio.create_task(_neuro_initial_sync())
+            except RuntimeError:
+                pass
+            # Then periodic
+            sync_interval = int(getattr(settings, "NEUROGLANCER_SYNC_INTERVAL_S", 300) or 300)
+            start_neuro_sync_loop(sync_interval)
+            logger.info(f"✅ Neuro core auto-sync loop started (every {sync_interval}s — deciding brain)")
+        except Exception as e:
+            logger.warning(f"Neuro sync loop failed to start: {e}")
 
     # Telegram signal monitor — start it with the app, not 63 s later when a
     # browser happens to hit a /plugins/telegram/* endpoint. ensure_started is
@@ -353,6 +398,13 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
     stop_background_workers()
+    try:
+        from app.neuro_brain.repo_sync import stop_neuro_trade_loop, stop_neuro_pull_loop
+        stop_neuro_trade_loop(); stop_neuro_pull_loop()
+        from app.neuro_brain.sync import stop_neuro_sync_loop
+        stop_neuro_sync_loop()
+    except Exception:
+        pass
     try:
         from app.core.scheduler import stop_price_tick_loop
         stop_price_tick_loop()

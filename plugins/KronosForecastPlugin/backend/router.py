@@ -66,6 +66,7 @@ async def list_models():
                 "installed": True,
                 "is_finetuned": True,
                 "job_id": j["id"],
+                "symbols_combined": j.get("symbols_combined"),
             })
     except Exception as exc:
         logger.debug(f"[Kronos] could not list finetuned models: {exc}")
@@ -644,11 +645,26 @@ async def finetune_job(job_id: int) -> FinetuneJobResponse:
 
 
 @router.delete("/finetune/jobs/{job_id}")
-async def finetune_cancel(job_id: int):
-    """Cancel a running fine-tune job (SIGTERM the trainer, mark cancelled)."""
+async def finetune_cancel(job_id: int, delete: bool = Query(False, description="Also delete checkpoints from disk + DB")):
+    """Cancel a running fine-tune job. With ``?delete=true`` the job and all of
+    its on-disk checkpoints are permanently removed to free space."""
+    from fastapi import HTTPException
     from plugins.KronosForecastPlugin.backend.services import finetune_service
+    if delete:
+        try:
+            return await finetune_service.finetune_manager.delete_job(job_id)
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
     ok = await finetune_service.finetune_manager.cancel(job_id)
     return {"ok": ok, "job_id": job_id}
+
+
+@router.post("/finetune/prune")
+async def finetune_prune():
+    """Delete every non-COMBINED fine-tune job + checkpoints (frees the machine
+    after everything has been merged into the combined model)."""
+    from plugins.KronosForecastPlugin.backend.services import finetune_service
+    return await finetune_service.finetune_manager.prune_non_combined()
 
 
 @router.post("/finetune/load/{job_id}")
@@ -671,6 +687,14 @@ async def finetune_combine(model_name: Optional[str] = Query(None, description="
         return FinetuneCombineResponse(**out)
     except (ValueError, RuntimeError) as exc:
         return FinetuneCombineResponse(ok=False, error=str(exc))
+
+
+@router.post("/finetune/weekly-run")
+async def finetune_weekly_run():
+    """Manually trigger the weekly combined-model improvement + prune cycle
+    (retrain the combined model, hot-swap it in, then delete non-combined jobs)."""
+    from plugins.KronosForecastPlugin.backend.services import weekly_service
+    return await weekly_service.run_weekly_cycle(force=True)
 
 
 # ── Chart drawings (auto-saved, removable, shared with + refined by agents) ────

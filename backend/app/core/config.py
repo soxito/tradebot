@@ -406,6 +406,23 @@ class Settings(BaseSettings):
     HERMES_GATEWAY_AUTOSTART: bool = True    # start sidecar as child process (like TradingAgents)
     SOUL_PATH: str = "SOUL.md"               # merged JARVIS/Paul/SOX directive
 
+    # ── Neuroglancer Core Brain (google/neuroglancer) ─────────────────
+    # WebGL volumetric brain + trade segmentation viewer — the CORE brain.
+    # All other brains (Hermes, Obsidian, AiMarketAnalyst, AgentDecision) are
+    # federated through it. Repo cloned to integrations/neuroglancer by start.py.
+    NEUROGLANCER_ENABLED: bool = True
+    NEUROGLANCER_REPO_URL: str = "https://github.com/google/neuroglancer.git"
+    NEUROGLANCER_BRANCH: str = "master"
+    NEUROGLANCER_LOCAL_PATH: str = ""        # default: integrations/neuroglancer
+    NEUROGLANCER_STATE_PATH: str = ""        # default: DATA_DIR/neuro_state.db or ./data/neuro_state.db
+    NEUROGLANCER_AUTO_PULL: bool = True      # background git pull every NEUROGLANCER_PULL_INTERVAL_S
+    NEUROGLANCER_PULL_INTERVAL_S: int = 21600  # 6 hours
+    NEUROGLANCER_AUTO_ANALYSE: bool = True   # auto-analyse trades for all pairs
+    NEUROGLANCER_TRADE_LOOP_S: int = 600     # 10 min — settle & analyse journal
+    NEUROGLANCER_FEDERATION_ENABLED: bool = True  # federated recall across all brains
+    NEUROGLANCER_SYNC_INTERVAL_S: int = 300  # 5 min — auto-sync every other brain into Neuro
+    NEUROGLANCER_DECIDING_ENABLED: bool = True  # Neuro is the DECIDING brain (veto/downgrade)
+
     # ── Desktop (packaged Electron app) ───────────────────────
     # Both are populated from TRADEBOT_DATA_DIR / TRADEBOT_STATIC_DIR by the
     # model validator below rather than declared as env fields, so the names the

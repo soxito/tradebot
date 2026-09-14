@@ -1,0 +1,27 @@
+---
+type: decision
+agent: strategy_optimizer
+symbol: BTCUSD
+action: hold
+confidence: 0.2
+ai_called: False
+date: 2026-09-09
+tags:
+  - decision
+  - BTCUSD
+  - strategy_optimizer
+  - hold
+---
+
+# Decision: strategy_optimizer → BTCUSD — HOLD @ 2026-09-09
+
+## Summary
+**Agent**: `strategy_optimizer` | **Action**: `HOLD` | **Confidence**: 20%
+**AI Called**: No (local memory)
+
+## Reasoning
+No outcome feedback available; sample size too small to assess strategy effectiveness.
+
+## Related
+- [[_daily/2026-09-09]]
+- [[signals/BTCUSD]] ← Recent signals for this symbol

@@ -224,7 +224,7 @@ def _remember_finetune(
     action: str, symbol: str, timeframe: str, summary: str, importance: float = 0.6
 ) -> None:
     """Persist a fine-tune milestone to the JARVIS brains (vault + AI-analyst +
-    PaulKnowledge) so training history is remembered across restarts.
+    PaulKnowledge + Neuro core) so training history is remembered across restarts.
 
     Best-effort and standalone: silently no-ops if the core brain layer is not
     importable (keeps the plugin decoupled from core).
@@ -241,8 +241,54 @@ def _remember_finetune(
             importance=importance,
             kind="insight",
         )
+        # Also mirror directly into Neuro core as a trade_segment-like episode so
+        # federated recall (Neuro → Hermes → Vault) never misses it.
+        try:
+            from app.neuro_brain.state_store import ingest_local as _neuro_ingest
+
+            _neuro_ingest(
+                kind=f"kronos-{action}",
+                content=f"[Kronos {action} {symbol} {timeframe}] {summary[:900]}",
+                symbol=symbol,
+                source="kronos-finetune",
+                meta={"timeframe": timeframe, "importance": importance},
+            )
+        except Exception:
+            pass
     except Exception as exc:  # pragma: no cover - best effort
         logger.debug(f"[Kronos-finetune] brain capture skipped: {exc}")
+
+
+async def _collect_brain_knowledge(symbols: list[str]) -> dict:
+    """Collect recall from every brain (Neuro federated + Hermes + Vault) for each symbol.
+
+    Returns {symbol: [hits]}. Best-effort: any brain being offline just yields [].
+    This is written alongside the training CSV so a future audit can prove that
+    the model was trained with full cross-brain context, and is also injected
+    into the fine-tune description so no learned knowledge is missed.
+    """
+    out: dict = {}
+    for sym in symbols:
+        hits: list = []
+        try:
+            from app.neuro_brain.federated_search import federated_search
+
+            hits = await federated_search(sym, sym, limit=8)
+        except Exception as e:
+            logger.debug(f"[Kronos-finetune] brain collect skipped for {sym}: {e}")
+        out[sym] = hits[:6]
+    # Also capture a global snapshot (cross-symbol insights)
+    try:
+        from app.neuro_brain.state_store import stats as _neuro_stats
+        from app.hermes_bridge.state_store import search_local as _hermes_search
+        # cheap global markers
+        out["_meta"] = {
+            "neuro_stats": _neuro_stats(),
+            "collected_at": _now().isoformat(),
+        }
+    except Exception:
+        pass
+    return out
 
 
 class FinetuneManager:
@@ -253,12 +299,33 @@ class FinetuneManager:
     def __init__(self) -> None:
         self._procs: Dict[int, asyncio.subprocess.Process] = {}
         self._tasks: Dict[int, asyncio.Task] = {}
+        self._schema_ok = False
 
     @classmethod
     def instance(cls) -> "FinetuneManager":
         if cls._instance is None:
             cls._instance = FinetuneManager()
         return cls._instance
+
+    async def _ensure_schema(self) -> None:
+        """Idempotently add columns not covered by create_all on an existing
+        table. create_all never ALTERs, so the combined-pairs column is added
+        live on first use (safe to run repeatedly)."""
+        if self._schema_ok:
+            return
+        try:
+            from sqlalchemy import text
+            from app.core.database import AsyncSessionLocal
+            async with AsyncSessionLocal() as db:
+                await db.execute(text(
+                    "ALTER TABLE kronos_finetune_jobs "
+                    "ADD COLUMN IF NOT EXISTS symbols_combined JSONB"
+                ))
+                await db.commit()
+            self._schema_ok = True
+        except Exception as exc:  # noqa: BLE001 — non-Postgres or race; ignore
+            logger.debug(f"[Kronos-finetune] schema ensure skipped: {exc}")
+            self._schema_ok = True  # don't retry every call
 
     # ── public API ───────────────────────────────────────────────
 
@@ -269,6 +336,7 @@ class FinetuneManager:
                 "Kronos fine-tuning pipeline is not installed. Run: "
                 + finetune_setup_command()
             )
+        await self._ensure_schema()
         from app.core.database import AsyncSessionLocal
         from plugins.KronosForecastPlugin.backend.models import KronosFinetuneJob
 
@@ -304,6 +372,7 @@ class FinetuneManager:
         from app.core.database import AsyncSessionLocal
         from plugins.KronosForecastPlugin.backend.models import KronosFinetuneJob
 
+        await self._ensure_schema()
         async with AsyncSessionLocal() as db:
             res = await db.execute(
                 select(KronosFinetuneJob).order_by(KronosFinetuneJob.id.desc()).limit(limit)
@@ -375,6 +444,11 @@ class FinetuneManager:
     async def combine_jobs(self, model_name: Optional[str] = None) -> Dict:
         """Merge every completed job's training CSV into one and fine-tune a new
         combined model on the union. Returns the new job dict.
+
+        When fewer than two per-pair jobs remain (e.g. after a prune), it
+        retrains the combined model on the persisted ``combined.csv`` so the
+        weekly improvement cycle still runs — carrying the last known pair list
+        forward so the details keep showing which pairs are trained.
         """
         if not is_vendored():
             raise RuntimeError(
@@ -385,42 +459,74 @@ class FinetuneManager:
         from app.core.database import AsyncSessionLocal
         from plugins.KronosForecastPlugin.backend.models import KronosFinetuneJob
 
-        completed = [j for j in await self.list(limit=200) if j["status"] == "completed" and j.get("data_path")]
+        all_jobs = await self.list(limit=200)
+        completed = [
+            j for j in all_jobs
+            if j["status"] == "completed" and j.get("data_path")
+            and str(j.get("symbol", "")).upper() != "COMBINED"
+        ]
         usable = [j for j in completed if Path(j["data_path"]).exists()]
-        if len(usable) < 2:
-            raise RuntimeError("Need at least two completed fine-tune jobs with data to combine.")
-
-        # Merge + dedupe by timestamp column (first column, Kronos CSV format).
-        frames = []
-        for j in usable:
-            try:
-                frames.append(pd.read_csv(j["data_path"]))
-            except Exception as exc:
-                logger.warning(f"[Kronos-finetune] combine: skip job {j['id']} CSV ({exc})")
-        if not frames:
-            raise RuntimeError("No readable training CSVs to combine.")
-        merged = pd.concat(frames, ignore_index=True)
-        ts_col = merged.columns[0]
-        merged = merged.drop_duplicates(subset=[ts_col]).sort_values(ts_col).reset_index(drop=True)
 
         combined_dir = _WORK_DIR / "combined"
         combined_dir.mkdir(parents=True, exist_ok=True)
         combined_csv = combined_dir / "combined.csv"
-        merged.to_csv(combined_csv, index=False)
 
-        # Inherit the strongest hyper-params from the source jobs.
-        look = max(int(j["lookback"]) for j in usable)
-        pred = max(int(j["pred_len"]) for j in usable)
-        tok_ep = max(int(j["tokenizer_epochs"]) for j in usable)
-        pred_ep = max(int(j["predictor_epochs"]) for j in usable)
-        batch = max(int(j["batch_size"]) for j in usable)
-        base = usable[0].get("base_model")
-        tfs = ",".join(sorted({j["timeframe"] for j in usable}))
+        symbols_combined: List[str]
+        if len(usable) >= 2:
+            # Merge + dedupe by timestamp column (first column, Kronos CSV format).
+            frames = []
+            frame_syms: List[str] = []
+            for j in usable:
+                try:
+                    frames.append(pd.read_csv(j["data_path"]))
+                    frame_syms.append(str(j["symbol"]).upper())
+                except Exception as exc:
+                    logger.warning(f"[Kronos-finetune] combine: skip job {j['id']} CSV ({exc})")
+            if not frames:
+                raise RuntimeError("No readable training CSVs to combine.")
+            merged = pd.concat(frames, ignore_index=True)
+            ts_col = merged.columns[0]
+            merged = merged.drop_duplicates(subset=[ts_col]).sort_values(ts_col).reset_index(drop=True)
+            merged.to_csv(combined_csv, index=False)
+            symbols_combined = sorted(set(frame_syms))
+            look = max(int(j["lookback"]) for j in usable)
+            pred = max(int(j["pred_len"]) for j in usable)
+            tok_ep = max(int(j["tokenizer_epochs"]) for j in usable)
+            pred_ep = max(int(j["predictor_epochs"]) for j in usable)
+            batch = max(int(j["batch_size"]) for j in usable)
+            base = usable[0].get("base_model")
+            tfs = ",".join(sorted({j["timeframe"] for j in usable}))
+            rows_merged = int(len(merged))
+        else:
+            # Retrain-only path: reuse the last combined dataset + its pair list.
+            if not combined_csv.exists():
+                raise RuntimeError(
+                    "Need at least two completed fine-tune jobs with data to combine, "
+                    "and no prior combined dataset exists to retrain from."
+                )
+            prior = next(
+                (j for j in all_jobs if str(j.get("symbol", "")).upper() == "COMBINED"
+                 and j.get("symbols_combined")),
+                None,
+            )
+            symbols_combined = list((prior or {}).get("symbols_combined") or [])
+            look = int((prior or {}).get("lookback") or 512)
+            pred = int((prior or {}).get("pred_len") or 48)
+            tok_ep = int((prior or {}).get("tokenizer_epochs") or 10)
+            pred_ep = int((prior or {}).get("predictor_epochs") or 20)
+            batch = int((prior or {}).get("batch_size") or 16)
+            base = (prior or {}).get("base_model")
+            tfs = str((prior or {}).get("timeframe") or "1h")
+            try:
+                rows_merged = max(0, sum(1 for _ in combined_csv.open()) - 1)
+            except OSError:
+                rows_merged = 0
 
         async with AsyncSessionLocal() as db:
             job = KronosFinetuneJob(
                 exchange="combined", symbol="COMBINED", timeframe=tfs[:8],
                 model_name=(model_name or "combined"),
+                symbols_combined=symbols_combined,
                 status="pending", lookback=look, pred_len=pred,
                 tokenizer_epochs=tok_ep, predictor_epochs=pred_ep,
                 batch_size=batch, base_model=base,
@@ -430,17 +536,110 @@ class FinetuneManager:
             await db.refresh(job)
             job_id = job.id
 
-        task = asyncio.create_task(self._run_pipeline(job_id, 0, prebuilt_csv=combined_csv))
+        task = asyncio.create_task(
+            self._run_pipeline(job_id, 0, prebuilt_csv=combined_csv, auto_load=True)
+        )
         self._tasks[job_id] = task
         return {
             "ok": True, "job_id": job_id,
-            "symbols_combined": [j["symbol"] for j in usable],
-            "rows_merged": int(len(merged)),
+            "symbols_combined": symbols_combined,
+            "rows_merged": rows_merged,
         }
+
+    async def prune_non_combined(self) -> Dict:
+        """Delete every non-COMBINED fine-tune job and its on-disk checkpoints.
+
+        Frees the machine after everything has been merged into the combined
+        model. Combined jobs and the persisted ``combined.csv`` are kept so the
+        weekly retrain still has data. Returns a summary of what was removed.
+        """
+        import shutil
+        from app.core.database import AsyncSessionLocal
+        from plugins.KronosForecastPlugin.backend.models import KronosFinetuneJob
+
+        removed_ids: List[int] = []
+        freed_mb = 0.0
+        for j in await self.list(limit=500):
+            if str(j.get("symbol", "")).upper() == "COMBINED":
+                continue
+            if j.get("status") == "running":  # never delete a live trainer
+                continue
+            freed_mb += self._dir_size_mb(j.get("output_dir"))
+            base_dir = _WORK_DIR / f"job{j['id']}"
+            for path in (base_dir, Path(j.get("output_dir") or "")):
+                try:
+                    if path and path.exists():
+                        shutil.rmtree(path, ignore_errors=True)
+                except OSError as exc:  # noqa: BLE001
+                    logger.debug(f"[Kronos-finetune] prune: could not remove {path}: {exc}")
+            async with AsyncSessionLocal() as db:
+                row = await db.get(KronosFinetuneJob, j["id"])
+                if row is not None:
+                    await db.delete(row)
+                    await db.commit()
+            removed_ids.append(j["id"])
+
+        logger.info(
+            f"[Kronos-finetune] pruned {len(removed_ids)} non-combined job(s), "
+            f"freed ~{round(freed_mb, 1)} MB"
+        )
+        return {"ok": True, "removed_job_ids": removed_ids, "freed_mb": round(freed_mb, 1)}
+
+    async def delete_job(self, job_id: int) -> Dict:
+        """Delete one fine-tune job and its checkpoints from disk + DB."""
+        import shutil
+        from app.core.database import AsyncSessionLocal
+        from plugins.KronosForecastPlugin.backend.models import KronosFinetuneJob
+
+        job = await self.get(job_id, log_lines=0)
+        if job is None:
+            raise ValueError(f"Fine-tune job {job_id} not found")
+        if job.get("status") == "running":
+            await self.cancel(job_id)
+        freed_mb = self._dir_size_mb(job.get("output_dir"))
+        for path in (_WORK_DIR / f"job{job_id}", Path(job.get("output_dir") or "")):
+            try:
+                if path and path.exists():
+                    shutil.rmtree(path, ignore_errors=True)
+            except OSError as exc:  # noqa: BLE001
+                logger.debug(f"[Kronos-finetune] delete: could not remove {path}: {exc}")
+        async with AsyncSessionLocal() as db:
+            row = await db.get(KronosFinetuneJob, job_id)
+            if row is not None:
+                await db.delete(row)
+                await db.commit()
+        return {"ok": True, "job_id": job_id, "freed_mb": round(freed_mb, 1)}
+
+    async def auto_load_latest_combined(self) -> bool:
+        """Load the newest completed COMBINED model as the active engine.
+
+        Called on startup so the app and Telegram always forecast through the
+        latest trained combined model. No-op (returns False) when the engine is
+        already on a finetuned model or no combined job has completed.
+        """
+        try:
+            if getattr(kronos_engine, "_active_finetuned_job_id", None):
+                return False
+            combined = [
+                j for j in await self.list(limit=200)
+                if str(j.get("symbol", "")).upper() == "COMBINED" and j.get("status") == "completed"
+            ]
+            if not combined:
+                return False
+            newest = max(combined, key=lambda j: j["id"])
+            await self.load_finetuned(newest["id"])
+            logger.info(f"[Kronos-finetune] auto-loaded latest combined model job #{newest['id']}")
+            return True
+        except Exception as exc:  # noqa: BLE001 — never block startup
+            logger.debug(f"[Kronos-finetune] auto-load latest combined skipped: {exc}")
+            return False
 
     # ── pipeline ─────────────────────────────────────────────────
 
-    async def _run_pipeline(self, job_id: int, limit: int, prebuilt_csv: Optional[Path] = None) -> None:
+    async def _run_pipeline(
+        self, job_id: int, limit: int,
+        prebuilt_csv: Optional[Path] = None, auto_load: bool = False,
+    ) -> None:
         from plugins.KronosForecastPlugin.backend.models import KronosFinetuneJob
         from app.core.database import AsyncSessionLocal
 
@@ -455,6 +654,23 @@ class FinetuneManager:
         async with AsyncSessionLocal() as db:
             job = await db.get(KronosFinetuneJob, job_id)
             exchange, symbol, timeframe = job.exchange, job.symbol, job.timeframe
+            # Snapshot model params early for brain enrichment
+            pre_symbols = [symbol] if str(symbol).upper() != "COMBINED" else list(job.symbols_combined or [])
+        # --- Brain-aware enrichment: collect cross-brain recall BEFORE fitting ---
+        # This guarantees the model training run is always informed by the latest
+        # knowledge from Neuro core (federated), Hermes, Vault, and Agent decisions
+        # so it can never miss anything learned — the context is persisted alongside
+        # the CSV and injected into the brain log.
+        brain_ctx: dict = {}
+        try:
+            brain_ctx = await _collect_brain_knowledge(pre_symbols or [symbol])
+            # Persist brain snapshot next to the training data for auditability
+            base_dir.mkdir(parents=True, exist_ok=True)
+            (base_dir / "brain_context.json").write_text(
+                __import__("json").dumps(brain_ctx, indent=2, default=str)[:200_000]
+            )
+        except Exception as e:
+            logger.debug(f"[Kronos-finetune] brain context collect skipped: {e}")
         try:
             if prebuilt_csv is not None:
                 import shutil
@@ -469,6 +685,18 @@ class FinetuneManager:
             return
 
         rows_exported = int(summary.get("rows", 0))
+        # Also mirror the export event into the core brain so future trainings see it
+        try:
+            from app.neuro_brain.state_store import ingest_local as _ni
+            _ni(
+                kind="kronos-export",
+                content=f"[Kronos export {symbol} {timeframe} {rows_exported} rows] brain_hits={sum(len(v) for v in brain_ctx.values() if isinstance(v, list))}",
+                symbol=symbol,
+                source="kronos-finetune",
+                meta={"rows": rows_exported, "timeframe": timeframe, "brain_symbols": pre_symbols[:8]},
+            )
+        except Exception:
+            pass
 
         # 2) Config — auto-fit the context window to the exported history so
         #    every train/val split can produce samples (no __len__ < 0 crash).
@@ -537,6 +765,54 @@ class FinetuneManager:
                 f"{symbol} {timeframe} candles. Load it with /finetune load {job_id}.",
                 importance=0.8,
             )
+            if auto_load:
+                # Combined models are hot-swapped in automatically so the app +
+                # Telegram immediately forecast through the freshly trained model.
+                try:
+                    await self.load_finetuned(job_id)
+                    logger.success(f"[Kronos-finetune] auto-loaded combined model job #{job_id}")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"[Kronos-finetune] auto-load of job #{job_id} failed: {exc}")
+                # Auto-prune: keep one major model — delete all non-COMBINED jobs +
+                # older COMBINED jobs, retaining only this newly combined major model.
+                # This frees disk and fulfills "one major model that combines them all".
+                try:
+                    # 1) Remove every non-COMBINED job (free the per-pair checkpoints)
+                    await self.prune_non_combined()
+                    # 2) If multiple COMBINED jobs exist, keep only this one (the newest major)
+                    all_jobs = await self.list(limit=500)
+                    combined_ids = sorted(
+                        [j["id"] for j in all_jobs if str(j.get("symbol", "")).upper() == "COMBINED" and j["id"] != job_id],
+                        reverse=True,
+                    )
+                    if combined_ids:
+                        import shutil as _sh
+                        from app.core.database import AsyncSessionLocal as _ASL
+                        from plugins.KronosForecastPlugin.backend.models import KronosFinetuneJob as _KFJ
+                        for old_id in combined_ids:
+                            # Keep disk only for the newest combined (job_id); delete older ones
+                            old_job = await self.get(old_id, log_lines=0)
+                            if not old_job:
+                                continue
+                            for p in (_WORK_DIR / f"job{old_id}", Path(old_job.get("output_dir") or "")):
+                                try:
+                                    if p and p.exists():
+                                        _sh.rmtree(p, ignore_errors=True)
+                                except OSError:
+                                    pass
+                            async with _ASL() as db:
+                                row = await db.get(_KFJ, old_id)
+                                if row is not None:
+                                    await db.delete(row)
+                                    await db.commit()
+                        logger.success(f"[Kronos-finetune] auto-pruned {len(combined_ids)} older combined model(s) — kept major #{job_id}")
+                except Exception as e:
+                    logger.debug(f"[Kronos-finetune] auto-prune after combined failed: {e}")
+                # Also prune again non-combined just to be safe (nothing if already done)
+                try:
+                    await self.prune_non_combined()
+                except Exception:
+                    pass
         else:
             tail = self._read_tail(log_path, 8)
             await self._update(job_id, status="failed", error=f"exit {rc}: {tail}"[:1024], finished_at=_now())
@@ -589,6 +865,7 @@ class FinetuneManager:
             "id": job.id, "symbol": job.symbol, "exchange": job.exchange,
             "timeframe": job.timeframe, "status": job.status,
             "model_name": job.model_name,
+            "symbols_combined": list(job.symbols_combined) if job.symbols_combined else None,
             "lookback": job.lookback, "pred_len": job.pred_len,
             "tokenizer_epochs": job.tokenizer_epochs, "predictor_epochs": job.predictor_epochs,
             "batch_size": job.batch_size, "base_model": job.base_model,

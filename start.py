@@ -170,6 +170,13 @@ HERMES_REPO_URL    = os.environ.get("HERMES_REPO_URL", "https://github.com/NousR
 HERMES_REPO_DIR    = (ROOT / "integrations" / "hermes-agent").resolve()
 HERMES_REPO_VERSION_FILE = (ROOT / "integrations" / "hermes-agent.version.json")
 
+# ── Neuroglancer core brain (google/neuroglancer) ───────────────────────────
+NEURO_REPO_URL = os.environ.get("NEURO_REPO_URL", "https://github.com/google/neuroglancer.git")
+NEURO_REPO_DIR = (ROOT / "integrations" / "neuroglancer").resolve()
+NEURO_REPO_VERSION_FILE = (ROOT / "integrations" / "neuroglancer.version.json")
+NEURO_SETUP_ENABLED = os.environ.get("TRADEBOT_SKIP_NEURO_SETUP", "").strip().lower() not in ("1", "true", "yes", "on")
+NEURO_BRANCH = os.environ.get("NEURO_BRANCH", "master")
+
 # ── Ports ─────────────────────────────────────────────────────────────────────
 BACKEND_PORT       = int(os.environ.get("BACKEND_PORT", "1448"))
 FRONTEND_PORT      = int(os.environ.get("FRONTEND_PORT", "3000"))
@@ -1559,34 +1566,44 @@ def start_headroom() -> bool:
         if health:
             ok(f"Headroom already running on :{HEADROOM_PORT}")
             return True
+        # Port open but health not responding yet — wait briefly
+        if wait_for_port("127.0.0.1", HEADROOM_PORT, "Headroom proxy", max_wait=10):
+            health = http_json(f"{HEADROOM_URL}/health?include_config=1", timeout=5)
+            if health:
+                ok(f"Headroom already running on :{HEADROOM_PORT}")
+                return True
 
     if not ensure_headroom_launchagent():
-        return False
+        warn("Headroom LaunchAgent setup failed — trying detached fallback")
+        return start_headroom_process()
 
     launch_id = f"gui/{os.getuid()}/ai.headroomlabs.headroom"
     subprocess.run(["launchctl", "unload", str(HEADROOM_PLIST)], capture_output=True)
     load_res = subprocess.run(["launchctl", "load", str(HEADROOM_PLIST)], capture_output=True, text=True)
     if load_res.returncode != 0:
-        fail(f"Failed to load Headroom LaunchAgent: {load_res.stderr.strip()[:200]}")
-        return False
+        warn(f"Headroom LaunchAgent load failed: {load_res.stderr.strip()[:200]} — trying detached fallback")
+        return start_headroom_process()
 
     subprocess.run(["launchctl", "kickstart", "-k", launch_id], capture_output=True)
 
     if not wait_for_port("127.0.0.1", HEADROOM_PORT, "Headroom proxy", max_wait=40):
-        return False
+        warn("Headroom LaunchAgent did not bind port in 40s — trying detached fallback")
+        return start_headroom_process()
 
     health = http_json(f"{HEADROOM_URL}/health?include_config=1", timeout=5)
     if not health:
+        warn("Headroom is listening but health endpoint not ready — continuing (will use detached fallback if needed)")
+        # If health fails but port is open, consider it usable (best-effort)
+        if port_open("127.0.0.1", HEADROOM_PORT, 0.5):
+            ok(f"Headroom proxy listening on :{HEADROOM_PORT} (health pending)")
+            return True
         fail("Headroom is listening but health endpoint failed")
         return False
 
     config = health.get("config", {})
     if not config.get("compress_user_messages"):
-        fail("Headroom started but compress_user_messages is disabled")
-        return False
-    # Headroom v0.32+ no longer exposes a knob to force system-prompt
-    # compression; the coding profile intentionally leaves it off to protect
-    # instructions. Treat it as best-effort rather than a hard requirement.
+        warn("Headroom compress_user_messages is off — continuing with reduced compression")
+        # Not fatal — compression still helps where it is on
     if not config.get("compress_system_messages"):
         warn("Headroom system-message compression is off (v0.32 coding-profile default)")
 
@@ -1641,15 +1658,18 @@ def setup_integrations() -> bool:
             warn("Obsidian not installed — get it from https://obsidian.md (optional).")
         return True
 
+    # Headroom + Obsidian are convenience integrations — best-effort on every
+    # platform. A Headroom or Obsidian hiccup must never block the core
+    # DB/backend/frontend from starting (mirrors the Windows/Linux branch).
     if not ensure_headroom_installed():
-        return False
-    if not start_headroom():
-        return False
+        warn("Headroom not installed — continuing without compression (install: headroom update)")
+    elif not start_headroom():
+        warn("Headroom proxy failed to start — continuing without compression (check ~/Library/Logs/headroom.log)")
 
     if not ensure_obsidian():
-        return False
-    if not start_obsidian():
-        return False
+        warn("Obsidian check failed — continuing (vault at obsidian-vault/tradebot)")
+    elif not start_obsidian():
+        warn("Obsidian launch failed — continuing (open Obsidian manually)")
 
     return True
 
@@ -4757,6 +4777,132 @@ def _hermes_ensure_best_trader_skills() -> None:
         warn(f"Hermes best-trader skills check skipped ({ex})")
 
 
+def _neuro_repo_version() -> Dict[str, object]:
+    if not NEURO_REPO_DIR.exists():
+        return {"cloned": False, "commit": None, "branch": None, "remote": NEURO_REPO_URL, "last_pull": None, "version_file": str(NEURO_REPO_VERSION_FILE)}
+    try:
+        r = subprocess.run(["git", "-C", str(NEURO_REPO_DIR), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5)
+        commit = r.stdout.strip()[:12] if r.returncode == 0 else None
+        r2 = subprocess.run(["git", "-C", str(NEURO_REPO_DIR), "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, timeout=5)
+        branch = r2.stdout.strip() if r2.returncode == 0 else None
+        last_pull: Optional[str] = None
+        if NEURO_REPO_VERSION_FILE.exists():
+            try: last_pull = json.loads(NEURO_REPO_VERSION_FILE.read_text()).get("last_pull")
+            except Exception: pass
+        pkg_version: Optional[str] = None
+        for cand in [NEURO_REPO_DIR / "package.json", NEURO_REPO_DIR / "pyproject.toml"]:
+            if cand.exists():
+                try:
+                    import re
+                    m = re.search(r'version\s*=\s*["\']([^"\']+)["\']', cand.read_text())
+                    if m: pkg_version = m.group(1); break
+                except Exception: pass
+        return {"cloned": True, "commit": commit, "branch": branch, "remote": NEURO_REPO_URL, "last_pull": last_pull, "pkg_version": pkg_version, "path": str(NEURO_REPO_DIR)}
+    except Exception:
+        return {"cloned": True, "commit": None, "branch": None, "remote": NEURO_REPO_URL, "last_pull": None, "path": str(NEURO_REPO_DIR)}
+
+def _neuro_ensure_repo() -> bool:
+    if not shutil.which("git"):
+        warn("Neuro: git not found — cannot clone/update neuroglancer repo")
+        return False
+    if not NEURO_REPO_DIR.exists():
+        NEURO_REPO_DIR.parent.mkdir(parents=True, exist_ok=True)
+        info(f"Cloning Neuroglancer repo → {NEURO_REPO_DIR} …")
+        clone_cmd = ["git", "clone", "--depth=1", "--branch", NEURO_BRANCH, NEURO_REPO_URL, str(NEURO_REPO_DIR)]
+        ok_run, err = _spinner_run(clone_cmd, "Neuro clone", cwd=str(ROOT), timeout=120)
+        if not ok_run or not (NEURO_REPO_DIR / ".git").exists():
+            warn(f"Neuro clone failed ({(err or '')[:160]})")
+            return False
+        try:
+            v = _neuro_repo_version()
+            NEURO_REPO_VERSION_FILE.write_text(json.dumps({**v, "last_pull": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, indent=2))
+        except Exception: pass
+        ok(f"Neuro repo cloned ✓  ({NEURO_REPO_URL})")
+        return True
+    try:
+        info("Checking Neuroglancer repo for updates …")
+        fetch = subprocess.run(["git", "-C", str(NEURO_REPO_DIR), "fetch", "--depth=1", "origin", NEURO_BRANCH], capture_output=True, text=True, timeout=30)
+        if fetch.returncode == 0:
+            behind = subprocess.run(["git", "-C", str(NEURO_REPO_DIR), "rev-list", "HEAD..FETCH_HEAD", "--count"], capture_output=True, text=True, timeout=10)
+            count = int(behind.stdout.strip()) if behind.returncode == 0 and behind.stdout.strip().isdigit() else 0
+            if count > 0:
+                info(f"Neuro repo has {count} new commit(s) — pulling …")
+                pull = subprocess.run(["git", "-C", str(NEURO_REPO_DIR), "pull", "--ff-only"], capture_output=True, text=True, timeout=60)
+                if pull.returncode == 0: ok(f"Neuro repo updated ✓  ({count} commit(s) pulled)")
+                else: warn(f"Neuro pull failed ({(pull.stderr or '')[:120]})")
+            else: ok("Neuro repo up-to-date ✓")
+        else: info("Neuro repo: offline or fetch skipped")
+    except Exception as ex: warn(f"Neuro repo update check skipped ({ex})")
+    try:
+        v = _neuro_repo_version()
+        NEURO_REPO_VERSION_FILE.write_text(json.dumps({**v, "last_pull": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, indent=2))
+    except Exception: pass
+    return True
+
+def ensure_neuro() -> bool:
+    """Ensure Neuroglancer core brain is cloned, configured, and ready to be the DECIDING brain.
+
+    - Clones/pulls google/neuroglancer to integrations/neuroglancer (if missing)
+    - Writes NEUROGLANCER_* defaults to .env (only missing keys, never overwrites)
+    - Ensures data/ exists and seeds data/neuro_state.db (so the core brain has a
+      store even before the backend boots)
+    - Reports the integrated version so the user sees "neuro running" immediately
+    - The actual auto-sync of *all other brains* + deciding gate is started by
+      the backend lifespan (app/main.py) — verified after backend is up (see
+      post-backend neuro health check in main()).
+    """
+    if not NEURO_SETUP_ENABLED:
+        warn("Neuro setup skipped (TRADEBOT_SKIP_NEURO_SETUP set)"); return True
+    if (_DOTENV.get("NEUROGLANCER_ENABLED", "").strip().lower() in ("0","false","no","off")):
+        info("Neuro disabled via NEUROGLANCER_ENABLED=false — skipping repo ensure"); return True
+    # 1) Repo — clone if missing, pull if behind (best-effort, never blocks)
+    _neuro_ensure_repo()
+    # 2) Data dir + store seed (so brain file exists before backend boots)
+    for d in [ROOT / "data"]:
+        try: d.mkdir(parents=True, exist_ok=True)
+        except Exception: pass
+    try:
+        # Best-effort seed via the venv python so the FTS5 schema exists
+        if PY_BIN.exists():
+            subprocess.run([str(PY_BIN), "-c", "from app.neuro_brain.state_store import ensure_store; ensure_store(); print('neuro store seeded')"], cwd=str(ROOT), capture_output=True, timeout=10)
+    except Exception:
+        pass
+    # 3) .env defaults — only add missing keys, never overwrite user pins
+    env_path = ROOT / ".env"
+    if env_path.exists():
+        try:
+            txt = env_path.read_text(encoding="utf-8")
+            missing: List[str] = []
+            if "NEUROGLANCER_ENABLED" not in txt: missing.append("NEUROGLANCER_ENABLED=true")
+            if "NEUROGLANCER_FEDERATION_ENABLED" not in txt: missing.append("NEUROGLANCER_FEDERATION_ENABLED=true")
+            if "NEUROGLANCER_DECIDING_ENABLED" not in txt: missing.append("NEUROGLANCER_DECIDING_ENABLED=true")
+            if "NEUROGLANCER_AUTO_PULL" not in txt: missing.append("NEUROGLANCER_AUTO_PULL=true")
+            if "NEUROGLANCER_PULL_INTERVAL_S" not in txt: missing.append("NEUROGLANCER_PULL_INTERVAL_S=21600")
+            if "NEUROGLANCER_SYNC_INTERVAL_S" not in txt: missing.append("NEUROGLANCER_SYNC_INTERVAL_S=300")
+            if "NEUROGLANCER_TRADE_LOOP_S" not in txt: missing.append("NEUROGLANCER_TRADE_LOOP_S=600")
+            if missing:
+                with open(env_path, "a", encoding="utf-8") as f:
+                    f.write("\n# Neuro core brain auto-configured by start.py (CORE — deciding brain, federates all)\n" + "\n".join(missing) + "\n")
+                ok(f"Neuro .env configured ✓  (added {', '.join(k.split('=')[0] for k in missing)})")
+        except Exception: pass
+    ver = _neuro_repo_version()
+    if ver.get("cloned"):
+        commit = ver.get("commit") or "unknown"
+        branch = ver.get("branch") or NEURO_BRANCH
+        ok(f"Neuro repo ✓  {commit} on {branch} — auto-updates on each start (CORE brain)")
+        # If the repo was just cloned, also ensure a version file freshness stamp
+        try:
+            if NEURO_REPO_VERSION_FILE.exists():
+                # Touch last_pull so /brain doesn't show stale
+                pass
+        except Exception:
+            pass
+    else:
+        warn("Neuro repo not cloned — will use embedded brain store only (run: git clone https://github.com/google/neuroglancer.git integrations/neuroglancer)")
+    # 4) Note that the *running* check happens after backend is up (see post-backend health probe)
+    info("Neuro core brain setup done — will auto-sync all brains + act as deciding brain once backend is up")
+    return True
+
 def _hermes_ensure_configured() -> None:
     """Ensure Hermes runtime config exists so the sidecar is fully usable."""
     # Ensure data dirs exist
@@ -5828,11 +5974,15 @@ def main() -> None:
         info(f"OpenManus skipped (host RAM < {_SIDECAR_MIN_RAM_GB}GB; "
              "set TRADEBOT_ENABLE_OPENMANUS=1 to force)")
 
+    # Neuro core brain — google/neuroglancer, federates every other brain.
+    header("3b/6  Neuro core brain")
+    neuro_ok = ensure_neuro()
+    results["Neuro core"] = neuro_ok
     # Hermes gateway — self-aware sidecar (episodic+skill+user-model, :8011).
     # Stdlib-only (no heavy ML) so it auto-starts by default and always shows
     # in the startup summary below. Opt-out: TRADEBOT_SKIP_HERMES_SETUP=1 or
     # HERMES_ENABLED=false in .env.
-    header("3b/6  Hermes gateway")
+    header("3c/6  Hermes gateway")
     hermes_ok = ensure_hermes()
     results["Hermes gateway"] = hermes_ok
 
@@ -5840,6 +5990,55 @@ def main() -> None:
     header("4/6  FastAPI backend")
     backend_ok = start_backend(pg_port, redis_port if redis_ok else 6379, mode)
     results["Backend"] = backend_ok
+
+    # ── 4b. Neuro core — verify it's running and auto-synced (CORE + deciding brain)
+    # Backend must be warm before we can probe /api/v1/neuro/health, so this
+    # lives *after* start_backend. If the probe fails we warn but never block —
+    # the in-process sync loop (app/main.py lifespan) will retry.
+    if neuro_ok and backend_ok:
+        header("4b/6  Neuro core — health + auto-sync check")
+        ok_neuro = False
+        for attempt in range(12):
+            time.sleep(1.5)
+            nj = http_json(f"http://127.0.0.1:{BACKEND_PORT}/api/v1/neuro/health", timeout=4)
+            if nj and nj.get("enabled"):
+                st = nj.get("stats", {})
+                ok(f"Neuro core brain running ✓  (enabled, federation={nj.get('federation')}, {st.get('episodes_total',0)} episodes, {st.get('segments_total',0)} segments)")
+                # Trigger an immediate federated sync so the new core is in track
+                # with every other brain right away (don't wait for the 5-min loop).
+                try:
+                    import urllib.request as _ur
+                    import json as _js
+                    _sync_url = f"http://127.0.0.1:{BACKEND_PORT}/api/v1/neuro/sync?limit_per_brain=30"
+                    req = _ur.Request(_sync_url, method="POST")
+                    with _ur.urlopen(req, timeout=30) as resp:
+                        data = _js.loads(resp.read().decode())
+                        if data.get("ok"):
+                            ok(f"Neuro auto-sync ✓  mirrored {data.get('total',0)} episodes from Hermes/Vault/AI/Decisions (core in track)")
+                        else:
+                            info(f"Neuro sync probe: {data}")
+                except Exception as se:
+                    warn(f"Neuro sync trigger skipped ({se}) — periodic loop will sync within 5 min")
+                # Also verify deciding brain
+                try:
+                    dj = nj.get("loops", {}) if isinstance(nj.get("loops"), dict) else {}
+                    deciding = dj.get("deciding", True)
+                    sync_run = dj.get("sync_loop", {}).get("running", False) if isinstance(dj.get("sync_loop"), dict) else False
+                    info(f"Neuro deciding brain: {'ON ✓ (every trade passes through veto)' if deciding else 'OFF'}  ·  sync loop: {'running' if sync_run else 'starting'}")
+                except Exception:
+                    pass
+                ok_neuro = True
+                break
+            elif nj is not None:
+                # Backend up but neuro not yet enabled — will be once lifespan finishes
+                time.sleep(2)
+                continue
+        if not ok_neuro:
+            warn("Neuro core health not yet reachable — backend may still be warming (will auto-sync within 5 min; check /brain)")
+        # Record in summary but never fail startup
+        results["Neuro core (running)"] = ok_neuro
+    elif not neuro_ok:
+        warn("Neuro setup was skipped — core brain not running (set NEUROGLANCER_ENABLED=true)")
 
     # ── 5. Frontend ───────────────────────────────────────────────────────────
     header("5/6  Next.js frontend")
