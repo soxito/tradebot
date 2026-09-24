@@ -91,6 +91,8 @@ class Trade(Base):
     exchange = Column(String, nullable=False, index=True)
     exchange_order_id = Column(String, nullable=True)
     signal_id = Column(Integer, nullable=True, index=True)  # Link to signal
+    #: The ``crypto_accounts`` row the order went to; NULL = the .env account.
+    crypto_account_id = Column(Integer, nullable=True, index=True)
     source = Column(String, default="signal", nullable=False)  # signal / sniper
     
     # Trading details
@@ -448,6 +450,11 @@ class AgentDecision(Base):
     outcome_recorded_at = Column(DateTime, nullable=True)
     ai_called = Column(Boolean, default=True)  # True=OpenAI, False=local memory
     memory_context_used = Column(Integer, default=0)  # how many past decisions were injected as context
+    #: Who made the call: board | oblivion_gate | oblivion_override_blocked |
+    #: execution | execution_blocked | trade_manager | custom_agent | copy_supervisor
+    origin = Column(String, default="board", nullable=True)
+    #: The OBLIVION read (``oblivion_reads.id``) the decision was made against.
+    oblivion_read_id = Column(Integer, nullable=True, index=True)
     created_at = Column(DateTime, default=_utcnow, nullable=False)
 
     def is_quota_error(self) -> bool:
@@ -843,6 +850,189 @@ class AgentInstructionRevision(Base):
     created_at = Column(DateTime, default=_utcnow, nullable=False)
 
 
+class OblivionSettings(Base):
+    """Global OBLIVION MASTER v5 engine settings. Only ever one row (id=1).
+
+    The JSON blob holds the ``OblivionConfig`` fields; the settings service
+    (``app.services.oblivion_settings``) validates writes against its field
+    spec, keeps a cached copy for the hot paths (scalp bot every 10 s, every
+    chart request) and bumps ``version`` so clients know to refetch.
+    """
+
+    __tablename__ = "oblivion_settings"
+
+    id = Column(Integer, primary_key=True, default=1)
+    settings = Column(Text, nullable=False, default="{}")
+    version = Column(Integer, nullable=False, default=1)
+    updated_at = Column(DateTime, default=now_sast, onupdate=now_sast)
+
+
+class OblivionRead(Base):
+    """One OBLIVION engine read of one pair on one timeframe.
+
+    The ledger that proves the engine saw a pair: the room's scanner, the
+    board's context and the execution re-check all write here, and execution
+    refuses a trade that has no fresh row for its symbol and timeframe.
+    """
+
+    __tablename__ = "oblivion_reads"
+
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String, nullable=False, index=True)
+    timeframe = Column(String, nullable=False, index=True)
+    source = Column(String, nullable=False)
+    analyzed_at = Column(DateTime, default=_utcnow, nullable=False, index=True)
+    bar_time = Column(Integer, nullable=True)
+    price = Column(Float, nullable=True)
+    signal_action = Column(String, nullable=True)
+    signal_kind = Column(String, nullable=True)
+    signal_new = Column(Boolean, default=False)
+    signal_confirmed = Column(Boolean, default=False)
+    signal_time = Column(Integer, nullable=True)
+    score_buy = Column(Float, nullable=True)
+    score_sell = Column(Float, nullable=True)
+    entry = Column(Float, nullable=True)
+    stop_loss = Column(Float, nullable=True)
+    tp1 = Column(Float, nullable=True)
+    tp2 = Column(Float, nullable=True)
+    tp3 = Column(Float, nullable=True)
+    market_bias = Column(String, nullable=True)
+    news_blocked = Column(Boolean, default=False)
+    tradeable = Column(Boolean, default=False)
+    verdict_reason = Column(Text, nullable=True)
+    settings_version = Column(Integer, nullable=True)
+    read_hash = Column(String, nullable=True, index=True)
+    session_id = Column(String, nullable=True, index=True)
+    compact_json = Column(Text, nullable=True)
+
+
+class PairApproval(Base):
+    """May the room trade this pair on this timeframe? Decided by its own backtest.
+
+    Updated after every room-profile backtest: approved when the pair's full
+    history clears the win-rate bar with positive expectancy over enough trades.
+    """
+
+    __tablename__ = "pair_approvals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String, nullable=False, index=True)
+    timeframe = Column(String, nullable=False, index=True)
+    trades = Column(Integer, default=0)
+    win_rate = Column(Float, nullable=True)
+    expectancy_r = Column(Float, nullable=True)
+    net_profit = Column(Float, nullable=True)
+    weeks = Column(Float, nullable=True)            # history length the stats cover
+    approved = Column(Boolean, default=False, nullable=False)
+    reason = Column(Text, nullable=True)
+    run_id = Column(Integer, nullable=True)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+class BacktestRun(Base):
+    """One OBLIVION / agents backtest. Full trades live in ``result_path`` (JSON)."""
+
+    __tablename__ = "backtest_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    status = Column(String, default="running", nullable=False)   # running | done | error
+    symbols = Column(String, nullable=False)
+    timeframe = Column(String, nullable=False)
+    start_balance = Column(Float, nullable=False)
+    risk_pct = Column(Float, nullable=False)
+    params_json = Column(Text, nullable=True)
+    summary_json = Column(Text, nullable=True)
+    result_path = Column(String, nullable=True)
+    pdf_path = Column(String, nullable=True)
+    telegram_sent = Column(Boolean, default=False)
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    finished_at = Column(DateTime, nullable=True)
+
+
+class RoomTradePlan(Base):
+    """The OBLIVION ladder behind one room order, so the trade manager can run it.
+
+    A pullback entry is a resting limit that expires after ``wait_bars`` bars;
+    once filled, ``tp1_close`` of it is banked at TP1 with the stop moved to
+    break-even, ``tp2_close`` at TP2 with the stop moved to TP1, and the rest
+    runs to TP3 (the broker's take-profit).
+    """
+
+    __tablename__ = "room_trade_plans"
+
+    id = Column(Integer, primary_key=True, index=True)
+    venue = Column(String, nullable=False, default="mt5")
+    account_id = Column(Integer, nullable=False, index=True)
+    ticket = Column(String, nullable=True, index=True)
+    symbol = Column(String, nullable=False, index=True)
+    side = Column(String, nullable=False)
+    timeframe = Column(String, nullable=True)
+    entry_mode = Column(String, nullable=False, default="market")
+    entry = Column(Float, nullable=True)
+    stop_loss = Column(Float, nullable=False)
+    tp1 = Column(Float, nullable=True)
+    tp2 = Column(Float, nullable=True)
+    tp3 = Column(Float, nullable=True)
+    tp1_close = Column(Float, default=0.5)
+    tp2_close = Column(Float, default=0.25)
+    #: After TP1 the stop trails this many ATRs behind each closed bar (None = fixed ladder).
+    trail_atr = Column(Float, nullable=True)
+    #: The trail starts after this rung (1 = TP1, 2 = TP2).
+    trail_from = Column(Integer, default=1)
+    #: At TP1 the stop moves to TP1 itself — the least a winner banks.
+    floor_at_tp1 = Column(Boolean, default=False)
+    stage = Column(Integer, default=0, nullable=False)       # 0 open, 1 TP1 banked, 2 TP2 banked
+    status = Column(String, default="pending", nullable=False)  # pending | open | closed | cancelled
+    expires_at = Column(DateTime, nullable=True)
+    oblivion_read_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+class RoomTradingAccount(Base):
+    """A live account the room is allowed to trade when live trading is on.
+
+    Demo accounts never need a row — they always trade. Only live accounts are
+    switched on and off, one by one.
+    """
+
+    __tablename__ = "room_trading_accounts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    venue = Column(String, nullable=False)          # mt5 | crypto
+    account_id = Column(Integer, nullable=False, index=True)
+    live_enabled = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+class CryptoAccount(Base):
+    """An exchange account (API key) the room can trade on.
+
+    Secrets are Fernet-encrypted (``app.core.secrets_box``) and never returned
+    by the API. ``account_type`` demo uses the exchange's demo/sandbox trading.
+    """
+
+    __tablename__ = "crypto_accounts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, nullable=True, index=True)
+    exchange = Column(String, nullable=False, default="bitget")
+    name = Column(String, nullable=False)
+    api_key_enc = Column(Text, nullable=False)
+    api_secret_enc = Column(Text, nullable=False)
+    passphrase_enc = Column(Text, nullable=True)
+    account_type = Column(String, nullable=False, default="live")   # demo | live
+    status = Column(String, nullable=False, default="unverified")   # unverified | active | error
+    status_message = Column(Text, nullable=True)
+    balance = Column(Float, default=0.0)
+    equity = Column(Float, default=0.0)
+    last_sync_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
 class RoomSettings(Base):
     """Execution policy for the trading room. Only ever one row (id=1).
 
@@ -932,6 +1122,49 @@ class RoomSettings(Base):
     # the configured risk. Off by default — inert until asked for.
     cycle_auto_risk = Column(Boolean, default=False, nullable=False)
     cycle_risk_multiplier = Column(Float, default=0.5, nullable=False)
+
+    # ── Real-time trade management (app.agents.trade_manager) ──
+    manage_tick_s = Column(Integer, default=5, nullable=False)
+    margin_warn_pct = Column(Float, default=300.0, nullable=False)
+    margin_critical_pct = Column(Float, default=150.0, nullable=False)
+    max_account_drawdown_pct = Column(Float, default=5.0, nullable=False)
+    shift_atr_mult = Column(Float, default=1.5, nullable=False)
+    shift_take_profit_fraction = Column(Float, default=0.5, nullable=False)
+
+    # ── Weekly profit target ──
+    weekly_target_usd = Column(Float, default=3000.0, nullable=False)
+    #: Size up (never beyond ``target_max_multiplier`` × normal risk) when the
+    #: week is behind target; back to normal once on pace.
+    target_pacing = Column(Boolean, default=True, nullable=False)
+    target_max_multiplier = Column(Float, default=2.0, nullable=False)
+    #: Kept for old rows; the weekly target is a minimum — trading never stops at it.
+    target_stop_when_hit = Column(Boolean, default=False, nullable=False)
+    #: Daily minimum profit as a % of the margin currently in use (200 = 2× margin).
+    daily_target_margin_pct = Column(Float, default=200.0, nullable=False)
+    #: The weekly minimum applies to each traded pair, not the whole book.
+    target_per_pair = Column(Boolean, default=True, nullable=False)
+    # ── Risk band: every room trade risks between these % of equity ──
+    min_risk_pct = Column(Float, default=1.0, nullable=False)
+    max_risk_pct = Column(Float, default=5.0, nullable=False)
+    # ── High-impact news: no entries from PRE before to COOLOFF after ──
+    news_pre_min = Column(Integer, default=30, nullable=False)
+    news_cooloff_min = Column(Integer, default=120, nullable=False)
+    # ── OBLIVION trading universe: scanned and traded beside the pinned pairs,
+    #    without convening the board's hourly focus rotation on each of them ──
+    universe_enabled = Column(Boolean, default=False, nullable=False)
+    universe_symbols = Column(Text, nullable=True)            # comma-separated
+    #: A pair/timeframe trades when its own backtest win rate is at least this.
+    pair_min_win_rate = Column(Float, default=0.95, nullable=False)
+    #: Daily floor: once today's closed room trades win less than this, only
+    #: pairs whose backtest won at least ``daily_recovery_min_wr`` may open.
+    daily_min_win_rate = Column(Float, default=0.90, nullable=False)
+    daily_recovery_min_wr = Column(Float, default=0.97, nullable=False)
+    #: Portfolio day target, % of the portfolio's value at 00:00 UTC: trades are
+    #: paced (inside the risk band) toward the minimum, sized at the band floor
+    #: once it is banked, and no new entries open after the cap — the day is
+    #: locked in instead of being traded back.
+    daily_target_min_pct = Column(Float, default=10.0, nullable=False)
+    daily_target_max_pct = Column(Float, default=20.0, nullable=False)
 
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 

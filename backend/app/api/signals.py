@@ -50,6 +50,11 @@ class GenerateSignalsRequest(BaseModel):
     timeframe: str = "1h"
     exchange: str = "bitget"
 
+    def validate_symbols(self):
+        if len(self.symbols) > 10:
+            raise ValueError("max 10 symbols per request — paginate (plan §10.4)")
+        return self
+
 
 class AnalyzeRequest(BaseModel):
     timeframe: str = "1h"
@@ -485,6 +490,8 @@ async def generate_signals(
     """
     if not req.symbols:
         raise HTTPException(status_code=400, detail="symbols list is required")
+    if len(req.symbols) > 10:
+        raise HTTPException(status_code=422, detail="max 10 symbols per request — paginate (X-Limit: 10)")
 
     try:
         exchange_enum = SupportedExchange(req.exchange.lower())
@@ -592,6 +599,16 @@ async def get_zones(
     sd = zones_data.get("supply_demand", {})
     ch = zones_data.get("channels", {})
 
+    # Chart patterns (flags, triangles, wedges, double top/bottom, H&S, rectangle, cup & handle)
+    chart_patterns_payload = None
+    chart_patterns_raw = None
+    try:
+        from app.signals.chart_patterns import analyze_chart_patterns as _cp
+        chart_patterns_raw = _cp(df)
+        chart_patterns_payload = chart_patterns_raw
+    except Exception:
+        chart_patterns_raw = None
+
     return {
         "symbol": symbol,
         "timeframe": timeframe,
@@ -601,6 +618,7 @@ async def get_zones(
         "demand_zones": [z for z in sd.get("zones", []) if z["type"] == "demand"],
         "channels": ch.get("channels", []),
         "s_r_levels": s_r_levels,
+        "chart_patterns": chart_patterns_raw,
     }
 
 

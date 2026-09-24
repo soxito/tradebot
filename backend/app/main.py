@@ -59,28 +59,53 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to initialize database: {e}")
 
-    # Restore the trading room's custom agent names/seats so a restart doesn't
-    # silently revert the board to the built-in personas.
+    # Multi-account trading: carry the single-account settings over once and
+    # encrypt any credential still stored as plaintext.
     try:
-        from app.core.database import AsyncSessionLocal
-        from app.api.agents import refresh_persona_overrides
-        async with AsyncSessionLocal() as db:
-            await refresh_persona_overrides(db)
+        from app.services.crypto_accounts import backfill as _accounts_backfill
+        await _accounts_backfill()
     except Exception as e:
-        logger.debug(f"Room persona overrides not loaded: {e}")
+        logger.warning(f"Trading-account backfill skipped: {e}")
+    try:
+        from app.backtest.service import mark_interrupted as _bt_interrupted
+        if (n := await _bt_interrupted()):
+            logger.info(f"Backtests interrupted by the last shutdown marked as errors: {n}")
+    except Exception as e:
+        logger.warning(f"Backtest run cleanup skipped: {e}")
 
-    # Bring un-customised agent instructions up to the current defaults. Prompts
-    # move into the DB the first time an install seeds them, so an improvement
-    # to the shipped text would otherwise never reach a running deployment —
-    # which is how a board kept answering "hold" long after the instruction that
-    # told it to had been rewritten. Anything a user edited is left alone.
+    # Persona + prompt upgrades run in parallel — both are independent DB reads
+    # (cuts ~2x sequential DB wait on cold boot; plan Phase 5)
+    async def _persona_upgrade():
+        try:
+            from app.core.database import AsyncSessionLocal
+            from app.api.agents import refresh_persona_overrides
+            async with AsyncSessionLocal() as db:
+                await refresh_persona_overrides(db)
+        except Exception as e:
+            logger.debug(f"Room persona overrides not loaded: {e}")
+    async def _prompt_upgrade():
+        try:
+            from app.agents.specialists import upgrade_stock_prompts
+            from app.core.database import AsyncSessionLocal
+            async with AsyncSessionLocal() as db:
+                await upgrade_stock_prompts(db)
+        except Exception as e:
+            logger.debug(f"Agent prompt upgrade skipped: {e}")
+    async def _oblivion_settings():
+        # The engine's global config: loaded once so the sync hot paths (scalp
+        # bot, chart overlays) never touch the DB; refreshed on every write.
+        try:
+            from app.core.database import AsyncSessionLocal
+            from app.services import oblivion_settings
+            async with AsyncSessionLocal() as db:
+                doc = await oblivion_settings.load(db)
+            logger.info(f"[Oblivion] settings v{doc['version']} loaded ({doc['settings']['trade_mode']})")
+        except Exception as e:
+            logger.warning(f"Oblivion settings not loaded — engine runs on env defaults: {e}")
     try:
-        from app.agents.specialists import upgrade_stock_prompts
-        from app.core.database import AsyncSessionLocal
-        async with AsyncSessionLocal() as db:
-            await upgrade_stock_prompts(db)
-    except Exception as e:
-        logger.debug(f"Agent prompt upgrade skipped: {e}")
+        await asyncio.gather(_persona_upgrade(), _prompt_upgrade(), _oblivion_settings())
+    except Exception:
+        pass
 
     # Initialize plugin database tables
     if settings.PLUGIN_AUTO_MOUNT:
@@ -184,13 +209,58 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Cycle detector failed to start: {e}")
 
-    # Whale watch — reads the curated BTC whale registry so the desk sees the
+     # Whale watch — reads the curated BTC whale registry so the desk sees the
     # big money accumulate or distribute before it becomes a candle.
     try:
         from app.core.scheduler import start_whale_watch_loop
         start_whale_watch_loop()
     except Exception as e:
         logger.warning(f"Whale watch failed to start: {e}")
+
+    # Neuroglancer Core Brain — ensure store + start federated trade setter + auto-pull + AUTO-SYNC all brains
+    # This is the CORE brain: it federates Hermes + Vault + AiAnalyst + Decisions + Journal
+    # and auto-syncs them into its FTS so it is ALWAYS in track, even though it was added new.
+    # It is also the DECIDING brain (see orchestrator._apply_neuro_decision) — every verdict
+    # passes through its veto before execution.
+    if getattr(settings, "NEUROGLANCER_ENABLED", True):
+        try:
+            from app.neuro_brain.state_store import ensure_store as _neuro_ensure
+            _neuro_ensure()
+            logger.info("✅ Neuro core brain store ready (CORE — federates all brains)")
+        except Exception as e:
+            logger.warning(f"Neuro store ensure skipped: {e}")
+        try:
+            from app.neuro_brain.repo_sync import start_neuro_trade_loop, start_neuro_pull_loop
+            if getattr(settings, "NEUROGLANCER_AUTO_ANALYSE", True):
+                start_neuro_trade_loop(int(getattr(settings, "NEUROGLANCER_TRADE_LOOP_S", 600) or 600))
+            if getattr(settings, "NEUROGLANCER_AUTO_PULL", True):
+                start_neuro_pull_loop(int(getattr(settings, "NEUROGLANCER_PULL_INTERVAL_S", 21600) or 21600))
+        except Exception as e:
+            logger.warning(f"Neuro loops failed to start: {e}")
+        # Auto-sync loop — mirrors every other brain into Neuro on a 5-min cadence
+        # so Neuro is always the complete track of everything that happened.
+        try:
+            from app.neuro_brain.sync import start_neuro_sync_loop, sync_once
+
+            # Kick one immediate backfill (don't block lifespan)
+            async def _neuro_initial_sync():
+                await asyncio.sleep(6)
+                try:
+                    res = await sync_once(limit_per_brain=40)
+                    logger.info(f"✅ Neuro core auto-sync backfill: {res.get('total',0)} episodes mirrored")
+                except Exception as ee:
+                    logger.debug(f"Neuro initial sync skipped: {ee}")
+
+            try:
+                asyncio.create_task(_neuro_initial_sync())
+            except RuntimeError:
+                pass
+            # Then periodic
+            sync_interval = int(getattr(settings, "NEUROGLANCER_SYNC_INTERVAL_S", 300) or 300)
+            start_neuro_sync_loop(sync_interval)
+            logger.info(f"✅ Neuro core auto-sync loop started (every {sync_interval}s — deciding brain)")
+        except Exception as e:
+            logger.warning(f"Neuro sync loop failed to start: {e}")
 
     # Telegram signal monitor — start it with the app, not 63 s later when a
     # browser happens to hit a /plugins/telegram/* endpoint. ensure_started is
@@ -206,6 +276,13 @@ async def lifespan(app: FastAPI):
         logger.info("✅ Telegram signal monitor started (lifespan autostart)")
     except Exception as e:  # never fatal — plugin may be absent
         logger.warning(f"Telegram monitor autostart skipped: {e}")
+
+    # X Scraper (ScrapeGraphAI) — version check + results load; never fatal
+    try:
+        from app.api.x_scraper import startup_check as _scraper_startup
+        await _scraper_startup()
+    except Exception as e:
+        logger.debug(f"X Scraper startup skipped: {e}")
 
     # Unified task supervisor — register every background loop as a supervised
     # adapter (observational: does not change what starts) and launch the memory
@@ -347,6 +424,13 @@ async def lifespan(app: FastAPI):
         pass
     stop_background_workers()
     try:
+        from app.neuro_brain.repo_sync import stop_neuro_trade_loop, stop_neuro_pull_loop
+        stop_neuro_trade_loop(); stop_neuro_pull_loop()
+        from app.neuro_brain.sync import stop_neuro_sync_loop
+        stop_neuro_sync_loop()
+    except Exception:
+        pass
+    try:
         from app.core.scheduler import stop_price_tick_loop
         stop_price_tick_loop()
     except Exception:
@@ -378,7 +462,9 @@ app = FastAPI(
     redoc_url="/redoc" if settings.DEBUG else None,
 )
 
-# CORS middleware
+# Compression + CORS middleware (compress first so CORS headers survive)
+from fastapi.middleware.gzip import GZipMiddleware
+app.add_middleware(GZipMiddleware, minimum_size=500)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins_list,

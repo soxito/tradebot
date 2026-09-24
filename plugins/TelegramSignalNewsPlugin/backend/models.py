@@ -461,4 +461,9 @@ class TelegramBotConfig(TelegramBase):
     # AI fallback for unrecognised text messages
     ai_fallback_enabled = Column(Boolean, nullable=False, default=False)
 
+    # One-time bootstrap: the first time the polling loop runs it force-enables
+    # polling + clears any stale webhook so the bot replies out-of-the-box.
+    # Once stamped True, manual UI toggles always win.
+    polling_bootstrap_v1 = Column(Boolean, nullable=False, default=False)
+
     updated_at = Column(DateTime, default=now_utc_naive, onupdate=now_utc_naive)

@@ -4,6 +4,11 @@ Shared bounded TTL cache — one registry so caches are visible and evictable.
 Small LRU + TTL over an OrderedDict (no new dependency). The module-level
 ``CACHES`` registry is the point: it gives the System Monitor page a caches
 table, the memory watchdog a single ``evict_all()`` lever, and a cheap sweeper.
+
+Redis-backed extension: when REDIS_URL is reachable, frequently-fetched quotes/
+signals use Redis SETEX as shared L2 (see get_redis_cache helper). In-memory
+remains L1 for latency; Redis persists across workers. Degraded to L1-only if
+Redis unavailable — no hard failure, just lower hit rate (plan §10.3).
 """
 from __future__ import annotations
 
@@ -108,3 +113,51 @@ def evict_all() -> int:
 
 def sweep_all() -> int:
     return sum(c.sweep() for c in list(CACHES.values()))
+
+
+# ── Redis L2 helper (optional) ────────────────────────────────────────────
+_redis_client = None  # lazy
+_redis_ok: bool | None = None
+
+
+def _get_redis():
+    global _redis_client, _redis_ok
+    if _redis_ok is not None:
+        return _redis_client if _redis_ok else None
+    try:
+        import redis.asyncio as _redis  # type: ignore
+        from app.core.config import settings
+        import asyncio
+        # Sync check via thread — avoid event-loop coupling at import
+        import redis as _sync_redis  # type: ignore
+        c = _sync_redis.Redis.from_url(settings.REDIS_URL, socket_connect_timeout=1)
+        c.ping()
+        _redis_client = c
+        _redis_ok = True
+        return _redis_client
+    except Exception:
+        _redis_ok = False
+        return None
+
+
+def redis_get(key: str):
+    r = _get_redis()
+    if r is None:
+        return None
+    try:
+        import json
+        raw = r.get(f"tb:cache:{key}")
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
+
+
+def redis_set(key: str, value, ttl: float = 60):
+    r = _get_redis()
+    if r is None:
+        return
+    try:
+        import json
+        r.setex(f"tb:cache:{key}", int(ttl), json.dumps(value, default=str))
+    except Exception:
+        pass

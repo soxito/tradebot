@@ -52,8 +52,10 @@ class BitgetConnector(ExchangeConnector):
     _precision_cache: Dict[str, Dict[str, Any]] = {}
     _precision_cache_ts: float = 0
 
-    def __init__(self, api_key: str, api_secret: str, passphrase: Optional[str] = None, testnet: bool = True):
+    def __init__(self, api_key: str, api_secret: str, passphrase: Optional[str] = None,
+                 testnet: bool = True, demo: bool = False):
         self.native_client: Optional[BitgetClient] = None
+        self.demo = demo
         super().__init__(api_key, api_secret, passphrase, testnet)
 
     @property
@@ -78,6 +80,7 @@ class BitgetConnector(ExchangeConnector):
                 api_key=self.api_key,
                 api_secret=self.api_secret,
                 passphrase=self.passphrase,
+                demo=getattr(self, "demo", False),
             )
             logger.info(f"[{self.exchange_name}] Native v2 API client initialized")
 

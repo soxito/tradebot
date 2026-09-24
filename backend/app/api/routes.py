@@ -19,6 +19,9 @@ from app.api.jarvis import router as jarvis_router
 from app.api.provider_relay import router as provider_relay_router
 from app.api.vision import router as vision_router
 from app.api.market import router as market_router
+from app.api.oblivion import router as oblivion_router
+from app.api.room_trading import router as room_trading_router
+from app.api.backtest import router as backtest_router
 from app.api.stream import router as stream_router
 from app.api.ngrok import router as ngrok_router
 from app.api.research import router as research_router
@@ -28,6 +31,9 @@ from app.api.market_cycle import router as market_cycle_router
 from app.api.whale import router as whale_router
 from app.api.tradingagents import router as tradingagents_router
 from app.api.hermes import router as hermes_router
+from app.api.neuro import router as neuro_router
+from app.api.x_monitor import router as x_monitor_router
+from app.api.x_scraper import router as x_scraper_router
 
 # WhatsApp Plugin - loaded via plugin system
 # Fallback import if plugin system doesn't load it
@@ -62,6 +68,9 @@ api_router.include_router(voice_router)
 api_router.include_router(provider_relay_router)
 api_router.include_router(vision_router)
 api_router.include_router(market_router)
+api_router.include_router(oblivion_router)
+api_router.include_router(room_trading_router)
+api_router.include_router(backtest_router)
 api_router.include_router(stream_router)
 api_router.include_router(ngrok_router)
 api_router.include_router(research_router)
@@ -71,6 +80,9 @@ api_router.include_router(market_cycle_router)
 api_router.include_router(whale_router)
 api_router.include_router(tradingagents_router)
 api_router.include_router(hermes_router)
+api_router.include_router(neuro_router)
+api_router.include_router(x_monitor_router)
+api_router.include_router(x_scraper_router)
 
 if HAS_WHATSAPP:
     api_router.include_router(whatsapp_router)

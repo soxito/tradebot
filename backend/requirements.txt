@@ -95,3 +95,7 @@ ngrok==1.4.0
 # mediapipe>=0.10.9
 # opencv-python-headless>=4.9.0
 # face_recognition>=1.3.0
+
+# AI Social-Link Scraper (X Monitor → AI Scraper tab)
+# Installed here so pip can resolve conflicts with openai/litellm in one pass.
+scrapegraphai>=1.0

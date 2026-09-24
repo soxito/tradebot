@@ -71,6 +71,14 @@ export default function TradingRoomPage() {
 
   // Research feed — calendar events appear on the news screen when no verdict is pending.
   const { data: resData } = useResearchFeed({ days: 7, fomo_only: true })
+  // Prefetch per-pair research when focus changes so agents have instant findings/plan/calendar
+  useEffect(() => {
+    if (!focusSymbol) return
+    // Fire-and-forget: warms backend cache for research_context.gather_research(symbol)
+    void apiClient.research.findings({ symbol: focusSymbol, limit: 20 }).catch(() => {})
+    void apiClient.research.plan(focusSymbol).catch(() => {})
+    void api.get(`/research/calendar/upcoming`, { params: { symbol: focusSymbol, limit: 8 } }).catch(() => {})
+  }, [focusSymbol])
 
   useRoomAnnouncements(lastCompleted, { enabled: voiceOn, seats })
 

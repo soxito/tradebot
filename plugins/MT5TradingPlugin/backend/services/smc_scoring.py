@@ -85,7 +85,20 @@ DEFAULT_WEIGHTS: Dict[str, float] = {
     # ZigZag deviation/depth algorithm this mirrors (ported locally below
     # since this plugin does not import from the main backend package).
     "fib_confluence": 0.05,
+    # oblivion — 0.08
+    #
+    # The OBLIVION MASTER v5 engine (backend/app/signals/oblivion.py): its signed
+    # bull/bear score and fresh BUY/SELL on the entry timeframe. Added the same
+    # way as macro and fib — 0.08 taken proportionally from every other family
+    # by scaling at score time (see ``_OBLIVION_SCALE``), so the weights still
+    # sum to 1.00 when it applies, and it redistributes when the engine could
+    # not run (too few bars, standalone plugin without the core package).
+    "oblivion_alignment": 0.08,
 }
+
+#: Every non-oblivion weight is multiplied by this at score time so the table
+#: above keeps its historical values while the total stays 1.00.
+_OBLIVION_SCALE = 1.0 - DEFAULT_WEIGHTS["oblivion_alignment"]
 
 FACTOR_FAMILY: Dict[str, str] = {
     "relative_volume": "volume",
@@ -105,6 +118,7 @@ FACTOR_FAMILY: Dict[str, str] = {
     "risk_reward": "risk",
     "macro_context": "macro",
     "fib_confluence": "fibonacci",
+    "oblivion_alignment": "oblivion",
 }
 
 
@@ -423,6 +437,7 @@ def score_signal(
     weights: Optional[Dict[str, float]] = None,
     macro: Optional[Any] = None,
     fib: Optional[Dict[str, Any]] = None,
+    oblivion: Optional[Dict[str, Any]] = None,
 ) -> ScoreBreakdown:
     """Score one candidate setup. Pure function of the inputs — no I/O.
 
@@ -444,6 +459,10 @@ def score_signal(
     w = dict(DEFAULT_WEIGHTS)
     if weights:
         w.update({k: float(v) for k, v in weights.items() if k in DEFAULT_WEIGHTS})
+    # Make room for the oblivion family without touching the historical table.
+    for k in w:
+        if FACTOR_FAMILY.get(k) != "oblivion":
+            w[k] = w[k] * _OBLIVION_SCALE
 
     # Instruments with no volume series at all (spot FX with no futures proxy,
     # synthesised metal crosses) would otherwise forfeit the volume family's
@@ -484,6 +503,12 @@ def score_signal(
     fib_applicable = bool(fib and fib.get("golden_zone"))
     if not fib_applicable:
         _redistribute(w, "fibonacci")
+
+    # The OBLIVION engine could not run (short series, plugin without the core
+    # package) — redistribute rather than dock the setup.
+    oblivion_applicable = bool(oblivion and not oblivion.get("error") and oblivion.get("score"))
+    if not oblivion_applicable:
+        _redistribute(w, "oblivion")
 
     factors: List[Factor] = []
 
@@ -598,6 +623,27 @@ def score_signal(
         else:
             fib_norm = fib_conf
         add("fib_confluence", fib_conf, fib_norm)
+
+    # ── OBLIVION ─────────────────────────────────────────────────────────────
+    # Signed (bull-bear)/required score read for the trade side; a fresh
+    # engine signal the same way is full credit, the other way a full penalty.
+    if oblivion_applicable:
+        _sc = oblivion.get("score") or {}
+        _req = max(1.0, float(_sc.get("scalp_min") or _sc.get("required") or 6))
+        _raw = (float(_sc.get("buy", _sc.get("bull")) or 0) - float(_sc.get("sell", _sc.get("bear")) or 0)) / _req
+        _sig = (oblivion.get("signal") or {})
+        _act = str(_sig.get("action") or "wait")
+        if _sig.get("new") and _act in ("buy", "sell"):
+            # A sniper signal passed every hard requirement (HTF, sweep, zone,
+            # major trend), so it is full credit; a scalp cleared a lower bar.
+            _weight = 1.0 if str(_sig.get("kind")) == "sniper" else 0.6
+            _norm = (_weight if (_act == "buy") == want_bull else -_weight)
+        else:
+            _norm = _raw if want_bull else -_raw
+            _bias = int(oblivion.get("market_bias") or 0)
+            if _bias:
+                _norm += 0.15 * (_bias if want_bull else -_bias)
+        add("oblivion_alignment", _raw, _norm)
 
     # ── Macro ────────────────────────────────────────────────────────────────
     # The bias arrives signed for the long side, so a short reads the same

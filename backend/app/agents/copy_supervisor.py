@@ -37,9 +37,10 @@ async def _log_decision(
     confidence: float, reasoning: str, market_data: Optional[str] = None,
 ) -> None:
     """Persist a supervisor decision so the room/UI can show what happened."""
-    from app.models.database import AgentDecision
+    from app.agents import brain_log
 
-    db.add(AgentDecision(
+    brain_log.log_decision(
+        db,
         agent_id=0,
         agent_name=SUPERVISOR_AGENT_NAME,
         agent_role=SUPERVISOR_AGENT_ROLE,
@@ -49,8 +50,9 @@ async def _log_decision(
         reasoning=reasoning,
         market_data=market_data,
         ai_called=False,  # deterministic rules, not an LLM call
-        session_id=f"copy-supervisor",
-    ))
+        session_id="copy-supervisor",
+        origin="copy_supervisor",
+    )
     await db.commit()
     logger.info(f"[CopySupervisor] {symbol}: {action} — {reasoning}")
 

@@ -196,8 +196,25 @@ async def get_ohlcv(
     }
     is_crypto = exchange.value in _CRYPTO_EXCHANGES
 
-    # Accept URL-safe format: BTCUSDT -> BTC/USDT, PEPEUSDT -> PEPE/USDT
-    if "/" not in symbol:
+    # Strip URL-safe hyphens (ETH-USD → ETHUSD, CAD-JPY → CADJPY) up front.
+    if "/" not in symbol and "-" in symbol:
+        symbol = symbol.replace("-", "")
+
+    # Classify FX / metals / index by the SYMBOL, independent of the exchange
+    # dropdown. The Kronos page always selects a crypto venue (Bitget), so an FX
+    # cross like CADJPY would otherwise be treated as crypto and fail with
+    # "bitget does not have market symbol CADJPY". Forex/metals must price off
+    # Swissquote (via MT5/Yahoo), never a crypto exchange.
+    _sym_is_fx_metal = False
+    try:
+        from app.exchanges.yahoo_provider import supports_non_crypto as _supports_non_crypto
+        _sym_is_fx_metal = _supports_non_crypto(symbol)
+    except Exception:
+        _sym_is_fx_metal = False
+
+    # Accept URL-safe format: BTCUSDT -> BTC/USDT, PEPEUSDT -> PEPE/USDT. FX and
+    # metals keep their native spelling so they reach the Swissquote path below.
+    if "/" not in symbol and not _sym_is_fx_metal:
         upper = symbol.upper()
         # 1. Explicit alias map (highest priority — handles XAUUSD → XAU/USDT etc.)
         if is_crypto and upper in _SYMBOL_ALIASES:
@@ -213,6 +230,109 @@ async def get_ohlcv(
             # 3. USD quote on crypto exchange → upgrade to USDT
             if not matched and is_crypto and upper.endswith("USD") and len(upper) > 3:
                 symbol = symbol[:-3] + "/USDT"
+
+    # ── Fast-path: MT5 then Yahoo for non-USDT crypto and all FX/metals ──────
+    # Avoids routing ETH/USD / EUR/USD through Bitget futures (wrong venue).
+    _is_non_usdt_spot = (
+        is_crypto
+        and symbol.endswith("/USD")
+        and not symbol.endswith("/USDT")
+        and symbol.split("/")[0] not in ("XAU", "XAG", "XPT", "XPD")
+    )
+    _is_fx_metal = _sym_is_fx_metal or not is_crypto
+
+    if _is_non_usdt_spot or _is_fx_metal:
+        try:
+            from app.core.database import AsyncSessionLocal as _ASL
+            from sqlalchemy import select as _sel
+            from plugins.MT5TradingPlugin.backend.models import MT5Account as _MT5Acct
+            from plugins.MT5TradingPlugin.backend.services.mt5_client import mt5_client as _mt5
+            _TF = {"1m":"M1","5m":"M5","15m":"M15","30m":"M30","1h":"H1","4h":"H4","1d":"D1"}
+            async with _ASL() as _db:
+                _accts = (await _db.execute(
+                    _sel(_MT5Acct).where(_MT5Acct.api_reachable.is_(True)).limit(3)
+                )).scalars().all()
+            for _acct in _accts:
+                try:
+                    _base = symbol.upper().replace("/", "").replace("-", "")
+                    # Exness broker appends "m"; try both bare and suffixed forms
+                    _sym_variants = [_base, _base + "m"]
+                    if _base.endswith("USD") and not _base.endswith("USDT"):
+                        _sym_variants.append(_base[:-3] + "USDTm")
+                    _bars = None
+                    for _sym in _sym_variants:
+                        try:
+                            _bars = await asyncio.wait_for(
+                                _mt5.get_candles(str(_acct.login), _acct.server,
+                                                 _acct.password_encrypted,
+                                                 _sym, _TF.get(timeframe, "H1"), limit),
+                                timeout=8.0,
+                            )
+                            if _bars:
+                                break
+                        except Exception:
+                            _bars = None
+                    if _bars and len(_bars) >= 5:
+                        # Put FX/metals bars on Swissquote's price scale — the
+                        # broker the user actually trades — so every chart agrees.
+                        if _is_fx_metal:
+                            try:
+                                from app.exchanges.forex_provider import anchor_bars_to_swissquote as _anchor_sq
+                                _bars = await _anchor_sq(symbol, _bars)
+                            except Exception:
+                                pass
+                        return {
+                            "exchange": f"mt5:{_acct.server}", "symbol": symbol,
+                            "timeframe": timeframe, "count": len(_bars),
+                            "data": [{"time": int(b["time"]), "open": float(b["open"]),
+                                      "high": float(b["high"]), "low": float(b["low"]),
+                                      "close": float(b["close"]),
+                                      "volume": float(b.get("volume", 0) or 0)}
+                                     for b in _bars],
+                        }
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        if _is_fx_metal:
+            try:
+                from app.exchanges.yahoo_provider import fetch_candles as _yf
+                _YF_TF = {"1m":"M1","5m":"M5","15m":"M15","30m":"M30",
+                          "1h":"H1","4h":"H4","1d":"D1"}
+                _yf_bars = await asyncio.wait_for(
+                    _yf(symbol, _YF_TF.get(timeframe, "H1"), limit), timeout=12.0
+                )
+                if _yf_bars and len(_yf_bars) >= 5:
+                    # Anchor Yahoo FX/metals bars to Swissquote's price scale
+                    # (corrects e.g. the COMEX gold-future premium over spot).
+                    try:
+                        from app.exchanges.forex_provider import anchor_bars_to_swissquote as _anchor_sq
+                        _yf_bars = await _anchor_sq(symbol, _yf_bars)
+                    except Exception:
+                        pass
+                    return {
+                        "exchange": "yahoo", "symbol": symbol,
+                        "timeframe": timeframe, "count": len(_yf_bars),
+                        "data": [{"time": int(b["time"]), "open": float(b["open"]),
+                                  "high": float(b["high"]), "low": float(b["low"]),
+                                  "close": float(b["close"]),
+                                  "volume": float(b.get("volume", 0) or 0)}
+                                 for b in _yf_bars],
+                    }
+            except Exception:
+                pass
+
+        # FX / metals / indices are never listed on a crypto exchange, so do not
+        # fall through to the Bitget connector below — that only yields a
+        # misleading "bitget does not have market symbol CADJPY". Return an
+        # honest empty result the chart can surface instead.
+        if _is_fx_metal:
+            return {
+                "exchange": "swissquote", "symbol": symbol,
+                "timeframe": timeframe, "data": [], "count": 0,
+                "error": f"No OHLCV data for {symbol} ({timeframe}) — MT5/Swissquote feed unavailable.",
+            }
 
     cache_key = f"{exchange.value}:{symbol}:{timeframe}:{limit}"
     now_ts = time.time()

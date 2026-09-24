@@ -23,10 +23,17 @@ from plugins.KronosForecastPlugin.backend.schemas import (
     MarketCapInfo,
     PositionInfo,
 )
+from plugins.KronosForecastPlugin.backend.config import KRONOS_PAPER_KNOWLEDGE
 
 _SYSTEM_PROMPT = (
     "You are JARVIS, a precise crypto/markets forecasting analyst. You are given "
-    "a Sox foundation-model price forecast plus live market context. Write a "
+    "a Sox foundation-model price forecast plus live market context. "
+    "You understand the model producing this forecast: "
+    + KRONOS_PAPER_KNOWLEDGE
+    + " Use that understanding when you interpret the numbers — e.g. read the "
+    "p10/p90 band as the model's own conviction, and never treat a NO_TRADE as a "
+    "bearish call (it means volume could not be established). "
+    "Write a "
     "thorough, well-structured analysis — a minimum of 500 words — that a trader "
     "can act on immediately. Always cover ALL of the following sections in full; "
     "never truncate or abbreviate any section: "
@@ -149,6 +156,7 @@ def _build_user_prompt(
     resp: ForecastResponse,
     market: Optional[MarketCapInfo],
     position: Optional[PositionInfo] = None,
+    drawings_note: Optional[str] = None,
 ) -> str:
     sig = resp.signal
     band_lo = resp.lower_band[-1].value if resp.lower_band else None
@@ -224,6 +232,8 @@ def _build_user_prompt(
                 else ""
             ),
         ]
+    if drawings_note:
+        lines += ["", drawings_note]
     lines.append("\nWrite the analysis now.")
     return "\n".join(lines)
 
@@ -652,7 +662,18 @@ async def analyze_forecast(
             ),
         )
 
-    analysis, provider, err = await _run_llm(_build_user_prompt(resp, market, position))
+    # The trader's own chart drawings become context the analyst respects.
+    try:
+        from plugins.KronosForecastPlugin.backend.services import drawings_service
+        drawings_note = await drawings_service.drawings_context(
+            resp.exchange, resp.symbol, resp.timeframe,
+        )
+    except Exception:
+        drawings_note = ""
+
+    analysis, provider, err = await _run_llm(
+        _build_user_prompt(resp, market, position, drawings_note or None)
+    )
 
     note: Optional[str] = None
     if analysis is None:

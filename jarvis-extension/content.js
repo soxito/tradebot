@@ -99,24 +99,49 @@
   //     ordinary follow-ups look like echoes and got silently dropped;
   //   • verbatim containment of the utterance (or a 5+-word run of it) = echo;
   //   • otherwise need BOTH ≥70% overlap AND ≥4 shared content words.
+  // Plain-JS copy of frontend/src/utils/selfEcho.ts — keep the two in step.
+  // Verbatim-only matching let a slightly misheard echo through as a command;
+  // this strips every stretch that follows JARVIS's own word order and calls it
+  // echo only when nothing meaningful of the user's is left.
+  const ECHO_FILLER = new Set(
+    ('a an the and or but so to of in on at for is it its be are was i you he she we they ' +
+     'me my your sir yes yeah ok okay uh um oh well just now this that').split(' '))
+  function echoContentWords(s) {
+    return normSpeech(s).split(' ').filter(w => w.length > 1 && !ECHO_FILLER.has(w))
+  }
+  function stripSelfEcho(transcript) {
+    const t = normSpeech(transcript)
+    const l = normSpeech(lastSpokenText)
+    if (!t || !l) return t
+    const tw = t.split(' ')
+    const lw = l.split(' ')
+    const known = new Set()
+    for (let i = 0; i + 1 < lw.length; i++) known.add(lw[i] + ' ' + lw[i + 1])
+    const drop = tw.map(() => false)
+    let i = 0
+    while (i < tw.length - 1) {
+      let j = i
+      while (j + 1 < tw.length && known.has(tw[j] + ' ' + tw[j + 1])) j++
+      const len = j - i + 1
+      if (len >= 3 || (len === 2 && (i === 0 || j === tw.length - 1))) {
+        for (let k = i; k <= j; k++) drop[k] = true
+      }
+      i = Math.max(j, i + 1)
+    }
+    return tw.filter((_, k) => !drop[k]).join(' ')
+  }
   function isSelfEcho(transcript) {
     if (!lastSpokenText) return false
     const t = normSpeech(transcript)
     const l = normSpeech(lastSpokenText)
     if (!t || !l) return false
-    if (l.includes(t)) return true
-    const tWords = t.split(' ').filter(w => w.length > 2)
-    const lWords = l.split(' ').filter(w => w.length > 2)
-    if (tWords.length >= 5) {
-      for (let i = 0; i + 5 <= tWords.length; i++) {
-        if (l.includes(tWords.slice(i, i + 5).join(' '))) return true
-      }
-    }
-    if (!tWords.length || !lWords.length) return false
-    const vocab = new Set(lWords)
-    let hit = 0
-    for (const w of tWords) if (vocab.has(w)) hit++
-    return hit >= 4 && hit / tWords.length >= 0.7
+    if ((' ' + l + ' ').includes(' ' + t + ' ')) return true
+    if (echoContentWords(stripSelfEcho(t)).length === 0) return true
+    const tc = echoContentWords(t)
+    if (tc.length < 3) return false
+    const vocab = new Set(echoContentWords(l))
+    const hit = tc.filter(w => vocab.has(w)).length
+    return hit >= 3 && hit / tc.length >= 0.75
   }
   // True when speech was recently loud enough to be the user (not faint noise).
   // Fails open when the frequency analyser isn't running (can't measure).
@@ -162,7 +187,7 @@
     pageSpeaking = false
     pageSpeakingSetAt = 0
     // Short echo tail: the speakers may still ring for a moment after cancel().
-    echoGuardUntil = Date.now() + 300
+    echoGuardUntil = Date.now() + 1200
     toPage({ type: 'interrupt' })
     toPage({ type: 'speak-status', speaking: false, allowBargeIn: false })
     badge('▶', '#06b6d4')
@@ -449,7 +474,7 @@
         restartTimer = setTimeout(() => {
           pageSpeaking = false
           pageSpeakingSetAt = 0
-          echoGuardUntil = Date.now() + 900
+          echoGuardUntil = Date.now() + 2000
           toPage({ type: 'speak-status', speaking: false, allowBargeIn: false })
         }, 900)
       }
@@ -1485,7 +1510,7 @@
           } else {
             pageSpeakingSetAt = 0  // cleared
             // Page finished speaking → open the echo-tail guard.
-            echoGuardUntil = Date.now() + 900
+            echoGuardUntil = Date.now() + 2000
           }
           // While JARVIS is talking we must never transcribe its own voice. Two
           // modes, chosen by the page via `allowBargeIn`:
@@ -1509,7 +1534,7 @@
           } else if (settings.enabled) {
             // JARVIS finished — open an echo-tail guard so the trailing speaker
             // echo isn't transcribed, then resume normal listening shortly after.
-            echoGuardUntil = Date.now() + 900
+            echoGuardUntil = Date.now() + 2000
             if (inConversation) enterConversation()
             manuallyStopped = false
             clearTimeout(restartTimer)

@@ -1,0 +1,22 @@
+# Soup LLM finetuning sidecar — MakazhanAlpamys/Soup
+# Isolated like hermes/tradingagents; backend proxies at /api/v1/plugins/soup/*
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 SOUP_UI_PORT=7860 SOUP_PORT=8012
+
+RUN apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir uv
+
+WORKDIR /app
+# Shallow clone (keeps image small); runtime updates via start.py git pull
+RUN git clone --depth 1 https://github.com/MakazhanAlpamys/Soup.git /app/soup
+WORKDIR /app/soup
+# Install with torch CPU fallback; heavy CUDA deps can be added via build arg
+RUN uv pip install --system -e ".[train,ui,serve,fast]" || pip install -e ".[train,ui,serve]" || pip install -e "."
+
+# Our thin shim that exposes /health + proxies soup ui/serve
+COPY soup_sidecar.py /app/soup_sidecar.py
+
+EXPOSE 7860 8012
+ENV SOUP_REPO_DIR=/app/soup
+CMD ["python", "/app/soup_sidecar.py"]

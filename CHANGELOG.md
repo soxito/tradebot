@@ -8,6 +8,280 @@ entries are grouped under `[Unreleased]` and dated milestone headings.
 
 ## [Unreleased]
 
+### Added — 2026-09-15 → 2026-09-24
+
+#### OBLIVION MASTER v5 — the house strategy
+- **One engine for every consumer.** The Pine v6 "OBLIVION MASTER v5 – Scalper +
+  Sniper" strategy is ported to `backend/app/signals/oblivion.py`
+  (`analyze_oblivion`, `oblivion_score`, `compact_for_prompt`,
+  `oblivion_to_overlays`, `is_news_blocked`), verified causal (no lookahead). The
+  trading room, `technical.analyze`, the MT5 scalp bot and SMC sniper, Kronos
+  (`ForecastResponse.oblivion`, `/plugins/kronos/oblivion/…`, OBLIVION leads and
+  Kronos confirms or vetoes) and Telegram (`/forecast`, `/room`, `/analyze` via a
+  dedicated chart image) all run the same function on the bars they draw or trade.
+- **Global settings.** `GET/PUT /oblivion/settings` + `POST /reset`
+  (`services/oblivion_settings.py`, one cached row, field spec mirroring Pine input
+  groups 01–20) and the settings popup (`OblivionSettingsModal`); a save changes
+  every consumer at once. `OBLIVION_*` env knobs are the bottom layer.
+- **Overlay everywhere.** `OblivionPrimitive.ts` draws boxes, labels, diamonds,
+  fib + entry/SL/TP lines, session bands and the dashboard on every
+  lightweight-charts surface; `/market/oblivion-overlay` accepts the chart's own
+  candles for parity. New `/oblivion` page with a multi-timeframe read panel.
+
+#### OBLIVION leads the trading room
+- **OBLIVION triggers, agents confirm or veto.** `agents/oblivion_gate.py` is the
+  room's only entry to the engine: every read is stored (`oblivion_reads`), the
+  verdict hard-blocks on no fresh signal, weak score or the news window, and the
+  board may only confirm the OBLIVION side or hold — an opposite call is rewritten
+  to hold and logged. Execution re-reads the pair before routing and refuses a
+  trade OBLIVION has not seen or no longer supports.
+- **Scanner.** `room_worker._oblivion_loop` scans the pinned pairs plus an optional
+  trading universe (`universe_enabled`, `universe_symbols`) on
+  4h/2h/1h/30m/15m/5m with per-timeframe pacing; a confirmed signal convenes the
+  board with trigger `oblivion`.
+- **Per-timeframe room profiles** (`signals/oblivion_profiles.py`): wide stops,
+  pullback limit entry (0.5 ATR), stop jumps to TP1 once reached, trail from TP2,
+  no broker take-profit — the trade rides past TP3 until the trail is hit. Live
+  plans and backtests share `entry_plan`.
+- **High-impact news gate** (`signals/news_gate.py`): no new room entries from
+  30 min before to 120 min after a high-impact release on the pair's currencies;
+  a still-fresh signal is taken after the cool-off.
+- **Everything goes into the AI brain** (`agents/brain_log.py`): every OBLIVION
+  read, board decision, order, execution block, trade-manager action and backtest,
+  with `agent_decisions.origin` / `oblivion_read_id`.
+
+#### Multi-account execution and trade management
+- **Demo always on, live per account.** `execution.mt5_targets` routes to every
+  demo MT5 account plus each live account switched on under the master "Live
+  trading" switch (`room_trading_accounts`); exchange accounts live in
+  `crypto_accounts` (Bitget, demo via demo trading). `GET/POST
+  /agents/room/accounts…` and the Trading accounts panel in Room Settings.
+- **Credentials encrypted at rest.** `core/secrets_box.py` (Fernet,
+  `CREDENTIALS_KEY` or `backend/data/.credentials_key`); stored MT5 passwords are
+  migrated on startup.
+- **Real-time trade manager** (`agents/trade_manager.py`, every 5 s): TP ladder
+  and trailing stop, break-even, margin warning/critical actions (worst loser cut
+  first), account drawdown flatten, and take-profit when OBLIVION turns against the
+  trade. The MT5 auto-manager skips room positions so the two never fight.
+
+#### Backtesting
+- **OBLIVION backtest engine + `/backtest` page** (`app/backtest/`): pick pairs,
+  timeframe, balance and risk; costs per pair, stop-before-target inside a bar,
+  news gate, the agents' confirm/veto book, trades on a chart, PDF report to
+  Telegram and every trade stored in the AI brain.
+- **Pair approval** (`agents/pair_gate.py`, `pair_approvals`): a pair/timeframe
+  trades only when its own backtest clears the approval bar (default 95%) with
+  ≥10 trades and positive expectancy, and an account lists it; untested pairs are
+  backtested automatically. Reports show the **traded book** beside all pairs,
+  with total profit, total losses and net P&L across every pair.
+- **Backtest my accounts** (`app/backtest/portfolio.py`, `POST
+  /backtest/portfolio`): the traded pairs replayed on every configured MT5/crypto
+  account's real equity with the live risk band, day target and cap, daily floor
+  and position cap — an honest walk-forward book (pairs chosen only on data before
+  the window) beside today's approved book, per account and for the whole
+  portfolio, with a PDF to Telegram.
+
+#### Targets and risk
+- Weekly minimum per pair (default $15,000, no cap) with pacing inside a **1–5%
+  risk band** per trade; JPY-cross sizing converted to dollars; orders clamped to
+  the broker's maximum lot and kept above the margin-level warning.
+- **Portfolio day band**: default 10% minimum / 20% cap of the portfolio's value at
+  00:00 UTC — paced toward the minimum, at the band floor once it is banked, no new
+  entries after the cap (the day is locked in). Replaces the "200% of margin" daily
+  minimum.
+- **Daily win-rate floor**: once today's closed room trades win less than 90%, only
+  pairs whose backtest won ≥97% may open for the rest of the day.
+
+#### Other
+- `scripts/run_soup_training.py`: trains `tradebot-local` on every app data source
+  and all tradeable pairs.
+- Speech engine runs in LITE mode on <32 GB machines under
+  `speech_engine/supervise.py` (low priority, auto-restart, TTS unloaded when idle).
+
+### Changed — 2026-09-15 → 2026-09-24
+- **Win rate over trade count.** Tested on history the approvals never saw, the
+  old book won 89.8%. 2h now trades only with the daily trend and OBLIVION's
+  structure, 1h only with the structure, 15m uses wider stops, and the approval bar
+  is 95%: the unseen-data book won 92.3% (80% of days at 90%+). Fewer trades
+  (~1.5 a weekday across the universe). No setting guarantees every day ≥90%.
+- Backtest runs execute one at a time; runs cut off by a restart are marked as
+  errors on startup; `POST /backtest/runs/{id}/cancel`; up to 80 pairs per run.
+- Paul chat: human chat is exempt from `TRAINING_PROVIDER`, a retired NVIDIA model
+  id drops only that model, low-value prompt sections are shed first so live MT5
+  positions survive the cap, saved chat transcripts are no longer injected as
+  memory, and the local Ollama fallback fits its context window.
+- Room seat prompts moved to "confirm or veto the OBLIVION mandate"; stock prompts
+  from between rewrites are now recognised and upgraded.
+
+### Fixed — 2026-09-15 → 2026-09-24
+- **JARVIS answered himself**: loud audio now only pauses his reply; a transcript
+  that is not his own echo confirms the barge-in (`utils/selfEcho.ts`, mirrored in
+  the browser extension).
+- **Dev frontend served stale chunks**: no immutable cache header in development,
+  and Turbopack is rooted at the frontend instead of `$HOME` (hydration errors,
+  "is not a function").
+- Gold "2h" candles that were really 1h bars are folded by their real spacing
+  (`candles._conform`).
+- A candle fetch that stalled blocked the whole OBLIVION scan (40 s timeout).
+- Empty answers from local model seats counted as vetoes; they now abstain.
+- JPY-cross orders were sized in yen (~150× too small); lot floor rounding.
+- A near-zero stop on flat data could size an enormous position (a 5m backtest
+  lost 1,185R on one fill); plans with a stop closer than 0.04% of price are
+  refused, live and in backtests.
+- Tests could write to the production database through the startup backfill.
+
+### Removed
+- Kronos fine-tune job 12 artifacts (model weights, training CSV) from the
+  repository.
+
+### Added — 2026-09-14
+
+#### Local LLM fallback + self-training (Ollama × Soup)
+- **Offline AI resilience.** When every configured cloud provider is down, the
+  agent router (`AiMarketAnalyst` `db_chat`) now falls back to a local model
+  served by [Ollama](https://ollama.com) instead of degrading straight to the
+  heuristic analyser. New `backend/app/services/ollama_service.py` is the single
+  import site: a tier→model catalogue (`qwen2.5:0.5b` on minimal … `qwen2.5:14b`
+  on ultra), resource-aware model picker, chat (sync/async), model-pull, and a
+  `ollama create` bridge for imported GGUFs.
+- **Zero-touch setup in `start.py`.** `ensure_ollama()` (mirrors the Kronos/Soup
+  bootstrap pattern) auto-installs the Ollama binary (Homebrew / `install.sh` /
+  winget), runs an update check, ensures `ollama serve` is reachable, and pulls
+  the best model for the detected resource tier — walking the catalogue to a
+  smaller candidate if a pull fails. Every failure degrades gracefully and never
+  blocks startup. Opt-outs: `TRADEBOT_SKIP_OLLAMA_SETUP=1`,
+  `TRADEBOT_SKIP_OLLAMA_UPDATE=1`, `OLLAMA_MANAGED=1` to have start.py own serve.
+- **Scheduled self-training on your own data.** A new background loop
+  (`start_ollama_train_loop` in the scheduler, wired into
+  `workers/runtime.py` and registered with the task supervisor) periodically
+  fine-tunes `tradebot-local` from Brain episodes + executed trades. The
+  `SoupPlugin` bridge (`soup_ollama_bridge.py`) builds a ShareGPT dataset,
+  runs `soup train` → `soup export --gguf`, then `ollama create
+  tradebot-local:latest`, pruning old datasets. Tier-gated (medium+ by default;
+  `TRADEBOT_FORCE_OLLAMA_TRAIN=1` overrides), interval-scaled per hardware tier.
+- **Config + env.** New `OLLAMA_*` settings in `config.py`
+  (`OLLAMA_ENABLED`, `OLLAMA_URL`, `OLLAMA_MODEL`, `OLLAMA_FALLBACK_ENABLED`,
+  `OLLAMA_AUTO_PULL`, `OLLAMA_MANAGED`, `OLLAMA_TIMEOUT_MS`,
+  `AUTO_START_OLLAMA_TRAIN_LOOP`, `OLLAMA_TRAIN_INTERVAL_HOURS`,
+  `OLLAMA_MIN_SAMPLES_FOR_TRAIN`, `OLLAMA_KEEP_LAST_N`) documented in
+  `.env.example`; `resource_tier.py` gains `ollama_train`/`ollama_serve` task
+  policies.
+
+#### Soup LLM fine-tuning plugin
+- **`SoupPlugin` (`/api/v1/plugins/soup/*`, `/soup-finetune`).** Fine-tune any
+  Hugging Face causal LM in an isolated venv (`~/.tradebot/soup-venv`, never the
+  backend venv), auto-updated on each `start.py` like Kronos. Hardware-adaptive
+  recipe selection (4-bit + layer streaming on weak hosts, bf16 on 16GB+ VRAM),
+  a unified model catalogue, dataset upload, an experimental OHLCV→ShareGPT-JSONL
+  bridge, and the embedded Soup web UI proxied with auth so the token never
+  leaks. Optional Docker sidecar (`docker/Dockerfile.soup`, `soup_sidecar.py`).
+
+#### Chart-pattern detectors
+- **Classic price patterns** (`backend/app/signals/chart_patterns.py`): double /
+  triple tops & bottoms, head & shoulders (and inverse), rising/falling &
+  expanding wedges, flags, pennants, rectangles, and ascending/descending/
+  symmetrical/expanding triangles — each with volume confirmation and measured
+  targets, and each returning `None` unless criteria are cleanly met (an unnamed
+  pattern beats a wrong one).
+
+
+
+#### Kronos forecast — every asset class (forex, futures/indices, and shares)
+- **All forex pairs and crosses forecast off Swissquote.** The chart OHLCV
+  endpoint (`GET /exchanges/{exchange}/ohlcv/{symbol}`) now classifies FX /
+  metals / indices by the **symbol**, not the exchange dropdown, so a pair like
+  CADJPY selected under a crypto venue (Bitget) routes to MT5/Yahoo and is
+  anchored to the Swissquote BBO price scale instead of erroring on the crypto
+  exchange. Forex/metals never fall through to a crypto connector — they return
+  an honest empty result rather than a misleading "does not have market symbol".
+- **Stock-exchange equities, ETFs and shares.** `yahoo_provider` now resolves
+  equity tickers (a curated set of ~250 US large/mega-caps + popular ETFs) and
+  any exchange-suffixed listing (`VOD.L`, `BMW.DE`, `RELIANCE.NS`), so
+  `/forecast AAPL`, `TSLA`, `NVDA`, `SPY` — and free-text entry of any ticker —
+  produce a full Kronos forecast with real share volume. Equities forecast on
+  price/structure (volume `NOT_APPLICABLE`, like cash indices) because a rolling
+  24-clock-hour volume gate does not fit a ~6.5h/day trading session.
+- **Forecast page discoverability.** `/kronos-forecast` search now lists forex
+  majors + crosses, indices (US30, US500, NAS100, GER40, UK100, JPN225), energy,
+  and a stocks/ETFs group alongside the live crypto catalog.
+
+### Fixed — 2026-09-07
+- **`/forecast <fx-cross>` crash.** `unsupported format string passed to
+  NoneType.__format__` — the volume-evidence line formatted a `None` volume
+  slope when the divergence window's borrowed CME volume averaged zero
+  (classified `UNKNOWN`, which the guard only excluded for `NEUTRAL`). The line
+  now renders only when both the price move and the volume slope are present.
+- **Forex/metals/index charts on the Kronos page.** Symbols such as CADJPY,
+  EURUSD, XAUUSD and US30 no longer 500/`does not have market symbol` on the
+  crypto exchange; they resolve via MT5/Yahoo and quote Swissquote. Gold now
+  prints spot (~Swissquote) rather than the COMEX-future premium.
+
+### Added — 2026-09-02 / 2026-09-04
+
+#### Kronos — auto-update, paper-aware agents & fine-tuning
+- **Kronos stays current on every launch.** `start.py` now records the vendored
+  upstream commit (`vendor/.kronos_commit`) and, when Kronos is already vendored,
+  compares it against `git ls-remote HEAD` for
+  [shiyu-coder/Kronos](https://github.com/shiyu-coder/Kronos) on each run. If they
+  differ it re-vendors the `model/` package and rewrites the hash (guarded by git
+  availability with a 10-second timeout, so no network = no-op).
+- **Every trading-room seat reads the forecast the way the paper intends.** A
+  compact fact-sheet from the Kronos paper (arXiv:2508.02739) — decoder-only,
+  pre-trained on 12B K-lines from 45 exchanges, p10/p90 band = conviction,
+  `NO_TRADE` = no volume (not bearish), confidence = path-agreement × volume ×
+  macro — is injected into the JARVIS analysis system prompt (`config.py`
+  `KRONOS_PAPER_KNOWLEDGE`) and into each forecast block the orchestrator hands
+  the seven agent seats.
+- **Fine-tune Kronos on your own data (a share-market example).** Full
+  tokenizer → predictor pipeline mirroring the upstream repo:
+  - Setup scripts vendor `finetune_csv/` from upstream
+    (`scripts/setup_kronos_finetune.sh` / `.ps1`, idempotent, `--force`).
+  - Backend: an OHLCV→CSV exporter, a `FinetuneManager` that runs
+    export → tokenizer training → predictor training as a background job and can
+    hot-swap the engine to a finished model, a `kronos_finetune_jobs` table, and
+    seven REST endpoints under `/api/v1/plugins/kronos/finetune/*`
+    (`setup-status`, `export`, `start`, `jobs`, `jobs/{id}`, cancel, `load/{id}`).
+  - Frontend: a **Fine-tune on your own data** panel on `/kronos-forecast` —
+    setup banner, data-source export/preview, training hyper-parameters, Start,
+    a job-history table with Load/Cancel, and a live training-log tail.
+- **Telegram.** `/forecast` now shows the model-context line and a 🎯 fine-tuned
+  badge when a locally trained model is loaded; `/room agents` notes the seats'
+  shared Kronos paper context; a new **`/finetune`** command
+  (`start` / `status` / `load` / `setup`) with help text and autorun-safe
+  registration.
+
+
+- **AI Scraper tab** on `/x-monitor` — second tab alongside the existing Monitor tab, powered by a new `backend/app/api/x_scraper.py` router at `prefix=/x-scraper`.
+- **Two-mode scraping**: basic mode (stdlib only, always active, zero extra packages) uses Twitter's public syndication API + t.co URL resolution via `urllib.request` and `re`; AI mode upgrades to ScrapeGraphAI when installed.
+- **One-click install / upgrade to AI mode** — Install button tries three pip strategies (standard, `--pre`, bounded `>=1.0,<2.0`) and installs `playwright` + Chromium separately so a browser error never blocks the core install. Full pip output is shown in the UI on failure.
+- **Persistent error panel** — install failures no longer disappear as a flash message; the complete pip output is shown with a pre-filled copy-to-clipboard manual install command using the backend's exact `python_executable`.
+- **Auto-install in `start.py`** — preflight check installs `scrapegraphai` into the backend venv (checked with `PY_BIN` subprocess, not start.py's own Python) and reports version in the startup banner.
+- **`scrapegraphai>=1.0` added to `backend/requirements.txt`** so pip can resolve it alongside `openai==1.82.0` and other existing deps in one pass.
+- **`GET /x-scraper/status`** returns `installed` (always `true`), `ai_mode`, `scrape_mode` (`"basic"` / `"ai"`), `installed_version`, `python_executable`, and `last_install_error` — status endpoint does a fresh `_detect_installed()` on every call.
+- **`POST /x-scraper/scrape/{username}`** and **`POST /x-scraper/scrape-all`** — work in both basic and AI mode; results persisted to `data/x_scraper_results.json`.
+- **`PUT /x-scraper/config`** — live-patches dedicated scraper credentials (`SCRAPEGRAPH_AI_API_KEY`, `SCRAPEGRAPH_AI_BASE_URL`, `SCRAPEGRAPH_AI_MODEL`) into runtime settings without restart.
+- **Configure Dedicated AI Provider** panel in the UI — optional separate API key / base URL / model for the scraper, isolated from system-wide NVIDIA/OpenAI credentials.
+- **Scraped Social Links table** — per-account results with expandable link list, website primary URL, bio excerpt, scrape timestamp, and per-account re-scrape button; all buttons enabled in both modes.
+- New env vars: `SCRAPEGRAPH_AI_API_KEY`, `SCRAPEGRAPH_AI_BASE_URL`, `SCRAPEGRAPH_AI_MODEL` (all optional, blank = use system credentials).
+- New settings fields in `backend/app/core/config.py`.
+
+#### X Monitor — Auth & API fixes
+- **OAuth 1.0a user-context monitoring** — home-timeline polling via `GET /1.1/statuses/home_timeline.json` (v1.1, no project enrollment required); falls back to app-only Bearer token path if OAuth keys absent.
+- **HMAC-SHA1 OAuth 1.0a signing** in `x_monitor.py` (`_oauth1_header`) using Python stdlib only — no extra packages.
+- **`_poll_home_timeline`** — single API call per cycle fetches up to 200 tweets from all followed accounts, filtered to monitored accounts server-side.
+- **Fixed `/2/users/me` 403** — startup probe and `test_connection` both changed from `GET /2/users/me` (user-context only) to appropriate endpoints: OAuth 1.0a uses `GET /1.1/account/verify_credentials.json`; Bearer uses `GET /2/users/by/username/twitter`.
+- **Auth mode exposed** — `GET /x-monitor/config` and `GET /x-monitor/status` both now return `auth_mode` (`"oauth1"` / `"bearer"` / `"none"`) and `oauth1_set`; `POST /x-monitor/start` accepts either credential set.
+- **AI Scraper tab status card** shows active auth mode instead of generic "Bearer Token" label.
+- **`TWITTER_USER_ID`** added to `.env` and settings — numeric ID for home-timeline endpoint (detected automatically via Twitter's public GraphQL endpoint).
+- **`start.py` X Monitor banner** — specific messages for 401 (token rejected), 403 (no Basic-tier access), and transient errors; new X AI Scraper status line showing scrapegraphai version.
+
+### Fixed — 2026-09-02
+
+- `start.py` scrapegraphai version check now uses `subprocess.run([PY_BIN, "-c", ...])` (backend venv Python) instead of `importlib.metadata` in start.py's own process — these are different Python environments and the old check always falsely reported "not installed".
+- Install endpoint returns full pip output on failure (was truncated to 500 chars).
+- `_detect_installed()` has a two-stage fallback: `importlib.metadata` → direct `import scrapegraphai` — handles cases where pip installs code but metadata is missing.
+- `scrape_account` and `scrape_all` endpoints no longer raise HTTP 400 when scrapegraphai is absent (basic mode handles both).
+
 ### Fixed
 - **The board no longer answers "hold" into a trending market.** Four of the
   seven live seats were still running the repo's *original crypto-only* system

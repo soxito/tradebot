@@ -159,6 +159,16 @@ async def deepgram_status():
 
 DEEPGRAM_LISTEN_URL = "https://api.deepgram.com/v1/listen"
 
+#: Vocabulary nova-3 is told to expect (its keyterm prompting; ignored by older
+#: models, so only sent to nova-3). Names, instruments and trading jargon the
+#: general model otherwise mishears.
+_STT_KEYTERMS = (
+    "Jarvis", "Paul", "XAUUSD", "XAGUSD", "BTCUSD", "BTCUSDT", "ETHUSDT",
+    "EURUSD", "GBPUSD", "USDJPY", "CADJPY", "NAS100", "US30", "MT5", "Bitget",
+    "Kronos", "take profit", "stop loss", "break even", "order block",
+    "fair value gap", "sniper", "lot size",
+)
+
 
 @router.post("/deepgram/stt")
 async def deepgram_stt(file: UploadFile = File(...)):
@@ -189,12 +199,25 @@ async def deepgram_stt(file: UploadFile = File(...)):
     # good recording, and Parakeet transcribes it for free with no budget
     # impact and no key requirement. Deepgram only pays when local is down.
     local_text = await _local_stt(audio, "clip.webm")
-    if local_text is not None:
+    # An empty transcript is the local engine hearing nothing — not an answer.
+    # Returning it skipped Deepgram on exactly the clips it exists to rescue.
+    if local_text and local_text.strip():
         return {
             "used_deepgram": False,
             "reason": "local_engine",
             "text": local_text,
             "engine": "local",
+            "budget": deepgram_budget.summary(),
+        }
+
+    # 1b. NVIDIA hosted ASR — free, ~0.5s — when the local engine is down.
+    nvidia_text = await _nvidia_stt(audio, "clip.webm")
+    if nvidia_text and nvidia_text.strip():
+        return {
+            "used_deepgram": False,
+            "reason": "nvidia_engine",
+            "text": nvidia_text,
+            "engine": "nvidia",
             "budget": deepgram_budget.summary(),
         }
 
@@ -216,7 +239,14 @@ async def deepgram_stt(file: UploadFile = File(...)):
         }
 
     content_type = file.content_type or "audio/webm"
-    params = {"model": settings.DEEPGRAM_STT_MODEL, "smart_format": "true"}
+    # Key terms bias recognition toward the words this user actually says —
+    # without them "XAUUSD" comes back as "zoo USD" and "Jarvis" as "service".
+    params: list[tuple[str, str]] = [
+        ("model", settings.DEEPGRAM_STT_MODEL),
+        ("smart_format", "true"),
+    ]
+    if settings.DEEPGRAM_STT_MODEL.startswith("nova-3"):
+        params += [("keyterm", t) for t in _STT_KEYTERMS]
 
     try:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -389,14 +419,59 @@ def _get_riva_tts_service():
     return _riva_tts_service
 
 
+async def _nvidia_asr_key() -> str:
+    """NVIDIA key for hosted ASR: .env first, else a connected NVIDIA provider.
+
+    The keys live in the AI provider list, not .env, so with only the env var
+    consulted the fast hosted recogniser never ran and every missed clip fell
+    to the 30-60s local engine or to nothing at all.
+    """
+    if settings.NVIDIA_API_KEY:
+        return settings.NVIDIA_API_KEY
+    try:
+        from sqlalchemy import select
+        from app.core.database import AsyncSessionLocal
+        from plugins.AiMarketAnalyst.backend.models import AILLMProvider
+        async with AsyncSessionLocal() as db:
+            rows = (await db.execute(
+                select(AILLMProvider)
+                .where(AILLMProvider.enabled.is_(True))
+                .where(AILLMProvider.base_url.contains("nvidia"))
+                .order_by(AILLMProvider.priority.asc())
+            )).scalars().all()
+        # Shared-pool keys first: a task-dedicated key is reserved for its task.
+        rows = sorted(rows, key=lambda p: bool(p.assigned_task))
+        return next((p.api_key for p in rows if p.api_key), "")
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"NVIDIA ASR key lookup failed: {e}")
+        return ""
+
+
+def collapse_spelled_letters(text: str) -> str:
+    """Join letters the recogniser spelled out: "C A D J P Y" → "CADJPY".
+
+    Tickers said letter by letter come back as separate one-letter words,
+    which no symbol parser recognises. Three or more in a row are joined.
+    """
+    import re as _re
+    return _re.sub(
+        r"\b(?:[A-Za-z](?:\. ?| )){2,}[A-Za-z]\b\.?",
+        lambda m: m.group(0).replace(".", "").replace(" ", "").upper(),
+        text or "",
+    )
+
+
 async def _nvidia_stt(content: bytes, filename: str) -> Optional[str]:
-    if not settings.NVIDIA_ASR_ENABLED or not settings.NVIDIA_API_KEY:
+    if not settings.NVIDIA_ASR_ENABLED:
+        return None
+    key = await _nvidia_asr_key()
+    if not key:
         return None
     try:
         async with httpx.AsyncClient(timeout=_nvidia_timeout()) as client:
             resp = await client.post(
                 settings.NVIDIA_ASR_INVOKE_URL,
-                headers={"Authorization": f"Bearer {settings.NVIDIA_API_KEY}"},
+                headers={"Authorization": f"Bearer {key}"},
                 data={"language": settings.NVIDIA_ASR_LANGUAGE},
                 files={"file": (filename, content)},
             )
@@ -410,7 +485,7 @@ async def _nvidia_stt(content: bytes, filename: str) -> Optional[str]:
             # rather than OpenAI-Whisper-shaped.
             first = data["results"][0]
             text = first.get("text") or (first.get("alternatives") or [{}])[0].get("transcript")
-        return text
+        return collapse_spelled_letters(text) if text else text
     except Exception as e:
         logger.warning(f"NVIDIA NIM ASR unavailable, trying next engine: {e}")
         return None
@@ -502,11 +577,23 @@ async def _local_stt(content: bytes, filename: str) -> Optional[str]:
         return None
 
 
+def _local_tts_timeout(text: str) -> float:
+    """Deadline for a local synthesis, sized to the text.
+
+    The flat 4s STT deadline cut off every reply longer than a sentence —
+    measured on an M2 Pro, Qwen3-TTS takes ~2s for 8 words and ~7s for 46, plus
+    ~3.5s when it has to load the model first (lite mode) — and with no other
+    voice configured that dropped Jarvis to the browser's robotic voice.
+    """
+    words = len((text or "").split())
+    return max(_speech_engine_timeout(), 8.0 + 0.25 * words)
+
+
 async def _local_tts(text: str) -> Optional[tuple[bytes, str]]:
     if not settings.SPEECH_ENGINE_ENABLED:
         return None
     try:
-        async with httpx.AsyncClient(timeout=_speech_engine_timeout()) as client:
+        async with httpx.AsyncClient(timeout=_local_tts_timeout(text)) as client:
             resp = await client.post(
                 f"{settings.SPEECH_ENGINE_URL}/tts",
                 data={"text": text},
@@ -532,12 +619,16 @@ async def speech_to_text(file: UploadFile = File(...)):
     if not content:
         raise HTTPException(status_code=400, detail="Empty audio file")
 
+    # Local first: measured 0.1-1.3s on this Mac and the most accurate engine
+    # (it keeps tickers like CADJPY whole). NVIDIA hosted (~0.5s) is the
+    # fallback when the engine is down. Empty text means "heard nothing" — try
+    # the next engine rather than return silence.
     local_text = await _local_stt(content, file.filename or "audio.wav")
-    if local_text is not None:
+    if local_text and local_text.strip():
         return {"text": local_text, "engine": "local"}
 
     nvidia_text = await _nvidia_stt(content, file.filename or "audio.wav")
-    if nvidia_text is not None:
+    if nvidia_text and nvidia_text.strip():
         return {"text": nvidia_text, "engine": "nvidia"}
 
     client = await get_client()

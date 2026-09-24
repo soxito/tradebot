@@ -2,6 +2,7 @@
   "paused": {
     "pair_catalog_sync": "watchdog",
     "research_loop": "watchdog",
+    "ollama_train": "watchdog",
     "signal_research_queue": "watchdog"
   },
   "intervals": {}

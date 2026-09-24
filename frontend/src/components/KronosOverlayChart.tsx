@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Telescope, GitBranch } from 'lucide-react';
+import { Telescope, GitBranch, Sparkles } from 'lucide-react';
 import TradingViewChart, {
   IndicatorOverlaySeries, IndicatorMarker,
 } from '@/components/TradingViewChart';
@@ -28,8 +28,20 @@ export default function KronosOverlayChart(props: {
 }) {
   const {
     symbol, exchange = 'bitget', timeframe = '1h',
-    overlays = [], markers = [], predLen = 24, ...rest
+    overlays = [], markers = [], predLen = 24, showOblivion = true, ...rest
   } = props;
+
+  // OBLIVION engine read for the header badge (the chart computes it on the
+  // bars it draws and reports it back through onOblivion). Visibility is
+  // owned here so the toggle sits with Forecast / Fib instead of under them.
+  const [oblivion, setOblivion] = useState<any | null>(null);
+  const [oblVisible, setOblVisible] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return true;
+    try { return window.localStorage.getItem('tv_oblivion_visible') !== '0'; } catch { return true; }
+  });
+  useEffect(() => {
+    try { window.localStorage.setItem('tv_oblivion_visible', oblVisible ? '1' : '0'); } catch {}
+  }, [oblVisible]);
 
   // The Bitcoin calendar rides along on cycle-driven symbols unless the host
   // page already supplied its own cycleWindows.
@@ -86,10 +98,34 @@ export default function KronosOverlayChart(props: {
 
   const dirColor = signal?.direction === 'up' ? 'text-green-400'
     : signal?.direction === 'down' ? 'text-red-400' : 'text-yellow-400';
+  const oblAction = String(oblivion?.signal?.action ?? 'wait').toUpperCase();
+  const oblColor = oblAction === 'BUY' ? 'text-lime-400' : oblAction === 'SELL' ? 'text-red-400' : 'text-gray-300';
 
   return (
     <div className="relative">
       <div className="absolute top-2 right-2 z-20 flex items-center gap-2">
+        {showOblivion && oblVisible && oblivion?.score && (
+          <span
+            className={`text-xs font-semibold bg-gray-900/80 rounded px-2 py-1 ${oblColor}`}
+            title={oblivion.summary ?? 'OBLIVION AI engine v4.0'}
+          >
+            {oblAction} {oblivion.score.bull}/{oblivion.score.bear}
+            {oblivion.news?.blocked ? ' · NEWS' : ''}
+          </span>
+        )}
+        {showOblivion && (
+          <button
+            type="button"
+            onClick={() => setOblVisible((v) => !v)}
+            title={oblivion?.summary ?? 'Toggle the OBLIVION AI engine overlay'}
+            className={`flex items-center gap-1 text-xs font-medium rounded px-2 py-1 transition-colors ${
+              oblVisible ? 'bg-lime-700 text-white' : 'bg-gray-800/80 text-gray-300 hover:text-white'
+            }`}
+          >
+            <Sparkles className="w-4 h-4" />
+            Oblivion
+          </button>
+        )}
         {show && signal && (
           <span className={`text-xs font-semibold bg-gray-900/80 rounded px-2 py-1 ${dirColor}`}>
             Kronos {signal.pct_change >= 0 ? '+' : ''}{signal.pct_change.toFixed(2)}% · {Math.round(signal.confidence * 100)}%
@@ -130,6 +166,10 @@ export default function KronosOverlayChart(props: {
         overlays={[...overlays, ...kOverlays, ...fibOverlays]}
         markers={[...markers, ...kMarkers, ...fibMarkers]}
         cycleWindows={autoCycle}
+        showOblivion={showOblivion}
+        onOblivion={setOblivion}
+        hideOblivionToggle
+        oblivionVisibleOverride={oblVisible}
         {...rest}
       />
     </div>

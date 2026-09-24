@@ -320,6 +320,56 @@ def _is_tool_plumbing(message: dict) -> bool:
     )
 
 
+#: Model ids a provider answered 404/410 for this process. Kept out of chat
+#: routing so a retired id stored in a catalogue is only ever tried once.
+_retired_models: set[str] = set()
+
+#: Surfaces where a person is waiting on a conversational reply.
+_HUMAN_CHAT_SOURCES = {"jarvis_chat", "telegram", "telegram_chat"}
+_HUMAN_CHAT_TASKS = {"paul_chat", "telegram_chat"}
+
+
+def _is_human_chat(source: str | None, task: str | None) -> bool:
+    """True when this call answers the user directly rather than the trading room."""
+    return (source or "") in _HUMAN_CHAT_SOURCES or (task or "") in _HUMAN_CHAT_TASKS
+
+
+def _fit_local_context(
+    messages: list[dict[str, Any]], num_ctx: int, max_tokens: int
+) -> tuple[list[dict[str, Any]], int]:
+    """Shrink a conversation so it fits the local model's context window.
+
+    Ollama refuses (400) any prompt longer than ``num_ctx`` rather than
+    truncating it, and Paul's system prompt alone is ~6k tokens against the
+    4k window the anti-freeze settings allow — so the local fallback failed on
+    exactly the turns that needed it. Keeps the head of the system prompt (the
+    persona and rules), the newest turns, and trims history oldest-first.
+    Returns the fitted messages and a completion budget that fits beside them.
+    """
+    # ~3.2 chars/token is conservative for English + numbers on llama/qwen.
+    reply_tokens = max(128, min(max_tokens, num_ctx // 4))
+    budget = int((num_ctx - reply_tokens - 64) * 3.2)
+
+    def size(ms: list[dict[str, Any]]) -> int:
+        return sum(len(m["content"]) if isinstance(m.get("content"), str) else 0 for m in ms)
+
+    system = [dict(m) for m in messages if m.get("role") == "system"]
+    rest = [m for m in messages if m.get("role") != "system"]
+    # Newest turns matter most; never let history crowd out the latest message.
+    while len(rest) > 1 and size(rest) > budget // 2:
+        rest = rest[1:]
+    room = max(0, budget - size(rest))
+    sys_chars = size(system)
+    if system and sys_chars > room:
+        text = "\n\n".join(m["content"] for m in system if isinstance(m.get("content"), str))
+        system = [{"role": "system", "content": text[:room]}] if room > 200 else []
+    if rest and size(system + rest) > budget and isinstance(rest[-1].get("content"), str):
+        last = dict(rest[-1])
+        last["content"] = last["content"][-max(200, budget - size(system)):]
+        rest = rest[:-1] + [last]
+    return system + rest, reply_tokens
+
+
 async def get_router_settings(db: AsyncSession) -> AIRouterSettings:
     """Fetch (or lazily create) the singleton router-settings row."""
     settings = await db.get(AIRouterSettings, 1)
@@ -554,8 +604,13 @@ async def _call_openai_compatible_msg(
     provider_id: int | None = None,
     request_timeout: float = _TIMEOUT,
     max_retries: int | None = None,
+    no_thinking: bool = False,
 ) -> tuple[str, dict[str, int], str | None, dict]:
     """Call an OpenAI-compatible chat endpoint, returning the full message.
+
+    ``no_thinking`` switches off the hidden reasoning pass on models that have
+    one (NVIDIA Nemotron 3). Measured on Paul's chat prompt it halves latency
+    and stops the thinking from eating the whole budget and returning nothing.
 
     For OpenAI (base_url with "openai.com") or NVIDIA (base_url with "nvidia.com" or "integrate.api.nvidia.com"),
     routes through the headroom proxy for compression. For other providers (Groq, Mistral, Cerebras, OpenRouter),
@@ -609,6 +664,8 @@ async def _call_openai_compatible_msg(
         payload["tools"] = tools
         if tool_choice:
             payload["tool_choice"] = tool_choice
+    if no_thinking and model in THINKING_SWITCHABLE_MODELS:
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
 
     async def _do_request(current_payload: dict) -> tuple[str, dict[str, int], str | None, dict]:
         started = time.monotonic()
@@ -1125,6 +1182,52 @@ async def db_chat(
     if not providers:
         return {"ok": False, "error": "No AI providers configured", "content": None}
 
+    # ── Local-first routing: use tradebot-local before cloud for non-research tasks ──
+    # Skip for vision, deep research and brain tasks — those need cloud capacity.
+    # Also skip if a specific model_override or preferred_providers has been set.
+    # A person talking to Paul/JARVIS is not trading-room work: the small local
+    # model is a poor conversationalist, so chat goes to the cloud first and
+    # only falls back to Ollama when every hosted provider has failed.
+    import os as _os
+    _human_chat = _is_human_chat(source, task)
+    _prefer_local = _os.getenv("OLLAMA_PREFER_LOCAL", "1").lower() not in ("0", "false", "no", "off")
+    _research_tasks = {"deep_reasoning", "vision_analysis", "brain_researcher",
+                       "brain_consolidator", "brain_critic", "brain_indexer", "brain_news_organiser"}
+    _is_research = task in _research_tasks if task else False
+    if (_prefer_local and not model_override and not preferred_providers
+            and not _is_research and source != "vision" and not _human_chat):
+        try:
+            from app.services.ollama_service import is_fallback_enabled as _ollama_fe
+            if _ollama_fe():
+                _local_res = await _try_ollama_chat(
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    json_mode=json_mode,
+                    orig_chars=_chars(messages),
+                    comp_chars=_chars(messages),
+                    agent_name=agent_name,
+                    agent_role=agent_role,
+                    source=source,
+                )
+                if _local_res.get("ok"):
+                    return _local_res
+        except Exception as _le:
+            logger.debug("[ai_router] local-first attempt skipped: {}", _le)
+
+    # ── Training-provider isolation ─────────────────────────────────────────────
+    # TRAINING_PROVIDER / OLLAMA_TRAINING_PROVIDER is reserved for training synthetic
+    # data and is kept out of the trading room (even as fallback). Direct chat
+    # with the user is exempt: when this provider is the only cloud key, barring
+    # it left Paul with nothing but a 4k-context local model to answer with.
+    _training_provider = (_os.getenv("TRAINING_PROVIDER", "") or _os.getenv("OLLAMA_TRAINING_PROVIDER", "")).strip().lower()
+    # also honour TRAINING_PROVIDER=nvidia alias (user requested) — match label or base_url
+    if _training_provider and not _human_chat:
+        providers = [p for p in providers
+                     if _training_provider not in (p.label or "").lower()
+                     and _training_provider not in (p.base_url or "").lower()
+                     and _training_provider not in (p.provider_key or "").lower()]
+
     # ── Headroom compression (token minimisation) ──
     orig_chars = _chars(messages)
     send_messages = messages
@@ -1166,8 +1269,9 @@ async def db_chat(
         max_tokens = max(floor, min(max_tokens, settings.per_agent_max_tokens))
 
     ordered = _order_providers(providers, settings.strategy, settings.round_robin_cursor)
-    if not ordered:
-        return {"ok": False, "error": "No usable (keyed) providers", "content": None}
+    # No usable cloud key is not the end of the call: the local Ollama fallback
+    # below still gets its turn. Returning here used to skip it entirely.
+    no_cloud = not ordered
 
     # When a per-agent model is requested (trading room seat / Recommended
     # Setup), route to the provider that actually offers it. Providers that do
@@ -1189,7 +1293,7 @@ async def db_chat(
 
     # Filter to preferred providers when the caller restricts provider selection
     # (e.g. Kronos JARVIS analysis must use NVIDIA NIM, never fall to Groq).
-    if preferred_providers:
+    if preferred_providers and not no_cloud:
         _pref_lower = [p_.lower() for p_ in preferred_providers]
         ordered = [
             p for p in ordered
@@ -1215,7 +1319,8 @@ async def db_chat(
     if settings.strategy == "round_robin":
         settings.round_robin_cursor = (settings.round_robin_cursor + 1) % max(1, len(ordered))
 
-    errors: list[str] = []
+    errors: list[str] = ["No usable (keyed) providers"] if no_cloud else []
+    call_max_tokens = max_tokens
     now = datetime.utcnow()
     for p in ordered:
         if not bypass_circuits and _cb_open(p.id):
@@ -1237,7 +1342,8 @@ async def db_chat(
                 else (p.default_model or model_override or "fable-5-high")
             )
         else:
-            model = model_override or p.default_model or "fable-5-high"
+            _override = model_override if model_override not in _retired_models else None
+            model = _override or p.default_model or "fable-5-high"
         try:
             # Only offer tools to a provider not already known to reject them,
             # so a repeat call costs no wasted round trip.
@@ -1276,6 +1382,9 @@ async def db_chat(
                 provider_id=p.id,
                 request_timeout=timeout_for_model(model, timeout),
                 max_retries=max_retries,
+                # A fast chat turn wants an answer, not a monologue first; a
+                # deep turn is routed under deep_reasoning and keeps thinking.
+                no_thinking=_human_chat and task != "deep_reasoning",
             )
             p.total_calls = (p.total_calls or 0) + 1
             p.daily_calls = (p.daily_calls or 0) + 1
@@ -1340,6 +1449,19 @@ async def db_chat(
         except Exception as exc:  # noqa: BLE001
             msg = str(exc)[:300]
             errors.append(f"{p.label}: {msg}")
+            # A 404/410 for a model that is not this provider's default is the
+            # *model* being retired, not the provider breaking. Tripping the
+            # breaker here sat the whole key out for half an hour, so the retry
+            # on the provider's own (live) default was refused too — which is
+            # how one retired chat model took Paul offline.
+            _status = getattr(getattr(exc, "response", None), "status_code", None)
+            if _status in (404, 410) and model and model != (p.default_model or ""):
+                _retired_models.add(model)
+                logger.warning(
+                    "AI provider {} no longer serves {} ({}) — dropping that model, "
+                    "keeping the provider", p.label, model, _status,
+                )
+                continue
             p.total_errors = (p.total_errors or 0) + 1
             p.status = "error"
             p.last_error = msg
@@ -1362,6 +1484,35 @@ async def db_chat(
                 max(0.0, _circuits.get(p.id, 0.0) - time.time()), msg,
             )
             continue
+
+    # ── Ollama local fallback (after provider pool, before giving up) ──────────
+    # When every configured cloud provider is capped/backing-off, the Ollama
+    # local LLM is the next rung on the ladder rather than a blank hold.
+    # It is up to the caller to treat a hold from here as a real local read —
+    # the fallback is still a model, just not a hosted one.
+    if errors:
+        try:
+            from app.services.ollama_service import is_fallback_enabled as _ollama_fallback
+
+            if _ollama_fallback():
+                ollama_res = await _try_ollama_chat(
+                    messages=send_messages,
+                    temperature=temperature,
+                    max_tokens=call_max_tokens if json_mode and source == "agent" else max_tokens,
+                    json_mode=json_mode,
+                    orig_chars=orig_chars,
+                    comp_chars=comp_chars,
+                    agent_name=agent_name,
+                    agent_role=agent_role,
+                    source=source,
+                )
+                if ollama_res.get("ok"):
+                    return ollama_res
+                # keep provider errors + ollama error for final message
+                if ollama_res.get("error"):
+                    errors.append(f"ollama: {ollama_res['error']}")
+        except Exception as _e:
+            logger.debug(f"[ai_router] ollama fallback skipped: {_e}")
 
     return {"ok": False, "error": " | ".join(errors) or "All providers failed", "content": None}
 
@@ -1436,7 +1587,8 @@ TASK_MODEL_CHAINS: dict[str, list[str]] = {
     # Snappy tool-calling turns: bot replies, position checks, quick lookups.
     "fast_agentic": ["nvidia/nemotron-3.5-lightning-30b-a3b"],
     # Strategy synthesis, forecast narration, full market analysis.
-    "deep_reasoning": ["z-ai/glm-5.2", "nvidia/nemotron-3-super-120b-a12b"],
+    # (z-ai/glm-5.2 removed — reached end-of-life 2026-08-21, answers 410 Gone.)
+    "deep_reasoning": ["nvidia/nemotron-3-super-120b-a12b"],
 
     # ── Surfaces ────────────────────────────────────────────────────────────
     # These name a *place the user talks to the system* rather than a kind of
@@ -1501,7 +1653,6 @@ _REASONING_MODELS = {
     "thinkingmachines/inkling",
     "meta/muse-glimmer-30b",
     "nvidia/nemotron-3.5-lightning-30b-a3b",
-    "z-ai/glm-5.2",
 }
 _MIN_REASONING_TOKENS = 2048
 
@@ -1638,7 +1789,93 @@ def timeout_for_model(model: str | None, requested: float | None = None) -> floa
     return _TIMEOUT
 
 
-# ── Conversational latency routing ───────────────────────────────────────────
+# ── Ollama local fallback helper (used after provider pool exhausts) ─────────
+async def _try_ollama_chat(
+    *,
+    messages: list[dict[str, str]],
+    temperature: float,
+    max_tokens: int,
+    json_mode: bool,
+    orig_chars: int,
+    comp_chars: int,
+    agent_name: str | None,
+    agent_role: str | None,
+    source: str,
+) -> dict[str, Any]:
+    """Try the local Ollama model as fallback. Returns ai_router-shaped dict."""
+    try:
+        from app.services.ollama_service import ollama_chat as _ollama_chat
+        from app.services.ollama_service import ollama_available as _ollama_avail
+        from app.services.ollama_service import resolve_fallback_model as _ollama_model
+    except Exception as exc:  # pragma: no cover — import never fails in normal run
+        return {"ok": False, "error": f"ollama import failed: {exc}", "content": None}
+    if not await _ollama_avail(timeout=2.0):
+        return {"ok": False, "error": "ollama not reachable at OLLAMA_URL", "content": None}
+    # resolve_fallback_model makes a blocking HTTP call; keep it off the loop.
+    model = await asyncio.to_thread(_ollama_model)
+    from app.services.ollama_service import ollama_num_ctx as _num_ctx
+    messages, max_tokens = _fit_local_context(messages, _num_ctx(), max_tokens)
+    try:
+        res = await _ollama_chat(
+            messages=messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            json_mode=json_mode,
+        )
+        content = res.get("content") or ""
+        if not content.strip():
+            return {"ok": False, "error": "ollama returned empty content", "content": None}
+        # Append interaction to training buffer so every local LLM use improves the model
+        try:
+            import asyncio as _asyncio
+            _asyncio.ensure_future(_append_ollama_interaction(messages, content))
+        except Exception:
+            pass
+        # Keep usage shape compatible (ollama doesn't report tokens the same way)
+        usage = {
+            "prompt_tokens": res.get("prompt_eval_count") or max(1, sum(len(m.get("content","")) for m in messages)//4),
+            "completion_tokens": res.get("eval_count") or max(1, len(content)//4),
+            "total_tokens": (res.get("prompt_eval_count") or 0) + (res.get("eval_count") or 0) or max(1, len(content)//4),
+        }
+        return {
+            "ok": True,
+            "content": content,
+            "provider": "ollama",
+            "model": model,
+            "routed_via": model,
+            "usage": usage,
+            "message": {"role": "assistant", "content": content},
+            "tool_calls": [],
+            "route_source": "ollama",
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)[:300], "content": None}
+
+
+async def _append_ollama_interaction(
+    messages: list[dict[str, str]], content: str
+) -> None:
+    """Append a successful local-LLM exchange to the training interaction buffer.
+
+    Called fire-and-forget so it never blocks the response path.
+    The buffer is drained by build_sharegpt_dataset_async on the next scheduled
+    training run, enriching the dataset with real usage interactions.
+    """
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+        _buf_dir = _Path(__file__).resolve().parents[4] / "data" / "ollama_training"
+        _buf_dir.mkdir(parents=True, exist_ok=True)
+        _buf = _buf_dir / "interaction_buffer.jsonl"
+        _row = {"messages": list(messages) + [{"role": "assistant", "content": content}]}
+        with open(_buf, "a", encoding="utf-8") as _f:
+            _f.write(_json.dumps(_row, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+
 # The chat surfaces (web Paul chat, Telegram bot) are the two places a human is
 # sitting there waiting, so they get their own routing rule: answer with the
 # fastest model that can do the job, and only reach for a thinking model when
@@ -1663,11 +1900,12 @@ def timeout_for_model(model: str | None, requested: float | None = None) -> floa
 # Gone, and a 410 is a config fault that sits the whole provider out for half an
 # hour, so heading the list with it would take NVIDIA down on the first chat.
 FAST_CHAT_MODELS: tuple[str, ...] = (
-    # NVIDIA NIM — nano 1.3s, mini 0.9s, nano-9b 4.0s, llama-3.3-70b 15.8s
-    "nvidia/nemotron-3-nano-30b-a3b",
-    "nvidia/nvidia-nemotron-nano-9b-v2",
-    "nvidia/nemotron-mini-4b-instruct",
-    "meta/llama-3.3-70b-instruct",
+    # NVIDIA NIM — re-measured 2026-09-23 with Paul's real prompt size:
+    # nemotron-3-super-120b-a12b 1.7s with a clean, conversational reply.
+    # nano-9b-v2, mini-4b, llama-3.3-70b, super-49b and nemotron-3-nano-30b are
+    # all retired upstream (410 Gone) and must not come back: a pinned dead id
+    # is what took Paul's chat offline.
+    "nvidia/nemotron-3-super-120b-a12b",
     # Groq / Cerebras — fastest inference of the free tiers
     "llama-3.1-8b-instant",
     "llama-3.3-70b-versatile",
@@ -1739,11 +1977,19 @@ def wants_deep_thinking(text: str | None) -> bool:
     return bool(_DEEP_WORK_RE.search(body))
 
 
+#: Models whose reasoning pass can be switched off per request, which a human
+#: chat turn does (``no_thinking``). With it off they answer directly, so they
+#: count as fast despite their size — measured 1.7s on Paul's chat prompt.
+THINKING_SWITCHABLE_MODELS = frozenset({"nvidia/nemotron-3-super-120b-a12b"})
+
+
 def is_fast_model(model: str | None) -> bool:
     """True when ``model`` answers directly rather than thinking first."""
     name = (model or "").strip()
     if not name:
         return False
+    if name in THINKING_SWITCHABLE_MODELS:
+        return True
     if name in _REASONING_MODELS:
         return False
     lowered = name.lower()
@@ -1816,7 +2062,7 @@ async def resolve_chat_route(
                 route_task = "deep_reasoning"
         for p in _apply_task_dedication(enabled, route_task):
             if p.api_key and p.base_url:
-                served.extend(_catalogue(p))
+                served.extend(m for m in _catalogue(p) if m not in _retired_models)
     except Exception as exc:  # noqa: BLE001
         # Not being able to read the provider list is not a reason to fail the
         # turn: an unpinned model still routes, each provider serving its own
@@ -1893,7 +2139,43 @@ async def chat_turn(
         task=route.task,
         **kwargs,
     )
-    if (result.get("ok") and (result.get("content") or "").strip()) or route.task == surface_task:
+    if result.get("ok") and (result.get("content") or "").strip():
+        return result
+
+    # The first attempt produced nothing. A pinned model is the usual culprit:
+    # NVIDIA rotates model ids and retires them, and a 404/410 there dooms every
+    # provider at once because db_chat hands them all the same dead id. So before
+    # giving up, retry once letting each provider serve its OWN default_model —
+    # the id the connection test actually verified — which recovers the turn
+    # whenever a live provider exists even though the pinned model is gone.
+    # Only when the pinned id itself is the problem (retired / unknown). An
+    # empty answer or a timeout is not fixed by switching to the provider
+    # default — on NVIDIA that is a slow reasoning model, and this retry turned
+    # one empty reply into a two-minute wait that ended with nothing.
+    _err = str(result.get("error") or "").lower()
+    _model_gone = any(s in _err for s in ("404", "410", "gone", "not found", "does not exist"))
+    if route.model is not None and _model_gone:
+        logger.warning(
+            "[AIRouter] pinned model {} failed ({}) — retrying with provider defaults",
+            route.model, str(result.get("error"))[:120],
+        )
+        recovered = await chat_with_tools(
+            db,
+            messages,
+            max_iterations=route.max_iterations,
+            total_budget_s=route.budget_s,
+            temperature=route.temperature,
+            max_tokens=route.max_tokens if max_tokens is None else max_tokens,
+            model_override=None,
+            max_retries=route.max_retries,
+            task=route.task,
+            **kwargs,
+        )
+        if recovered.get("ok") and (recovered.get("content") or "").strip():
+            return recovered
+        result = recovered
+
+    if route.task == surface_task:
         return result
 
     logger.warning(
@@ -2081,6 +2363,11 @@ async def chat_with_tools(
             # ``<<TOOL: …>>`` directive) and run one more turn on the results.
             inline = ai_tools.parse_inline_tool_calls(last.get("content") or "")
             inline += ai_tools.parse_text_directives(last.get("content") or "")
+            if not inline and executed and not (last.get("content") or "").strip():
+                # Tools ran but the model came back with nothing to say —
+                # intermittent on Nemotron. Ask once more with tools off below
+                # rather than handing the user an empty turn.
+                break
             if inline:
                 results = await _run_calls(
                     [(d["name"], d["arguments"]) for d in inline]
@@ -2128,6 +2415,12 @@ async def chat_with_tools(
 
     # Iteration cap or budget reached with tools still pending — ask once more
     # with tools switched off so the model has to answer from what it has.
+    if executed:
+        convo = convo + [{
+            "role": "user",
+            "content": "Answer my question now, in plain prose, from the data "
+                       "you have fetched above. Do not call any more tools.",
+        }]
     final = await db_chat(db, convo, bypass_openmanus=True, **db_chat_kwargs)
     if final.get("ok"):
         final["tools_used"] = executed

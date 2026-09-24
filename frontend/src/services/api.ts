@@ -13,7 +13,7 @@ const DEFAULT_API_BASE_URL = 'http://127.0.0.1:1448/api/v1';
  * platform without affecting LAN / remote hostnames.
  */
 const normalizeBrowserHost = (url: string): string => {
-  if (typeof window === 'undefined' || !url) return url;
+  if (!url) return url;
   return url.replace('://localhost:', '://127.0.0.1:').replace('://localhost/', '://127.0.0.1/');
 };
 
@@ -242,8 +242,17 @@ export const apiClient = {
     api.get('/signals/', { params }),
   getSignal: (id: number) => api.get(`/signals/${id}`),
   createSignal: (data: any) => api.post('/signals/', data),
-  generateSignals: (data: { symbols: string[]; timeframe?: string; exchange?: string }) =>
-    api.post('/signals/generate', data),
+  generateSignals: (data: { symbols: string[]; timeframe?: string; exchange?: string }) => {
+    // Client-side paginate over 10-symbol server limit (plan §10.4)
+    if (data.symbols.length <= 10) return api.post('/signals/generate', data);
+    const chunks: string[][] = [];
+    for (let i = 0; i < data.symbols.length; i += 10) chunks.push(data.symbols.slice(i, i + 10));
+    return Promise.all(chunks.map((symbols) => api.post('/signals/generate', { ...data, symbols })))
+      .then((ress) => {
+        const merged = ress.flatMap((r: any) => r.data?.signals ?? r.data ?? []);
+        return { data: { signals: merged, paginated: true, chunks: chunks.length } } as any;
+      });
+  },
   generateSmcSignal: (data: {
     symbol: string;
     timeframe?: string;
@@ -595,7 +604,9 @@ export const apiClient = {
   getAgentStatus: () => api.get('/agents/status'),
   toggleAiAgents: () => api.post('/agents/toggle'),
   analyzeSymbol: (data: { symbol: string; timeframe?: string }) =>
-    api.post('/agents/analyze', { symbol: data.symbol, timeframe: data.timeframe || '1h' }),
+    // A full seven-seat session runs for minutes; the default 30 s timeout
+    // made the page report a failure while the room was still sitting.
+    api.post('/agents/analyze', { symbol: data.symbol, timeframe: data.timeframe || '1h' }, { timeout: 420000 }),
   analyzeMultipleSymbols: (data: { symbols: string[]; timeframe?: string }) =>
     api.post('/agents/analyze-multiple', { symbols: data.symbols, timeframe: data.timeframe || '1h' }),
   getAgentDecisions: (params?: { limit?: number; symbol?: string; session_id?: string }) =>
@@ -1191,6 +1202,28 @@ export const apiClient = {
       symbol: string,
       params?: { timeframe?: string; limit?: number; indicators?: string },
     ) => api.get(`/market/indicator-overlay/${exchange}/${symbol.replace('/', '')}`, { params }),
+    /** OBLIVION AI engine v4.0 read + overlay bundle, computed on the feed the
+     *  chart's own OHLCV route resolves for this exchange/symbol. */
+    oblivionOverlay: (
+      exchange: string,
+      symbol: string,
+      params?: { timeframe?: string; limit?: number },
+    ) => api.get(`/market/oblivion-overlay/${exchange}/${symbol.replace('/', '')}`, { params, timeout: 30000 }),
+    /** Same read on caller-supplied candles — the bars the chart is drawing,
+     *  so every box / label / level lands on what the user sees. */
+    oblivionOverlayFromCandles: (
+      symbol: string,
+      timeframe: string,
+      candles: { time: number; open: number; high: number; low: number; close: number; volume?: number }[],
+      config?: Record<string, unknown>,
+    ) => api.post('/market/oblivion-overlay', { symbol, timeframe, candles, config }, { timeout: 30000 }),
+  },
+
+  oblivion: {
+    getSettings: () => api.get('/oblivion/settings', { timeout: 15000 }),
+    updateSettings: (patch: Record<string, unknown>) => api.put('/oblivion/settings', { settings: patch }),
+    resetSettings: () => api.post('/oblivion/settings/reset'),
+    getVersion: () => api.get('/oblivion/settings/version'),
   },
 
   kronos: {
@@ -1216,6 +1249,21 @@ export const apiClient = {
       symbol: string,
       params?: { timeframe?: string; pred_len?: number; samples?: number },
     ) => api.get(`/plugins/kronos/overlay/${exchange}/${symbol.replace('/', '')}`, { params, timeout: 120000 }),
+    /** OBLIVION engine signals on every timeframe, each confirmed by its Kronos forecast. */
+    oblivion: (
+      exchange: string,
+      symbol: string,
+      params?: { timeframes?: string; with_kronos?: boolean },
+    ) => api.get(`/plugins/kronos/oblivion/${exchange}/${symbol.replace('/', '')}`, { params, timeout: 180000 }),
+    /** AI narrative of the OBLIVION read (gated: only a faithful answer, else the engine's own summary). */
+    oblivionAnalysis: (exchange: string, symbol: string, params?: { timeframe?: string }) =>
+      api.get(`/plugins/kronos/oblivion/analysis/${exchange}/${symbol.replace('/', '')}`, { params, timeout: 180000 }),
+    /** Same narrative on the read the chart already computed — keeps text and picture on one feed. */
+    oblivionAnalysisFor: (body: { symbol: string; timeframe: string; exchange: string; oblivion: unknown }) =>
+      api.post('/plugins/kronos/oblivion/analysis', body, { timeout: 180000 }),
+    /** Route one OBLIVION timeframe signal to every configured venue. */
+    executeOblivion: (params: { symbol: string; side: 'buy' | 'sell'; entry: number; stop_loss: number; take_profit: number; timeframe?: string }) =>
+      api.post('/plugins/kronos/oblivion/execute', null, { params, timeout: 60000 }),
     /** Compact speech-friendly forecast for JARVIS. */
     jarvis: (symbol: string, params?: { exchange?: string; timeframe?: string; pred_len?: number }) =>
       api.get(`/plugins/kronos/jarvis/${symbol.replace('/', '')}`, { params, timeout: 120000 }),
@@ -1236,9 +1284,73 @@ export const apiClient = {
      *  leverage, min size/precision, existing position, and max-open-remaining. */
     tradability: (exchange: string, symbol: string) =>
       api.get(`/plugins/kronos/tradability/${exchange}/${symbol.replace('/', '')}`, { timeout: 30000 }),
+    /** Execute a sniper entry via the room engine (handles Bitget AND MT5/Exness). */
+    execute: (params: { symbol: string; side: string; entry: number; stop_loss: number; take_profit: number; timeframe?: string }) =>
+      api.post('/plugins/kronos/execute', null, { params, timeout: 30000 }),
+    /** Linked live MT5 accounts with equity/margin for sizing display. */
+    mt5Accounts: () => api.get('/plugins/kronos/mt5-accounts', { timeout: 10000 }),
+    /** Execute a Kronos sniper entry on MT5 with room risk % lot sizing.
+     *  dry_run=true returns computed lots without placing. */
+    executeMT5: (params: {
+      symbol: string; side: string; entry: number; stop_loss: number;
+      take_profit?: number; timeframe?: string; dry_run?: boolean;
+    }) => api.post('/plugins/kronos/execute-mt5', null, { params, timeout: 30000 }),
     /** Batch forecast several symbols at once. */
     batch: (data: { exchange?: string; timeframe?: string; symbols: string[]; lookback?: number; pred_len?: number; samples?: number }) =>
       api.post('/plugins/kronos/batch', data),
+
+    // ── Chart drawings: auto-saved, removable, shared with + refined by agents ──
+    drawings: {
+      /** Load the trader's saved drawings (user + agent shapes) for a chart tab. */
+      get: (exchange: string, symbol: string, timeframe = '1h') =>
+        api.get(`/plugins/kronos/drawings/${exchange}/${symbol.replace('/', '')}`, { params: { timeframe }, timeout: 15000 }),
+      /** Persist the full drawing list (auto-save). */
+      save: (exchange: string, symbol: string, data: { timeframe: string; drawings: any[] }) =>
+        api.put(`/plugins/kronos/drawings/${exchange}/${symbol.replace('/', '')}`, data, { timeout: 15000 }),
+      /** Remove one shape (and any agent shape refined from it). */
+      remove: (exchange: string, symbol: string, drawingId: string, timeframe = '1h') =>
+        api.delete(`/plugins/kronos/drawings/${exchange}/${symbol.replace('/', '')}/${encodeURIComponent(drawingId)}`, { params: { timeframe }, timeout: 15000 }),
+      /** Clear every shape on the chart tab. */
+      clear: (exchange: string, symbol: string, timeframe = '1h') =>
+        api.delete(`/plugins/kronos/drawings/${exchange}/${symbol.replace('/', '')}`, { params: { timeframe }, timeout: 15000 }),
+      /** Ask the agents to sharpen the trader's drawings onto real swing structure. */
+      refine: (exchange: string, symbol: string, timeframe = '1h') =>
+        api.post(`/plugins/kronos/drawings/${exchange}/${symbol.replace('/', '')}/refine`, null, { params: { timeframe }, timeout: 60000 }),
+    },
+
+    // ── Fine-tuning on your own data (tokenizer → predictor) ──────────────
+    finetune: {
+      /** Is the finetune_csv pipeline vendored + how to install it. */
+      setupStatus: () => api.get('/plugins/kronos/finetune/setup-status'),
+      /** Export live OHLCV to a Kronos CSV (preview, no training). */
+      export: (data: { exchange?: string; symbol: string; timeframe?: string; limit?: number; use_pattern_features?: boolean }) =>
+        api.post('/plugins/kronos/finetune/export', data, { timeout: 120000 }),
+      /** Start a fine-tune job (export → tokenizer → predictor). */
+      start: (data: {
+        exchange?: string; symbol: string; timeframe?: string; limit?: number;
+        model_name?: string;
+        lookback?: number; pred_len?: number; tokenizer_epochs?: number;
+        predictor_epochs?: number; batch_size?: number; base_model?: string;
+        use_pattern_features?: boolean;
+      }) => api.post('/plugins/kronos/finetune/start', data, { timeout: 30000 }),
+      /** List recent fine-tune jobs. */
+      list: () => api.get('/plugins/kronos/finetune/jobs'),
+      /** One job with a tail of its live training log. */
+      job: (jobId: number) => api.get(`/plugins/kronos/finetune/jobs/${jobId}`),
+      /** Cancel a running fine-tune job. */
+      cancel: (jobId: number) => api.delete(`/plugins/kronos/finetune/jobs/${jobId}`),
+      /** Permanently delete a job + its checkpoints from disk to free space. */
+      delete: (jobId: number) => api.delete(`/plugins/kronos/finetune/jobs/${jobId}`, { params: { delete: true } }),
+      /** Hot-swap the engine to a completed job's model. */
+      load: (jobId: number) => api.post(`/plugins/kronos/finetune/load/${jobId}`, null, { timeout: 60000 }),
+      /** Merge all completed datasets into one and train a combined model. */
+      combine: (modelName?: string) =>
+        api.post('/plugins/kronos/finetune/combine', null, { params: modelName ? { model_name: modelName } : {}, timeout: 60000 }),
+      /** Delete every non-combined job + checkpoints (frees the machine). */
+      prune: () => api.post('/plugins/kronos/finetune/prune', null, { timeout: 60000 }),
+      /** Manually run the weekly combined-model improvement + prune cycle. */
+      weeklyRun: () => api.post('/plugins/kronos/finetune/weekly-run', null, { timeout: 60000 }),
+    },
   },
 
   // ── Background research + news/FOMO prediction ───────────────────────────
@@ -1373,6 +1485,37 @@ export const apiClient = {
     getMcpSchema: () => api.get('/plugins/openhuman/mcp/schema'),
   },
 
+  // ── Neuroglancer Core Brain (google/neuroglancer) — federates all brains ─
+  neuro: {
+    health: () => api.get('/neuro/health'),
+    overview: () => api.get('/neuro/overview'),
+    repo: () => api.get('/neuro/repo'),
+    repoPull: () => api.post('/neuro/repo/pull'),
+    search: (q: string, symbol?: string, limit = 12) =>
+      api.get('/neuro/search', { params: { q, ...(symbol ? { symbol } : {}), limit } }),
+    recall: (symbol: string, max_chars = 700) =>
+      api.get('/neuro/recall', { params: { symbol, max_chars } }),
+    graph: (limit = 80) => api.get('/neuro/graph', { params: { limit } }),
+    trades: (params?: { limit?: number; symbol?: string; outcome?: string; asset_class?: string }) =>
+      api.get('/neuro/trades', { params }),
+    recordTrade: (data: { symbol: string; side: string; entry: number; stop_loss?: number; take_profit?: number; confidence?: number; price_at_signal?: number; timeframe?: string; asset_class?: string; exchange?: string; source?: string; agent_role?: string }) =>
+      api.post('/neuro/trades/record', data),
+    analysis: (limit = 200) => api.get('/neuro/analysis', { params: { limit } }),
+    settle: (limit = 8) => api.post('/neuro/analysis/settle', null, { params: { limit } }),
+    sync: (limit_per_brain = 30) => api.post('/neuro/sync', null, { params: { limit_per_brain } }),
+    decide: (symbol: string, action: string, confidence = 0.5, timeframe = '1h') =>
+      api.post('/neuro/decide', null, { params: { symbol, action, confidence, timeframe } }),
+    viewerState: (limit = 120, include_demo = false, hemibrain = true) => api.get('/neuro/viewer-state', { params: { limit, include_demo, hemibrain } }),
+    viewerUrl: (limit = 120) => `${getApiRootUrl()}/api/v1/neuro/viewer-state?limit=${limit}`,
+    hemibrain: () => api.get('/neuro/hemibrain'),
+    rois: (roi_id?: string) => api.get('/neuro/rois', { params: roi_id ? { roi_id } : {} }),
+    cellTypes: () => api.get('/neuro/cell-types'),
+    pipeline: () => api.get('/neuro/pipeline'),
+    neuprint: (cypher: string, limit = 25) => api.get('/neuro/neuprint/query', { params: { cypher, limit } }),
+    adjacencies: (limit = 100, format: 'json' | 'csv' = 'json') => api.get('/neuro/adjacencies', { params: { limit, format } }),
+    status: () => api.get('/neuro/status'),
+    prune: (days = 90) => api.post('/neuro/prune', null, { params: { days } }),
+  },
   // ── Hermes (NousResearch/hermes-agent sidecar, :8011) ────────────────
   hermes: {
     health: () => api.get('/hermes/health'),
@@ -1414,6 +1557,85 @@ export const apiClient = {
     getRun: (runId: string) => api.get(`/tradingagents/runs/${runId}`),
     /** SSE progress feed URL — consume with `new EventSource(url)`. */
     streamUrl: (runId: string) => `${getApiBaseUrl()}/tradingagents/runs/${runId}/stream`,
+  },
+
+  // ── X (Twitter) Whale Monitor ───────────────────────────
+  getXMonitorConfig: () => api.get('/x-monitor/config'),
+  updateXMonitorConfig: (data: { interval_seconds?: number; enabled?: boolean }) =>
+    api.put('/x-monitor/config', data),
+  getXMonitorAccounts: () => api.get('/x-monitor/accounts'),
+  addXMonitorAccount: (data: {
+    username: string;
+    display_name?: string;
+    symbols?: string[];
+    tier?: number;
+    reliability?: number;
+  }) => api.post('/x-monitor/accounts', data),
+  removeXMonitorAccount: (username: string) =>
+    api.delete(`/x-monitor/accounts/${encodeURIComponent(username)}`),
+  updateXMonitorAccount: (username: string, data: {
+    display_name?: string;
+    symbols?: string[];
+    tier?: number;
+    reliability?: number;
+    active?: boolean;
+  }) => api.put(`/x-monitor/accounts/${encodeURIComponent(username)}`, data),
+  getXMonitorStatus: () => api.get('/x-monitor/status'),
+  startXMonitor: () => api.post('/x-monitor/start'),
+  stopXMonitor: () => api.post('/x-monitor/stop'),
+  getXMonitorFeed: (limit?: number) =>
+    api.get('/x-monitor/feed', { params: { limit } }),
+  pollXMonitorNow: () => api.post('/x-monitor/poll-now'),
+  testXMonitorConnection: () => api.get('/x-monitor/test-connection'),
+
+  // ── X Scraper (ScrapeGraphAI social link extractor) ──────────────────────
+  getXScraperStatus:      () => api.get('/x-scraper/status'),
+  installXScraper:        () => api.post('/x-scraper/install'),
+  refreshXScraperVersion: () => api.post('/x-scraper/refresh-version'),
+  updateXScraperConfig: (data: { api_key?: string; base_url?: string; model?: string }) =>
+    api.put('/x-scraper/config', data),
+  getXScraperResults:     () => api.get('/x-scraper/results'),
+  scrapeXAccount:         (username: string) => api.post(`/x-scraper/scrape/${encodeURIComponent(username)}`),
+  scrapeAllXAccounts:     () => api.post('/x-scraper/scrape-all'),
+
+  // ── Soup LLM Finetuning (MakazhanAlpamys/Soup — trysoup.dev) ──────────────
+  soup: {
+    status: () => api.get('/plugins/soup/status'),
+    health: () => api.get('/plugins/soup/health'),
+    models: () => api.get('/plugins/soup/models'),
+    modelsCatalogue: () => api.get('/plugins/soup/models/catalogue'),
+    compat: (model: string) => api.get('/plugins/soup/models/compat', { params: { model } }),
+    bestModel: () => api.get('/plugins/soup/models/best'),
+    pullModel: (model: string) => api.post('/plugins/soup/models/pull', { model }, { timeout: 30000 }),
+    pullStatus: (model: string) => api.get('/plugins/soup/models/pull/status', { params: { model } }),
+    pullCancel: (model: string) => api.delete('/plugins/soup/models/pull', { params: { model } }),
+    tradebotLocalTrain: (data?: { base?: string; epochs?: number; auto_download?: boolean; symbols?: string[] }) => api.post('/plugins/soup/tradebot-local/train', data || {}, { timeout: 60000 }),
+    tradebotLocalStatus: () => api.get('/plugins/soup/tradebot-local/status'),
+    recipes: () => api.get('/plugins/soup/recipes'),
+    kronosOverview: () => api.get('/plugins/soup/kronos/overview'),
+    checkUpdate: () => api.get('/plugins/soup/check-update'),
+    pullSoupUpdate: () => api.post('/plugins/soup/check-update/pull', {}, { timeout: 180000 }),
+    uiStatus: () => api.get('/plugins/soup/ui/status'),
+    uiProxyUrl: (path?: string) => `${getApiBaseUrl()}/plugins/soup/ui/proxy${path ? `/${path}` : ''}`,
+    start: (data: {
+      base: string; task?: string; template?: string;
+      dataset_path?: string; dataset_format?: string; dataset_inline?: any[];
+      val_split?: number; epochs?: number; learning_rate?: number; batch_size?: string;
+      lora_r?: number; lora_alpha?: number; quantization?: string | null; stream_layers?: boolean;
+      ohlcv_symbol?: string; ohlcv_timeframe?: string; ohlcv_limit?: number; output_name?: string;
+    }) => api.post('/plugins/soup/finetune/start', data, { timeout: 30000 }),
+    jobs: () => api.get('/plugins/soup/finetune/jobs'),
+    job: (id: number, log_lines?: number) => api.get(`/plugins/soup/finetune/jobs/${id}`, { params: log_lines ? { log_lines } : {} }),
+    cancel: (id: number) => api.delete(`/plugins/soup/finetune/jobs/${id}`),
+    delete: (id: number) => api.delete(`/plugins/soup/finetune/jobs/${id}`, { params: { delete: true } }),
+    upload: (file: File) => {
+      const form = new FormData(); form.append('file', file);
+      return api.post('/plugins/soup/data/upload', form, { headers: { 'Content-Type': 'multipart/form-data' }, timeout: 120000 });
+    },
+    uploadJson: (samples: any[]) => api.post('/plugins/soup/data/upload', { samples }, { timeout: 60000 }),
+    ohlcvExport: (data: { symbol?: string; symbols?: string[]; timeframe?: string; limit?: number }) => api.post('/plugins/soup/ohlcv/export', data, { timeout: 300000 }),
+    ohlcvPreview: (symbol: string, timeframe?: string, limit?: number) => api.get('/plugins/soup/ohlcv/preview', { params: { symbol, timeframe, limit } }),
+    serveStart: (model: string) => api.post('/plugins/soup/serve/start', { model }, { timeout: 30000 }),
   },
 };
 

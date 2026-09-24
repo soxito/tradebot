@@ -86,6 +86,9 @@ def register_core_tasks() -> None:
         _spec("vault_sync", "Obsidian vault sync", 300,
               start=s.start_vault_sync_loop, stop=s.stop_vault_sync_loop,
               status=s.get_vault_sync_status),
+        _spec("ollama_train", "Ollama local-LLM fine-tune scheduler", 86400,
+              start=s.start_ollama_train_loop, stop=s.stop_ollama_train_loop,
+              status=s.get_ollama_train_status),
     ]
 
     # signal_research_queue has start/stop but no status getter.

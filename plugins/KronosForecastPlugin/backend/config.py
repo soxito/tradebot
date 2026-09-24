@@ -14,6 +14,34 @@ import os
 from dataclasses import dataclass
 
 
+# ── Kronos paper knowledge (arXiv:2508.02739) ─────────────────────────────────
+# A compact fact-sheet every agent / narrative that reasons over a Kronos
+# forecast is given, so the desk understands the *model* it is reading — not
+# just its numbers. Sourced from the paper and the model card.
+KRONOS_PAPER_KNOWLEDGE: str = (
+    "Kronos (arXiv:2508.02739, AAAI 2026) is the first open-source FOUNDATION MODEL "
+    "for the language of financial markets — candlesticks (K-lines). It is a "
+    "decoder-only autoregressive transformer (GPT-style, but for OHLCV instead of "
+    "text), built in two stages: (1) a specialised TOKENIZER quantises continuous "
+    "OHLCV candles into hierarchical discrete tokens, preserving both price dynamics "
+    "and trade-activity patterns; (2) the transformer is pre-trained with a "
+    "next-token objective on 12 BILLION K-line records from 45 global exchanges, so "
+    "it has seen crypto, FX, equities, metals and indices and learns cross-asset "
+    "and seasonal structure. Zero-shot it beats the leading time-series foundation "
+    "model by 93% RankIC on price forecasting and cuts volatility-forecast MAE by 9%. "
+    "How to read a Kronos forecast: it samples MANY stochastic paths (temperature + "
+    "top_p nucleus sampling); the mean path is the forecast and the p10/p90 band is "
+    "its uncertainty — a TIGHT band means model conviction, a WIDE band means high "
+    "dispersion/low conviction. The confidence score (0-1) is the fraction of paths "
+    "agreeing on direction, then adjusted by the volume gate and macro bias. Volume "
+    "is a HARD precondition here: on a dead or unresolvable tape Kronos returns "
+    "NO_TRADE (silence), it does not guess a direction from price alone. Model sizes: "
+    "Kronos-mini (4.1M, ctx 2048), Kronos-small (24.7M, ctx 512), Kronos-base "
+    "(102.3M, ctx 512). The model can be FINE-TUNED on your own OHLCV so it "
+    "specialises to a specific instrument/timeframe."
+)
+
+
 # ── Published model catalogue (shown in the UI dropdown) ──────────────────────
 KRONOS_MODELS: list[dict] = [
     {
@@ -93,6 +121,22 @@ class KronosConfig:
     # Cache forecasts for this many seconds (per symbol/timeframe/params).
     # 180s is safe for 1h/4h charts — prices don't shift meaningfully in 3 min.
     cache_ttl_s: int = int(os.getenv("KRONOS_CACHE_TTL_S", "180"))
+
+    # ── HLC3/Kaufman adaptive MA overlay (PineScript v2 port) ────────────────
+    # Toggle the whole indicator off with KRONOS_HLC3_KAUFMAN_ENABLED=false.
+    hlc3_kaufman_enabled: bool = os.getenv(
+        "KRONOS_HLC3_KAUFMAN_ENABLED", "true"
+    ).strip().lower() not in ("0", "false", "no", "off")
+    hlc3_kaufman_length: int = int(os.getenv("KRONOS_HLC3_KAUFMAN_LENGTH", "5"))
+    hlc3_kaufman_slow_period: int = int(os.getenv("KRONOS_HLC3_KAUFMAN_SLOW_PERIOD", "20"))
+
+    # ── LuxAlgo Support & Resistance Signals MTF overlay (v5 port) ───────────
+    # Toggle the whole indicator off with KRONOS_SR_SIGNALS_ENABLED=false.
+    sr_signals_enabled: bool = os.getenv(
+        "KRONOS_SR_SIGNALS_ENABLED", "true"
+    ).strip().lower() not in ("0", "false", "no", "off")
+    sr_signals_length: int = int(os.getenv("KRONOS_SR_SIGNALS_LENGTH", "15"))
+    sr_signals_margin: float = float(os.getenv("KRONOS_SR_SIGNALS_MARGIN", "2.0"))
 
 
 kronos_config = KronosConfig()

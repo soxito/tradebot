@@ -1332,6 +1332,83 @@ def get_jarvis_learning_status() -> dict:
     }
 
 
+# ── Ollama Training Loop (Soup → GGUF → ollama create) ─────
+_ollama_train_task: asyncio.Task | None = None
+_ollama_train_running = False
+_ollama_train_started_at: str | None = None
+_ollama_train_last_run: dict | None = None
+
+
+async def _ollama_train_loop() -> None:
+    global _ollama_train_running, _ollama_train_last_run
+    interval_h = max(1, int(getattr(settings, "OLLAMA_TRAIN_INTERVAL_HOURS", 24)))
+    interval_s = interval_h * 3600
+    # scale by tier multiplier so weak machines train far less often
+    try:
+        from app.core.resource_tier import interval_multiplier
+
+        interval_s = int(interval_s * interval_multiplier(getattr(settings, "PERF_TIER", "high")))
+    except Exception:
+        pass
+    logger.info(f"🦙 [OLLAMA TRAIN] Started — every {interval_h}h (effective {interval_s/3600:.1f}h, scaled by tier)")
+    # initial delay so boot isn't training immediately
+    try:
+        await asyncio.sleep(min(600, interval_s // 4))
+    except asyncio.CancelledError:
+        _ollama_train_running = False
+        return
+    while _ollama_train_running:
+        try:
+            from app.workers.ollama_train_worker import maybe_train_ollama
+
+            res = await maybe_train_ollama()
+            _ollama_train_last_run = {"at": now_sast().isoformat(), **res}
+            if res.get("ok"):
+                logger.info(f"🦙 [OLLAMA TRAIN] completed — {res}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"🦙 [OLLAMA TRAIN] error: {e}")
+            _ollama_train_last_run = {"at": now_sast().isoformat(), "ok": False, "error": str(e)}
+        try:
+            await asyncio.sleep(interval_s)
+        except asyncio.CancelledError:
+            break
+    _ollama_train_running = False
+    logger.info("🦙 [OLLAMA TRAIN] Stopped")
+
+
+def start_ollama_train_loop() -> bool:
+    global _ollama_train_task, _ollama_train_running, _ollama_train_started_at
+    if _ollama_train_task is not None and not _ollama_train_task.done():
+        return False
+    if not getattr(settings, "AUTO_START_OLLAMA_TRAIN_LOOP", True):
+        logger.info("🦙 [OLLAMA TRAIN] auto-start disabled by config")
+        return False
+    _ollama_train_running = True
+    _ollama_train_started_at = now_sast().isoformat()
+    _ollama_train_task = asyncio.create_task(_ollama_train_loop())
+    logger.info("🦙 Ollama training loop started")
+    return True
+
+
+def stop_ollama_train_loop() -> bool:
+    global _ollama_train_running, _ollama_train_task, _ollama_train_started_at
+    if not _ollama_train_running and (_ollama_train_task is None or _ollama_train_task.done()):
+        return False
+    _ollama_train_running = False
+    if _ollama_train_task:
+        _ollama_train_task.cancel()
+        _ollama_train_task = None
+    _ollama_train_started_at = None
+    logger.info("🦙 Ollama training loop stopped")
+    return True
+
+
+def get_ollama_train_status() -> dict:
+    return {"running": _ollama_train_running, "started_at": _ollama_train_started_at, "last_run": _ollama_train_last_run}
+
+
 # ── Agent Decision Learning Loop ───────────────────────────
 # Closes the room's learning loop: settles every unresolved buy/sell
 # agent_decisions row against closed trades in both order books, then runs the

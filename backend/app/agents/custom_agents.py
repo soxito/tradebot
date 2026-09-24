@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, and_, func
 
 from app.models.database import AgentDecision, Trade, SentimentScore
+from app.agents import brain_log
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -798,7 +799,7 @@ async def custom_validate_trade(
 
     # Store decisions
     for dec in decisions:
-        db.add(AgentDecision(
+        brain_log.log_decision(db,
             agent_id=0,  # custom agent, no DB agent row
             agent_name=dec.get("agent_name", "Custom Agent"),
             agent_role=dec.get("agent_role", "custom"),
@@ -810,7 +811,8 @@ async def custom_validate_trade(
             session_id=session_id,
             ai_called=False,
             memory_context_used=0,
-        ))
+            origin="custom_agent",
+        )
     await db.commit()
 
     # Determine approval

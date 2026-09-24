@@ -1,5 +1,6 @@
 import Head from 'next/head';
 import dynamic from 'next/dynamic';
+import Link from 'next/link';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Telescope, RefreshCw, TrendingUp, TrendingDown, Minus,
@@ -18,6 +19,8 @@ import { useJarvisSpeak } from '@/hooks/useJarvisSpeak';
 
 // Chart is client-only (lightweight-charts touches window)
 const TradingViewChart = dynamic(() => import('@/components/TradingViewChart'), { ssr: false });
+const OblivionMultiTfPanel = dynamic(() => import('@/components/OblivionMultiTfPanel'), { ssr: false });
+const OblivionSettingsModal = dynamic(() => import('@/components/OblivionSettingsModal'), { ssr: false });
 
 const TIMEFRAMES = ['5m', '15m', '1h', '4h', '1d'];
 const EXCHANGES = ['bitget', 'binance', 'bybit', 'okx', 'kucoin'];
@@ -27,7 +30,9 @@ const EXCHANGES = ['bitget', 'binance', 'bybit', 'okx', 'kucoin'];
 const FOREX_METALS: { symbol: string; name: string; category: string }[] = [
   { symbol: 'XAU/USD',   name: 'Gold (Spot)',        category: 'Metals'   },
   { symbol: 'XAG/USD',   name: 'Silver (Spot)',       category: 'Metals'   },
-  { symbol: 'XAU/USDT',  name: 'Gold / Tether',       category: 'Metals'   },
+  { symbol: 'XPT/USD',   name: 'Platinum (Spot)',     category: 'Metals'   },
+  { symbol: 'XPD/USD',   name: 'Palladium (Spot)',    category: 'Metals'   },
+  // Forex majors
   { symbol: 'EUR/USD',   name: 'Euro / US Dollar',    category: 'Forex'    },
   { symbol: 'GBP/USD',   name: 'British Pound / USD', category: 'Forex'    },
   { symbol: 'USD/JPY',   name: 'US Dollar / Yen',     category: 'Forex'    },
@@ -35,6 +40,64 @@ const FOREX_METALS: { symbol: string; name: string; category: string }[] = [
   { symbol: 'AUD/USD',   name: 'Australian Dollar',   category: 'Forex'    },
   { symbol: 'NZD/USD',   name: 'New Zealand Dollar',  category: 'Forex'    },
   { symbol: 'USD/CAD',   name: 'Canadian Dollar',     category: 'Forex'    },
+  // Forex crosses
+  { symbol: 'EUR/GBP',   name: 'Euro / Pound',        category: 'Forex'    },
+  { symbol: 'EUR/JPY',   name: 'Euro / Yen',          category: 'Forex'    },
+  { symbol: 'GBP/JPY',   name: 'Pound / Yen',         category: 'Forex'    },
+  { symbol: 'AUD/JPY',   name: 'Aussie / Yen',        category: 'Forex'    },
+  { symbol: 'CAD/JPY',   name: 'Loonie / Yen',        category: 'Forex'    },
+  { symbol: 'CHF/JPY',   name: 'Franc / Yen',         category: 'Forex'    },
+  { symbol: 'NZD/JPY',   name: 'Kiwi / Yen',          category: 'Forex'    },
+  { symbol: 'EUR/AUD',   name: 'Euro / Aussie',       category: 'Forex'    },
+  { symbol: 'EUR/CHF',   name: 'Euro / Franc',        category: 'Forex'    },
+  { symbol: 'GBP/CHF',   name: 'Pound / Franc',       category: 'Forex'    },
+  { symbol: 'AUD/NZD',   name: 'Aussie / Kiwi',       category: 'Forex'    },
+  { symbol: 'USD/ZAR',   name: 'US Dollar / Rand',    category: 'Forex'    },
+  { symbol: 'USD/MXN',   name: 'US Dollar / Peso',    category: 'Forex'    },
+  { symbol: 'USD/SGD',   name: 'US Dollar / SGD',     category: 'Forex'    },
+  // Indices (futures-backed)
+  { symbol: 'US30',      name: 'Dow Jones 30',        category: 'Indices'  },
+  { symbol: 'US500',     name: 'S&P 500',             category: 'Indices'  },
+  { symbol: 'NAS100',    name: 'Nasdaq 100',          category: 'Indices'  },
+  { symbol: 'US2000',    name: 'Russell 2000',        category: 'Indices'  },
+  { symbol: 'GER40',     name: 'DAX 40',              category: 'Indices'  },
+  { symbol: 'UK100',     name: 'FTSE 100',            category: 'Indices'  },
+  { symbol: 'JPN225',    name: 'Nikkei 225',          category: 'Indices'  },
+  // Energy
+  { symbol: 'USOIL',     name: 'WTI Crude Oil',       category: 'Energy'   },
+  { symbol: 'UKOIL',     name: 'Brent Crude Oil',     category: 'Energy'   },
+  { symbol: 'NGAS',      name: 'Natural Gas',         category: 'Energy'   },
+];
+
+// Stock-exchange equities & ETFs — routed to Yahoo by the backend. Free-text
+// entry accepts any ticker (US bare, or suffixed like VOD.L); this list only
+// powers search discoverability.
+const STOCKS: { symbol: string; name: string; category: string }[] = [
+  { symbol: 'AAPL', name: 'Apple',            category: 'Stocks' },
+  { symbol: 'MSFT', name: 'Microsoft',        category: 'Stocks' },
+  { symbol: 'NVDA', name: 'NVIDIA',           category: 'Stocks' },
+  { symbol: 'GOOGL', name: 'Alphabet',        category: 'Stocks' },
+  { symbol: 'AMZN', name: 'Amazon',           category: 'Stocks' },
+  { symbol: 'META', name: 'Meta Platforms',   category: 'Stocks' },
+  { symbol: 'TSLA', name: 'Tesla',            category: 'Stocks' },
+  { symbol: 'AVGO', name: 'Broadcom',         category: 'Stocks' },
+  { symbol: 'AMD',  name: 'AMD',              category: 'Stocks' },
+  { symbol: 'NFLX', name: 'Netflix',          category: 'Stocks' },
+  { symbol: 'JPM',  name: 'JPMorgan Chase',   category: 'Stocks' },
+  { symbol: 'V',    name: 'Visa',             category: 'Stocks' },
+  { symbol: 'WMT',  name: 'Walmart',          category: 'Stocks' },
+  { symbol: 'COIN', name: 'Coinbase',         category: 'Stocks' },
+  { symbol: 'PLTR', name: 'Palantir',         category: 'Stocks' },
+  { symbol: 'HOOD', name: 'Robinhood',        category: 'Stocks' },
+  { symbol: 'UBER', name: 'Uber',             category: 'Stocks' },
+  { symbol: 'DIS',  name: 'Disney',           category: 'Stocks' },
+  { symbol: 'BA',   name: 'Boeing',           category: 'Stocks' },
+  { symbol: 'XOM',  name: 'Exxon Mobil',      category: 'Stocks' },
+  { symbol: 'SPY',  name: 'S&P 500 ETF',      category: 'ETF'    },
+  { symbol: 'QQQ',  name: 'Nasdaq 100 ETF',   category: 'ETF'    },
+  { symbol: 'IWM',  name: 'Russell 2000 ETF', category: 'ETF'    },
+  { symbol: 'GLD',  name: 'Gold ETF',         category: 'ETF'    },
+  { symbol: 'TLT',  name: '20Y Treasury ETF', category: 'ETF'    },
 ];
 
 interface PairOption {
@@ -61,6 +124,8 @@ interface KronosStatus {
   model_name: string;
   device: string;
   detail: string;
+  display_name?: string;
+  finetuned_job_id?: number | null;
 }
 
 interface MarketCapInfo {
@@ -145,6 +210,8 @@ interface Tradability {
   exchange: string;
   symbol: string;
   tradable: boolean;
+  tradable_via_mt5?: boolean;
+  venue?: string;
   margin_coin: string;
   available_margin: number;
   max_leverage: number | null;
@@ -154,6 +221,44 @@ interface Tradability {
   max_open_margin: number;
   max_open_notional: number;
   note?: string | null;
+}
+
+interface MT5AccountInfo {
+  id: number;
+  name: string;
+  server: string;
+  equity: number;
+  balance: number;
+  free_margin: number;
+  leverage: number;
+  currency: string;
+  online?: boolean;
+}
+
+interface MT5PlacedResult {
+  account: string;
+  account_id: number;
+  lot: number;
+  size_note: string;
+  order_id?: string | number;
+  equity: number;
+  currency: string;
+  risk_pct: number;
+  dry_run?: boolean;
+}
+
+interface MT5ExecResponse {
+  ok: boolean;
+  symbol: string;
+  side: string;
+  entry: number;
+  stop_loss: number;
+  take_profit?: number | null;
+  risk_pct: number;
+  placed: MT5PlacedResult[];
+  errors: { account: string; account_id: number; reason: string }[];
+  dry_run?: boolean;
+  error?: string;
 }
 
 const fmtUsd = (v?: number | null): string => {
@@ -186,6 +291,7 @@ export default function KronosForecastPage() {
   const [exchange, setExchange] = useState('bitget');
   const [timeframe, setTimeframe] = useState('1h');
   const [marginMode, setMarginMode] = useState<'crossed' | 'isolated'>('isolated');
+  const [kronosSettingsOpen, setKronosSettingsOpen] = useState(false);
   const [predLen, setPredLen] = useState(24);
   const [samples, setSamples] = useState(10);
   const [temperature, setTemperature] = useState(1.0);
@@ -261,6 +367,14 @@ export default function KronosForecastPage() {
             f.category.toLowerCase().includes(q),
         ).map<PairOption>((f) => ({ symbol: f.symbol, name: f.name, category: f.category }));
 
+        // Stocks / ETFs — static list (backend routes any ticker to Yahoo).
+        const stockMatches = STOCKS.filter(
+          (s) =>
+            s.symbol.toLowerCase().includes(q) ||
+            s.name.toLowerCase().includes(q) ||
+            s.category.toLowerCase().includes(q),
+        ).map<PairOption>((s) => ({ symbol: s.symbol, name: s.name, category: s.category }));
+
         // Crypto catalog — live search.
         const res = await apiClient.jarvis.pairs(val.trim(), 28);
         const crypto: PairOption[] = (res.data?.pairs || []).map((p: any) => ({
@@ -272,7 +386,7 @@ export default function KronosForecastPage() {
           market_cap_rank: p.market_cap_rank,
         }));
 
-        setSearchResults([...fxMatches, ...crypto]);
+        setSearchResults([...fxMatches, ...stockMatches, ...crypto]);
       } catch {
         setSearchResults([]);
       } finally {
@@ -332,7 +446,7 @@ export default function KronosForecastPage() {
   const { data, loading, error, refetch } = useKronosForecast(exchange, symbol, params);
 
   // ── Model selector ───────────────────────────────────────────────────────
-  interface KronosModelEntry { id: string; label: string; params_m: number; max_context: number; installed?: boolean; }
+  interface KronosModelEntry { id: string; label: string; params_m: number; max_context: number; installed?: boolean; is_finetuned?: boolean; job_id?: number; symbols_combined?: string[] | null; }
   const [modelCatalog, setModelCatalog] = useState<KronosModelEntry[]>([]);
   const [activeModel, setActiveModel] = useState<string>('');
   const [switching, setSwitching] = useState(false);
@@ -344,7 +458,12 @@ export default function KronosForecastPage() {
       setModelCatalog(r.data?.models ?? []);
       // Always sync the highlighted model to the server's real current model so
       // the selector reflects what's actually loaded (reflects hot-swaps).
-      if (r.data?.current) setActiveModel(r.data.current);
+      // A loaded finetuned model wins over the base model id.
+      if (r.data?.current_finetuned_job_id != null) {
+        setActiveModel(`finetuned:${r.data.current_finetuned_job_id}`);
+      } else if (r.data?.current) {
+        setActiveModel(r.data.current);
+      }
       return r.data?.models ?? [];
     } catch {
       return [];
@@ -373,24 +492,27 @@ export default function KronosForecastPage() {
   const switchKronosModel = async (modelId: string) => {
     if (modelId === activeModel || switching) return;
     setSwitching(true);
+    const isFt = modelId.startsWith('finetuned:');
+    const expectedJobId = isFt ? parseInt(modelId.split(':')[1], 10) : null;
     try {
       await apiClient.kronos.switchModel(modelId);
-      // Poll status until the model name changes (background load on server).
-      // Larger variants (Kronos-base) may download weights on first use, so
-      // allow a generous window before giving up.
+      // Poll status until the model actually loads (background load on server).
+      // Finetuned checkpoints and larger variants may take a while.
       let confirmed = false;
       for (let i = 0; i < 120; i++) {
         await new Promise((r) => setTimeout(r, 2000));
         const s = await apiClient.kronos.status().catch(() => null);
-        if (s?.data?.model_name === modelId && s?.data?.available) {
+        const ok = isFt
+          ? s?.data?.finetuned_job_id === expectedJobId && s?.data?.available
+          : s?.data?.model_name === modelId && s?.data?.available;
+        if (ok) {
           setActiveModel(modelId);
-          setStatus(s.data);
+          setStatus(s!.data);
           confirmed = true;
           break;
         }
       }
-      // Reconcile the selector with the server's real current model either way
-      // (covers slow loads that finish just after the poll window).
+      // Reconcile the selector with the server's real current model either way.
       await refreshModels();
       if (!confirmed) {
         const s = await apiClient.kronos.status().catch(() => null);
@@ -421,6 +543,12 @@ export default function KronosForecastPage() {
   const [confirmId, setConfirmId] = useState<string | null>(null);
   const [execId, setExecId] = useState<string | null>(null);
   const [execResults, setExecResults] = useState<Record<string, { ok: boolean; msg: string }>>({});
+
+  // ── MT5 direct execution ───────────────────────────────────────────────────
+  const [mt5Accounts, setMT5Accounts] = useState<MT5AccountInfo[] | null>(null);
+  const [mt5ConfirmId, setMT5ConfirmId] = useState<string | null>(null);
+  const [mt5ExecId, setMT5ExecId] = useState<string | null>(null);
+  const [mt5ExecResults, setMT5ExecResults] = useState<Record<string, { ok: boolean; msg: string }>>({});
 
   // Live exchange context for order sizing (available margin, max open, etc.)
   const [tradability, setTradability] = useState<Tradability | null>(null);
@@ -483,8 +611,19 @@ export default function KronosForecastPage() {
     }
   };
 
+  // Linked live MT5 accounts for the MT5 execution panel.
+  const fetchMT5Accounts = async () => {
+    try {
+      const r = await apiClient.kronos.mt5Accounts();
+      setMT5Accounts(r.data?.accounts ?? []);
+    } catch {
+      setMT5Accounts([]);
+    }
+  };
+
   useEffect(() => {
     fetchTradability();
+    fetchMT5Accounts();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol, exchange]);
 
@@ -543,6 +682,24 @@ export default function KronosForecastPage() {
           ...p,
           [s.id]: { ok: true, msg: `Paper ${s.side.toUpperCase()} · $${effMargin.toFixed(2)} margin (${sizeStr} @ ${s.leverage}x)` },
         }));
+      } else if (tradability?.venue === 'mt5' || tradability?.tradable_via_mt5) {
+        // Route through the room engine so both MT5 and exchange execute when both are configured.
+        const r = await apiClient.kronos.execute({
+          symbol,
+          side: s.side === 'long' ? 'buy' : 'sell',
+          entry,
+          stop_loss: s.stop_loss,
+          take_profit: s.take_profit_1,
+          timeframe,
+        });
+        const ok = r.data?.ok ?? false;
+        const venues = (r.data?.placed ?? []).map((o: any) => `${o.venue}/${o.role ?? ''}`.replace(/\/$/, '')).join(', ');
+        setExecResults((p) => ({
+          ...p,
+          [s.id]: ok
+            ? { ok: true, msg: `MT5 ${s.side.toUpperCase()} sent → ${venues || 'room engine'}` }
+            : { ok: false, msg: r.data?.errors?.[0]?.reason ?? r.data?.reason ?? 'Execution failed' },
+        }));
       } else {
         await apiClient.createBitgetFuturesOrder({
           symbol: symbol.replace('/', ''),
@@ -573,6 +730,48 @@ export default function KronosForecastPage() {
       setExecResults((p) => ({ ...p, [s.id]: { ok: false, msg } }));
     } finally {
       setExecId(null);
+    }
+  };
+
+  // Execute a sniper entry directly on MT5 with room risk % lot sizing.
+  const executeOnMT5 = async (s: SniperSignal) => {
+    if (mt5ConfirmId !== s.id) {
+      setMT5ConfirmId(s.id);
+      return;
+    }
+    setMT5ConfirmId(null);
+    setMT5ExecId(s.id);
+    setMT5ExecResults((prev) => { const n = { ...prev }; delete n[s.id]; return n; });
+    try {
+      const entry = s.entry > 0 ? s.entry : (sniper?.anchor_price || 0);
+      if (entry <= 0) throw new Error('No valid entry price');
+      const r = await apiClient.kronos.executeMT5({
+        symbol,
+        side: s.side === 'long' ? 'buy' : 'sell',
+        entry,
+        stop_loss: s.stop_loss,
+        take_profit: s.take_profit_1,
+        timeframe,
+      });
+      const data = r.data as MT5ExecResponse;
+      if (data.ok) {
+        const summary = data.placed
+          .map((p) => `${p.account}: ${p.lot}L · #${p.order_id ?? '—'} (${p.size_note})`)
+          .join(' | ');
+        setMT5ExecResults((p) => ({ ...p, [s.id]: { ok: true, msg: `MT5 ${s.side.toUpperCase()} → ${summary}` } }));
+        fetchMT5Accounts();
+      } else {
+        const errMsg = data.error || data.errors?.[0]?.reason || 'MT5 execution failed';
+        setMT5ExecResults((p) => ({ ...p, [s.id]: { ok: false, msg: errMsg } }));
+      }
+    } catch (e: any) {
+      const detail = e?.response?.data?.detail;
+      const msg = typeof detail === 'string' ? detail
+        : Array.isArray(detail) ? detail.map((d: any) => d.msg || JSON.stringify(d)).join('; ')
+        : (detail?.msg || e?.message || 'MT5 error');
+      setMT5ExecResults((p) => ({ ...p, [s.id]: { ok: false, msg } }));
+    } finally {
+      setMT5ExecId(null);
     }
   };
 
@@ -634,7 +833,7 @@ export default function KronosForecastPage() {
             >
               <Cpu className="w-4 h-4" />
               {status.engine === 'kronos'
-                ? `${status.model_name} · ${status.device}`
+                ? `${status.display_name || status.model_name} · ${status.device}`
                 : 'Heuristic fallback — run setup_kronos.sh for the real model'}
             </div>
           )}
@@ -649,7 +848,9 @@ export default function KronosForecastPage() {
                     key={m.id}
                     disabled={switching || installingAll}
                     onClick={() => switchKronosModel(m.id)}
-                    title={`${m.label}${m.installed ? ' — installed' : ' — downloads on first use'}`}
+                    title={m.is_finetuned
+                      ? `${m.label} — custom fine-tuned model${m.symbols_combined && m.symbols_combined.length ? `\nTrained & improved on ${m.symbols_combined.length} pairs: ${m.symbols_combined.join(', ')}` : ''}`
+                      : `${m.label}${m.installed ? ' — installed' : ' — downloads on first use'}`}
                     className={`px-2.5 py-1 rounded-lg text-xs font-medium transition-all inline-flex items-center gap-1 ${
                       activeModel === m.id
                         ? 'bg-purple-600 text-white'
@@ -658,13 +859,20 @@ export default function KronosForecastPage() {
                   >
                     {switching && activeModel !== m.id ? (
                       <Loader2 className="w-3 h-3 animate-spin inline" />
+                    ) : m.is_finetuned ? (
+                      <span className="text-[10px] leading-none text-amber-300" aria-hidden>✦</span>
                     ) : (
                       <span
                         className={`w-1.5 h-1.5 rounded-full ${m.installed ? 'bg-green-400' : 'bg-gray-500'}`}
                         aria-hidden
                       />
                     )}
-                    {m.id.split('/')[1]}
+                    {m.is_finetuned ? m.label : m.id.split('/')[1]}
+                    {m.is_finetuned && m.symbols_combined && m.symbols_combined.length > 0 && (
+                      <span className="ml-1 px-1 py-0.5 rounded bg-fuchsia-500/20 text-fuchsia-200 text-[9px] leading-none">
+                        {m.symbols_combined.length}p
+                      </span>
+                    )}
                   </button>
                 ))}
               </div>
@@ -833,6 +1041,12 @@ export default function KronosForecastPage() {
           </div>
 
           <button
+            onClick={() => setKronosSettingsOpen(true)}
+            className="flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-700 text-slate-300 hover:bg-slate-800 text-xs font-semibold"
+          >
+            <Settings2 className="w-3.5 h-3.5" /> Oblivion settings
+          </button>
+          <button
             onClick={refetch}
             disabled={loading}
             className="ml-auto flex items-center gap-2 px-4 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 text-white text-sm font-medium disabled:opacity-50"
@@ -863,6 +1077,17 @@ export default function KronosForecastPage() {
                 strategyAction={sig?.direction}
                 strategyScore={sig ? sig.confidence : undefined}
                 initialCandles={data?.candles?.length ? data.candles : undefined}
+                // OBLIVION engine overlay: when the backend supplied the bars it
+                // analysed (FX / metals), draw the bundle it computed on them;
+                // otherwise the chart runs the engine on the bars it fetched.
+                oblivionBundle={data?.candles?.length ? (data as any)?.overlay_bundle ?? null : undefined}
+                showOblivion={!data?.candles?.length}
+                // Zoom the viewport onto the current/live bar (with room on the
+                // right for the forecast projection) instead of fitting all history.
+                fitMode="forecast"
+                // TradingView-style drawing tools: fullscreen, auto-saved, and the
+                // trading-room agents read + refine whatever you draw here.
+                enableDrawings
                 // Backend only returns `candles` for FX / metals, and those bars
                 // are anchored to Swissquote — naming the crypto exchange there
                 // would credit the wrong feed.
@@ -894,7 +1119,15 @@ export default function KronosForecastPage() {
               tradability={tradability}
               tradabilityLoading={tradabilityLoading}
               onRefreshTradability={fetchTradability}
+              mt5Accounts={mt5Accounts}
+              mt5ConfirmId={mt5ConfirmId}
+              mt5ExecId={mt5ExecId}
+              mt5ExecResults={mt5ExecResults}
+              onMT5Execute={executeOnMT5}
             />
+
+            {/* OBLIVION engine on every timeframe, Kronos-confirmed */}
+            <OblivionMultiTfPanel exchange={exchange} symbol={symbol} />
           </div>
 
           {/* Forecast metrics */}
@@ -1111,6 +1344,28 @@ export default function KronosForecastPage() {
             </div>
           </div>
         </div>
+
+        {/* Fine-tune Kronos on your own data — dedicated lab */}
+        <Link
+          href="/kronos-finetune"
+          className="flex items-center justify-between px-4 py-3 bg-gray-900/60 border border-gray-700/50 rounded-xl hover:border-fuchsia-500/50 transition-colors group"
+        >
+          <span className="flex items-center gap-2">
+            <div className="p-1.5 rounded-lg bg-fuchsia-500/15">
+              <Sparkles className="w-5 h-5 text-fuchsia-400" />
+            </div>
+            <span>
+              <span className="block text-sm font-semibold text-white">Fine-tune on your own data</span>
+              <span className="block text-[11px] text-gray-500">
+                Train custom models (e.g. super-base), view every run &amp; size, combine into one
+              </span>
+            </span>
+          </span>
+          <span className="flex items-center gap-1 text-xs text-fuchsia-300 group-hover:text-fuchsia-200">
+            Open fine-tune lab <ChevronRight className="w-4 h-4" />
+          </span>
+        </Link>
+        <OblivionSettingsModal open={kronosSettingsOpen} onClose={() => setKronosSettingsOpen(false)} onSaved={() => window.dispatchEvent(new CustomEvent('oblivion-settings-changed', { detail: { version: Date.now() }}))} />
       </div>
     </>
   );
@@ -1161,6 +1416,12 @@ interface SniperPanelProps {
   tradability: Tradability | null;
   tradabilityLoading: boolean;
   onRefreshTradability: () => void;
+  // MT5 direct execution
+  mt5Accounts: MT5AccountInfo[] | null;
+  mt5ConfirmId: string | null;
+  mt5ExecId: string | null;
+  mt5ExecResults: Record<string, { ok: boolean; msg: string }>;
+  onMT5Execute: (s: SniperSignal) => void;
 }
 
 function SniperPanel({
@@ -1169,10 +1430,13 @@ function SniperPanel({
   marginMode, setMarginMode,
   confirmId, execId, execResults, onExecute, onRefresh,
   tradability, tradabilityLoading, onRefreshTradability,
+  mt5Accounts, mt5ConfirmId, mt5ExecId, mt5ExecResults, onMT5Execute,
 }: SniperPanelProps) {
   const signals = sniper?.signals ?? [];
   const overMargin = !paperMode && !!tradability?.tradable
     && tradability.available_margin > 0 && marginUsd > tradability.available_margin;
+  const hasMT5 = mt5Accounts !== null && mt5Accounts.length > 0;
+  const totalMT5Equity = mt5Accounts?.reduce((s, a) => s + (a.equity || a.balance), 0) ?? 0;
 
   return (
     <div className="bg-gray-900/60 border border-gray-700/50 rounded-xl p-4">
@@ -1274,6 +1538,41 @@ function SniperPanel({
         <div className="flex items-center gap-2 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2 text-xs text-red-300 mb-3">
           <ShieldAlert className="w-4 h-4 shrink-0" />
           Live mode places real Bitget futures orders with SL/TP attached. Click once to arm, again to confirm.
+        </div>
+      )}
+
+      {/* MT5 linked accounts summary (always visible when accounts exist) */}
+      {hasMT5 && (
+        <div className="flex flex-wrap items-center gap-2 mb-3 text-[11px] bg-blue-500/[0.04] border border-blue-700/30 rounded-lg px-3 py-2">
+          <Crosshair className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+          <span className="text-blue-300 font-medium">MT5:</span>
+          {mt5Accounts!.map((a) => {
+            const bal = a.equity || a.balance;
+            const offline = a.online === false;
+            const noFunds = !offline && bal === 0;
+            return (
+              <span
+                key={a.id}
+                title={
+                  offline ? `${a.name} — offline / not reachable`
+                  : noFunds ? `${a.name} — connected but balance is 0 (check ${a.server})`
+                  : `${a.name} · ${a.server}`
+                }
+                className={`rounded px-1.5 py-0.5 border tabular-nums ${
+                  offline ? 'bg-gray-700/40 border-gray-600/40 text-gray-500 line-through'
+                  : noFunds ? 'bg-amber-500/10 border-amber-700/30 text-amber-300'
+                  : 'bg-blue-500/15 border-blue-700/30 text-blue-200'
+                }`}
+              >
+                <span className={`mr-1 ${offline ? 'text-gray-600' : noFunds ? 'text-amber-400' : 'text-green-400'}`}>●</span>
+                {a.name}
+                {!offline && <>{': '}<span className="text-white">{a.currency}&nbsp;{bal.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span></>}
+                {offline && <span className="ml-1 text-[9px] text-gray-600">offline</span>}
+                {noFunds && <span className="ml-1 text-[9px] text-amber-500">no funds</span>}
+              </span>
+            );
+          })}
+          <span className="text-blue-400/70 ml-auto">Lot sized by room risk %&nbsp;·&nbsp;click once to arm</span>
         </div>
       )}
 
@@ -1476,6 +1775,114 @@ function SniperPanel({
                     Execution available for USDT crypto pairs — chart-only for {symbol}
                   </div>
                 )}
+
+                {/* ── MT5 direct execution ────────────────────────────── */}
+                {(() => {
+                  const mt5Armed = mt5ConfirmId === s.id;
+                  const mt5Busy = mt5ExecId === s.id;
+                  const mt5Result = mt5ExecResults[s.id];
+                  return (
+                    <div className="mt-2 space-y-1.5">
+                      {/* Divider */}
+                      <div className="flex items-center gap-2">
+                        <div className="flex-1 h-px bg-gray-700/60" />
+                        <span className="text-[10px] text-gray-500 font-medium tracking-wide">MT5</span>
+                        <div className="flex-1 h-px bg-gray-700/60" />
+                      </div>
+
+                      {/* Account summary */}
+                      {mt5Accounts === null ? (
+                        <div className="text-[11px] text-gray-500 flex items-center gap-1">
+                          <Loader2 className="w-3 h-3 animate-spin" /> Loading MT5 accounts…
+                        </div>
+                      ) : mt5Accounts.length === 0 ? (
+                        <div className="text-[11px] text-amber-300">
+                          No live MT5 accounts configured — add one under{' '}
+                          <span
+                            className="text-purple-300 hover:underline cursor-pointer"
+                            onClick={() => window.location.href = '/mt5-live'}
+                          >
+                            /mt5-live
+                          </span>
+                        </div>
+                      ) : (
+                        <div className="flex flex-wrap gap-1.5 text-[10px]">
+                          {mt5Accounts.map((a) => {
+                            const bal = a.equity || a.balance;
+                            const offline = a.online === false;
+                            const noFunds = !offline && bal === 0;
+                            return (
+                              <span
+                                key={a.id}
+                                title={
+                                  offline ? `${a.name} offline — not reachable via MT5 API`
+                                  : noFunds ? `${a.name}: connected but balance is 0 (check ${a.server})`
+                                  : undefined
+                                }
+                                className={`rounded px-1.5 py-0.5 border tabular-nums ${
+                                  offline ? 'bg-gray-700/30 border-gray-600/30 text-gray-500'
+                                  : noFunds ? 'bg-amber-500/10 border-amber-700/30 text-amber-300'
+                                  : 'bg-blue-500/10 border-blue-700/30 text-blue-200'
+                                }`}
+                              >
+                                <span className={`mr-0.5 ${offline ? 'text-gray-600' : noFunds ? 'text-amber-400' : 'text-green-400'}`}>●</span>
+                                {a.name}
+                                {!offline && (
+                                  <>{': '}<span className="text-white">{a.currency}&nbsp;{bal.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span></>
+                                )}
+                                {a.free_margin > 0 && !offline && (
+                                  <span className="text-blue-300"> / {a.free_margin.toLocaleString(undefined, { maximumFractionDigits: 0 })} free</span>
+                                )}
+                                {offline && <span className="ml-1 text-gray-600">(offline)</span>}
+                                {noFunds && !offline && <span className="ml-1 text-amber-500">(no funds)</span>}
+                              </span>
+                            );
+                          })}
+                        </div>
+                      )}
+
+                      {/* MT5 execution result */}
+                      {mt5Result && (
+                        <div
+                          className={`flex items-start gap-1.5 rounded-lg px-2.5 py-1.5 text-[11px] ${
+                            mt5Result.ok
+                              ? 'bg-blue-500/10 text-blue-200 border border-blue-500/30'
+                              : 'bg-red-500/10 text-red-300 border border-red-500/30'
+                          }`}
+                        >
+                          {mt5Result.ok
+                            ? <Check className="w-3.5 h-3.5 mt-px shrink-0 text-blue-300" />
+                            : <X className="w-3.5 h-3.5 mt-px shrink-0" />}
+                          <span>{mt5Result.msg}</span>
+                        </div>
+                      )}
+
+                      {/* MT5 execute button */}
+                      {mt5Accounts !== null && mt5Accounts.length > 0 && (
+                        <button
+                          onClick={() => onMT5Execute(s)}
+                          disabled={mt5Busy}
+                          title="Execute on MT5 using room risk % lot sizing"
+                          className={`w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm font-semibold transition-all disabled:opacity-60 ${
+                            mt5Armed
+                              ? (long
+                                  ? 'bg-blue-600 hover:bg-blue-500 text-white ring-2 ring-blue-400/50'
+                                  : 'bg-blue-800 hover:bg-blue-700 text-white ring-2 ring-blue-400/50')
+                              : 'bg-blue-700/70 hover:bg-blue-700 text-white'
+                          }`}
+                        >
+                          {mt5Busy ? (
+                            <><Loader2 className="w-4 h-4 animate-spin" /> Placing on MT5…</>
+                          ) : mt5Armed ? (
+                            <><Check className="w-4 h-4" /> Confirm MT5 {long ? 'BUY' : 'SELL'} · room risk % lot</>
+                          ) : (
+                            <><Crosshair className="w-4 h-4" /> Execute {long ? 'BUY' : 'SELL'} on MT5 · {mt5Accounts.length} account{mt5Accounts.length !== 1 ? 's' : ''}</>
+                          )}
+                        </button>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
             );
           })}
@@ -1502,3 +1909,5 @@ function Level({ label, value, tone }: { label: string; value: string; tone: 'up
     </div>
   );
 }
+
+

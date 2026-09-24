@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { createChart, IChartApi, ISeriesApi, SeriesMarker, Time } from 'lightweight-charts';
 import { attachZonesOverlay, type ZonesOverlay } from '@/utils/zonesOverlay';
+import { attachOblivionPrimitive, type OblivionPrimitive, type OblivionOverlayBundle } from '@/components/OblivionPrimitive';
 import { useZonesData } from '@/hooks/useZonesData';
 import type { CycleWindowBox, ZonesData } from '@/utils/zonesOverlay';
-import { apiClient } from '@/services/api';
+import { api, apiClient } from '@/services/api';
 import { calcMinMove, calcChartPrecision } from '@/utils/price';
 import { formatTimeZA } from '@/utils/datetime';
+import ChartDrawingLayer from '@/components/ChartDrawingLayer';
 
 interface PriceLine {
   price: number;
@@ -87,6 +89,34 @@ interface TradingViewChartProps {
   showZones?: boolean;
   /** Bitcoin 1064-day cycle boxes (green bull / red bear) behind the candles. */
   cycleWindows?: CycleWindowBox[];
+  /** Fit mode for the time scale: genesis fits all candles, recent shows last 2
+   *  cycles, forecast zooms tight on the current bar with room on the right for
+   *  the projection. */
+  fitMode?: 'genesis' | 'recent' | 'forecast';
+  /** Enable the TradingView-style drawing toolbox (fullscreen + auto-saved shapes
+   *  the trading-room agents read and refine). Opt-in so other charts are untouched. */
+  enableDrawings?: boolean;
+  /** Drawing identity overrides (default to this chart's exchange/symbol/timeframe). */
+  drawingsExchange?: string;
+  drawingsSymbol?: string;
+  drawingsTimeframe?: string;
+  /** OBLIVION AI engine overlay. `showOblivion` makes the chart compute it on
+   *  the very candles it draws (POST /market/oblivion-overlay); `oblivionBundle`
+   *  supplies a bundle already computed on those candles (Kronos page). */
+  showOblivion?: boolean;
+  oblivionBundle?: OblivionOverlayBundle | null;
+  /** Called with the engine read whenever the chart computed its own overlay. */
+  onOblivion?: (read: any | null) => void;
+  /** Hide the header toggle (a wrapper renders its own). */
+  hideOblivionToggle?: boolean;
+  /** Controlled visibility of the overlay, when a wrapper owns the toggle. */
+  oblivionVisibleOverride?: boolean;
+}
+
+const OBLIVION_VISIBLE_KEY = 'tv_oblivion_visible';
+function loadOblivionVisible(): boolean {
+  if (typeof window === 'undefined') return true;
+  try { return window.localStorage.getItem(OBLIVION_VISIBLE_KEY) !== '0'; } catch { return true; }
 }
 
 /**
@@ -115,6 +145,31 @@ function toApiTimeframe(tf: string): string {
   return TF_API_MAP[tf] ?? tf;
 }
 
+/** Normalise any timeframe (api '1h' or MT5 'H1') to the MT5 form the
+ *  broker-independent `/market/candles` feed expects. Case-sensitive so the
+ *  1-minute '1m' and 1-month '1M' don't collide. */
+const TF_MT5_MAP: Record<string, string> = {
+  '1m': 'M1', '3m': 'M3', '5m': 'M5', '15m': 'M15', '30m': 'M30',
+  '1h': 'H1', '2h': 'H2', '4h': 'H4', '1d': 'D1', '1w': 'W1', '1M': 'MN1',
+  M1: 'M1', M3: 'M3', M5: 'M5', M15: 'M15', M30: 'M30',
+  H1: 'H1', H2: 'H2', H4: 'H4', H6: 'H6', H12: 'H12', D1: 'D1', W1: 'W1', MN1: 'MN1',
+};
+function toMt5Timeframe(tf: string): string {
+  return TF_MT5_MAP[tf] ?? 'H1';
+}
+
+/** Seconds per bar for any timeframe (api '1h' or MT5 'H1') — used to place the
+ *  live forming bar on the correct candle boundary. */
+const TF_SECONDS_MAP: Record<string, number> = {
+  '1m': 60, '3m': 180, '5m': 300, '15m': 900, '30m': 1800,
+  '1h': 3600, '2h': 7200, '4h': 14400, '1d': 86400, '1w': 604800, '1M': 2592000,
+  M1: 60, M3: 180, M5: 300, M15: 900, M30: 1800,
+  H1: 3600, H2: 7200, H4: 14400, H6: 21600, H12: 43200, D1: 86400, W1: 604800, MN1: 2592000,
+};
+function tfSeconds(tf: string): number {
+  return TF_SECONDS_MAP[tf] ?? 3600;
+}
+
 export default function TradingViewChart({ 
   symbol, 
   exchange = 'bitget',
@@ -133,11 +188,42 @@ export default function TradingViewChart({
   sourceLabel,
   showZones = false,
   cycleWindows,
+  fitMode = 'genesis',
+  enableDrawings = false,
+  drawingsExchange,
+  drawingsSymbol,
+  drawingsTimeframe,
+  showOblivion = false,
+  oblivionBundle,
+  onOblivion,
+  hideOblivionToggle = false,
+  oblivionVisibleOverride,
 }: TradingViewChartProps) {
   const chartContainerRef = useRef<HTMLDivElement>(null);
+  const chartWrapRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candlestickSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const zonesOverlayRef = useRef<ZonesOverlay | null>(null);
+  const oblivionRef = useRef<OblivionPrimitive | null>(null);
+  const [oblivionVisible, setOblivionVisible] = useState<boolean>(loadOblivionVisible);
+  // The bars currently drawn (for the parity POST and diamond anchoring).
+  const drawnBarsRef = useRef<{ time: number; open: number; high: number; low: number; close: number; volume?: number }[]>([]);
+  const [drawnVersion, setDrawnVersion] = useState(0);
+  const [selfBundle, setSelfBundle] = useState<OblivionOverlayBundle | null>(null);
+  // Which instrument the drawn bars belong to. Bars live in a ref, so without
+  // this tag a symbol switch would hand the Oblivion parity POST the *previous*
+  // pair's candles under the new pair's name — the read, the levels and the
+  // trade plan would all still describe the old instrument.
+  const instrumentKey = `${exchange}|${symbol}|${timeframe}`;
+  const drawnKeyRef = useRef<string | null>(null);
+  const noteDrawnBars = (data: any[], key: string) => {
+    drawnBarsRef.current = (data || []).map((c: any) => ({
+      time: Number(c.time), open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume,
+    }));
+    drawnKeyRef.current = key;
+    try { oblivionRef.current?.setBars(drawnBarsRef.current); } catch {}
+    setDrawnVersion(v => v + 1);
+  };
   // The hook always runs (rules of hooks) but only fetches when enabled; the
   // ref lets the primitive hydrate from the latest data at attach time.
   const zonesData = useZonesData(symbol, timeframe, showZones);
@@ -154,6 +240,14 @@ export default function TradingViewChart({
   // True until the candles have been fitted once for the current chart instance.
   // Prevents the background refresh from resetting the user's zoom/pan.
   const didFitRef = useRef(false);
+  // Newest bar time currently drawn (seconds). Lets the realtime refresh skip
+  // stale bars — lightweight-charts' update() throws if given a time older than
+  // the last bar, which a briefly-lagging market feed can otherwise trigger.
+  const lastBarTimeRef = useRef(0);
+  // Close of the newest bar + the in-progress live bar, so the live-price poll
+  // can tick the forming candle between REST refreshes (TradingView-style).
+  const lastCloseRef = useRef(0);
+  const liveBarRef = useRef<{ time: number; open: number; high: number; low: number; close: number } | null>(null);
   // Abort controller so in-flight fetch is cancelled when symbol/timeframe changes
   const abortRef = useRef<AbortController | null>(null);
   const [loading, setLoading] = useState(true);
@@ -162,6 +256,47 @@ export default function TradingViewChart({
   // Incremented each time the chart/series is (re)created so the overlay effect
   // re-runs even when overlays/markers props haven't changed.
   const [chartInitCount, setChartInitCount] = useState(0);
+
+  // True browser fullscreen for the chart (drawing toolbox uses this).
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const isFullscreenRef = useRef(false);
+  isFullscreenRef.current = isFullscreen;
+  const toggleFullscreen = useCallback(() => {
+    const el = chartWrapRef.current;
+    if (!el) return;
+    if (document.fullscreenElement === el) {
+      document.exitFullscreen().catch(() => {});
+    } else {
+      el.requestFullscreen?.().catch(() => {});
+    }
+  }, []);
+  useEffect(() => {
+    const onFsChange = () => setIsFullscreen(document.fullscreenElement === chartWrapRef.current);
+    document.addEventListener('fullscreenchange', onFsChange);
+    return () => document.removeEventListener('fullscreenchange', onFsChange);
+  }, []);
+  // Resize the chart to fill the screen while fullscreen; restore on exit.
+  useEffect(() => {
+    const chart = chartRef.current;
+    const wrap = chartWrapRef.current;
+    if (!chart || !wrap) return;
+    const apply = () => {
+      const el = chartContainerRef.current;
+      const width = el?.clientWidth || wrap.clientWidth || 600;
+      // In fullscreen the container is flex-1, so its own height is the screen
+      // minus the toolbar — use that so the chart truly fills the display.
+      const height = isFullscreen
+        ? (el?.clientHeight || window.innerHeight)
+        : (maximized ? window.innerHeight - 120 : 400);
+      try { chart.applyOptions({ width, height }); } catch {}
+    };
+    // Two passes: one after the fullscreen transition settles, one on the next
+    // frame so the flex layout has committed the container's final height.
+    const id1 = setTimeout(apply, 80);
+    const id2 = requestAnimationFrame(() => requestAnimationFrame(apply));
+    return () => { clearTimeout(id1); cancelAnimationFrame(id2); };
+  }, [isFullscreen, maximized, chartInitCount]);
+
 
   // Drag state for SL/TP editing
   const [editingSl, setEditingSl] = useState<number | null>(null);
@@ -173,6 +308,14 @@ export default function TradingViewChart({
   const tpLineRef = useRef<any>(null);
 
   // Fetch real market data
+  // Record the newest bar so the live-price poll knows where the forming candle
+  // sits. resetLive drops the in-progress bar after a full series replace.
+  const rememberLastBar = (time?: number, close?: number, resetLive = false) => {
+    if (typeof time === 'number' && time > 0) lastBarTimeRef.current = time;
+    if (typeof close === 'number' && close > 0) lastCloseRef.current = close;
+    if (resetLive) liveBarRef.current = null;
+  };
+
   const fetchChartData = async () => {
     // Capture the series this fetch belongs to. The chart (and this ref) is
     // recreated whenever the symbol/exchange/timeframe changes, so a slow
@@ -182,6 +325,9 @@ export default function TradingViewChart({
     const targetChart = chartRef.current;
     const isStale = () =>
       candlestickSeriesRef.current !== targetSeries || chartRef.current !== targetChart;
+    // The instrument this fetch is for — stamped onto the bars it draws so the
+    // Oblivion read can never be computed from another pair's candles.
+    const fetchKey = instrumentKey;
 
     const fitAndScale = () => {
       if (!didFitRef.current) {
@@ -201,9 +347,72 @@ export default function TradingViewChart({
     try {
       setError(null);
 
-      // If pre-fetched candles were supplied (e.g. forex/metals from Kronos),
+      // If pre-fetched candles were supplied (e.g. forex/metals from Kronos or BTC cycle),
       // use them directly without hitting the crypto exchange endpoint.
+      // On a background refresh (didFitRef already true) tick the forming bar in
+      // realtime instead of re-drawing the same static snapshot — otherwise the
+      // chart only moved when the user refreshed the page.
       if (initialCandles && initialCandles.length > 0 && targetSeries) {
+        const isBtcCycle = symbol.toUpperCase().replace('/','').startsWith('BTC') && initialCandles.length > 500
+        if (didFitRef.current && !isStale()) {
+          try {
+            if (isBtcCycle) {
+              // BTC cycle: the genesis-aware cycle endpoint keeps the last bar accurate.
+              const tfMap: Record<string,string> = { H1:'H1', H4:'H4', D1:'D1', W1:'W1', MN1:'MN1' }
+              const cycleTf = tfMap[timeframe] ?? timeframe
+              if (['H1','H4','D1','W1','MN1'].includes(cycleTf)) {
+                const { data: latestData } = await apiClient.getCycleCandles(cycleTf, 2) as any
+                const latest = latestData?.candles?.slice(-1)[0]
+                if (latest && latest.time && latest.close && !isStale()) {
+                  const lastTime = Math.max(lastBarTimeRef.current, initialCandles[initialCandles.length-1]?.time as number ?? 0)
+                  if (latest.time >= lastTime) {
+                    targetSeries.update({ time: latest.time as any, open: latest.open, high: latest.high, low: latest.low, close: latest.close } as any)
+                    rememberLastBar(latest.time as number, latest.close as number)
+                    setLastUpdate(new Date())
+                    setLoading(false)
+                    return
+                  }
+                }
+              }
+            } else {
+              // FX / metals / indices / equities: the crypto exchange can't price
+              // these, so poll the broker-independent market feed (same Yahoo/
+              // Swissquote source the Kronos candles came from) and update the
+              // last two bars — a new bar appears and the forming bar ticks live.
+              const { data: fresh } = await apiClient.getMarketCandles(
+                symbol, toMt5Timeframe(timeframe), 10, controller.signal,
+              ) as any
+              const rows: any[] = fresh?.candles ?? []
+              if (rows.length && !isStale()) {
+                for (const c of rows.slice(-2)) {
+                  if (c && c.time != null && c.close != null && (c.time as number) >= lastBarTimeRef.current) {
+                    targetSeries.update({ time: c.time as any, open: c.open, high: c.high, low: c.low, close: c.close } as any)
+                    rememberLastBar(c.time as number, c.close as number)
+                  }
+                }
+                setLastUpdate(new Date())
+                setLoading(false)
+                return
+              }
+            }
+          } catch {}
+          // Realtime fetch missed — redraw the snapshot without refitting so a
+          // transient network error can't reset the user's zoom/pan.
+          const data = initialCandles.map((c) => ({
+            time: c.time as any,
+            open: c.open,
+            high: c.high,
+            low: c.low,
+            close: c.close,
+          }));
+          if (isStale()) return;
+          targetSeries.setData(data);
+          noteDrawnBars(data, fetchKey);
+          rememberLastBar(data[data.length - 1]?.time as number, data[data.length - 1]?.close as number, true);
+          setLastUpdate(new Date());
+          setLoading(false);
+          return;
+        }
         const data = initialCandles.map((c) => ({
           time: c.time as any,
           open: c.open,
@@ -213,6 +422,8 @@ export default function TradingViewChart({
         }));
         if (isStale()) return;
         targetSeries.setData(data);
+        noteDrawnBars(data, fetchKey);
+        rememberLastBar(data[data.length - 1]?.time as number, data[data.length - 1]?.close as number, true);
         const allPrices = data.flatMap((c) => [c.open, c.high, c.low, c.close]).filter((p) => p > 0);
         if (allPrices.length > 0) {
           const precision = calcChartPrecision(allPrices);
@@ -243,6 +454,8 @@ export default function TradingViewChart({
       const data = response.data?.data;
       if (Array.isArray(data) && data.length > 0) {
         targetSeries.setData(data);
+        noteDrawnBars(data, fetchKey);
+        rememberLastBar((data[data.length - 1] as any)?.time as number, (data[data.length - 1] as any)?.close as number, true);
 
         // Auto-detect price precision from OHLCV data (handles PEPE, SHIB etc.)
         const allPrices = data.flatMap((c: any) => [c.open, c.high, c.low, c.close]).filter((p: number) => p > 0);
@@ -269,6 +482,11 @@ export default function TradingViewChart({
         // No data for this symbol (e.g. unknown/invalid pair). Clear any stale
         // candles so we never show the previous symbol's chart, and surface why.
         targetSeries.setData([]);
+        // Drop the previous pair's bars too, or the engine read and trade plan
+        // would keep describing it while the chart sits empty.
+        noteDrawnBars([], fetchKey);
+        rememberLastBar(0, 0, true);
+        lastBarTimeRef.current = 0;
         setError(response.data?.error || `No chart data for ${symbol}`);
         setLoading(false);
       }
@@ -279,6 +497,7 @@ export default function TradingViewChart({
       // Clear stale candles on error too, so a failed load can't leave the
       // previous symbol's chart on screen under the new symbol's label.
       try { targetSeries?.setData([]); } catch {}
+      noteDrawnBars([], fetchKey);
       // FastAPI returns detail as an array of objects for 422 validation errors — coerce to string.
       const rawDetail = err.response?.data?.detail;
       const detail = Array.isArray(rawDetail) ? rawDetail.map((d: any) => d?.msg ?? JSON.stringify(d)).join('; ') : rawDetail;
@@ -338,18 +557,23 @@ export default function TradingViewChart({
     zonesOverlayRef.current.setData(
       composeOverlayData(zonesDataRef.current, cycleWindowsRef.current, showZones && zonesVisible),
     );
+    // OBLIVION engine overlay rides the same pane; fed by the effect below.
+    oblivionRef.current = attachOblivionPrimitive(candlestickSeries);
 
     // Initial data fetch
     fetchChartData();
 
-    // Adaptive refresh: fast timeframes get more frequent updates for real-time feel.
-    // 1m → 10 s | 3m/5m → 15 s | 15m/30m → 30 s | 1h+ → 60 s
+    // Adaptive refresh: realtime for all TFs like TradingView — H1/H4 need frequent last-bar updates
     const refreshMs = (() => {
       const tf = timeframe.toLowerCase();
-      if (tf === '1m') return 10_000;
-      if (tf === '3m' || tf === '5m') return 15_000;
-      if (tf === '15m' || tf === '30m') return 30_000;
-      return 60_000;
+      if (tf === '1m') return 5_000;
+      if (tf === '3m' || tf === '5m') return 10_000;
+      if (tf === '15m' || tf === '30m') return 15_000;
+      if (tf === 'h1' || tf === '1h') return 10_000; // 1H realtime: every 10s
+      if (tf === 'h4' || tf === '4h') return 15_000; // 4H realtime: every 15s
+      if (tf === '1d' || tf === 'd1') return 30_000;
+      if (tf === '1w' || tf === 'w1' || tf === 'mn1' || tf === '1m') return 60_000;
+      return 30_000;
     })();
     const refreshInterval = setInterval(fetchChartData, refreshMs);
 
@@ -358,12 +582,13 @@ export default function TradingViewChart({
     // responsive grid reflow, or the container gaining width after mount).
     const handleResize = () => {
       if (chartContainerRef.current && chartRef.current) {
-        const width = chartContainerRef.current.clientWidth;
+        const el = chartContainerRef.current;
+        const width = el.clientWidth;
         if (width > 0) {
-          chartRef.current.applyOptions({
-            width,
-            height: maximized ? window.innerHeight - 120 : 400,
-          });
+          const height = isFullscreenRef.current
+            ? (el.clientHeight || window.innerHeight)
+            : (maximized ? window.innerHeight - 120 : 400);
+          chartRef.current.applyOptions({ width, height });
         }
       }
     };
@@ -378,9 +603,68 @@ export default function TradingViewChart({
       resizeObserver.disconnect();
       clearInterval(refreshInterval);
       zonesOverlayRef.current = null;
+      oblivionRef.current = null;
       chart.remove();
     };
   }, [symbol, exchange, timeframe, maximized, initialCandles]);
+
+  // Live forming-bar poll — ticks the newest candle between REST refreshes so
+  // every chart moves in realtime like TradingView, even on higher timeframes
+  // (H1/H4/D1) where a full new candle only closes once an hour or day. One
+  // universal quote (`/market/price`) covers crypto, FX, metals, indices and
+  // equities, so this works for every symbol the chart can draw.
+  useEffect(() => {
+    const series = candlestickSeriesRef.current;
+    if (!series) return;
+    let cancelled = false;
+    let failStreak = 0;
+    let timer: ReturnType<typeof setTimeout>;
+    const tfSec = tfSeconds(timeframe);
+
+    const poll = async () => {
+      if (cancelled) return;
+      try {
+        // Wait until the historical series has loaded so we know where the
+        // forming bar sits and never write one older than the newest bar.
+        if (lastBarTimeRef.current > 0) {
+          const res = await apiClient.getMarketPrice(symbol);
+          const price = res.data?.price;
+          const s = candlestickSeriesRef.current;
+          if (!cancelled && s === series && typeof price === 'number' && isFinite(price) && price > 0) {
+            failStreak = 0;
+            const barTime = Math.floor(Math.floor(Date.now() / 1000) / tfSec) * tfSec;
+            if (barTime >= lastBarTimeRef.current) {
+              const prev = liveBarRef.current;
+              if (!prev || prev.time !== barTime) {
+                const seed = lastCloseRef.current > 0 ? lastCloseRef.current : price;
+                liveBarRef.current = { time: barTime, open: seed, high: Math.max(seed, price), low: Math.min(seed, price), close: price };
+              } else {
+                liveBarRef.current = { ...prev, high: Math.max(prev.high, price), low: Math.min(prev.low, price), close: price };
+              }
+              const b = liveBarRef.current;
+              try {
+                series.update({ time: b.time as any, open: b.open, high: b.high, low: b.low, close: b.close } as any);
+                lastBarTimeRef.current = b.time;
+                lastCloseRef.current = b.close;
+                setLastUpdate(new Date());
+              } catch { /* series replaced mid-write */ }
+            }
+          } else {
+            failStreak++;
+          }
+        }
+      } catch {
+        failStreak++;
+      }
+      // Back off hard after repeated failures so an unpriceable symbol does not
+      // hammer the endpoint; otherwise tick every ~3s for a smooth live feel.
+      if (!cancelled) timer = setTimeout(poll, failStreak >= 3 ? 30_000 : 3_000);
+    };
+    timer = setTimeout(poll, 2_000);
+
+    return () => { cancelled = true; clearTimeout(timer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [symbol, exchange, timeframe, chartInitCount]);
 
   // Push fresh zone data into the primitive; also re-run when the user
   // toggles visibility or new cycle boxes arrive so a re-attach picks up
@@ -392,6 +676,57 @@ export default function TradingViewChart({
     // The chart repaints primitives on view changes; nudge it after data swap.
     chartRef.current?.timeScale().applyOptions({});
   }, [zonesData, zonesVisible, cycleWindows]);
+
+  useEffect(() => {
+    const h = () => setDrawnVersion(v => v + 1);
+    window.addEventListener('oblivion-settings-changed', h as any);
+    return () => window.removeEventListener('oblivion-settings-changed', h as any);
+  }, []);
+
+  // OBLIVION: when asked to self-compute, POST the drawn candles so the read
+  // and every box / label / level are on exactly the bars on screen.
+  useEffect(() => {
+    // Clearing the read (not just the bundle) is what makes the dashboard and
+    // the trade plan blank out the moment the pair changes, instead of keeping
+    // the previous instrument's levels on screen until new bars arrive.
+    const clear = () => { setSelfBundle(null); onOblivion?.(null); };
+    if (!showOblivion) { clear(); return; }
+    // The bars are only usable if they are *this* instrument's bars. On a pair
+    // switch this effect re-runs before the new candles have loaded, and the ref
+    // still holds the old pair's — computing on those would produce a read (and
+    // a trade plan) for the old instrument labelled with the new symbol.
+    if (drawnKeyRef.current !== instrumentKey) { clear(); return; }
+    const bars = drawnBarsRef.current;
+    if (!bars || bars.length < 60) { clear(); return; }
+    let cancelled = false;
+    const _oblFetch = (apiClient as any)?.technical?.oblivionOverlayFromCandles
+      ? (apiClient as any).technical.oblivionOverlayFromCandles(symbol, timeframe ?? '1h', bars)
+      : (api as any).post('/market/oblivion-overlay', { symbol, timeframe: timeframe ?? '1h', candles: bars });
+    _oblFetch
+      .then((res: any) => {
+        // Also drop a response that landed after the user moved on.
+        if (cancelled || drawnKeyRef.current !== instrumentKey) return;
+        const payload = res?.data ?? {};
+        setSelfBundle(payload.overlay_bundle ?? null);
+        onOblivion?.(payload.oblivion ?? null);
+      })
+      .catch(() => { if (!cancelled) clear(); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showOblivion, instrumentKey, drawnVersion]);
+
+  useEffect(() => {
+    const prim = oblivionRef.current;
+    if (!prim) return;
+    const bundle = oblivionBundle ?? selfBundle ?? null;
+    const visible = oblivionVisibleOverride ?? oblivionVisible;
+    prim.setBundle(visible ? bundle : null);
+    chartRef.current?.timeScale().applyOptions({});
+  }, [oblivionBundle, selfBundle, oblivionVisible, oblivionVisibleOverride, chartInitCount]);
+
+  useEffect(() => {
+    try { window.localStorage.setItem(OBLIVION_VISIBLE_KEY, oblivionVisible ? '1' : '0'); } catch {}
+  }, [oblivionVisible]);
 
   // Draw indicator overlays on the chart.
   // Custom mode does not support true multi-pane rendering, so non-main panes
@@ -432,8 +767,15 @@ export default function TradingViewChart({
         }));
     };
 
+    // Configure separate price scale for Fisher to avoid squashing BTC price (70k vs 0-2)
+    const isFisherOverlay = (name: string) => name.toLowerCase().includes('fisher')
+    try { chart.priceScale('fisher').applyOptions({ borderColor: '#2a2e4a', scaleMargins: { top: 0.85, bottom: 0 } }) } catch {}
+    try { chart.priceScale('right').applyOptions({ scaleMargins: { top: 0.05, bottom: 0.15 } }) } catch {}
+
     overlays.forEach(overlay => {
       const overlayType = overlay.type === 'histogram' ? 'histogram' : 'line';
+      const isFisher = isFisherOverlay(overlay.name)
+      const priceScaleId = isFisher ? 'fisher' : (overlay.pane && overlay.pane !== 'main' ? overlay.pane : undefined)
 
       if (overlayType === 'histogram') {
         const histogramData = normalizeHistogramData(
@@ -447,6 +789,7 @@ export default function TradingViewChart({
             color: overlay.color,
             priceLineVisible: false,
             lastValueVisible: false,
+            priceScaleId: priceScaleId as any,
           });
           histogramSeries.setData(histogramData as any);
           overlaySeriesRef.current.push(histogramSeries);
@@ -461,6 +804,7 @@ export default function TradingViewChart({
             crosshairMarkerVisible: false,
             priceLineVisible: false,
             lastValueVisible: false,
+            priceScaleId: priceScaleId as any,
           });
           signalSeries.setData(signalLine as any);
           overlaySeriesRef.current.push(signalSeries);
@@ -479,6 +823,7 @@ export default function TradingViewChart({
         crosshairMarkerVisible: false,
         priceLineVisible: false,
         lastValueVisible: false,
+        priceScaleId: priceScaleId as any,
       });
       lineSeries.setData(lineData as any);
       overlaySeriesRef.current.push(lineSeries);
@@ -486,6 +831,8 @@ export default function TradingViewChart({
       (overlay.extra_lines || []).forEach(extra => {
         const extraData = normalizeLineData(extra.data);
         if (extraData.length === 0) return;
+        const extraIsFisher = isFisherOverlay(extra.name)
+        const extraScaleId = extraIsFisher ? 'fisher' : undefined
         const extraSeries = chart.addLineSeries({
           color: extra.color,
           lineWidth: 1,
@@ -493,15 +840,20 @@ export default function TradingViewChart({
           crosshairMarkerVisible: false,
           priceLineVisible: false,
           lastValueVisible: false,
+          priceScaleId: extraScaleId as any,
         });
         extraSeries.setData(extraData as any);
         overlaySeriesRef.current.push(extraSeries);
       });
     });
 
-    // Set markers on candlestick series
+    // Set markers on candlestick series — normalize ms→sec if needed (backend sends ms)
     if (markers.length > 0) {
-      const sortedMarkers = [...markers].sort((a, b) => a.time - b.time);
+      const normMarkers = markers.map(m => ({
+        ...m,
+        time: (m.time as unknown as number) > 1e11 ? Math.floor(Number(m.time) / 1000) as Time : m.time as Time,
+      }))
+      const sortedMarkers = [...normMarkers].sort((a, b) => (a.time as number) - (b.time as number));
       const chartMarkers: SeriesMarker<Time>[] = sortedMarkers.map(m => ({
         time: m.time as Time,
         position: m.position,
@@ -514,6 +866,53 @@ export default function TradingViewChart({
       series.setMarkers([]);
     }
   }, [overlays, markers, chartInitCount]);
+
+  // Fit mode: genesis shows all candles from day 1, recent shows last 2 cycles (~2858d).
+  // For intraday (H1/H4) recent mode the page passes only 2000/1000 actual bars, so
+  // we show a tight viewport of 200 bars so the current/live bar is immediately visible.
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart || !initialCandles || initialCandles.length === 0) return;
+    const id = setTimeout(() => {
+      try {
+        if (fitMode === 'genesis') {
+          chart.timeScale().fitContent();
+        } else if (fitMode === 'forecast') {
+          // Zoom tight on the current bar. Use a logical range so the right edge
+          // extends past the last candle into whitespace — that reserved space
+          // is where the Kronos forecast projection is drawn.
+          const endIdx = initialCandles.length - 1;
+          chart.timeScale().setVisibleLogicalRange({
+            from: Math.max(0, endIdx - 150),
+            to: endIdx + 40,
+          });
+        } else {
+          const tfUpper = (timeframe || 'D1').toUpperCase();
+          const endIdx = initialCandles.length - 1;
+          if (tfUpper === 'H1' || tfUpper === 'H4') {
+            // Show last 200 H1/H4 bars in the viewport so the live bar is front and centre.
+            // The caller already limited the dataset to ~2000 real bars for recent mode so
+            // older data is still reachable via scroll.
+            const startIdx = Math.max(0, endIdx - 200);
+            const startTime = initialCandles[startIdx]?.time as Time;
+            const endTime = initialCandles[endIdx]?.time as Time;
+            if (startTime && endTime) chart.timeScale().setVisibleRange({ from: startTime, to: endTime });
+            else chart.timeScale().fitContent();
+          } else {
+            // D1/W1/MN1: show the last 2-cycle window (time-based to handle varying dataset sizes)
+            const recentMap: Record<string, number> = { MN1: 100, W1: 420, D1: 2858 };
+            const want = recentMap[tfUpper] ?? 800;
+            const startIdx = Math.max(0, endIdx - want + 1);
+            const startTime = initialCandles[startIdx]?.time as Time;
+            const endTime = initialCandles[endIdx]?.time as Time;
+            if (startTime && endTime) chart.timeScale().setVisibleRange({ from: startTime, to: endTime });
+            else chart.timeScale().fitContent();
+          }
+        }
+      } catch {}
+    }, 80);
+    return () => clearTimeout(id);
+  }, [fitMode, initialCandles, timeframe]);
 
   // Draw SL/TP/Entry price lines for positions matching this symbol
   // SL/TP lines are click-to-drag editable when onSlTpChange is provided
@@ -770,6 +1169,20 @@ export default function TradingViewChart({
               Zones
             </button>
           )}
+          {(showOblivion || oblivionBundle) && !hideOblivionToggle && (
+            <button
+              type="button"
+              onClick={() => setOblivionVisible((v) => !v)}
+              className={`text-xs px-2 py-1 rounded border transition-colors ${
+                oblivionVisible
+                  ? 'border-lime-500/60 bg-lime-500/10 text-lime-300'
+                  : 'border-gray-600 text-gray-400 hover:text-gray-200'
+              }`}
+              title="Toggle the OBLIVION AI engine overlay (FVG/OB, structure, sweeps, fib, entry/SL/TP, sessions, dashboard)"
+            >
+              Oblivion
+            </button>
+          )}
           {strategyScore !== undefined && (
             <div className="flex items-center gap-2">
               <span className={`text-sm font-bold px-2 py-0.5 rounded ${
@@ -818,7 +1231,30 @@ export default function TradingViewChart({
           )}
         </div>
       </div>
-      <div ref={chartContainerRef} className="rounded-lg overflow-hidden border border-gray-700" />
+      <div
+        ref={chartWrapRef}
+        className={`relative ${isFullscreen ? 'bg-[#0a0e27] w-screen h-screen flex flex-col' : ''}`}
+      >
+        {enableDrawings && (
+          <ChartDrawingLayer
+            chartApiRef={chartRef}
+            seriesApiRef={candlestickSeriesRef}
+            containerRef={chartContainerRef}
+            chartInitCount={chartInitCount}
+            exchange={drawingsExchange ?? exchange}
+            symbol={drawingsSymbol ?? symbol}
+            timeframe={drawingsTimeframe ?? toApiTimeframe(timeframe)}
+            onToggleFullscreen={toggleFullscreen}
+            isFullscreen={isFullscreen}
+          />
+        )}
+        <div
+          ref={chartContainerRef}
+          className={`relative overflow-hidden border border-gray-700 ${
+            isFullscreen ? 'flex-1 min-h-0 w-full rounded-none' : 'rounded-lg'
+          }`}
+        />
+      </div>
 
       {/* SL/TP Edit Bar — shows when actively editing */}
       {onSlTpChange && (editingSl !== null || editingTp !== null) && editingPosition && (

@@ -22,11 +22,12 @@ import { attachZonesOverlay, type CycleWindowBox, type ZonesData, type ZonesOver
 import { useZonesData } from '@/hooks/useZonesData'
 import { useBtcCycleWindows } from '@/hooks/useBtcCycle'
 import { toCycleBoxes } from '@/utils/cycleOverlay'
-import { apiClient } from '@/services/api'
+import { api, apiClient } from '@/services/api'
 import {
   Search, RefreshCw, ChevronDown, TrendingUp, CandlestickChart, LineChart,
-  Maximize2, Minimize2, Ruler, Eraser, Activity, GitBranch,
+  Maximize2, Minimize2, Ruler, Eraser, Activity, GitBranch, Sparkles,
 } from 'lucide-react'
+import { OblivionPrimitive, type OblivionOverlayBundle } from '@/components/OblivionPrimitive'
 import { formatTimeZA } from '@/utils/datetime'
 import { pollMultiplier } from '@/utils/devicePerformance'
 
@@ -310,6 +311,14 @@ export default function MT5AdvancedChart({
   const [showEMA, setShowEMA] = useState(true)
   const [showLevels, setShowLevels] = useState(true)
   const [showFib, setShowFib] = useState(false)
+  // OBLIVION engine overlay — on by default, remembered per browser.
+  const [showOblivion, setShowOblivion] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return true
+    try { return window.localStorage.getItem('mt5adv_oblivion') !== '0' } catch { return true }
+  })
+  const oblivionPrim = useRef<OblivionPrimitive | null>(null)
+  const [oblivionBundle, setOblivionBundle] = useState<OblivionOverlayBundle | null>(null)
+  const [oblivionRead, setOblivionRead] = useState<any | null>(null)
   const [showVolume, setShowVolume] = useState(true)
   const [showRSI, setShowRSI] = useState(true)
   const [drawMode, setDrawMode] = useState(false)
@@ -404,6 +413,10 @@ export default function MT5AdvancedChart({
     priceChart.current = pc
     studyChart.current = sc
     candleSeries.current = cs
+    // OBLIVION engine overlay on the price pane.
+    const op = new OblivionPrimitive()
+    cs.attachPrimitive(op)
+    oblivionPrim.current = op
     lineSeries.current = ls
     volSeries.current = vol
     ema9Series.current = e9
@@ -446,8 +459,41 @@ export default function MT5AdvancedChart({
       priceChart.current = null
       studyChart.current = null
       zonesOverlay.current = null
+      oblivionPrim.current = null
     }
   }, [])
+
+  // ── OBLIVION engine overlay (computed on the candles this chart draws) ──────
+  useEffect(() => {
+    try { window.localStorage.setItem('mt5adv_oblivion', showOblivion ? '1' : '0') } catch {}
+  }, [showOblivion])
+
+  useEffect(() => {
+    if (!showOblivion || candles.length < 60) { setOblivionBundle(null); setOblivionRead(null); return }
+    let cancelled = false
+    const tf = MT5_TF_TO_EXCHANGE[timeframe] ?? timeframe
+    const _oblFetch2 = (apiClient as any)?.technical?.oblivionOverlayFromCandles
+      ? (apiClient as any).technical.oblivionOverlayFromCandles(symbol, tf, candles.map(c => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume ?? 0 })))
+      : (api as any).post('/market/oblivion-overlay', { symbol, timeframe: tf, candles: candles.map(c => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume ?? 0 })) })
+    _oblFetch2
+      .then((res: any) => {
+        if (cancelled) return
+        setOblivionBundle(res.data?.overlay_bundle ?? null)
+        setOblivionRead(res.data?.oblivion ?? null)
+      })
+      .catch(() => { if (!cancelled) { setOblivionBundle(null); setOblivionRead(null) } })
+    return () => { cancelled = true }
+  }, [showOblivion, candles, symbol, timeframe])
+
+  useEffect(() => {
+    const prim = oblivionPrim.current
+    if (!prim) return
+    try {
+      prim.setBars(candles.map(c => ({ time: Number(c.time), high: c.high, low: c.low })))
+      prim.setBundle(showOblivion ? oblivionBundle : null)
+      priceChart.current?.timeScale().applyOptions({})
+    } catch {}
+  }, [oblivionBundle, showOblivion, candles])
 
   // Toggle study pane visibility by resizing — handled in render via height.
 
@@ -903,6 +949,7 @@ export default function MT5AdvancedChart({
           <IconToggle active={showEMA} onClick={() => setShowEMA(v => !v)} title="EMA 9/21/50"><TrendingUp className="w-3.5 h-3.5" /></IconToggle>
           <IconToggle active={showLevels} onClick={() => setShowLevels(v => !v)} title="S/R levels"><Activity className="w-3.5 h-3.5" /></IconToggle>
           <IconToggle active={showFib} onClick={() => setShowFib(v => !v)} title="Auto fib retracement"><GitBranch className="w-3.5 h-3.5" /></IconToggle>
+          <IconToggle active={showOblivion} onClick={() => setShowOblivion(v => !v)} title={oblivionRead?.summary ?? 'OBLIVION AI engine overlay'}><Sparkles className="w-3.5 h-3.5" /></IconToggle>
           <IconToggle active={drawMode} onClick={() => setDrawMode(v => !v)} title="Draw level (click chart)"><Ruler className="w-3.5 h-3.5" /></IconToggle>
           <IconToggle active={false} onClick={clearManualLevels} title="Clear drawn levels"><Eraser className="w-3.5 h-3.5" /></IconToggle>
         </div>

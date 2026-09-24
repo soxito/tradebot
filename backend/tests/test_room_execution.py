@@ -24,6 +24,25 @@ def quiet_bus(monkeypatch):
     return published
 
 
+@pytest.fixture(autouse=True)
+def oblivion_agrees(monkeypatch):
+    """These tests are about the gates after OBLIVION; the engine agrees here.
+
+    The OBLIVION gate itself is covered in test_oblivion_gate.py.
+    """
+    async def _agree(s, *, symbol, action, timeframe=None, session_id=None):
+        return {"verdict": {"tradeable": True, "action": action}, "read_id": None,
+                "timeframe": timeframe or "1h", "price": None}
+
+    monkeypatch.setattr(execution, "oblivion_recheck", _agree)
+
+    async def _open(db, symbol, timeframe):
+        return None
+
+    # Pair approval / news / weekly-minimum gates are covered in their own tests.
+    monkeypatch.setattr(execution, "_room_entry_gates", _open)
+
+
 def _result(**over):
     base = {
         "symbol": "XAUUSD",
@@ -426,10 +445,10 @@ def _policy(**over):
     return s
 
 
-def test_a_crypto_pair_goes_to_the_exchange_not_the_broker():
-    """The old if/elif gave MT5 every trade and left the exchange idle."""
+def test_a_crypto_pair_goes_to_the_exchange_and_also_mt5_when_both_enabled():
+    """Exness (and similar) list crypto CFDs — both venues execute concurrently."""
     venues = execution.venues_for("BTCUSDT", _policy())
-    assert "crypto" in venues and "mt5" not in venues
+    assert "crypto" in venues and "mt5" in venues
 
 
 def test_gold_and_the_crosses_go_to_the_broker():

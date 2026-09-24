@@ -36,7 +36,28 @@ export function useZonesData(
           params: { timeframe },
           timeout: 15000,
         });
-        if (!cancelled && res?.data) setData(res.data as ZonesData);
+        if (!cancelled && res?.data) {
+          const raw: any = res.data;
+          // Normalise chart_patterns: API returns {patterns:[...]} object, overlay expects array
+          const cp = raw.chart_patterns;
+          const chartPatternsArray: any[] = Array.isArray(cp)
+            ? cp
+            : Array.isArray(cp?.patterns)
+              ? cp.patterns
+              : [];
+          // Normalise channels shape from API ([{kind,...}] vs {channels:[...]})
+          const channelsArr = Array.isArray(raw.channels) ? raw.channels : (raw.channels?.channels ?? []);
+          const norm: ZonesData = {
+            supply_zones: raw.supply_zones ?? [],
+            demand_zones: raw.demand_zones ?? [],
+            channels: channelsArr,
+            s_r_levels: raw.s_r_levels ?? [],
+            fib: raw.fib ?? null,
+            chart_patterns: chartPatternsArray.slice(0, 5),
+            cycle_windows: raw.cycle_windows ?? [],
+          } as any;
+          setData(norm);
+        }
       } catch {
         // A missing/failed zone read is silence on the chart, not an error banner.
         if (!cancelled) setData(null);

@@ -63,6 +63,10 @@ class KronosEngine:
         self._active_model: Optional[str] = None
         self._active_tokenizer: Optional[str] = None
         self._active_max_context: Optional[int] = None
+        # Set when the loaded model is a user fine-tuned checkpoint (not a
+        # published HF variant). Lets the UI show it as a first-class model.
+        self._active_finetuned_job_id: Optional[int] = None
+        self._active_finetuned_display_name: Optional[str] = None
 
     @classmethod
     def instance(cls) -> "KronosEngine":
@@ -97,13 +101,30 @@ class KronosEngine:
 
     @staticmethod
     def _read_selected() -> Optional[dict]:
-        """Return the persisted model selection ({model, tokenizer, max_context})
-        if it is valid and still in the published catalogue, else None."""
+        """Return the persisted model selection if valid, else None.
+
+        A finetuned selection (``model == "__finetuned__"``) carries local
+        checkpoint dirs and survives restarts even though it is not in the
+        published catalogue; a standard selection must still be a published id.
+        """
         try:
             if not _STATE_FILE.exists():
                 return None
             data = json.loads(_STATE_FILE.read_text())
             model_id = data.get("model")
+            if model_id == "__finetuned__":
+                pred = data.get("finetuned_pred_dir")
+                tok = data.get("finetuned_tok_dir")
+                if not pred or not tok or not Path(pred).exists() or not Path(tok).exists():
+                    return None
+                return {
+                    "model": "__finetuned__",
+                    "tokenizer": tok,
+                    "pred_dir": pred,
+                    "max_context": int(data.get("max_context") or kronos_config.max_context),
+                    "finetuned_job_id": data.get("finetuned_job_id"),
+                    "finetuned_display_name": data.get("finetuned_display_name"),
+                }
             if not model_id or not any(m["id"] == model_id for m in KRONOS_MODELS):
                 return None
             return {
@@ -115,13 +136,27 @@ class KronosEngine:
             return None
 
     @staticmethod
-    def _write_selected(model_name: str, tokenizer_name: str, max_context: int) -> None:
+    def _write_selected(
+        model_name: str,
+        tokenizer_name: str,
+        max_context: int,
+        *,
+        finetuned_job_id: Optional[int] = None,
+        finetuned_pred_dir: Optional[str] = None,
+        finetuned_display_name: Optional[str] = None,
+    ) -> None:
         try:
-            _STATE_FILE.write_text(json.dumps({
+            payload = {
                 "model": model_name,
                 "tokenizer": tokenizer_name,
                 "max_context": max_context,
-            }))
+            }
+            if finetuned_job_id is not None:
+                payload["finetuned_job_id"] = finetuned_job_id
+                payload["finetuned_tok_dir"] = tokenizer_name
+                payload["finetuned_pred_dir"] = finetuned_pred_dir
+                payload["finetuned_display_name"] = finetuned_display_name
+            _STATE_FILE.write_text(json.dumps(payload))
         except Exception as exc:
             logger.debug(f"[Kronos] could not persist model selection: {exc}")
 
@@ -151,7 +186,9 @@ class KronosEngine:
                 return
 
             sel = self._read_selected()
-            model_name = sel["model"] if sel else kronos_config.model_name
+            is_finetuned = bool(sel and sel.get("model") == "__finetuned__")
+            # For a finetuned selection the load paths are local checkpoint dirs.
+            model_name = (sel.get("pred_dir") if is_finetuned else sel["model"]) if sel else kronos_config.model_name
             tokenizer_name = sel["tokenizer"] if sel else kronos_config.tokenizer_name
             max_context = sel["max_context"] if sel else kronos_config.max_context
 
@@ -162,7 +199,7 @@ class KronosEngine:
                 logger.info(
                     f"[Kronos] Loading {model_name} "
                     f"(tokenizer={tokenizer_name}) on {kronos_config.device}"
-                    + (" [restored selection]" if sel else "")
+                    + (" [restored finetuned]" if is_finetuned else " [restored selection]" if sel else "")
                 )
                 tokenizer = KronosTokenizer.from_pretrained(tokenizer_name)
                 model = Kronos.from_pretrained(model_name)
@@ -174,6 +211,9 @@ class KronosEngine:
                 self._active_model = model_name
                 self._active_tokenizer = tokenizer_name
                 self._active_max_context = max_context
+                if is_finetuned:
+                    self._active_finetuned_job_id = sel.get("finetuned_job_id")
+                    self._active_finetuned_display_name = sel.get("finetuned_display_name")
                 logger.success(f"[Kronos] Model loaded and ready ({model_name})")
             except Exception as exc:  # torch missing, weights download failed, etc.
                 self._load_error = f"{type(exc).__name__}: {exc}"
@@ -208,6 +248,15 @@ class KronosEngine:
     @property
     def active_max_context(self) -> Optional[int]:
         return self._active_max_context
+
+    @property
+    def active_finetuned_job_id(self) -> Optional[int]:
+        """The finetune job id whose checkpoints are loaded, else None."""
+        return self._active_finetuned_job_id
+
+    @property
+    def active_finetuned_display_name(self) -> Optional[str]:
+        return self._active_finetuned_display_name
 
     # ── local install management ────────────────────────────────
 
@@ -273,6 +322,9 @@ class KronosEngine:
                 self._active_model = model_name
                 self._active_tokenizer = tokenizer_name
                 self._active_max_context = max_context
+                # A standard variant switch clears any finetuned selection.
+                self._active_finetuned_job_id = None
+                self._active_finetuned_display_name = None
                 self._load_error = None
                 self._write_selected(model_name, tokenizer_name, max_context)
                 logger.success(f"[Kronos] Switched to {model_name}")

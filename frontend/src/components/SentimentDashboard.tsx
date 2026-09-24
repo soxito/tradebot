@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { apiClient } from '@/services/api';
+import { useSmartPoll } from '@/hooks/useSmartPoll';
 
 interface Sentiment {
   symbol: string;
@@ -13,13 +14,7 @@ export default function SentimentDashboard() {
   const [sentiments, setSentiments] = useState<Sentiment[]>([]);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    fetchSentiments();
-    const interval = setInterval(fetchSentiments, 30000); // Refresh every 30s
-    return () => clearInterval(interval);
-  }, []);
-
-  const fetchSentiments = async () => {
+  const fetchSentiments = useCallback(async () => {
     try {
       const response = await apiClient.getSentiments();
       setSentiments(response.data.sentiments || []);
@@ -28,7 +23,13 @@ export default function SentimentDashboard() {
       console.error('Failed to fetch sentiments:', error);
       setLoading(false);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    fetchSentiments();
+  }, [fetchSentiments]);
+
+  useSmartPoll(fetchSentiments, { intervalMs: 30000 });
 
   const getSentimentLabel = (score: number) => {
     if (score > 0.05) return 'Bullish';

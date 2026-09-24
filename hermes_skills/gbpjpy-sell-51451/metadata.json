@@ -1,0 +1,7 @@
+{
+  "symbol": "GBPJPY",
+  "action": "sell",
+  "agreement": 0.8,
+  "created_at": 1790251451.885942,
+  "source": "hermes_bridge"
+}

@@ -95,10 +95,18 @@ async def plan_mt5(
         "account_id": account.id,
     }
 
+    # The OBLIVION engine read rides on the analysis; Paul quotes it so the
+    # plan and the sniper chart describe the same score / bias / news state.
+    obl = analysis.get("oblivion") or {}
+    obl_note = f" | {obl['summary']}" if obl.get("summary") else ""
+
     if analysis.get("error") or not signals:
+        rejected = analysis.get("rejected_signals") or []
+        news = any(r.get("gate") == "news_window" for r in rejected)
         base["reasoning"] = (
-            f"SMC ({data_source}): {analysis.get('error') or 'no high-probability sniper setup'} "
-            f"(bias {analysis.get('bias')}, RSI {analysis.get('rsi')})."
+            f"SMC ({data_source}): "
+            f"{analysis.get('error') or ('news window — no new entries' if news else 'no high-probability sniper setup')} "
+            f"(bias {analysis.get('bias')}, RSI {analysis.get('rsi')}).{obl_note}"
         )
         return base
 
@@ -109,7 +117,7 @@ async def plan_mt5(
         return base
 
     reasoning = best.get("reason") or "SMC sniper setup."
-    reasoning = f"{reasoning} [data: {data_source}]"
+    reasoning = f"{reasoning} [data: {data_source}]{obl_note}"
     provenance = PaulProvenance.HEURISTIC
 
     # Optional AI review — enriches reasoning / confidence using the same router

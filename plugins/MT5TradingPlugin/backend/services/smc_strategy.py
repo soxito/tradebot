@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from plugins.MT5TradingPlugin.backend.services import smc_scoring
 
@@ -679,6 +679,35 @@ def pip_size_for_symbol(symbol: str) -> float:
     return point_size_for_symbol(symbol) * 10.0
 
 
+def _infer_timeframe(candles: Sequence[Candle]) -> str:
+    """MT5-style timeframe label from the median bar spacing (seconds)."""
+    try:
+        gaps = sorted(
+            int(b.time - a.time) for a, b in zip(candles[-40:-1], candles[-39:]) if b.time > a.time
+        )
+        sec = gaps[len(gaps) // 2] if gaps else 3600
+    except Exception:  # noqa: BLE001
+        sec = 3600
+    table = [(60, "M1"), (300, "M5"), (900, "M15"), (1800, "M30"), (3600, "H1"),
+             (14400, "H4"), (86400, "D1"), (604800, "W1")]
+    return min(table, key=lambda t: abs(t[0] - sec))[1]
+
+
+def _oblivion_payload(res: Optional[Dict[str, Any]], candles: Sequence[Candle]) -> Optional[Dict[str, Any]]:
+    """Engine read + overlay bundle for the sniper chart, or None."""
+    if not res:
+        return None
+    try:
+        from app.signals.oblivion import compact_for_prompt, oblivion_to_overlays
+
+        out = compact_for_prompt(res)
+        out["overlay_bundle"] = oblivion_to_overlays(res, res.get("timeframe"))
+        out["signals_history"] = res.get("signals_history") or []
+        return out
+    except Exception:  # noqa: BLE001
+        return None
+
+
 class SMCStrategyEngine:
     """Smart Money Concepts sniper engine. Stateless — pass candles per call."""
 
@@ -1123,6 +1152,7 @@ class SMCStrategyEngine:
         # / risk factors, each with a numeric raw value and contribution. See
         # services/smc_scoring.py for the factor definitions and weights.
         breakdown = smc_scoring.score_signal(
+            oblivion=prim.get("oblivion"),
             side=side,
             zone_index=zone.index,
             zone_kind=zone.kind,
@@ -1324,6 +1354,27 @@ class SMCStrategyEngine:
             fib_zone=fib_zone_hit,
         )
 
+    # -- OBLIVION engine -----------------------------------------------------------
+
+    @staticmethod
+    def _oblivion_read(candles: List[Candle]) -> Optional[Dict[str, Any]]:
+        """Run the shared OBLIVION engine on these bars; None when unavailable.
+
+        The timeframe is inferred from bar spacing because the engine only
+        receives candles. Guarded: a standalone plugin deployment without the
+        core package must keep working.
+        """
+        try:
+            from app.signals.oblivion import analyze_oblivion, candles_to_rows
+
+            if len(candles) < 60:
+                return None
+            tf = _infer_timeframe(candles)
+            res = analyze_oblivion(candles_to_rows(candles), tf)
+            return None if res.get("error") else res
+        except Exception:  # noqa: BLE001 — enrichment only
+            return None
+
     # -- higher-timeframe bias --------------------------------------------------
 
     def _htf_bias(self, htf_candles: Optional[List[Candle]]) -> Optional[str]:
@@ -1368,6 +1419,10 @@ class SMCStrategyEngine:
         prim = self._primitives(candles)
         prim["htf_bias"] = self._htf_bias(htf_candles)
         prim["macro"] = macro
+        # OBLIVION AI engine v4.0 on the same bars — once per analysis, not per
+        # candidate. Feeds one scoring factor, the news-window gate below, and
+        # the chart (``analysis["oblivion"]`` + its overlay bundle).
+        prim["oblivion"] = self._oblivion_read(candles)
         atr = prim["atr"]
         last_price = candles[-1].close
         bias = prim["bias"]
@@ -1517,11 +1572,21 @@ class SMCStrategyEngine:
 
         signals = _generate(zones)
 
+        # ── OBLIVION news window: no new entries ─────────────────────────────
+        # Candidates are kept as rejections so the panel says *why* the chart
+        # has setups but no signals, instead of showing an empty list.
+        _obl_news = bool(((prim.get("oblivion") or {}).get("news") or {}).get("blocked"))
+        if _obl_news and signals:
+            for _s in signals:
+                self._reject(_s.side, _s.entry, _s.rr, _s.confidence, "news_window",
+                             "Oblivion news filter: inside the news window, entries blocked")
+            signals = []
+
         # ── US-session fallback ───────────────────────────────────────────────
         # When US-session anchoring is on but the session-filtered zones yield no
         # setups, retry against the full zone set so the user always sees signals
         # (the US-session reference levels are still returned for context).
-        if not signals and self.us_session_only and all_zones is not zones:
+        if not signals and not _obl_news and self.us_session_only and all_zones is not zones:
             signals = _generate(all_zones)
 
         signals.sort(key=lambda s: s.confidence, reverse=True)
@@ -1577,6 +1642,8 @@ class SMCStrategyEngine:
             },
             # ── Macro context, reported whether or not it applied ─────────────
             "macro": _macro_payload(macro),
+            # ── OBLIVION AI engine v4.0 — full read + chart overlay bundle ────
+            "oblivion": _oblivion_payload(prim.get("oblivion"), candles),
         }
 
         # ── Supply/demand + channel context from the shared core module ────

@@ -271,6 +271,29 @@ def technical_context(candles: list[list]) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         logger.debug("[Room] ATR skipped: {}", exc)
 
+    try:
+        from app.signals.chart_patterns import analyze_chart_patterns
+        from app.signals.candle_patterns import detect_patterns
+        # chart patterns (flags, triangles, H&S, island, etc.)
+        cp = analyze_chart_patterns(df)
+        if cp.get("patterns"):
+            out["chart_patterns"] = cp["patterns"][:3]
+            out["chart_pattern_best"] = cp.get("best")
+            out["chart_pattern_score"] = cp.get("score")
+        # candle patterns last 20 bars summary for the chart subtitle
+        rows = [[int(ts.timestamp()*1000) if hasattr(ts, 'timestamp') else int(ts), float(o), float(h), float(l), float(c), float(v)]
+                for ts, o, h, l, c, v in zip(df["timestamp"], df["open"], df["high"], df["low"], df["close"], df["volume"])]
+        evts = detect_patterns(rows)
+        recent = [e for e in evts if e.get("index", 0) >= len(rows) - 20]
+        if recent:
+            counts: dict[str, int] = {}
+            for e in recent:
+                counts[e["name"]] = counts.get(e["name"], 0) + 1
+            out["candle_patterns"] = recent[-5:]
+            out["candle_summary"] = ", ".join(f"{k} x{v}" if v>1 else k for k, v in counts.items())
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[Room] chart/candle patterns skipped: {}", exc)
+
     return out
 
 
@@ -420,6 +443,80 @@ def overlay_from_result(
         final = targets[-1]
         projection = [entry + (final - entry) * f for f in (0.3, 0.62, 0.85, 1.0)]
 
+    # ── Cheat-sheet pattern overlay: candle + chart ────────────────────────
+    candle_pats = []
+    chart_pats = []
+    pattern_note = None
+    pattern_reasons: list[str] = []
+    try:
+        # candle patterns from technical_context (last 20 bars, up to 5)
+        for cp in (context.get("candle_patterns") or [])[:5]:
+            idx = None
+            # context may store original index vs trimmed rows; keep as is
+            try:
+                idx = int(cp.get("index", cp.get("idx", 0)))
+            except Exception:
+                idx = 0
+            candle_pats.append({"index": idx, "name": cp.get("name", "pattern"), "direction": cp.get("direction", "")})
+        # chart patterns (top 3)
+        for pat in (context.get("chart_patterns") or [])[:3]:
+            chart_pats.append(dict(pat))
+        # build human note naming the cheat sheets
+        names = []
+        for cp in candle_pats[:2]:
+            names.append(cp.get("name", ""))
+        for pat in chart_pats[:2]:
+            kind = str(pat.get("kind", "")).replace("_", " ")
+            brk = " breakout" if pat.get("broken") else " pending"
+            names.append(f"{kind}{brk}")
+        if names:
+            pattern_note = " + ".join(n for n in names if n)[:140]
+        # build why explanations (volume-aware)
+        for cp in candle_pats[:2]:
+            direction = cp.get("direction", "")
+            n = cp.get("name", "pattern")
+            # generic why per pattern family
+            why = ""
+            low = n.lower()
+            if "hammer" in low:
+                why = f"{n}: long lower wick ≥2×body at reaction level, rejection of lower prices"
+            elif "engulfing" in low:
+                why = f"{n}: body engulfs prior body, momentum flip with volume confirmation"
+            elif "morning" in low or "evening" in low:
+                why = f"{n}: 3-bar reversal, star gaps and closes beyond midpoint, volume confirms"
+            elif "doji" in low:
+                why = f"{n}: indecision at key level, buyers/sellers balanced"
+            elif "harami" in low:
+                why = f"{n}: small body inside prior large body, momentum stall"
+            elif "pin" in low:
+                why = f"{n}: pin rejection wick, price snapped back"
+            else:
+                why = f"{n}: {direction} reversal signal at structure"
+            # volume check
+            try:
+                from app.signals.technical import atr as _atr
+                # placeholder volume note — context doesn't carry vol ratio per pattern, add generic
+                why += " — confirm with volume & price action (cheat-sheet rule)"
+            except Exception:
+                pass
+            pattern_reasons.append(why)
+        for pat in chart_pats[:2]:
+            kind = str(pat.get("kind", "pattern")).replace("_", " ")
+            sig = pat.get("signal", "")
+            conf = pat.get("confidence")
+            broken = pat.get("broken")
+            neck = pat.get("neckline")
+            tgt = pat.get("target")
+            conf_s = f" (conf {float(conf):.0%})" if isinstance(conf, (int, float)) else ""
+            extra = f" neckline {_fmt_level(float(neck))}" if isinstance(neck, (int, float)) else ""
+            if pat.get("top") and pat.get("bottom"):
+                if isinstance(pat['top'], (int,float)) and isinstance(pat['bottom'], (int,float)):
+                    extra = f" range {_fmt_level(float(pat['bottom']))}-{_fmt_level(float(pat['top']))}"
+            tgt_s = f" → target {_fmt_level(float(tgt))}" if isinstance(tgt, (int,float)) else ""
+            pattern_reasons.append(f"{kind} {sig} {'broken' if broken else 'pending'}{conf_s}{extra}{tgt_s} — cheat-sheet breakout level")
+    except Exception as exc:
+        logger.debug(f"[Room] pattern overlay build skipped: {exc}")
+
     return PlanOverlay(
         direction="long" if is_long else "short" if action == "sell" else None,
         entry=entry, stop_loss=stop, take_profits=targets,
@@ -429,6 +526,10 @@ def overlay_from_result(
         fib_golden_zone=context.get("fib_golden_zone"),
         support_zones=context.get("support_zones") or [],
         resistance_zones=context.get("resistance_zones") or [],
+        candle_patterns=candle_pats,
+        chart_patterns=chart_pats,
+        pattern_note=pattern_note,
+        pattern_reasons=pattern_reasons,
     )
 
 
@@ -810,6 +911,11 @@ def plan_levels_text(overlay: PlanOverlay | None) -> str:
     if overlay.resistance_zones:
         r = overlay.resistance_zones[0]
         out += f"\nNearest resistance {r['low']:.6g} – {r['high']:.6g}"
+    if getattr(overlay, 'pattern_note', None):
+        out += f"\n📚 <b>Cheat-sheet:</b> {html.escape(overlay.pattern_note)}"
+    if getattr(overlay, 'pattern_reasons', None):
+        for reason in (overlay.pattern_reasons or [])[:2]:
+            out += f"\n• {html.escape(reason)}"
     return out
 
 
@@ -969,6 +1075,405 @@ async def build_room_chart(
     return chart
 
 
+def _align_series_to_candles(
+    series: list[Any], candles: list[list]
+) -> list[float | None]:
+    """Map a Kronos OverlaySeries (time/value points, unix seconds) onto the
+    candle list so it can be drawn as a per-candle ``custom_lines`` entry."""
+    by_ts: dict[int, float] = {}
+    for pt in series or []:
+        t = getattr(pt, "time", None)
+        v = getattr(pt, "value", None)
+        if t is not None and v is not None:
+            by_ts[int(t)] = float(v)
+    out: list[float | None] = []
+    for c in candles:
+        ts = int(c[0]) // 1000
+        out.append(by_ts.get(ts))
+    return out
+
+
+def forecast_overlay_from_kronos(
+    resp: Any, candles: list[list], symbol: str = ""
+) -> PlanOverlay:
+    """Build a chart overlay from a Kronos ``ForecastResponse``.
+
+    Entry/SL/TP come from the first market sniper entry when one exists (so the
+    picture matches the plan the card describes); otherwise they are synthesised
+    from the forecast bands. The HLC3/Kaufman bfma & bsma lines are drawn as
+    custom lines, and the S&R nearest levels become support/resistance zones.
+    """
+    from plugins.KronosForecastPlugin.backend.services.forecast_service import (
+        build_sniper_signals,
+    )
+
+    sig = getattr(resp, "signal", None)
+    direction = None
+    if sig is not None:
+        if sig.direction == "up":
+            direction = "long"
+        elif sig.direction == "down":
+            direction = "short"
+
+    entry = stop = None
+    targets: list[float] = []
+    try:
+        snipers = build_sniper_signals(resp)
+        market = next((s for s in snipers if s.order_kind == "market"), None)
+        if market:
+            entry = market.entry
+            stop = market.stop_loss
+            targets = [t for t in (market.take_profit_1, market.take_profit_2) if t]
+            direction = "long" if market.side == "long" else "short"
+    except Exception as exc:  # noqa: BLE001 — chart must not fail on sniper build
+        logger.debug("[Forecast] sniper levels unavailable for the chart: {}", exc)
+
+    anchor = float(getattr(resp, "anchor_price", 0) or (candles[-1][4] if candles else 0))
+    if entry is None:
+        entry = anchor or None
+    if stop is None and resp.lower_band and resp.upper_band:
+        lows = [b.value for b in resp.lower_band]
+        highs = [b.value for b in resp.upper_band]
+        if direction == "long" and lows:
+            stop = min(lows) * 0.997
+            targets = targets or [max(highs)] if highs else []
+        elif direction == "short" and highs:
+            stop = max(highs) * 1.003
+            targets = targets or [min(lows)] if lows else []
+
+    # Forecast path as the projection (mean predicted closes).
+    projection = [float(c.close) for c in (resp.forecast[:6] if resp.forecast else [])]
+
+    # HLC3/Kaufman lines + S&R level lines from the response overlays. The two
+    # HLC3 series vary per candle (aligned by timestamp); the Support/Resistance
+    # series are flat 2-point levels drawn as full horizontal dashed lines.
+    custom_lines: list[dict[str, Any]] = []
+
+    def _flat_level(series: list[Any]) -> list[float | None]:
+        level = next(
+            (float(getattr(p, "value")) for p in (series or [])
+             if getattr(p, "value", None) is not None),
+            None,
+        )
+        return [level] * len(candles) if level is not None else []
+
+    for ov in getattr(resp, "overlays", []) or []:
+        name = getattr(ov, "name", "")
+        if name == "HLC3 Daily HTF":
+            custom_lines.append({
+                "values": _align_series_to_candles(ov.data, candles),
+                "color": (34, 211, 238), "label": "HLC3 HTF", "width": 2,
+            })
+        elif name == "HLC3 KAMA":
+            custom_lines.append({
+                "values": _align_series_to_candles(ov.data, candles),
+                "color": (249, 115, 22), "label": "KAMA", "width": 2,
+            })
+        elif name.startswith("Support"):
+            vals = _flat_level(ov.data)
+            if vals:
+                custom_lines.append({
+                    "values": vals, "color": (8, 153, 129),
+                    "label": name, "width": 1, "dashed": True,
+                })
+        elif name.startswith("Resistance"):
+            vals = _flat_level(ov.data)
+            if vals:
+                custom_lines.append({
+                    "values": vals, "color": (242, 54, 69),
+                    "label": name, "width": 1, "dashed": True,
+                })
+
+    # S&R zones from the response.
+    support_zones: list[dict[str, Any]] = []
+    resistance_zones: list[dict[str, Any]] = []
+    sr = getattr(resp, "sr_signals", None)
+    if sr is not None and getattr(sr, "enabled", False) and not getattr(sr, "error", None):
+        for z in getattr(sr, "support_zones", []) or []:
+            support_zones.append({"low": z.zone_bottom, "high": z.zone_top})
+        for z in getattr(sr, "resistance_zones", []) or []:
+            resistance_zones.append({"low": z.zone_bottom, "high": z.zone_top})
+
+    blocks: list[dict[str, Any]] = []
+    if entry and stop:
+        blocks.append({
+            "low": min(entry, stop), "high": max(entry, stop),
+            "kind": "bullish" if direction == "long" else "bearish",
+            "label": "Entry / risk zone",
+        })
+
+    return PlanOverlay(
+        direction=direction, entry=entry, stop_loss=stop, take_profits=targets,
+        order_blocks=blocks, projection=projection,
+        support_zones=support_zones, resistance_zones=resistance_zones,
+        custom_lines=custom_lines,
+    )
+
+
+async def build_forecast_chart(symbol: str, timeframe: str, resp: Any) -> bytes | None:
+    """Render a zoomed chart for a Kronos ``/forecast`` with both indicators.
+
+    Fetches fresh candles, overlays the forecast plan + HLC3/Kaufman + S&R, and
+    zooms the frame to the entry/SL/TP so the plan fills the image.
+    """
+    candles = await _fetch_candles(symbol, timeframe, limit=150)
+    if not candles:
+        return None
+
+    overlay = forecast_overlay_from_kronos(resp, candles, symbol=symbol)
+    engine = str(getattr(resp, "engine", "") or "").capitalize()
+    sig = getattr(resp, "signal", None)
+    direction = (getattr(sig, "direction", "") or "").upper() if sig else ""
+    conf = int(round((getattr(sig, "confidence", 0) or 0) * 100)) if sig else 0
+    subtitle = f"Kronos {engine} {direction} {conf}% conf".strip()
+    return render_plan_chart(
+        candles, symbol=symbol, timeframe=timeframe, overlay=overlay,
+        subtitle=subtitle, candle_count=100, zoom_to_levels=True,
+    )
+
+
+async def oblivion_read(
+    symbol: str, timeframe: str, candles: list[list] | None = None,
+) -> tuple[dict[str, Any] | None, list[list]]:
+    """Run the OBLIVION engine on the feed the charts draw. ``(result, candles)``.
+
+    400 bars so the EMA200, the 92-bar dealing range and the swing history
+    match the app's own charts; the same rows are handed to the renderer, so
+    picture and text agree.
+    """
+    try:
+        from app.signals.oblivion import analyze_oblivion
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[Oblivion] engine unavailable: {}", exc)
+        return None, []
+    if candles is None or len(candles) < 200:
+        candles = await _fetch_candles(symbol, timeframe, limit=400) or candles or []
+    if not candles or len(candles) < 60:
+        return None, candles or []
+    try:
+        res = analyze_oblivion(candles, timeframe)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Oblivion] engine failed for {} {}: {}", symbol, timeframe, exc)
+        return None, candles
+    if res.get("error"):
+        logger.debug("[Oblivion] {} {}: {}", symbol, timeframe, res.get("error"))
+        return None, candles
+    return res, candles
+
+
+async def build_oblivion_chart(
+    symbol: str, timeframe: str, candles: list[list] | None = None,
+) -> bytes | None:
+    """The dedicated OBLIVION image (PNG bytes) for ``symbol``/``timeframe``."""
+    obl, rows = await oblivion_read(symbol, timeframe, candles)
+    if not obl:
+        return None
+    try:
+        from plugins.AiMarketAnalyst.backend.services.oblivion_chart import render_oblivion_chart
+
+        return render_oblivion_chart(rows, obl, symbol=symbol, timeframe=timeframe)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Oblivion] chart failed for {} {}: {}", symbol, timeframe, exc)
+        return None
+
+
+def oblivion_caption(symbol: str, timeframe: str, obl: dict[str, Any]) -> str:
+    sig = obl.get("signal") or {}
+    sc = obl.get("score") or {}
+    oc = obl.get("outcomes") or {}
+    action = str(sig.get("action") or "wait").upper()
+    kind = sig.get("kind")
+    if action != "WAIT":
+        if kind:
+            action += f" ({kind})"
+        if not sig.get("confirmed"):
+            action += " — forming"
+    cap = (
+        f"🔮 OBLIVION MASTER v5 {obl.get('mode', 'HYBRID')} — {symbol} {timeframe}: {action} · "
+        f"buy {sc.get('buy', 0)} / sell {sc.get('sell', 0)} (scalp ≥{sc.get('scalp_min', 6)}, sniper ≥{sc.get('sniper_min', 9)}) · "
+        f"bias {obl.get('bias_label', 'NEUTRAL')} · {(obl.get('session') or {}).get('name', 'OFF')}"
+    )
+    if oc.get("win_rate") is not None:
+        cap += f" · win rate {oc['win_rate'] * 100:.0f}% of {oc.get('count', 0)}"
+    if (obl.get("news") or {}).get("blocked"):
+        cap += " · NEWS WINDOW — no new entries"
+    return cap[:1000]
+
+
+def oblivion_card(symbol: str, timeframe: str, obl: dict[str, Any]) -> str:
+    """The engine read as a Telegram HTML card — same dict as the image."""
+    sc = obl.get("score") or {}
+    comps = sc.get("components") or {}
+    sig = obl.get("signal") or {}
+    last = obl.get("last_signal") or {}
+    dash = obl.get("dashboard") or {}
+    oc = obl.get("outcomes") or {}
+    news = obl.get("news") or {}
+    action = str(sig.get("action") or "wait").upper()
+    icon = "🟢" if action == "BUY" else "🔴" if action == "SELL" else "⚪"
+
+    def chips(d: dict) -> str:
+        return ", ".join(f"{k} +{v}" for k, v in (d or {}).items()) or "none"
+
+    head = action
+    if action != "WAIT":
+        if sig.get("kind"):
+            head += f" ({sig['kind']})"
+        head += "" if sig.get("confirmed") else " · forming bar"
+    lines = [
+        f"{icon} <b>OBLIVION MASTER v5 — {html.escape(symbol)} {timeframe}</b>  <i>{obl.get('mode', 'HYBRID')}</i>",
+        f"<b>{head}</b> · bias <b>{html.escape(str(obl.get('bias_label') or 'NEUTRAL'))}</b> · {html.escape(str(dash.get('Structure') or 'WAIT'))}",
+        "",
+        f"<b>Score</b>  buy <code>{sc.get('buy', 0)}</code> / sell <code>{sc.get('sell', 0)}</code> · "
+        f"scalp ≥<code>{sc.get('scalp_min', 6)}</code>, sniper ≥<code>{sc.get('sniper_min', 9)}</code>",
+        f"  buy: <i>{html.escape(chips(comps.get('buy')))}</i>",
+        f"  sell: <i>{html.escape(chips(comps.get('sell')))}</i>",
+        "",
+        f"Trend {html.escape(str(dash.get('Trend') or '—'))} · HTF {html.escape(str(dash.get('HTF') or '—'))} · "
+        f"VWAP {html.escape(str(dash.get('VWAP') or '—'))} · {html.escape(str(dash.get('Zone') or '—')).lower()} · "
+        f"OTE {html.escape(str(dash.get('OTE') or 'NONE'))}",
+        f"FVG {html.escape(str(dash.get('FVG') or 'NONE'))} · liquidity {html.escape(str(dash.get('Liquidity') or 'NONE'))} · "
+        f"session {html.escape(str(dash.get('Session') or 'OFF'))} · volume {html.escape(str(dash.get('Volume') or 'N/A'))} · "
+        f"news {'<b>BLOCKED</b>' if news.get('blocked') else 'clear'}",
+    ]
+    plan = sig if sig.get("entry") is not None else last
+    if plan and plan.get("entry") is not None:
+        title = "Plan" if plan is sig else f"Last {str(plan.get('action', '')).upper()} ({plan.get('kind', '')}) · {plan.get('bars_since', '?')} bars ago"
+        lines += [
+            "",
+            f"<b>{title}</b>",
+            f"Entry <code>{_fmt_level(plan['entry'])}</code>  SL <code>{_fmt_level(plan['stop_loss'])}</code>",
+            f"TP1 <code>{_fmt_level(plan['tp1'])}</code>  TP2 <code>{_fmt_level(plan['tp2'])}</code>  TP3 <code>{_fmt_level(plan['tp3'])}</code>"
+            f"  ({plan.get('kind') and ''}0.5R / 1R / 1.5R)",
+        ]
+        outcome = (plan.get("outcome") or {}).get("status")
+        if outcome and plan is not sig:
+            lines.append(f"Outcome: <b>{str(outcome).upper()}</b>")
+        if sig.get("blocked_by_news"):
+            lines.append("⛔ entry blocked by the news window")
+        elif sig.get("gate"):
+            lines.append(f"⏸ {html.escape(str(sig['gate']))}")
+    else:
+        lines += ["", "No active signal — a side must clear its minimum, beat the other side and pass the gates on a closed bar."]
+    if oc.get("count"):
+        lines += [
+            "",
+            f"<b>Outcomes</b> ({oc['count']} signals: {oc.get('scalp', 0)} scalp / {oc.get('sniper', 0)} sniper) — "
+            f"TP1 {oc.get('tp1', 0)} · TP2 {oc.get('tp2', 0)} · TP3 {oc.get('tp3', 0)} · SL {oc.get('sl', 0)} · open {oc.get('open', 0)}"
+            + (f" · win rate <b>{oc['win_rate'] * 100:.0f}%</b>" if oc.get("win_rate") is not None else ""),
+        ]
+    return "\n".join(lines)[:3900]
+
+
+async def send_oblivion_analysis(
+    token: str,
+    chat_id: str,
+    symbol: str,
+    timeframe: str,
+    *,
+    candles: list[list] | None = None,
+    deep: bool = True,
+) -> dict[str, Any] | None:
+    """Send the OBLIVION read for a pair: the dedicated image, then the card.
+
+    One code path for /forecast, /room, /analyze and free-text pair questions,
+    so every surface shows the same engine on the same candles. Never raises;
+    returns the engine result (or None) so callers can reuse it.
+    """
+    from plugins.TelegramSignalNewsPlugin.backend.services import bot_service
+
+    obl, rows = await oblivion_read(symbol, timeframe, candles)
+    if not obl:
+        logger.debug("[Oblivion] nothing to send for {} {}", symbol, timeframe)
+        return None
+
+    # 1. the image — the deliverable
+    try:
+        from plugins.AiMarketAnalyst.backend.services.oblivion_chart import render_oblivion_chart
+
+        png = render_oblivion_chart(rows, obl, symbol=symbol, timeframe=timeframe)
+        if png:
+            await bot_service.send_photo(token, chat_id, png, caption=oblivion_caption(symbol, timeframe, obl))
+        else:
+            logger.warning("[Oblivion] image not produced for {} {}", symbol, timeframe)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Oblivion] image send failed for {} {}: {}", symbol, timeframe, exc)
+
+    # 2. the card, with 1-click entries when the engine has a plan
+    markup = None
+    try:
+        from plugins.KronosForecastPlugin.backend.services.oblivion_signals import build_oblivion_standalone_signals
+
+        signals = build_oblivion_standalone_signals(obl, symbol)
+        if signals:
+            markup = _oblivion_keyboard(symbol, signals)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[Oblivion] keyboard skipped: {}", exc)
+    try:
+        await bot_service.send_message(token, chat_id, oblivion_card(symbol, timeframe, obl), "HTML", markup)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Oblivion] card send failed: {}", exc)
+
+    # 3. narrative on the same read — the model's words only when they quote
+    # this read and do not loop; otherwise the engine's own structured read.
+    if deep:
+        try:
+            from plugins.KronosForecastPlugin.backend.services.oblivion_analysis import (
+                _fallback_analysis, analyze_oblivion as _deep,
+            )
+
+            text = ""
+            try:
+                res = await _deep(symbol, timeframe, "bitget", obl=obl)
+                text = str(getattr(res, "analysis", "") or "")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[Oblivion] LLM narrative failed: {}", exc)
+            if not narrative_is_faithful(text, obl):
+                logger.info("[Oblivion] narrative rejected for {} {} — using the engine's own read", symbol, timeframe)
+                text = _fallback_analysis(obl, symbol, timeframe, None, None)
+            await bot_service.send_message(
+                token, chat_id,
+                f"🧠 <b>OBLIVION read — {html.escape(symbol)} {timeframe}</b>\n\n"
+                + format_for_telegram(text[:3500], limit=3700),
+                "HTML",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[Oblivion] narrative skipped: {}", exc)
+    return obl
+
+
+def narrative_is_faithful(text: str, obl: dict[str, Any]) -> bool:
+    """See :func:`oblivion_analysis.narrative_is_faithful` — one gate everywhere."""
+    from plugins.KronosForecastPlugin.backend.services.oblivion_analysis import narrative_is_faithful as _gate
+
+    return _gate(text, obl)
+
+
+def _oblivion_keyboard(symbol: str, signals: list) -> dict | None:
+    """Inline buttons that hand the entry to the existing /order flow.
+
+    Same callback convention as the Kronos sniper card (``cq_order``), so the
+    order is sized and routed exactly like every other one-tap entry.
+    """
+    try:
+        from plugins.KronosForecastPlugin.backend.services.forecast_service import is_order_placeable
+
+        placeable = is_order_placeable(symbol)
+    except Exception:  # noqa: BLE001
+        placeable = symbol.upper().replace("/", "").endswith(("USDT", "USDC"))
+    rows: list[list[dict]] = []
+    for s in signals[:2]:
+        side = "LONG" if s.side == "long" else "SHORT"
+        kind = "market" if s.order_kind == "market" else "limit"
+        base = f"cq_order:{s.side}:{s.order_kind}:{symbol}:5"
+        rows.append([
+            {"text": f"{side} {kind} @ {_fmt_level(s.entry)} — $5 paper", "callback_data": base},
+            {"text": "🔴 LIVE $5" if placeable else "📈 LIVE MT5", "callback_data": f"{base}:live"},
+            {"text": "✏️ custom", "callback_data": f"cq_custom_order:{s.side}:{s.order_kind}:{symbol}"},
+        ])
+    return {"inline_keyboard": rows} if rows else None
+
+
 async def run_pair(token: str, chat_id: str, symbol: str, timeframe: str) -> None:
     """Convene the room on ``symbol`` and reply with the verdict and a chart."""
     from app.agents.orchestrator import AgentOrchestrator
@@ -1051,6 +1556,11 @@ async def run_pair(token: str, chat_id: str, symbol: str, timeframe: str) -> Non
         await bot_service.send_photo(
             token, chat_id, chart, caption=f"{symbol} {timeframe} — trading room plan"
         )
+
+    # The OBLIVION AI v5 read as its own image + card, after the room's plan
+    # so the two are never confused: the plan is what the board decided, this
+    # is what the house engine sees on the same candles.
+    await send_oblivion_analysis(token, chat_id, symbol, timeframe, candles=candles)
 
 
 def _execution_note(report: dict) -> str:

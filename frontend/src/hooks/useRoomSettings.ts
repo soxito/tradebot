@@ -67,6 +67,29 @@ export interface ExecutionPolicy {
   /** When on, the room supervisor reviews and manages all copy profiles. */
   manage_copy_profiles?: boolean
   copy_max_drawdown_pct?: number
+  // ── Real-time trade management ──
+  manage_tick_s?: number
+  margin_warn_pct?: number
+  margin_critical_pct?: number
+  max_account_drawdown_pct?: number
+  shift_atr_mult?: number
+  shift_take_profit_fraction?: number
+  weekly_target_usd?: number
+  target_pacing?: boolean
+  target_max_multiplier?: number
+  daily_target_margin_pct?: number
+  target_per_pair?: boolean
+  min_risk_pct?: number
+  max_risk_pct?: number
+  news_pre_min?: number
+  news_cooloff_min?: number
+  universe_enabled?: boolean
+  universe_symbols?: string
+  pair_min_win_rate?: number
+  daily_min_win_rate?: number
+  daily_recovery_min_wr?: number
+  daily_target_min_pct?: number
+  daily_target_max_pct?: number
   trades_today?: number
   mt5_accounts?: Mt5AccountOption[]
   global_auto_trading_enabled?: boolean

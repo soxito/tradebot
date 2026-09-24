@@ -256,7 +256,89 @@ async def _fetch_public_ccxt_ohlcv(
     return []
 
 
+# ── MT5 primary source — all pair types (crypto spot, FX, metals, indices) ──
+# Tried first so ETH/USD, BTC/USD, XRP/USD get broker-native candles from
+# Swissquote-SPOT / Exness / any configured account.
+
+_MT5_TF_MAP: Dict[str, str] = {
+    "1m": "M1", "5m": "M5", "15m": "M15", "30m": "M30",
+    "1h": "H1", "2h": "H2", "4h": "H4", "6h": "H6", "12h": "H12",
+    "1d": "D1", "1w": "W1",
+}
+
+
+async def _fetch_mt5_ohlcv(symbol: str, timeframe: str, limit: int) -> Tuple[List[list], str]:
+    """Fetch OHLCV from the first reachable MT5 account for any pair type.
+
+    Returns (ccxt_rows, server_name); both empty/blank on failure.
+    """
+    try:
+        from app.core.database import AsyncSessionLocal
+        from sqlalchemy import select
+        from plugins.MT5TradingPlugin.backend.models import MT5Account
+        from plugins.MT5TradingPlugin.backend.services.mt5_client import mt5_client
+
+        async with AsyncSessionLocal() as db:
+            res = await db.execute(
+                select(MT5Account)
+                .where(MT5Account.api_reachable.is_(True))
+                .order_by(MT5Account.id)
+                .limit(5)
+            )
+            accounts = res.scalars().all()
+
+        if not accounts:
+            return [], ""
+
+        base_sym = symbol.upper().replace("/", "").replace("-", "")
+        tf_mt5 = _MT5_TF_MAP.get((timeframe or "").lower(), "H1")
+
+        # Build broker-specific symbol variants (Exness appends "m"; also try
+        # USD→USDT swap for pairs like BTC/USD where only BTCUSDTm is listed).
+        variants: List[str] = [base_sym]
+        if not base_sym.endswith("m"):
+            variants.append(base_sym + "m")
+        if base_sym.endswith("USD") and not base_sym.endswith("USDT"):
+            variants.append(base_sym[:-3] + "USDTm")
+
+        for acct in accounts:
+            for mt5_sym in variants:
+                try:
+                    bars = await mt5_client.get_candles(
+                        str(acct.login), acct.server, acct.password_encrypted,
+                        mt5_sym, tf_mt5, limit,
+                    )
+                    if not bars:
+                        continue
+                    rows = [
+                        [int(b["time"]) * 1000,
+                         float(b["open"]), float(b["high"]),
+                         float(b["low"]),  float(b["close"]),
+                         float(b.get("volume", 0) or 0)]
+                        for b in bars
+                    ]
+                    if rows:
+                        logger.info(
+                            f"[Kronos] MT5 OHLCV {mt5_sym} {timeframe}: "
+                            f"{len(rows)} bars from {acct.server}"
+                        )
+                        return rows, acct.server
+                except Exception as e:
+                    logger.debug(f"[Kronos] MT5 {mt5_sym}/{timeframe} on {acct.server}: {e}")
+    except Exception as exc:
+        logger.debug(f"[Kronos] MT5 OHLCV unavailable for {symbol}: {exc}")
+    return [], ""
+
+
 async def _fetch_ohlcv(exchange: str, symbol: str, timeframe: str, limit: int) -> List[list]:
+    # 0) MT5 first for ALL pairs — Swissquote-SPOT/Exness supports crypto spot,
+    #    FX, metals and indices natively; this eliminates Bitget-futures failures.
+    mt5_rows, _mt5_server = await _fetch_mt5_ohlcv(symbol, timeframe, limit)
+    if mt5_rows and len(mt5_rows) >= 5:
+        if _is_forex(symbol):
+            return await _anchor_to_swissquote(symbol, mt5_rows)
+        return mt5_rows
+
     # Route forex / metals / indices to Yahoo first: it serves the requested
     # intraday timeframe *and* carries CME contract volume. forex_provider is
     # only a price fallback — Frankfurter answers every timeframe with daily
@@ -353,10 +435,11 @@ def _rows_to_frame(rows: List[list]) -> Tuple[pd.DataFrame, pd.Series]:
 def _historical_candles(rows: List[list], symbol: str) -> List[ForecastCandle]:
     """History as ForecastCandles so the frontend can draw the series itself.
 
-    Populated for forex/metals where the exchange has no data; empty for crypto
-    (the frontend fetches crypto OHLCV directly for better resolution).
+    Populated for all pair types when MT5 was the source (covers crypto spot,
+    FX, metals, indices). The frontend uses these directly so it never falls
+    back to a futures-only exchange endpoint for non-USDT pairs (e.g. ETH/USD).
     """
-    if not _is_forex(symbol):
+    if not rows:
         return []
     out: List[ForecastCandle] = []
     for r in rows:
@@ -585,6 +668,13 @@ def _volume_unit(exchange: str, symbol: str = "") -> str:
     """
     if (exchange or "").strip().lower() == "mt5":
         return "tick"
+    # Equities carry Yahoo's own real share volume — not a borrowed CME contract.
+    try:
+        from app.exchanges.yahoo_provider import is_equity as _is_equity
+        if symbol and _is_equity(symbol):
+            return "base"
+    except Exception:
+        pass
     if symbol and _is_forex(symbol):
         return "futures"
     return "base"
@@ -728,6 +818,162 @@ def _build_overlays(
     return [forecast_line, upper_line, lower_line], markers
 
 
+def _attach_hlc3_kaufman_overlays(
+    rows: List[list], timeframe: str,
+) -> Tuple[Optional["HLC3KaufmanSignal"], List[OverlaySeries], List[OverlayMarker]]:
+    """Compute the HLC3/Kaufman indicator and turn it into chart overlays.
+
+    Returns ``(schema, overlays, markers)``; ``schema`` is None when the
+    indicator is toggled off. Never raises — an indicator failure degrades to
+    an empty overlay set.
+    """
+    from plugins.KronosForecastPlugin.backend.schemas import HLC3KaufmanSignal
+    from plugins.KronosForecastPlugin.backend.services import hlc3_kaufman as hk
+
+    if not kronos_config.hlc3_kaufman_enabled or not hk.is_enabled():
+        return None, [], []
+
+    res = hk.compute_hlc3_kaufman(
+        rows, timeframe,
+        length=kronos_config.hlc3_kaufman_length,
+        slow_ma_period=kronos_config.hlc3_kaufman_slow_period,
+    )
+    schema = HLC3KaufmanSignal(
+        enabled=res.enabled, signal=res.signal,
+        bfma_current=res.bfma_current, bsma_current=res.bsma_current,
+        bfma_prev=res.bfma_prev, bsma_prev=res.bsma_prev,
+        crossover=res.crossover, crossunder=res.crossunder,
+        bars_since_cross=res.bars_since_cross, summary=res.summary, error=res.error,
+    )
+    overlays: List[OverlaySeries] = []
+    markers: List[OverlayMarker] = []
+    if res.error or not res.bfma_series:
+        return schema, overlays, markers
+
+    overlays.append(OverlaySeries(
+        name="HLC3 Daily HTF", color="#22d3ee", lineWidth=2, lineStyle=0,
+        data=[OverlayLinePoint(time=t, value=v) for t, v in res.bfma_series],
+    ))
+    overlays.append(OverlaySeries(
+        name="HLC3 KAMA", color="#f97316", lineWidth=2, lineStyle=0,
+        data=[OverlayLinePoint(time=t, value=v) for t, v in res.bsma_series],
+    ))
+    if (res.crossover or res.crossunder) and res.bsma_series:
+        last_t = res.bsma_series[-1][0]
+        markers.append(OverlayMarker(
+            time=last_t,
+            position="belowBar" if res.crossover else "aboveBar",
+            color="#22c55e" if res.crossover else "#ef4444",
+            shape="arrowUp" if res.crossover else "arrowDown",
+            text="HLC3 BUY" if res.crossover else "HLC3 SELL",
+        ))
+    return schema, overlays, markers
+
+
+def _attach_oblivion(
+    rows: List[list], timeframe: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """OBLIVION AI engine v4.0 on the exact rows the forecast used.
+
+    Returns ``(compact_read, overlay_bundle)``; both None when the engine
+    cannot run (short series, import failure). Never raises.
+    """
+    try:
+        from app.signals.oblivion import analyze_oblivion, compact_for_prompt, oblivion_to_overlays
+
+        if not rows or len(rows) < 60:
+            return None, None
+        res = analyze_oblivion(rows, timeframe)
+        if res.get("error"):
+            return None, None
+        read = compact_for_prompt(res)
+        read["signals_history"] = res.get("signals_history") or []
+        return read, oblivion_to_overlays(res, timeframe)
+    except Exception as exc:  # noqa: BLE001 — enrichment only
+        logger.debug(f"[Kronos] oblivion skipped: {exc}")
+        return None, None
+
+
+def _attach_sr_overlays(
+    rows: List[list],
+) -> Tuple[Optional["SRSignalsSchema"], List[OverlaySeries], List[OverlayMarker]]:
+    """Compute LuxAlgo S&R zones and turn them into chart overlays + markers.
+
+    Returns ``(schema, overlays, markers)``; ``schema`` is None when the
+    indicator is toggled off. Never raises.
+    """
+    from plugins.KronosForecastPlugin.backend.schemas import (
+        SRSignalsSchema, SRZoneSchema, SRSignalEventSchema,
+    )
+    from plugins.KronosForecastPlugin.backend.services import sr_signals as sr
+
+    if not kronos_config.sr_signals_enabled or not sr.is_enabled():
+        return None, [], []
+
+    res = sr.compute_sr_signals(
+        rows,
+        length=kronos_config.sr_signals_length,
+        sr_margin=kronos_config.sr_signals_margin,
+    )
+
+    def _zone_schema(z) -> SRZoneSchema:
+        return SRZoneSchema(
+            level=z.level, zone_top=z.zone_top, zone_bottom=z.zone_bottom,
+            kind=z.kind, formed_unix=z.formed_unix, broken=z.broken,
+            tested=z.tested, retested=z.retested, manipulated=z.manipulated,
+        )
+
+    def _event_schema(e) -> SRSignalEventSchema:
+        return SRSignalEventSchema(
+            unix_time=e.unix_time, event_type=e.event_type, price=e.price,
+            level_price=e.level_price, zone_kind=e.zone_kind,
+        )
+
+    schema = SRSignalsSchema(
+        enabled=res.enabled,
+        support_zones=[_zone_schema(z) for z in res.support_zones],
+        resistance_zones=[_zone_schema(z) for z in res.resistance_zones],
+        recent_events=[_event_schema(e) for e in res.recent_events],
+        current_event=_event_schema(res.current_event) if res.current_event else None,
+        nearest_support=res.nearest_support, nearest_resistance=res.nearest_resistance,
+        summary=res.summary, error=res.error,
+    )
+    overlays: List[OverlaySeries] = []
+    markers: List[OverlayMarker] = []
+    if res.error:
+        return schema, overlays, markers
+
+    if not rows:
+        return schema, overlays, markers
+    first_t = int(rows[0][0]) // 1000
+    last_t = int(rows[-1][0]) // 1000
+
+    def _level_line(level: float, color: str, name: str) -> OverlaySeries:
+        return OverlaySeries(
+            name=name, color=color, lineWidth=1, lineStyle=2,
+            data=[OverlayLinePoint(time=first_t, value=level),
+                  OverlayLinePoint(time=last_t, value=level)],
+        )
+
+    for i, z in enumerate(res.support_zones):
+        overlays.append(_level_line(z.level, "#089981", f"Support {i + 1}"))
+    for i, z in enumerate(res.resistance_zones):
+        overlays.append(_level_line(z.level, "#f23645", f"Resistance {i + 1}"))
+
+    ev = res.current_event
+    if ev:
+        bull = ev.event_type.endswith("_bull")
+        markers.append(OverlayMarker(
+            time=ev.unix_time,
+            position="belowBar" if bull else "aboveBar",
+            color="#089981" if bull else "#f23645",
+            shape="arrowUp" if bull else "arrowDown",
+            text=ev.event_type.replace("_", " ").upper(),
+        ))
+    return schema, overlays, markers
+
+
+
 # ── public API ──────────────────────────────────────────────────
 
 def get_status() -> ForecastStatus:
@@ -744,6 +990,13 @@ def get_status() -> ForecastStatus:
         detail = f"Kronos model warming up ({model_name})…"
     else:
         detail = kronos_engine.load_error or "heuristic fallback"
+    # Short label for the engine chip: the custom name for a finetuned model,
+    # else the trailing part of the HF id (e.g. "Kronos-base").
+    ft_job_id = kronos_engine.active_finetuned_job_id
+    if ft_job_id is not None:
+        display_name = kronos_engine.active_finetuned_display_name or f"Custom #{ft_job_id}"
+    else:
+        display_name = model_name.split("/")[-1]
     return ForecastStatus(
         available=True,  # the endpoint always works (heuristic fallback)
         # Report kronos while warming up too — forecasts wait for the load and
@@ -754,6 +1007,8 @@ def get_status() -> ForecastStatus:
         device=kronos_config.device,
         max_context=max_context,
         detail=detail,
+        display_name=display_name,
+        finetuned_job_id=ft_job_id,
     )
 
 
@@ -855,6 +1110,13 @@ async def run_forecast(
     overlays, markers = _build_overlays(
         forecast, upper, lower, anchor_unix, anchor_price, signal.direction
     )
+    hlc3_schema, hlc3_overlays, hlc3_markers = _attach_hlc3_kaufman_overlays(rows, timeframe)
+    sr_schema, sr_overlays, sr_markers = _attach_sr_overlays(rows)
+    oblivion_read, oblivion_bundle = _attach_oblivion(rows, timeframe)
+    overlays.extend(hlc3_overlays)
+    overlays.extend(sr_overlays)
+    markers.extend(hlc3_markers)
+    markers.extend(sr_markers)
 
     resp = ForecastResponse(
         exchange=exchange, symbol=symbol, timeframe=timeframe, engine=engine,
@@ -862,6 +1124,8 @@ async def run_forecast(
         samples=samples, anchor_time=anchor_unix, anchor_price=anchor_price,
         forecast=forecast, upper_band=upper, lower_band=lower, signal=signal,
         overlays=overlays, markers=markers, candles=_historical_candles(rows, symbol),
+        hlc3_kaufman=hlc3_schema, sr_signals=sr_schema,
+        oblivion=oblivion_read, overlay_bundle=oblivion_bundle,
         volume=vol_ctx, decision=signal.decision,
         note=None if engine == "kronos" else _heuristic_note(heuristic_reason),
     )
@@ -999,12 +1263,21 @@ async def forecast_from_rows(
     overlays, markers = _build_overlays(
         forecast, upper, lower, anchor_unix, anchor_price, signal.direction
     )
+    hlc3_schema, hlc3_overlays, hlc3_markers = _attach_hlc3_kaufman_overlays(rows, timeframe)
+    sr_schema, sr_overlays, sr_markers = _attach_sr_overlays(rows)
+    oblivion_read, oblivion_bundle = _attach_oblivion(rows, timeframe)
+    overlays.extend(hlc3_overlays)
+    overlays.extend(sr_overlays)
+    markers.extend(hlc3_markers)
+    markers.extend(sr_markers)
     return ForecastResponse(
         exchange=exchange, symbol=symbol, timeframe=timeframe, engine=engine,
         model_name=kronos_config.model_name, lookback=len(rows), pred_len=pred_len,
         samples=samples, anchor_time=anchor_unix, anchor_price=anchor_price,
         forecast=forecast, upper_band=upper, lower_band=lower, signal=signal,
         overlays=overlays, markers=markers,
+        hlc3_kaufman=hlc3_schema, sr_signals=sr_schema,
+        oblivion=oblivion_read, overlay_bundle=oblivion_bundle,
         volume=vol_ctx, decision=signal.decision,
         note=None if engine == "kronos" else _heuristic_note(),
     )
@@ -1119,17 +1392,27 @@ def _available_margin(accounts: Optional[List[dict]], margin_coin: str = "USDT")
 
 
 def is_order_placeable(symbol: str) -> bool:
-    """True when an entry for ``symbol`` can actually be sent to an exchange.
+    """True when an entry for ``symbol`` can be sent to a crypto exchange (Bitget etc.).
 
-    FX, metals, indices and energy are *forecastable* — Kronos reads them from
-    Yahoo with CME contract volume — but the crypto connectors list none of
-    them, so a sniper entry on one is analysis, never an executable order.
+    FX, metals, indices and USD-quoted crypto CFDs (ETHUSD, BTCUSD) are not
+    listed on USDT-margined futures exchanges. Any surface that renders an
+    exchange execute button must gate on this.
 
-    Any surface that renders an execute button (the Telegram sniper keyboard,
-    the sniper panel) must gate on this: emitting a "LIVE $5" button for GBP/USD
-    offers an order Bitget cannot fill.
+    USD-quoted crypto (ETHUSD) is an MT5 CFD; ``tradable_via_mt5`` in
+    ``get_pair_tradability`` covers that path.
     """
-    return not _is_forex(symbol)
+    if _is_forex(symbol):
+        return False
+    # USD-quoted crypto (ETHUSD, BTCUSD) → MT5 CFD, not exchange-tradeable.
+    s = (symbol or "").upper().replace("/", "")
+    if s.endswith("USD") and not s.endswith(("USDT", "USDC")) and len(s) > 3:
+        from app.exchanges.yahoo_provider import _CRYPTO_BASES
+        try:
+            if s[:-3] in _CRYPTO_BASES:
+                return False
+        except Exception:
+            pass
+    return True
 
 
 async def get_pair_tradability(exchange: str, symbol: str) -> dict:
@@ -1138,15 +1421,38 @@ async def get_pair_tradability(exchange: str, symbol: str) -> dict:
     resulting max-open-remaining (notional + margin) for the symbol.
 
     Read-only; used by the sniper panel to size orders against what's actually
-    available on the exchange. Returns tradable=False for non-crypto pairs.
+    available on the exchange. Falls back to the room's MT5 account (Exness,
+    etc.) when the crypto exchange is not configured or the pair is FX/metals.
     """
     result: dict = {
         "exchange": exchange, "symbol": symbol, "tradable": False,
+        "venue": "exchange",  # 'exchange' | 'mt5'
         "margin_coin": "USDT", "available_margin": 0.0, "max_leverage": None,
         "min_trade_size": None, "size_precision": None, "min_notional": None,
         "current_position": None, "max_open_margin": 0.0, "max_open_notional": 0.0,
-        "note": None,
+        "note": None, "tradable_via_mt5": False,
     }
+
+    # ── Check MT5 (always — MT5 brokers list both crypto CFDs and FX/metals) ──
+    try:
+        from app.agents.execution import get_settings
+        from app.core.database import AsyncSessionLocal
+        async with AsyncSessionLocal() as _db:
+            _s = await get_settings(_db)
+        _has_mt5 = bool(
+            getattr(_s, "allow_mt5", False)
+            and (getattr(_s, "mt5_account_id", None) or getattr(_s, "mt5_demo_account_id", None))
+        )
+        result["tradable_via_mt5"] = _has_mt5
+        if _has_mt5 and not is_order_placeable(symbol):
+            # FX/metals can only execute via MT5 — skip Bitget entirely.
+            result["venue"] = "mt5"
+            result["tradable"] = True
+            result["note"] = "MT5 broker (e.g., Exness) — order will route to your configured account."
+            return result
+    except Exception as _exc:  # noqa: BLE001
+        logger.debug(f"[Kronos] MT5 tradability check skipped: {_exc}")
+
     if not is_order_placeable(symbol):
         result["note"] = "Order placement is only available for crypto USDT futures pairs."
         return result
@@ -1156,7 +1462,13 @@ async def get_pair_tradability(exchange: str, symbol: str) -> dict:
     except (ValueError, Exception):
         exch = None
     if exch is None or not hasattr(exch, "get_futures_balance"):
-        result["note"] = f"{exchange} does not support futures order placement."
+        # Crypto pair but Bitget not configured — try MT5 if available.
+        if result.get("tradable_via_mt5"):
+            result["venue"] = "mt5"
+            result["tradable"] = True
+            result["note"] = "Bitget not configured — routing to MT5 broker."
+        else:
+            result["note"] = f"{exchange} does not support futures order placement."
         return result
 
     compact = symbol.replace("/", "").upper()
@@ -1215,6 +1527,174 @@ async def get_pair_tradability(exchange: str, symbol: str) -> dict:
     return result
 
 
+def _sniper_indicator_reasons(resp: ForecastResponse, direction: str) -> List[str]:
+    """Human-readable HLC3/Kaufman + S&R context lines for a sniper entry.
+
+    Confirms or warns about the Kronos direction using the two toggleable
+    indicators. Returns an empty list when both are disabled/unavailable.
+    """
+    lines: List[str] = []
+
+    hk = resp.hlc3_kaufman
+    if hk is not None and hk.enabled and not hk.error and hk.signal != "neutral":
+        agree = hk.signal == ("buy" if direction == "up" else "sell")
+        verb = "confirms" if agree else "opposes"
+        cross = ""
+        if hk.crossover or hk.crossunder:
+            cross = " (fresh cross)"
+        elif hk.bars_since_cross is not None:
+            cross = f" ({hk.bars_since_cross} bars since cross)"
+        lines.append(
+            f"HLC3/Kaufman {hk.signal.upper()}{cross} {verb} the Kronos {direction} bias."
+        )
+
+    sr = resp.sr_signals
+    if sr is not None and sr.enabled and not sr.error:
+        if direction == "up" and sr.nearest_resistance is not None:
+            lines.append(
+                f"Nearest S&R resistance at {_fmt_price(sr.nearest_resistance)} — watch as the first TP ceiling."
+            )
+        elif direction == "down" and sr.nearest_support is not None:
+            lines.append(
+                f"Nearest S&R support at {_fmt_price(sr.nearest_support)} — watch as the first TP floor."
+            )
+        if sr.current_event is not None:
+            ev = sr.current_event.event_type.replace("_", " ")
+            lines.append(f"LuxAlgo S&R just printed a {ev} signal on the latest bar.")
+    return lines
+
+
+def _sniper_indicator_adjustments(
+    resp: ForecastResponse, direction: str
+) -> Tuple[float, Optional[float], Optional[float]]:
+    """Numeric refinements to sniper levels/confidence from HLC3/Kaufman + S&R.
+
+    Returns ``(conf_mult, sr_tp, sr_sl_guard)``:
+    * ``conf_mult`` scales the Kronos path confidence up when HLC3/Kaufman
+      confirms the direction and down when it opposes (drives leverage too).
+    * ``sr_tp`` is the nearest S&R wall in the trade direction used to cap the
+      take-profits (resistance for longs, support for shorts).
+    * ``sr_sl_guard`` is the opposite S&R structure level used to tighten the
+      stop (support for longs, resistance for shorts).
+    """
+    conf_mult = 1.0
+    hk = resp.hlc3_kaufman
+    if hk is not None and hk.enabled and not hk.error and hk.signal != "neutral":
+        agree = hk.signal == ("buy" if direction == "up" else "sell")
+        fresh = bool(hk.crossover or hk.crossunder)
+        if agree:
+            conf_mult *= 1.12 if fresh else 1.06
+        else:
+            conf_mult *= 0.82 if fresh else 0.90
+
+    sr_tp: Optional[float] = None
+    sr_sl_guard: Optional[float] = None
+    sr = resp.sr_signals
+    if sr is not None and sr.enabled and not sr.error:
+        if direction == "up":
+            sr_tp = sr.nearest_resistance
+            sr_sl_guard = sr.nearest_support
+        elif direction == "down":
+            sr_tp = sr.nearest_support
+            sr_sl_guard = sr.nearest_resistance
+    return conf_mult, sr_tp, sr_sl_guard
+
+
+#: A Kronos path this confident *against* an Oblivion signal vetoes it; the
+#: same threshold the MT5 scalp bot uses for its Kronos veto.
+OBLIVION_KRONOS_VETO = 0.45
+#: Confidence lift when the forecast agrees with the engine (× |kronos conf|).
+OBLIVION_KRONOS_BONUS = 0.25
+
+
+def fuse_oblivion_with_kronos(
+    obl_signal: Dict[str, Any], score: Dict[str, Any], kronos_sig: Optional[ForecastSignal],
+) -> Tuple[float, Optional[bool], Optional[str]]:
+    """Oblivion leads, Kronos confirms.
+
+    Returns ``(confidence, kronos_aligned, vetoed_by)``. Base confidence is the
+    engine score over 12; an agreeing forecast adds ``OBLIVION_KRONOS_BONUS``
+    × its confidence, a decisively opposing one (>= ``OBLIVION_KRONOS_VETO``)
+    vetoes. A flat / absent forecast leaves the engine's call untouched.
+    """
+    action = str(obl_signal.get("action") or "wait")
+    req = max(1, int(score.get("required") or 6))
+    pts = int(obl_signal.get("score") or 0)
+    base = max(0.0, min(1.0, pts / 12.0))
+    if action not in ("buy", "sell"):
+        return round(base, 3), None, None
+    if kronos_sig is None or kronos_sig.direction not in ("up", "down"):
+        return round(base, 3), None, None
+    kdir = "buy" if kronos_sig.direction == "up" else "sell"
+    kconf = float(kronos_sig.confidence or 0.0)
+    if kdir == action:
+        return round(min(1.0, base + OBLIVION_KRONOS_BONUS * kconf), 3), True, None
+    if kconf >= OBLIVION_KRONOS_VETO:
+        return round(base, 3), False, "kronos"
+    return round(max(0.0, base - 0.10 * kconf), 3), False, None
+
+
+def _oblivion_sniper_entries(resp: ForecastResponse, max_leverage: Optional[int]) -> List[SniperSignal]:
+    """The engine's Entry / SL / TP1-3 as the first sniper entry, Kronos-fused."""
+    obl = resp.oblivion or {}
+    obl_sig = obl.get("signal") or {}
+    action = str(obl_sig.get("action") or "wait")
+    if action not in ("buy", "sell") or obl_sig.get("entry") is None:
+        return []
+    entry = float(obl_sig["entry"])
+    sl = float(obl_sig["stop_loss"])
+    tp1 = float(obl_sig["tp1"])
+    tp2 = float(obl_sig.get("tp2") or tp1)
+    tp3 = obl_sig.get("tp3")
+    risk = abs(entry - sl)
+    if risk <= 0 or (action == "buy" and tp1 <= entry) or (action == "sell" and tp1 >= entry):
+        return []
+    conf, aligned, vetoed = fuse_oblivion_with_kronos(obl_sig, obl.get("score") or {}, resp.signal)
+    if vetoed:
+        return []
+    vol = resp.volume
+    if max_leverage and max_leverage > 0:
+        leverage = int(max_leverage)
+    else:
+        leverage = 10 if conf >= 0.7 else (5 if conf >= 0.5 else 3)
+    sc = obl.get("score") or {}
+    reasons = [
+        f"OBLIVION v4 {action.upper()} on {resp.timeframe}: bull {sc.get('bull', 0)} / bear {sc.get('bear', 0)} "
+        f"(need {sc.get('required', 6)}), bias {obl.get('bias_label', 'NEUTRAL')}, "
+        f"{(obl.get('structure') or {}).get('now', 'WAIT')}, session {(obl.get('session') or {}).get('name', 'OFF')}.",
+        f"Stop {_fmt_price(sl)} = structural swing or 1.5×ATR (whichever is wider); "
+        f"TP1 {_fmt_price(tp1)} = 1R, TP2 {_fmt_price(tp2)} = 2R" + (f", TP3 {_fmt_price(float(tp3))} = 3R." if tp3 else "."),
+    ]
+    if not obl_sig.get("confirmed"):
+        reasons.append("Signal bar has not closed — rest at the entry rather than chase it.")
+    if resp.signal is not None and resp.signal.direction in ("up", "down"):
+        if aligned:
+            reasons.append(
+                f"Kronos confirms: projects {resp.signal.direction.upper()} {resp.signal.pct_change:+.2f}% "
+                f"({int(resp.signal.confidence * 100)}% path agreement) — confidence lifted."
+            )
+        else:
+            reasons.append(
+                f"Kronos leans {resp.signal.direction.upper()} ({int(resp.signal.confidence * 100)}%) against the "
+                f"engine — below the veto line, confidence trimmed."
+            )
+    else:
+        reasons.append("Kronos is flat — the engine's call stands on its own.")
+    if obl.get("summary"):
+        reasons.append(str(obl["summary"]))
+    side = "long" if action == "buy" else "short"
+    return [SniperSignal(
+        id=f"{resp.symbol}-{side}-oblivion", side=side,
+        order_kind="market" if obl_sig.get("confirmed") else "limit",
+        label=f"Oblivion {action.upper()}",
+        entry=round(entry, 8), stop_loss=round(sl, 8), take_profit_1=round(tp1, 8),
+        take_profit_2=round(tp2, 8), risk_reward=round(abs(tp1 - entry) / risk, 2),
+        confidence=round(conf, 3), leverage=leverage, reasons=reasons,
+        volume_24h=getattr(vol, "volume_24h", None), volume_1h=getattr(vol, "volume_1h", None),
+        relative_volume=getattr(vol, "relative_volume", None),
+        volume_regime=getattr(vol, "regime", "UNKNOWN"), volume_divergence=getattr(vol, "divergence", "UNKNOWN"),
+    )]
+
 
 def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = None) -> List[SniperSignal]:
     """Turn a Kronos forecast into concrete, executable sniper entries.
@@ -1242,14 +1722,28 @@ def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = N
     vol = resp.volume
     if vol is None or vol.status not in ("OK", "NOT_APPLICABLE"):
         return []
-    if sig.decision != "OK":
+
+    # ── OBLIVION news window: no entries of any kind ─────────────────────────
+    obl = resp.oblivion or {}
+    if bool((obl.get("news") or {}).get("blocked")):
         return []
+
+    # ── OBLIVION leads, Kronos confirms ──────────────────────────────────────
+    # A fresh engine BUY / SELL is the first entry regardless of the path
+    # decision: its structural stop and 1R/2R/3R ladder are the plan; the
+    # forecast lifts confidence when it agrees and vetoes only when it opposes
+    # decisively.
+    oblivion_entries = _oblivion_sniper_entries(resp, max_leverage)
+
+    if sig.decision != "OK":
+        return oblivion_entries
 
     anchor = float(resp.anchor_price)
     if anchor <= 0:
         return []
     direction = sig.direction
-    conf = float(sig.confidence)
+    path_conf = float(sig.confidence)
+    conf = path_conf
     volume_reasons = volctx.volume_evidence_lines(vol)
     volume_fields = dict(
         volume_24h=vol.volume_24h,
@@ -1258,6 +1752,12 @@ def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = N
         volume_regime=vol.regime,
         volume_divergence=vol.divergence,
     )
+
+    # HLC3/Kaufman + S&R agreement notes appended to every emitted entry, plus
+    # the numeric refinements those same overlays apply to the levels below.
+    indicator_reasons = _sniper_indicator_reasons(resp, direction)
+    conf_mult, sr_tp, sr_sl_guard = _sniper_indicator_adjustments(resp, direction)
+    conf = max(0.0, min(0.99, path_conf * conf_mult))
 
     lows = [b.value for b in resp.lower_band] or [c.low for c in resp.forecast]
     highs = [b.value for b in resp.upper_band] or [c.high for c in resp.forecast]
@@ -1278,7 +1778,7 @@ def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = N
         leverage = 10 if conf >= 0.7 else (5 if conf >= 0.5 else 3)
     buf = 0.003  # 0.3% stop buffer beyond the predicted band
 
-    signals: List[SniperSignal] = []
+    signals: List[SniperSignal] = list(oblivion_entries)
 
     def _rr(entry: float, sl: float, tp: float) -> float:
         risk = abs(entry - sl)
@@ -1288,6 +1788,16 @@ def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = N
         sl = band_low * (1 - buf)
         tp1 = max(target, anchor)
         tp2 = band_high
+        # Cap take-profits at the nearest S&R resistance and tighten the stop
+        # to just below the nearest support when that keeps every entry valid.
+        if sr_tp is not None and sr_tp > anchor:
+            tp2 = min(tp2, sr_tp)
+            if sr_tp < tp1:
+                tp1 = sr_tp
+        if sr_sl_guard is not None and sr_sl_guard < anchor:
+            structure_sl = sr_sl_guard * (1 - buf)
+            if structure_sl < min(anchor, near_low):
+                sl = max(sl, structure_sl)
         entries = [
             ("market", "Market entry", anchor),
             ("limit", "Limit — buy the dip", min(near_low, anchor)),
@@ -1298,7 +1808,7 @@ def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = N
             rr = _rr(entry, sl, tp1)
             reasons = [
                 f"Kronos projects {resp.symbol} UP {sig.pct_change:+.2f}% over {horizon} "
-                f"({int(conf * 100)}% path agreement).",
+                f"({int(path_conf * 100)}% path agreement).",
                 f"Predicted mean target {_fmt_price(target)} sits above current {_fmt_price(anchor)} — bullish drift.",
                 f"Stop {_fmt_price(sl)} is placed below the p10 floor ({_fmt_price(band_low)}), "
                 f"so a break there invalidates the up-thesis.",
@@ -1310,6 +1820,7 @@ def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = N
                 )
             reasons.extend(volume_reasons)
             reasons.extend(sig.rationale)
+            reasons.extend(indicator_reasons)
             signals.append(SniperSignal(
                 id=f"{resp.symbol}-long-{kind}", side="long", order_kind=kind, label=label,
                 entry=round(entry, 8), stop_loss=round(sl, 8), take_profit_1=round(tp1, 8),
@@ -1321,6 +1832,16 @@ def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = N
         sl = band_high * (1 + buf)
         tp1 = min(target, anchor)
         tp2 = band_low
+        # Cap take-profits at the nearest S&R support and tighten the stop to
+        # just above the nearest resistance when that keeps every entry valid.
+        if sr_tp is not None and sr_tp < anchor:
+            tp2 = max(tp2, sr_tp)
+            if sr_tp > tp1:
+                tp1 = sr_tp
+        if sr_sl_guard is not None and sr_sl_guard > anchor:
+            structure_sl = sr_sl_guard * (1 + buf)
+            if structure_sl > max(anchor, near_high):
+                sl = min(sl, structure_sl)
         entries = [
             ("market", "Market entry", anchor),
             ("limit", "Limit — sell the bounce", max(near_high, anchor)),
@@ -1331,7 +1852,7 @@ def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = N
             rr = _rr(entry, sl, tp1)
             reasons = [
                 f"Kronos projects {resp.symbol} DOWN {sig.pct_change:+.2f}% over {horizon} "
-                f"({int(conf * 100)}% path agreement).",
+                f"({int(path_conf * 100)}% path agreement).",
                 f"Predicted mean target {_fmt_price(target)} sits below current {_fmt_price(anchor)} — bearish drift.",
                 f"Stop {_fmt_price(sl)} is placed above the p90 ceiling ({_fmt_price(band_high)}), "
                 f"so a break there invalidates the down-thesis.",
@@ -1343,6 +1864,7 @@ def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = N
                 )
             reasons.extend(volume_reasons)
             reasons.extend(sig.rationale)
+            reasons.extend(indicator_reasons)
             signals.append(SniperSignal(
                 id=f"{resp.symbol}-short-{kind}", side="short", order_kind=kind, label=label,
                 entry=round(entry, 8), stop_loss=round(sl, 8), take_profit_1=round(tp1, 8),
@@ -1368,7 +1890,13 @@ async def generate_sniper_signals(
     sig = resp.signal
     note = None
     if not signals:
-        if resp.decision == "NO_TRADE":
+        if bool(((resp.oblivion or {}).get("news") or {}).get("blocked")):
+            note = (
+                "NEWS WINDOW — the OBLIVION news filter is active "
+                f"({((resp.oblivion or {}).get('news') or {}).get('window')} "
+                f"{((resp.oblivion or {}).get('news') or {}).get('tz')}); no entries are emitted inside it."
+            )
+        elif resp.decision == "NO_TRADE":
             note = (
                 f"NO_TRADE — volume is a hard precondition for a sniper entry and it "
                 f"is {(resp.volume.status.lower() if resp.volume else 'unavailable')} "

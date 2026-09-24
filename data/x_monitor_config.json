@@ -1,0 +1,8 @@
+{
+  "config": {
+    "enabled": true,
+    "interval_seconds": 600
+  },
+  "custom_accounts": {},
+  "paused_accounts": []
+}

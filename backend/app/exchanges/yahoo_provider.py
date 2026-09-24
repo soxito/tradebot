@@ -127,8 +127,7 @@ _FX_FUTURES: Dict[str, str] = {
 # Indices need no equivalent map: unlike spot FX — which has no volume of its
 # own and must borrow its future's — an index symbol resolves *straight* to its
 # future in YAHOO_TICKERS above, so price and volume come from the same series.
-# The ones Yahoo lists no future for keep pointing at cash and report no volume,
-# which the forecast's volume gate treats as NO_TRADE.
+# The ones Yahoo lists no future for keep pointing at cash and report no volume,# which the forecast's volume gate treats as NO_TRADE.
 
 # Stand-ins for tickers with holes in Yahoo's history on some intervals.
 # USDCNH=X serves intraday fine but its daily series is entirely null except
@@ -137,6 +136,88 @@ _TICKER_FALLBACKS = {"USDCNH=X": "USDCNY=X"}
 
 # Broker decorations to strip: EURUSD.m, XAUUSD_i, US30.cash, GBPUSDpro …
 _SUFFIXES = (".CASH", ".SPOT", ".PRO", ".ECN", ".RAW", ".MICRO", ".M", ".I", ".C", ".R", ".Z", ".A")
+
+# Stock-exchange equities Yahoo serves under their bare ticker (US listings) or
+# an exchange-suffixed ticker (VOD.L, BMW.DE, RELIANCE.NS). Bare US tickers must
+# be enumerated so a plain "AAPL" routes to Yahoo instead of a crypto exchange;
+# any suffixed ticker (containing a ".") is treated as an equity regardless.
+# This is a broad, non-exhaustive set — the ".SUFFIX" rule covers everything
+# else on the world's exchanges. Crypto-overlapping tickers are deliberately
+# excluded so a base like SOL/COIN never misroutes.
+_EQUITY_TICKERS: set = {
+    # Mega-cap tech
+    "AAPL", "MSFT", "GOOG", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AVGO",
+    "ORCL", "CRM", "ADBE", "AMD", "INTC", "QCOM", "TXN", "CSCO", "IBM", "NOW",
+    "INTU", "AMAT", "MU", "LRCX", "ADI", "KLAC", "SNPS", "CDNS", "PANW", "ANET",
+    "PLTR", "SNOW", "NET", "DDOG", "CRWD", "ZS", "SHOP", "UBER", "ABNB", "DASH",
+    "SQ", "PYPL", "COIN", "HOOD", "RBLX", "U", "SMCI", "ARM", "DELL", "HPQ",
+    "MRVL", "ON", "MCHP", "WDC", "STX", "FTNT", "TEAM", "WDAY", "ADSK", "ROP",
+    # Comms / media / internet
+    "NFLX", "DIS", "CMCSA", "T", "VZ", "TMUS", "WBD", "PARA", "SPOT", "PINS",
+    "SNAP", "ROKU", "TTD", "MTCH", "BIDU", "PDD", "JD", "BABA", "SE", "MELI",
+    # Financials
+    "JPM", "BAC", "WFC", "C", "GS", "MS", "SCHW", "BLK", "AXP", "USB", "PNC",
+    "TFC", "COF", "BK", "SPGI", "MCO", "ICE", "CME", "V", "MA", "FIS", "FISV",
+    "ALLY", "SOFI", "DFS", "SYF", "AIG", "MET", "PRU", "AFL",
+    # Healthcare / pharma / biotech
+    "UNH", "JNJ", "LLY", "PFE", "MRK", "ABBV", "TMO", "ABT", "DHR", "BMY",
+    "AMGN", "GILD", "CVS", "CI", "HUM", "ELV", "ISRG", "MDT", "SYK", "BSX",
+    "REGN", "VRTX", "MRNA", "BIIB", "ZTS", "BDX", "HCA", "IDXX", "DXCM", "ILMN",
+    # Consumer / retail / staples
+    "WMT", "COST", "HD", "LOW", "TGT", "PG", "KO", "PEP", "MCD", "SBUX", "NKE",
+    "LULU", "CMG", "YUM", "DPZ", "MDLZ", "MNST", "KHC", "GIS", "KMB", "CL",
+    "EL", "STZ", "KDP", "HSY", "K", "CAG", "SYY", "DG", "DLTR", "ROST", "TJX",
+    "ULTA", "BBY", "EBAY", "ETSY", "W", "CVNA", "GME", "AMC", "F", "GM",
+    # Industrials / energy / materials
+    "BA", "CAT", "DE", "GE", "HON", "MMM", "LMT", "RTX", "NOC", "GD", "EMR",
+    "ETN", "ITW", "PH", "CMI", "FDX", "UPS", "UNP", "CSX", "NSC", "LUV", "DAL",
+    "UAL", "AAL", "XOM", "CVX", "COP", "SLB", "EOG", "MPC", "PSX", "VLO", "OXY",
+    "WMB", "KMI", "HAL", "DVN", "FCX", "NEM", "NUE", "DOW", "DD", "LIN", "APD",
+    "SHW", "ECL", "CTVA", "MOS", "CF", "ALB",
+    # Autos / EV / transport
+    "RIVN", "LCID", "NIO", "LI", "XPEV", "FSLR", "ENPH", "PLUG", "CHPT",
+    # Utilities / real estate
+    "NEE", "DUK", "SO", "D", "AEP", "EXC", "SRE", "XEL", "PEG", "ED", "AMT",
+    "PLD", "CCI", "EQIX", "PSA", "O", "SPG", "WELL", "DLR", "VICI",
+    # Popular ETFs (Yahoo serves them like equities, with real volume)
+    "SPY", "QQQ", "IWM", "DIA", "VOO", "VTI", "VEA", "VWO", "IVV", "VUG", "VTV",
+    "XLK", "XLF", "XLE", "XLV", "XLY", "XLP", "XLI", "XLU", "XLB", "XLRE", "XLC",
+    "GLD", "SLV", "USO", "UNG", "TLT", "HYG", "LQD", "ARKK", "SMH", "SOXX",
+    "TQQQ", "SQQQ", "SOXL", "SOXS", "UVXY", "VXX", "GDX", "GDXJ", "XBI", "IBB",
+}
+
+# Yahoo's exchange suffixes for non-US listings — a ticker ending in one of
+# these keeps the suffix (VOD.L, BMW.DE, RELIANCE.NS). None overlap the broker
+# decorations stripped by ``normalize``.
+_EQUITY_EXCHANGE_SUFFIXES = (
+    ".L", ".DE", ".PA", ".AS", ".MI", ".MC", ".SW", ".BR", ".LS", ".VI",
+    ".ST", ".HE", ".OL", ".CO", ".TO", ".V", ".NE", ".HK", ".T", ".KS",
+    ".KQ", ".TW", ".NS", ".BO", ".AX", ".NZ", ".SA", ".MX", ".JO", ".SI",
+)
+
+
+def is_equity(symbol: str) -> bool:
+    """True when *symbol* is a stock-exchange equity Yahoo can serve.
+
+    A bare ticker must be in the curated set; a ticker carrying one of Yahoo's
+    exchange suffixes (``VOD.L``, ``BMW.DE``) is an equity by construction.
+    Crypto/FX are excluded.
+    """
+    raw = (symbol or "").upper().strip().replace("/", "").replace(" ", "")
+    for suf in _EQUITY_EXCHANGE_SUFFIXES:
+        if raw.endswith(suf) and raw[: -len(suf)].isalpha():
+            return True
+    return normalize(symbol) in _EQUITY_TICKERS
+
+
+def equity_ticker(symbol: str) -> Optional[str]:
+    """Yahoo ticker for an equity *symbol*, preserving any exchange suffix."""
+    raw = (symbol or "").upper().strip().replace("/", "").replace(" ", "")
+    for suf in _EQUITY_EXCHANGE_SUFFIXES:
+        if raw.endswith(suf) and raw[: -len(suf)].isalpha():
+            return raw
+    norm = normalize(symbol)
+    return norm if norm in _EQUITY_TICKERS else None
 
 
 def normalize(symbol: str) -> str:
@@ -182,6 +263,10 @@ def resolve_ticker(symbol: str) -> Optional[str]:
     # FX: two ISO codes back to back
     if len(s) == 6 and s[:3] in _CURRENCIES and s[3:] in _CURRENCIES:
         return f"{s}=X"
+    # Stock-exchange equities (US bare tickers + suffixed global listings).
+    eq = equity_ticker(symbol)
+    if eq:
+        return eq
     return None
 
 

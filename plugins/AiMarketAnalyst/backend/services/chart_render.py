@@ -66,6 +66,20 @@ class PlanOverlay:
     #: {"low": float, "high": float} bands from support_resistance_mtf.
     support_zones: list[dict[str, Any]] = field(default_factory=list)
     resistance_zones: list[dict[str, Any]] = field(default_factory=list)
+    #: Arbitrary indicator lines aligned to the candle list, e.g. the HLC3/Kaufman
+    #: bfma/bsma. Each: {"values": [float|None...], "color": (r,g,b),
+    #: "label": str, "dashed": bool, "width": int}.
+    custom_lines: list[dict[str, Any]] = field(default_factory=list)
+    #: Cheat-sheet patterns used for this plan — rendered as a legend and as chart annotations.
+    #: candle_patterns: [{"index": int, "name": str, "direction": str}] (index into candle list)
+    candle_patterns: list[dict[str, Any]] = field(default_factory=list)
+    #: chart_patterns: [{"kind": str, "signal": str, "confidence": float, "broken": bool,
+    #: "neckline": float|None, "top": float|None, "bottom": float|None, ...}]
+    chart_patterns: list[dict[str, Any]] = field(default_factory=list)
+    #: Human sentence naming the cheat sheets, e.g. "Bullish Engulfing at demand + Ascending Triangle breakout"
+    pattern_note: str | None = None
+    #: Per-pattern why explanations, e.g. ["Hammer: long lower wick 2.6×body at demand with volume 1.4× avg"]
+    pattern_reasons: list[str] = field(default_factory=list)
 
 
 def _load_font(size: int):
@@ -96,10 +110,17 @@ def render_plan_chart(
     timeframe: str,
     overlay: PlanOverlay | None = None,
     subtitle: str = "",
+    candle_count: int | None = None,
+    zoom_to_levels: bool = False,
 ) -> bytes | None:
     """Draw ``candles`` with ``overlay`` on top. Returns PNG bytes, or None.
 
     ``candles`` are ccxt-style ``[ts, open, high, low, close, volume]``.
+
+    ``candle_count`` — when set, only the last N candles are drawn (the overlay's
+    per-candle ``ema`` and ``custom_lines`` series are trimmed to match).
+    ``zoom_to_levels`` — when set and entry+SL are present, the price axis is
+    tightened around entry/SL/TP levels so the plan fills the frame.
     """
     rows = [c for c in (candles or []) if c and len(c) >= 5]
     if len(rows) < 5:
@@ -107,6 +128,20 @@ def render_plan_chart(
         return None
 
     overlay = overlay or PlanOverlay()
+
+    # ── Trim to the most recent window, keeping overlay series aligned ───────
+    if candle_count and candle_count > 0 and len(rows) > candle_count:
+        trim = len(rows) - candle_count
+        rows = rows[trim:]
+        if overlay.ema:
+            overlay.ema = {
+                p: series[trim:] for p, series in overlay.ema.items()
+            }
+        if overlay.custom_lines:
+            for line in overlay.custom_lines:
+                vals = line.get("values")
+                if isinstance(vals, list) and len(vals) > candle_count:
+                    line["values"] = vals[trim:]
 
     try:
         from PIL import Image, ImageDraw
@@ -144,18 +179,42 @@ def render_plan_chart(
                 + zone_bounds
                 + [lv.get("price") for lv in overlay.fib_levels]
                 + [v for series in overlay.ema.values() for v in series]
+                + [v for line in overlay.custom_lines for v in line.get("values", [])]
             ) if isinstance(v, (int, float))
         ]
         lo, hi = min(lows + extra), max(highs + extra)
         if hi <= lo:
             hi = lo + max(abs(lo) * 0.001, 1e-8)
+
+        # ── Optional zoom: tighten the axis around the plan levels so entry/SL/TP
+        # fill the frame instead of being a thin band amid full history.
+        if zoom_to_levels and isinstance(overlay.entry, (int, float)) \
+                and isinstance(overlay.stop_loss, (int, float)):
+            entry = float(overlay.entry)
+            sl = float(overlay.stop_loss)
+            stop_dist = abs(entry - sl)
+            level_vals = [entry, sl] + [
+                float(tp) for tp in overlay.take_profits
+                if isinstance(tp, (int, float))
+            ]
+            recent = rows[-20:] if len(rows) >= 20 else rows
+            level_vals += [float(c[2]) for c in recent] + [float(c[3]) for c in recent]
+            level_vals += [float(p) for p in overlay.projection if isinstance(p, (int, float))]
+            z_lo = min(level_vals) - stop_dist * 0.5
+            z_hi = max(level_vals) + stop_dist * 0.5
+            if z_hi > z_lo:
+                lo, hi = z_lo, z_hi
+
         span = hi - lo
         lo -= span * 0.06
         hi += span * 0.06
         span = hi - lo
 
         def y_of(price: float) -> int:
-            return int(plot_b - (price - lo) / span * (plot_b - plot_t))
+            # Clamp to the plot area so a candle or level outside a zoomed band
+            # is pinned to the edge rather than drawn over the header/footer.
+            y = plot_b - (price - lo) / span * (plot_b - plot_t)
+            return int(max(plot_t, min(plot_b, y)))
 
         step = (candle_r - plot_l) / max(1, len(rows))
         body_w = max(1, int(step * 0.62))
@@ -230,6 +289,36 @@ def render_plan_chart(
             draw.text((legend_x, plot_t + 4), text, fill=colour, font=f_sm)
             legend_x += draw.textbbox((0, 0), text, font=f_sm)[2] + 12
 
+        # ── Custom indicator lines (e.g. HLC3/Kaufman bfma & bsma) ───────────
+        for line in overlay.custom_lines:
+            vals = line.get("values") or []
+            colour = line.get("color", _MUTED)
+            width = int(line.get("width", 2))
+            dashed = bool(line.get("dashed", False))
+            pts = [
+                (int(plot_l + i * step + step / 2), y_of(float(v)))
+                for i, v in enumerate(vals[:len(rows)])
+                if isinstance(v, (int, float))
+            ]
+            if len(pts) < 2:
+                continue
+            if dashed:
+                for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+                    segments = max(1, int(abs(x2 - x1) / 9)) or 1
+                    for s in range(0, segments, 2):
+                        t1, t2 = s / segments, min((s + 1) / segments, 1.0)
+                        draw.line(
+                            [(x1 + (x2 - x1) * t1, y1 + (y2 - y1) * t1),
+                             (x1 + (x2 - x1) * t2, y1 + (y2 - y1) * t2)],
+                            fill=colour, width=width,
+                        )
+            else:
+                draw.line(pts, fill=colour, width=width)
+            text = str(line.get("label") or "")
+            if text:
+                draw.text((legend_x, plot_t + 4), text, fill=colour, font=f_sm)
+                legend_x += draw.textbbox((0, 0), text, font=f_sm)[2] + 12
+
         # ── Fib retracement levels ───────────────────────────────────────────
         for lv in overlay.fib_levels:
             price = lv.get("price")
@@ -242,6 +331,68 @@ def render_plan_chart(
             if label:
                 tw = draw.textbbox((0, 0), label, font=f_sm)[2]
                 draw.text((plot_r - tw - 4, y - 15), label, fill=(*_FIB_COLOUR, 220), font=f_sm)
+
+        # ── Cheat-sheet chart patterns (necklines, rectangle edges, flag rails) ──
+        for pat in (overlay.chart_patterns or [])[:3]:
+            kind = str(pat.get("kind", "pattern"))
+            signal = str(pat.get("signal", ""))
+            broken = bool(pat.get("broken"))
+            conf = pat.get("confidence")
+            conf_s = f" {float(conf):.0%}" if isinstance(conf, (int, float)) else ""
+            # choose colour by signal
+            col = _TARGET if signal == "bullish" else _STOP if signal == "bearish" else _MUTED
+            # collect levels that define the pattern
+            levels = []
+            for key in ("neckline", "top", "bottom", "flag_high", "flag_low", "upper_now", "lower_now"):
+                v = pat.get(key)
+                if isinstance(v, (int, float)):
+                    levels.append((key, float(v)))
+            for key, price in levels:
+                y = y_of(price)
+                # dashed if pending, solid if broken
+                if broken:
+                    draw.line([(plot_l, y), (plot_r, y)], fill=col, width=2)
+                else:
+                    for x in range(plot_l, plot_r, 10):
+                        draw.line([(x, y), (min(x + 5, plot_r), y)], fill=col, width=2)
+                label = f"{kind} {key}{conf_s}"
+                tw = draw.textbbox((0, 0), label, font=f_sm)[2]
+                draw.rectangle([plot_r - tw - 8, y - 18, plot_r - 2, y - 2], fill=(*col, 210))
+                draw.text((plot_r - tw - 5, y - 17), label, fill=(11, 15, 25), font=f_sm)
+            # island markers
+            for k in ("island_high", "island_low"):
+                v = pat.get(k)
+                if isinstance(v, (int, float)):
+                    y = y_of(float(v))
+                    draw.line([(plot_l, y), (plot_r, y)], fill=col, width=1)
+
+        # ── Candle pattern markers (text above/below the bar that printed it) ──
+        for cp in (overlay.candle_patterns or [])[:6]:
+            idx = cp.get("index")
+            name = str(cp.get("name", "pattern"))
+            direction = str(cp.get("direction", ""))
+            if not isinstance(idx, int) or idx < 0 or idx >= len(rows):
+                continue
+            # x of the bar
+            x = int(plot_l + idx * step + step / 2)
+            if x < plot_l or x > candle_r:
+                continue
+            # y just above high for bear, below low for bull
+            c = rows[idx]
+            h, l = float(c[2]), float(c[3])
+            y_ref = y_of(h) - 14 if direction == "bear" else y_of(l) + 10
+            # clamp
+            y_ref = int(max(plot_t + 12, min(plot_b - 10, y_ref)))
+            col = _TARGET if direction == "bull" else _STOP if direction == "bear" else _MUTED
+            # tiny arrow + label
+            arr = "▲" if direction == "bull" else "▼" if direction == "bear" else "◆"
+            label = f"{arr} {name}"
+            # background pill
+            tw = draw.textbbox((0, 0), label, font=f_sm)[2]
+            # clamp horizontally
+            tx = max(plot_l, min(x - tw // 2, plot_r - tw - 4))
+            draw.rectangle([tx - 3, y_ref - 11, tx + tw + 3, y_ref + 3], fill=(*col, 180))
+            draw.text((tx, y_ref - 10), label, fill=(11, 15, 25), font=f_sm)
 
         last_close = float(rows[-1][4])
 
@@ -288,6 +439,17 @@ def render_plan_chart(
         if subtitle:
             draw.text((_PAD_L + draw.textbbox((0, 0), head, font=f_lg)[2] + 18, 16),
                       subtitle[:90], fill=_MUTED, font=f_md)
+        # cheat-sheet legend (just under header, so it is visible on the Telegram thumbnail)
+        if overlay.pattern_note or overlay.pattern_reasons:
+            legend_y = 30
+            if overlay.pattern_note:
+                legend = f"📚 {overlay.pattern_note[:120]}"
+                draw.text((_PAD_L, legend_y), legend, fill=(250, 204, 21), font=f_sm)
+                legend_y += 16
+            for reason in (overlay.pattern_reasons or [])[:2]:
+                line = f"• {reason[:110]}"
+                draw.text((_PAD_L, legend_y), line, fill=_MUTED, font=f_sm)
+                legend_y += 14
         draw.text((_PAD_L, _H - 22),
                   "Generated by the trading room — levels are the agents' plan, not advice. "
                   "Verify before trading.", fill=_MUTED, font=f_sm)
@@ -298,3 +460,24 @@ def render_plan_chart(
     except Exception as exc:  # noqa: BLE001
         logger.warning("[ChartRender] could not draw chart: {}", exc)
         return None
+
+
+# ── OBLIVION dedicated chart ───────────────────────────────────────────────
+
+
+def render_oblivion_chart(
+    candles: Sequence[Sequence[float]],
+    oblivion_result: dict[str, Any] | None,
+    *,
+    symbol: str,
+    timeframe: str,
+    candle_count: int | None = 120,
+    source: str = "",
+) -> bytes | None:
+    """The dedicated OBLIVION AI v4.0 analysis image — see :mod:`oblivion_chart`."""
+    from plugins.AiMarketAnalyst.backend.services.oblivion_chart import render_oblivion_chart as _render
+
+    return _render(
+        candles, oblivion_result, symbol=symbol, timeframe=timeframe,
+        candle_count=candle_count, source=source,
+    )

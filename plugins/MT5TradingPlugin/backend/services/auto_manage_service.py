@@ -263,13 +263,17 @@ async def _apply_protective_stops(
     terminal belongs to the user, and silently moving its stop would override a
     decision the app was never asked to make. Returns how many were moved.
     """
-    from app.trading.order_tags import is_app_order
+    from app.trading.order_tags import SOURCE_ROOM, classify, is_app_order
     from app.trading.trailing import protective_stop
     from plugins.MT5TradingPlugin.backend.services.mt5_client import mt5_client
 
     moved = 0
     for pos in positions:
         if not is_app_order(pos.comment):
+            continue
+        # Room trades are managed in real time by app.agents.trade_manager;
+        # two loops moving one stop would fight each other.
+        if classify(pos.comment)["source"] == SOURCE_ROOM:
             continue
         new_sl = protective_stop(
             side=pos.side.value if hasattr(pos.side, "value") else str(pos.side),

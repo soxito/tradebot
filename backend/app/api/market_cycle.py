@@ -115,10 +115,14 @@ async def cycle_windows() -> dict:
     )
     if snap is None:
         return {"ok": False, "windows": []}
+    # Return all cycles since genesis so the chart can show the full 2010→now timeline
+    # (previous default of 3 only showed the last ~10 years, hiding early cycles on W1/D1 genesis view).
+    anchors_list = market_cycle.parse_anchors(anchors or market_cycle.DEFAULT_ANCHORS)
     windows = market_cycle.build_windows(
         anchors or market_cycle.DEFAULT_ANCHORS,
         bull_days=bull or market_cycle.BULL_DAYS,
         bear_days=bear or market_cycle.BEAR_DAYS,
+        history_cycles=max(10, len(anchors_list) + 5),
     )
     return {
         "ok": True,
@@ -252,13 +256,16 @@ async def cycle_bias(symbol: str = Query(..., min_length=1, max_length=24)) -> d
 @router.get("/candles")
 async def cycle_candles(
     timeframe: Optional[str] = Query(default="D1", description="Timeframe: MN1,W1,D1,H4,H1"),
-    limit: Optional[str] = Query(default=None, description="Candles, 10-150000. Empty = full genesis"),
+    limit: Optional[str] = Query(default=None, description="Candles, 10-150000. Empty = default window"),
+    full: bool = Query(default=False, description="When true, H1/H4 return full 15y genesis (150k/40k); false (default) returns 4y/last-halving (35040/8760)"),
 ) -> dict:
-    """Full-history BTC candles for every timeframe — genesis-aware.
+    """BTC candles — 4y/last-halving default for H1/H4, genesis for others.
 
-    * MN1/W1/D1 → Yahoo `max` + CoinMetrics daily backfill → true 2010 genesis.
-    * H4/H1 → Bitget paginated (real) + synthetic daily→hourly for 2010→Bitget-start gap → continuous 2010 line.
-    Cached per timeframe (TTL = CYCLE_CACHE_TTL_SECONDS). Large H1 payloads are ~5-6 MB.
+    * MN1/W1/D1 → Yahoo `max` + CoinMetrics daily backfill → true 2010 genesis (always).
+    * H4/H1 → Bitget paginated (real) + synthetic daily→hourly for gap.
+      `full=false` (default) → 4y / last halving (35040 H1 / 8760 H4) so agents have enough context without 96k crash.
+      `full=true` → 15y genesis (150k/40k, downsampled to 5k in UI).
+    Cached per timeframe+full (TTL = CYCLE_CACHE_TTL_SECONDS).
     """
     from app.services import market_cycle
 
@@ -271,7 +278,7 @@ async def cycle_candles(
         tf = "D1"
     if lim is not None and not (10 <= lim <= 150000):
         lim = None
-    bars = await market_cycle.resolve_btc_candles(timeframe=tf, limit=lim)
+    bars = await market_cycle.resolve_btc_candles(timeframe=tf, limit=lim, full=full)
     candles = [
         {
             "time": int(b["time"]),

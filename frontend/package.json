@@ -1,7 +1,8 @@
 {
   "scripts": {
-    "dev": "NODE_OPTIONS='--max-old-space-size=2048' next dev",
+    "dev": "next dev",
     "build": "next build",
+    "analyze": "ANALYZE=true next build",
     "start": "next start -p 3000",
     "lint": "eslint . --ext .js,.jsx,.ts,.tsx",
     "test": "vitest run",

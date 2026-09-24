@@ -418,6 +418,8 @@ async def run_sync(
         f"[ObsidianSync] Complete — written={written} skipped={skipped} errors={errors} "
         f"duration={duration_ms}ms"
     )
+    if errors and details:
+        logger.warning(f"[ObsidianSync] error details: {'; '.join(details[:10])}")
 
     return {
         "written": written,
@@ -568,6 +570,8 @@ async def _run_one_cycle() -> Dict[str, Any]:
             f"🗂️  [VAULT SYNC] {_last_run['written']} written, "
             f"{_last_run['skipped']} unchanged, {_last_run['errors']} error(s)"
         )
+        if _last_run["errors"] and result.get("details"):
+            logger.warning(f"🗂️  [VAULT SYNC] error details: {'; '.join(result['details'][:10])}")
     except Exception as exc:  # noqa: BLE001 — a bad cycle must not kill the loop
         _last_run = {
             "at": started, "status": "error",

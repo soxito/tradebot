@@ -1,0 +1,7 @@
+{
+  "symbol": "ETHUSD",
+  "action": "sell",
+  "agreement": 0.6,
+  "created_at": 1788320013.505079,
+  "source": "hermes_bridge"
+}

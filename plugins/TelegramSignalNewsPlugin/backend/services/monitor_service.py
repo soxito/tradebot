@@ -1062,6 +1062,15 @@ async def run_monitor_cycle(db: AsyncSession, *, do_poll: bool = True) -> dict[s
         logger.warning("Volume-channel processing failed: {}", exc)
         vol_stats = {"error": str(exc)}
 
+    # Weekly Kronos combined-model improvement (Sunday, once/week gate lives in
+    # the Kronos plugin). Piggybacks this already-supervised loop because the
+    # core lifespan means plugin startup hooks never fire. Fully graceful.
+    try:
+        from plugins.KronosForecastPlugin.backend.services import weekly_service
+        await weekly_service.maybe_run_weekly()
+    except Exception as exc:  # noqa: BLE001 — Kronos hook must never break the monitor
+        logger.debug("Kronos weekly hook skipped: {}", exc)
+
     return {
         "polled": do_poll,
         "polled_channels": poll_channels,
@@ -1214,6 +1223,7 @@ class TelegramSignalMonitor:
             send_message,
             answer_callback_query,
             sync_bot_commands,
+            delete_webhook,
         )
         from plugins.TelegramSignalNewsPlugin.backend.services.command_service import (
             parse_and_execute,
@@ -1222,6 +1232,51 @@ class TelegramSignalMonitor:
 
         await asyncio.sleep(3)  # let the main loop start first
         logger.info("🤖 Bot polling loop running")
+
+        # ── One-time bootstrap ────────────────────────────────────────────
+        # create_all never ALTERs an existing table, so add the bootstrap flag
+        # column live, then (once) force-enable polling + AI fallback and clear
+        # any stale webhook so the bot replies out-of-the-box. Manual UI toggles
+        # win on every run after this.
+        try:
+            from sqlalchemy import text
+            async with session_factory() as db0:
+                await db0.execute(text(
+                    "ALTER TABLE telegram_bot_configs "
+                    "ADD COLUMN IF NOT EXISTS polling_bootstrap_v1 BOOLEAN NOT NULL DEFAULT FALSE"
+                ))
+                await db0.commit()
+                cfg0 = (await db0.execute(select(TelegramBotConfig).limit(1))).scalars().first()
+                if cfg0 is None:
+                    cfg0 = TelegramBotConfig(polling_enabled=True, ai_fallback_enabled=True,
+                                             polling_bootstrap_v1=True)
+                    db0.add(cfg0)
+                    await db0.commit()
+                    logger.info("🤖 Bot bootstrap: created default config with polling enabled")
+                    boot_token = cfg0.bot_token_override or ""
+                elif not getattr(cfg0, "polling_bootstrap_v1", False):
+                    cfg0.polling_enabled = True
+                    cfg0.ai_fallback_enabled = True
+                    cfg0.webhook_url = None
+                    cfg0.polling_bootstrap_v1 = True
+                    boot_token = cfg0.bot_token_override or ""
+                    await db0.commit()
+                    logger.info("🤖 Bot bootstrap: forced polling + AI fallback on, cleared webhook")
+                else:
+                    boot_token = None
+            if boot_token is not None:
+                if not boot_token:
+                    from plugins.TelegramSignalNewsPlugin.backend.models import TelegramPluginSettings
+                    async with session_factory() as dbt:
+                        ps = (await dbt.execute(select(TelegramPluginSettings).limit(1))).scalars().first()
+                        boot_token = (ps.bot_token if ps else "") or ""
+                if boot_token:
+                    try:
+                        await delete_webhook(boot_token)
+                    except Exception:  # noqa: BLE001
+                        pass
+        except Exception as exc:  # noqa: BLE001 — never block the loop on bootstrap
+            logger.warning("[BotPolling] bootstrap skipped: {}", exc)
 
         offset: int | None = None
         commands_synced_for: str | None = None  # token the / menu was pushed for

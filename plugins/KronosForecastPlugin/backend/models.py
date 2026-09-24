@@ -52,3 +52,79 @@ class KronosForecast(KronosBase):
 
     scored = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+
+class KronosFinetuneJob(KronosBase):
+    """A fine-tuning run: export live OHLCV → CSV → train tokenizer + predictor.
+
+    Standalone table; no cross-plugin foreign keys. The subprocess trainer
+    writes progress to ``log_path`` and its checkpoints under ``output_dir``.
+    """
+
+    __tablename__ = "kronos_finetune_jobs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    exchange = Column(String(32), nullable=False)
+    symbol = Column(String(64), nullable=False, index=True)
+    timeframe = Column(String(8), nullable=False)
+
+    # Optional user label for the produced model, e.g. "super-base".
+    model_name = Column(String(128), nullable=True)
+
+    # For a COMBINED model: the list of source pairs merged into it, so the
+    # /kronos-forecast details can show which pairs are trained and improved.
+    symbols_combined = Column(JSON, nullable=True)
+
+    # pending | exporting | running | completed | failed | cancelled
+    status = Column(String(16), nullable=False, default="pending", index=True)
+
+    # Training parameters
+    lookback = Column(Integer, nullable=False, default=512)
+    pred_len = Column(Integer, nullable=False, default=48)
+    tokenizer_epochs = Column(Integer, nullable=False, default=30)
+    predictor_epochs = Column(Integer, nullable=False, default=20)
+    batch_size = Column(Integer, nullable=False, default=32)
+    base_model = Column(String(128), nullable=True)      # pretrained start point
+
+    # Paths + process
+    data_path = Column(String(512), nullable=True)
+    config_path = Column(String(512), nullable=True)
+    log_path = Column(String(512), nullable=True)
+    output_dir = Column(String(512), nullable=True)      # finetuned checkpoints
+    pid = Column(Integer, nullable=True)
+
+    rows_exported = Column(Integer, nullable=True)
+    error = Column(String(1024), nullable=True)
+
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+
+class KronosChartDrawing(KronosBase):
+    """User-authored (and agent-refined) chart drawings for a chart tab.
+
+    One row per (exchange, symbol, timeframe). ``drawings`` holds the full list
+    of shapes — both ``source='user'`` shapes the trader draws and
+    ``source='agent'`` shapes the analysis pipeline refines — as a JSON array so
+    the trading-room agents can read them as context and write back sharper
+    levels. Standalone table; no cross-plugin foreign keys.
+    """
+
+    __tablename__ = "kronos_chart_drawings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    exchange = Column(String(32), nullable=False, index=True)
+    symbol = Column(String(64), nullable=False, index=True)
+    timeframe = Column(String(8), nullable=False, index=True)
+
+    # Full list of shapes (user + agent). Each item is a dict:
+    # {id, type, points:[{time,price}], color, width, text?, source, locked?,
+    #  agent_note?, refined_from?}
+    drawings = Column(JSON, nullable=False, default=list)
+
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+

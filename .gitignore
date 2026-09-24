@@ -105,3 +105,22 @@ backend/app/api/models/*.task
 desktop/resources/
 dist-desktop/
 .build-cache/
+
+# Credential encryption key (app/core/secrets_box.py)
+backend/data/.credentials_key
+backend/data/backtests/
+
+# Separate git checkouts (pinned by integrations/*.version.json) and local-only data
+integrations/TradingAgents/
+integrations/hermes-agent/
+integrations/neuroglancer/
+integrations/soup/
+osiris/
+data/ollama_training/
+data/soup_jobs/
+.codex/
+.soup-crashes/
+backend/data/news_history.json
+
+# Kronos fine-tune outputs (model weights, training data) — local only, too large for git
+plugins/KronosForecastPlugin/backend/data/finetune/

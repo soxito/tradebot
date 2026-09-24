@@ -1,0 +1,7 @@
+{
+  "symbol": "CADJPY",
+  "action": "buy",
+  "agreement": 1.0,
+  "created_at": 1790010882.6785102,
+  "source": "hermes_bridge"
+}

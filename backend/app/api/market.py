@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 from fastapi import APIRouter, Query
 from loguru import logger
+from pydantic import BaseModel, Field
 
 from app.exchanges.yahoo_provider import (
     fetch_candles as yahoo_candles,
@@ -467,7 +468,7 @@ async def indicator_overlay(
     exchange: str,
     symbol: str,
     timeframe: str = Query(default="1d"),
-    limit: int = Query(default=400, ge=30, le=1500),
+    limit: int = Query(default=400, ge=30, le=10000),
     indicators: str = Query(default="ema,rsi,macd", description="Comma set: ema, rsi, macd"),
 ):
     """Trend + momentum indicators as chart overlay series.
@@ -483,27 +484,39 @@ async def indicator_overlay(
     wanted = {t.strip().lower() for t in (indicators or "").split(",") if t.strip()}
 
     try:
+        # For BTC, use full-history Yahoo+CoinMetrics when venue history is thin
+        # (Bitget weekly only has 13 bars, not enough for EMA). This ensures W1/D1
+        # indicators show full genesis like the candles do.
+        is_btc = symbol.replace("/", "").upper() in ("BTCUSD", "BTCUSDT", "BTC")
         connector = exchange_manager.get_exchange(SupportedExchange(exchange.lower()))
         if not connector:
             return empty
         ohlcv = await connector.get_ohlcv(symbol=symbol, timeframe=timeframe, limit=limit)
-        if not ohlcv or len(ohlcv) < 30:
+        ohlcv = ohlcv or []
+        # Don't give up early for BTC — try Yahoo before returning empty
+        if (not ohlcv or len(ohlcv) < 30) and not is_btc:
             return empty
-
-        # Venues cap their own history (Bitget serves 90 dailies), which would
+        # Venues cap their own history (Bitget serves 90 dailies / 13 weeklies), which would
         # leave the 200-day EMA — the trend line this endpoint exists for — as
-        # warm-up NaNs. On the daily, top up from the Yahoo provider, which
-        # carries ~10 years of BTC.
-        if len(ohlcv) < min(limit, 210) and (timeframe or "").upper() in {"1D", "D1"}:
+        # warm-up NaNs. On BTC D1/W1, top up from Yahoo period fetch which carries full genesis.
+        if len(ohlcv) < min(limit, 210) and (timeframe or "").upper() in {"1D", "D1", "1W", "W1"}:
             try:
-                from app.exchanges import yahoo_provider
-
-                ybars = await yahoo_provider.fetch_candles(
-                    symbol, "D1", limit=max(limit, 400)
-                )
+                ybars = None
+                if is_btc:
+                    try:
+                        from app.services.market_cycle import _fetch_yahoo_btc_full
+                        tf_key = "W1" if (timeframe or "").upper() in {"1W", "W1"} else "D1"
+                        ybars_period = await _fetch_yahoo_btc_full(tf_key, max(limit, 400))
+                        ybars = ybars_period or []
+                    except Exception:
+                        ybars = None
+                if ybars is None:
+                    from app.exchanges import yahoo_provider
+                    y_tf = "W1" if (timeframe or "").upper() in {"1W", "W1"} else "D1"
+                    ybars = await yahoo_provider.fetch_candles(symbol, y_tf, limit=max(limit, 400))
                 converted = [
                     [int(b["time"]) * 1000, b.get("open"), b.get("high"),
-                     b.get("low"), b.get("close"), b.get("volume") or 0]
+                      b.get("low"), b.get("close"), b.get("volume") or 0]
                     for b in (ybars or []) if b.get("time") and b.get("close")
                 ]
                 if len(converted) > len(ohlcv):
@@ -604,10 +617,10 @@ async def pattern_overlay(
     exchange: str,
     symbol: str,
     timeframe: str = Query(default="1d"),
-    limit: int = Query(default=400, ge=30, le=3000),
+    limit: int = Query(default=400, ge=30, le=10000),
     patterns: str = Query(
-        default="morning_star,evening_star,inverted_hammer,hammer,shooting_star,engulfing",
-        description="Comma set of candlestick patterns to flag",
+        default="",
+        description="Comma set of candlestick patterns to flag (empty = all)",
     ),
     fisher: bool = Query(default=True, description="Include the Fisher transform pane"),
 ):
@@ -627,6 +640,16 @@ async def pattern_overlay(
 
         rows = await candle_resolver.fetch(symbol, timeframe, limit)
         tf_up = (timeframe or "").upper()
+        # BTC weekly venue history is only 13 bars — use Yahoo period for full genesis so W1 shows all cycles
+        is_btc_w = symbol.replace("/", "").upper() in ("BTCUSD", "BTCUSDT", "BTC") and tf_up in {"1W", "W1"}
+        if is_btc_w and (not rows or len(rows) < 100):
+            try:
+                from app.services.market_cycle import _fetch_yahoo_btc_full
+                ybars = await _fetch_yahoo_btc_full("W1", limit)
+                if ybars and len(ybars) > len(rows or []):
+                    rows = [[int(b["time"]) * 1000, b["open"], b["high"], b["low"], b["close"], b["volume"] or 0] for b in ybars]
+            except Exception:
+                pass
         if not rows and tf_up in {"MN1", "1M"}:
             # Monthly is the cycle screen's timeframe; only the Yahoo provider
             # carries it, so ask there directly before giving up.
@@ -642,10 +665,14 @@ async def pattern_overlay(
             return empty
 
         wanted = [p.strip().lower() for p in (patterns or "").split(",") if p.strip()]
+        # empty means all patterns; limit marker spam by keeping last 40 events (triple patterns span 60 bars)
         events = detect_patterns(rows, patterns=wanted or None)
+        # throttling for chart markers: keep most recent 40 to avoid clutter
+        if len(events) > 40:
+            events = events[-40:]
         markers = [
             {
-                "time": int(ev["time"]) if int(ev["time"]) > 10**12 else int(ev["time"]),
+                "time": int(ev["time"]) // 1000 if int(ev["time"]) > 10**12 else int(ev["time"]),
                 "position": "belowBar" if ev["direction"] == "bull" else "aboveBar",
                 "color": "#22c55e" if ev["direction"] == "bull" else "#ef4444",
                 "shape": "arrowUp" if ev["direction"] == "bull" else "arrowDown",
@@ -687,16 +714,135 @@ async def pattern_overlay(
                     ],
                 })
 
+        # Chart patterns for the same window — overlay geometry for triangles/flags/H&S etc.
+        chart_patterns = None
+        try:
+            from app.signals.chart_patterns import analyze_chart_patterns as _cp
+            from app.signals.technical import ohlcv_to_dataframe as _cdf
+            df = _cdf(rows)
+            if len(df) >= 40:
+                chart_patterns = _cp(df)
+        except Exception:
+            pass
+
         return {
             "symbol": symbol,
             "timeframe": timeframe,
             "overlays": overlays,
             "markers": markers,
+            "chart_patterns": chart_patterns,
             "signal": {
                 "patterns_found": len(events),
                 "last_pattern": events[-1]["name"] if events else None,
+                "chart_patterns_found": (chart_patterns or {}).get("count", 0) if chart_patterns else 0,
+                "best_chart_pattern": (chart_patterns or {}).get("best", {}).get("kind") if chart_patterns else None,
             },
         }
     except Exception as e:  # noqa: BLE001 - an overlay must never break the chart
         logger.warning(f"[Market] pattern overlay {exchange}/{symbol}: {e}")
+        return empty
+
+
+# ── OBLIVION AI engine overlay ──────────────────────────────────────────────
+
+
+class OblivionOverlayRequest(BaseModel):
+    """Candles the chart is drawing, so the overlay is computed on that exact
+    series (data-source parity). ``candles`` are lightweight-charts bars with
+    ``time`` in seconds, or ccxt rows ``[ms, o, h, l, c, v]``."""
+    symbol: str
+    timeframe: str = "1h"
+    candles: List[Any] = Field(default_factory=list)
+    config: Optional[Dict[str, Any]] = None
+
+
+def _oblivion_overlay_payload(symbol: str, timeframe: str, rows: List[Any],
+                              config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    from app.signals.oblivion import analyze_oblivion, compact_for_prompt, config_from_dict, oblivion_to_overlays
+
+    empty = {"symbol": symbol, "timeframe": timeframe, "oblivion": None, "overlay_bundle": None, "error": None}
+    if not rows or len(rows) < 60:
+        empty["error"] = f"need at least 60 candles, got {len(rows or [])}"
+        return empty
+    res = analyze_oblivion(rows, timeframe, config_from_dict(config))
+    if res.get("error"):
+        empty["error"] = res["error"]
+        return empty
+    read = compact_for_prompt(res)
+    read["signals_history"] = res.get("signals_history") or []
+    return {
+        "symbol": symbol, "timeframe": timeframe,
+        "oblivion": read,
+        "overlay_bundle": oblivion_to_overlays(res, timeframe),
+        "error": None,
+    }
+
+
+@router.post("/oblivion-overlay")
+async def oblivion_overlay_from_candles(req: OblivionOverlayRequest):
+    """OBLIVION AI engine v4.0 read + chart overlay bundle on caller-supplied candles.
+
+    The chart POSTs the bars it is drawing so every box, label and level lands
+    on the candles the user sees (see the data-source parity note in the
+    project memory). Returns ``{oblivion, overlay_bundle}``.
+    """
+    try:
+        rows: List[List[float]] = []
+        for c in req.candles or []:
+            if isinstance(c, dict):
+                t = c.get("time") or c.get("timestamp")
+                if t is None or c.get("close") is None:
+                    continue
+                t = float(t)
+                rows.append([int(t * 1000) if t < 1e11 else int(t), float(c.get("open", c["close"])),
+                             float(c.get("high", c["close"])), float(c.get("low", c["close"])),
+                             float(c["close"]), float(c.get("volume") or 0.0)])
+            elif isinstance(c, (list, tuple)) and len(c) >= 5:
+                t = float(c[0])
+                rows.append([int(t * 1000) if t < 1e11 else int(t), float(c[1]), float(c[2]), float(c[3]), float(c[4]),
+                             float(c[5]) if len(c) > 5 and c[5] is not None else 0.0])
+        rows.sort(key=lambda r: r[0])
+        return _oblivion_overlay_payload(req.symbol, req.timeframe, rows, req.config)
+    except Exception as e:  # noqa: BLE001 - an overlay must never break the chart
+        logger.warning(f"[Market] oblivion overlay (candles) {req.symbol}: {e}")
+        return {"symbol": req.symbol, "timeframe": req.timeframe, "oblivion": None, "overlay_bundle": None,
+                "error": str(e)}
+
+
+@router.get("/oblivion-overlay/{exchange}/{symbol}")
+async def oblivion_overlay(
+    exchange: str,
+    symbol: str,
+    timeframe: str = Query(default="1h"),
+    limit: int = Query(default=400, ge=60, le=5000),
+):
+    """OBLIVION AI engine v4.0 overlay for a chart that fetched its own bars via
+    ``/exchanges/{exchange}/ohlcv/{symbol}``.
+
+    Resolves candles through that same route function, so the engine runs on
+    the feed the chart drew (Bitget for crypto, MT5/Swissquote-anchored Yahoo
+    for FX & metals) rather than the server-side resolver's own pick.
+    """
+    empty = {"symbol": symbol, "timeframe": timeframe, "oblivion": None, "overlay_bundle": None, "error": None}
+    try:
+        from app.api.exchanges import get_ohlcv as _chart_ohlcv
+        from app.exchanges.manager import SupportedExchange
+
+        try:
+            venue = SupportedExchange(exchange.lower())
+        except Exception:
+            venue = SupportedExchange.BITGET
+        payload = await _chart_ohlcv(venue, symbol, timeframe=timeframe, limit=limit)
+        bars = (payload or {}).get("data") or []
+        rows = [[int(b["time"]) * 1000, float(b["open"]), float(b["high"]), float(b["low"]), float(b["close"]),
+                 float(b.get("volume") or 0.0)] for b in bars if b.get("close") is not None]
+        if not rows:
+            from app.services import candles as candle_resolver
+            rows = list(await candle_resolver.fetch(symbol, timeframe, limit) or [])
+        out = _oblivion_overlay_payload(symbol, timeframe, rows)
+        out["source"] = (payload or {}).get("exchange") or exchange
+        return out
+    except Exception as e:  # noqa: BLE001 - an overlay must never break the chart
+        logger.warning(f"[Market] oblivion overlay {exchange}/{symbol}: {e}")
+        empty["error"] = str(e)
         return empty

@@ -23,6 +23,7 @@ import {
 } from 'lightweight-charts'
 import { apiClient, type PriceBasis } from '@/services/api'
 import { ZoneBoxPrimitive, ZoneBox } from './MT5ZonePrimitive'
+import { OblivionPrimitive, type OblivionOverlayBundle } from './OblivionPrimitive'
 import {
   Crosshair, RefreshCw, Target, TrendingUp, TrendingDown, Activity,
   Zap, FlaskConical, ChevronRight, AlertTriangle, Brain, CheckCircle, X,
@@ -171,7 +172,23 @@ interface Analysis {
   us_session?: { enabled: boolean; open_time: number | null; open_price: number | null; live_in_session: boolean }
   ai?: AiReview | null
   kronos?: KronosBlock | null
+  /** OBLIVION AI engine v4.0 read on the same candles + its overlay bundle. */
+  oblivion?: OblivionBlock | null
   error?: string
+}
+
+interface OblivionBlock {
+  summary?: string
+  score?: { bull: number; bear: number; required: number; components?: { bull: Record<string, number>; bear: Record<string, number> } }
+  market_bias?: number
+  bias_label?: string
+  structure?: { now?: string }
+  session?: { name?: string; active?: boolean }
+  news?: { blocked?: boolean; in_window?: boolean; window?: string; tz?: string }
+  signal?: { action: string; new?: boolean; confirmed?: boolean; score?: number; entry?: number | null; stop_loss?: number | null; tp1?: number | null; tp2?: number | null; tp3?: number | null; blocked_by_news?: boolean }
+  last_signal?: { action: string; entry?: number; stop_loss?: number; tp1?: number; tp2?: number; tp3?: number; bars_since?: number } | null
+  dashboard?: Record<string, string>
+  overlay_bundle?: OblivionOverlayBundle | null
 }
 
 interface KronosOverlay {
@@ -307,7 +324,7 @@ function supportsPriceBasis(sym: string): boolean {
 }
 
 // ── Chart layer visibility ───────────────────────────────────────────────────
-const LAYER_KEYS = ['zones', 'range', 'liquidity', 'setup', 'structure', 'position', 'kronos', 'fib'] as const
+const LAYER_KEYS = ['zones', 'range', 'liquidity', 'setup', 'structure', 'position', 'kronos', 'fib', 'oblivion'] as const
 type LayerKey = typeof LAYER_KEYS[number]
 const LAYER_LABELS: Record<LayerKey, string> = {
   zones:     'OB/FVG',
@@ -318,6 +335,7 @@ const LAYER_LABELS: Record<LayerKey, string> = {
   position:  'Position',
   kronos:    'Kronos',
   fib:       'Auto Fib',
+  oblivion:  'Oblivion',
 }
 const LAYER_COLORS: Record<LayerKey, string> = {
   zones:     '#3b82f6',
@@ -328,6 +346,7 @@ const LAYER_COLORS: Record<LayerKey, string> = {
   position:  '#f97316',
   kronos:    '#a78bfa',
   fib:       '#009688',
+  oblivion:  '#84cc16',
 }
 const LAYERS_CFG_KEY = 'mt5_sniper_layers'
 function loadLayerCfg(): Record<LayerKey, boolean> {
@@ -519,6 +538,55 @@ function loadSniperCfg(): SniperCfg {
 
 // ── Component ────────────────────────────────────────────────────────────────
 
+/** Compact OBLIVION engine card for the sniper side panel. */
+function OblivionPanel({ obl, canPlace, placing, onUsePlan }: {
+  obl: OblivionBlock; canPlace: boolean; placing: boolean; onUsePlan: () => void
+}) {
+  const sig = obl.signal?.entry != null ? obl.signal : null
+  const last = obl.last_signal ?? null
+  const plan = sig ?? last
+  const action = (sig?.action ?? 'wait').toUpperCase()
+  const sigColor = action === 'BUY' ? 'text-lime-400' : action === 'SELL' ? 'text-red-400' : 'text-gray-400'
+  const biasColor = obl.market_bias === 1 ? 'text-lime-400' : obl.market_bias === -1 ? 'text-red-400' : 'text-gray-400'
+  const news = !!obl.news?.blocked
+  return (
+    <div className="rounded border border-lime-700/30 bg-lime-950/10 px-2 py-1.5 space-y-0.5 text-[11px]" title={obl.summary}>
+      <div className="flex items-center justify-between">
+        <span className="text-lime-300 font-semibold">OBLIVION v4</span>
+        <span className={`font-mono font-bold ${sigColor}`}>{action}{sig && !sig.confirmed ? ' (forming)' : ''}</span>
+      </div>
+      <div className="flex items-center justify-between">
+        <span className="text-gray-400">Score</span>
+        <span className="font-mono"><span className="text-lime-400">{obl.score?.bull ?? 0}</span> / <span className="text-red-400">{obl.score?.bear ?? 0}</span> <span className="text-gray-500">need {obl.score?.required ?? 6}</span></span>
+      </div>
+      <div className="flex items-center justify-between">
+        <span className="text-gray-400">Bias · Structure</span>
+        <span className={`font-mono ${biasColor}`}>{obl.bias_label ?? 'NEUTRAL'} <span className="text-gray-300">· {obl.structure?.now ?? 'WAIT'}</span></span>
+      </div>
+      <div className="flex items-center justify-between">
+        <span className="text-gray-400">Session · News</span>
+        <span className="font-mono text-gray-200">{obl.session?.name ?? 'OFF'} · <span className={news ? 'text-orange-400' : 'text-lime-400'}>{news ? 'BLOCKED' : 'CLEAR'}</span></span>
+      </div>
+      {plan && plan.entry != null && (
+        <div className="font-mono text-[10px] text-gray-300 tabular-nums">
+          {sig ? '' : `last ${(last?.action ?? '').toUpperCase()} ${last?.bars_since ?? '?'} bars ago · `}
+          E {plan.entry} · SL {plan.stop_loss} · TP {plan.tp1} / {plan.tp2} / {plan.tp3}
+        </div>
+      )}
+      {plan && plan.entry != null && (
+        <button
+          onClick={onUsePlan}
+          disabled={!canPlace || placing}
+          className="w-full mt-1 px-2 py-0.5 rounded text-[10px] font-semibold bg-lime-700/30 border border-lime-600/40 text-lime-200 hover:bg-lime-700/50 disabled:opacity-40"
+          title={news ? 'News window — entries blocked' : 'Place the engine plan as a limit order (TP2)'}
+        >
+          {placing ? 'Placing…' : `Use Oblivion ${(plan.action ?? '').toUpperCase()} plan`}
+        </button>
+      )}
+    </div>
+  )
+}
+
 export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', accountBalance = 0, accountCurrency = 'USD', fallbackExchange, onPlaced, orders = [], onCancelOrder, positions = [], onSymbolChange, onTimeframeChange }: Props) {
   const chartRef = useRef<HTMLDivElement>(null)
   const chart = useRef<IChartApi | null>(null)
@@ -527,6 +595,7 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
   const overlayLines = useRef<any[]>([])
   const kronosSeries = useRef<any[]>([])
   const zonePrimitive = useRef<ZoneBoxPrimitive | null>(null)
+  const oblivionPrimitive = useRef<OblivionPrimitive | null>(null)
   const livePriceLine = useRef<any>(null)
   const liveBar = useRef<{ time: number; open: number; high: number; low: number; close: number } | null>(null)
   const candlesRef = useRef<Candle[]>([])
@@ -820,6 +889,11 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
     const zp = new ZoneBoxPrimitive()
     cs.attachPrimitive(zp)
     zonePrimitive.current = zp
+    // OBLIVION engine overlay (FVG/OB boxes, HH/HL labels, BOS/CHOCH, sweeps,
+    // fib + entry/SL/TP lines, BUY/SELL diamonds, session bands, dashboard).
+    const op = new OblivionPrimitive()
+    cs.attachPrimitive(op)
+    oblivionPrimitive.current = op
 
     // Manually handle resize (avoids autoSize ResizeObserver firing after disposal)
     const handleResize = () => {
@@ -838,6 +912,7 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
       overlayLines.current = []
       orderPriceLines.current = []
       zonePrimitive.current = null
+      oblivionPrimitive.current = null
       try { c.remove() } catch {}
       chart.current = null
       candleSeries.current = null
@@ -944,6 +1019,7 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
           const prec = precisionFor(raw.flatMap(c => [c.open, c.high, c.low, c.close]))
           cs.applyOptions({ priceFormat: { type: 'price', precision: prec, minMove: Math.pow(10, -prec) } })
           cs.setData(raw.map(c => ({ time: c.time as Time, open: c.open, high: c.high, low: c.low, close: c.close })))
+          try { oblivionPrimitive.current?.setBars(raw.map(c => ({ time: Number(c.time), high: c.high, low: c.low }))) } catch {}
           // Frame the newest bars of *this* pair — on page load and on every
           // symbol/timeframe switch, so no view is inherited from the last pair.
           resetChartView(raw.length)
@@ -1204,7 +1280,7 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
     overlayLines.current = []
     kronosSeries.current.forEach(s => { try { chart.current?.removeSeries(s) } catch {} })
     kronosSeries.current = []
-    if (!analysis) { try { cs.setMarkers([]) } catch {}; return }
+    if (!analysis) { try { cs.setMarkers([]); oblivionPrimitive.current?.setBundle(null) } catch {}; return }
 
     const add = (opts: any) => { try { overlayLines.current.push(cs.createPriceLine(opts)) } catch {} }
 
@@ -1226,6 +1302,12 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
       }
     })
     try { zonePrimitive.current?.setBoxes(visibleLayers.zones ? zoneBoxes : []) } catch {}
+
+    // ── OBLIVION engine overlay bundle ──────────────────────────────────────
+    try {
+      const bundle = analysis.oblivion?.overlay_bundle ?? null
+      oblivionPrimitive.current?.setBundle(visibleLayers.oblivion ? bundle : null)
+    } catch {}
 
     // Equilibrium (premium/discount divider)
     if (visibleLayers.range) {
@@ -1427,6 +1509,32 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
       setPlaceMsg({ ok: false, text: sniperApiErr(e) })
     } finally {
       setPlacingIdx(null)
+    }
+  }
+
+  // ── Place the OBLIVION engine's plan (entry / structural SL / TP2) ─────────
+  const [placingOblivion, setPlacingOblivion] = useState(false)
+  const placeOblivionPlan = async () => {
+    const obl = analysis?.oblivion
+    const sig = obl?.signal?.entry != null ? obl?.signal : obl?.last_signal
+    if (!accountId || !sig || sig.entry == null || sig.stop_loss == null || sig.tp1 == null) return
+    if (obl?.news?.blocked) { setPlaceMsg({ ok: false, text: 'Oblivion news window — no new entries' }); return }
+    const side = sig.action === 'sell' ? 'sell' : 'buy'
+    setPlacingOblivion(true)
+    setPlaceMsg(null)
+    try {
+      await apiClient.mt5.smcPlace({
+        account_id: accountId, symbol, side,
+        entry: sig.entry, stop_loss: sig.stop_loss, take_profit: sig.tp2 ?? sig.tp1,
+        volume: parseFloat(lot) || 0.01,
+        comment: `OBLIVION ${side.toUpperCase()} ${obl?.score?.bull ?? 0}/${obl?.score?.bear ?? 0}`,
+      })
+      setPlaceMsg({ ok: true, text: `Oblivion ${side.toUpperCase()} @ ${sig.entry} placed (SL ${sig.stop_loss} / TP ${sig.tp2 ?? sig.tp1})` })
+      await onPlaced?.()
+    } catch (e: any) {
+      setPlaceMsg({ ok: false, text: sniperApiErr(e) })
+    } finally {
+      setPlacingOblivion(false)
     }
   }
 
@@ -1930,6 +2038,14 @@ export default function MT5SniperChart({ accountId, defaultSymbol = 'XAUUSD', ac
               </div>
               <div className="flex items-center justify-between"><span className="text-gray-400">Momentum</span><span className="text-gray-200">{analysis.momentum} · vol z {analysis.volume_z?.toFixed(2)}</span></div>
               <div className="flex items-center justify-between"><span className="text-gray-400">ATR / RSI</span><span className="text-gray-200">{analysis.atr_pct?.toFixed(2)}% · {analysis.rsi?.toFixed(0)}</span></div>
+              {analysis.oblivion && (
+                <OblivionPanel
+                  obl={analysis.oblivion}
+                  placing={placingOblivion}
+                  canPlace={!!accountId && !analysis.oblivion.news?.blocked}
+                  onUsePlan={placeOblivionPlan}
+                />
+              )}
               {analysis.kronos?.direction && (
                 <div className="flex items-center justify-between">
                   <span className="text-gray-400">Kronos AI</span>

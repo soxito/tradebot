@@ -129,6 +129,45 @@ async def notify_photo(
         return False
 
 
+async def notify_document(
+    document: bytes, filename: str, caption: str = "", db: AsyncSession | None = None
+) -> bool:
+    """Send a file to every configured notification chat (test runs never send)."""
+    if _under_test():
+        logger.debug("notify_document suppressed under test")
+        return False
+    try:
+        from plugins.TelegramSignalNewsPlugin.backend.services.bot_service import send_document
+    except Exception:  # noqa: BLE001
+        return False
+
+    async def _send(_db: AsyncSession) -> bool:
+        token, chat_ids = await _resolve(_db)
+        if not token or not chat_ids:
+            logger.warning("notify_document: no bot token or chat configured")
+            return False
+        sent = False
+        for cid in chat_ids:
+            try:
+                res = await send_document(token, cid, document, filename, caption=caption)
+                if not res.get("ok"):
+                    logger.warning("notify_document to {} failed: {}", cid, res.get("description"))
+                sent = sent or bool(res.get("ok"))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("notify_document to {} failed: {}", cid, exc)
+        return sent
+
+    try:
+        if db is not None:
+            return await _send(db)
+        from app.core.database import AsyncSessionLocal
+        async with AsyncSessionLocal() as _db:
+            return await _send(_db)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("notify_document failed: {}", exc)
+        return False
+
+
 def _fmt_levels(tps: Iterable[float] | None, sl: float | None) -> str:
     parts: list[str] = []
     tp_list = [t for t in (tps or []) if t]

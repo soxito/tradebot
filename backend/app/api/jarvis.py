@@ -182,8 +182,8 @@ def jarvis_learn_all_brains(
     importance: float = 0.5,
     kind: str = "insight",
 ) -> None:
-    """Persist any JARVIS event to ALL three knowledge brains:
-    vault (file + DB row), AI Analyst store, and PaulKnowledge.
+    """Persist any JARVIS event to ALL brains: vault, AI Analyst, PaulKnowledge + Neuro core.
+
     Fire-and-forget — never blocks the caller."""
     try:
         loop = asyncio.get_running_loop()
@@ -197,6 +197,19 @@ def jarvis_learn_all_brains(
         loop.create_task(
             _knowledge_capture(action, symbol, summary, detail, importance)
         )
+        # Neuro core — federated mirror (kind includes jarvis- so recall finds it)
+        try:
+            from app.neuro_brain.state_store import ingest_local as _neuro_ingest_local
+            # need sync ingest off loop; schedule via to_thread equivalent
+            async def _neuro_capture():
+                try:
+                    import asyncio as _aio
+                    await _aio.to_thread(_neuro_ingest_local, f"jarvis-{action}", summary + (" — " + detail[:400] if detail else ""), symbol, "", "", source="jarvis", meta={"tags": _tags, "importance": importance})
+                except Exception:
+                    pass
+            loop.create_task(_neuro_capture())
+        except Exception:
+            pass
     except Exception as e:
         logger.debug(f"[JARVIS brain] learn_all_brains scheduling skipped: {e}")
 
@@ -699,14 +712,21 @@ async def _brain_recall_context(symbol: str, max_chars: int = 600) -> str:
             sections.append("LATEST MARKET NEWS (organised by JARVIS brain):\n" + "\n─\n".join(news_parts[:2]))
 
         if not sections:
-            return ""
-
-        joined = "\n\n".join(sections)
-        return (
-            f"\n[JARVIS BRAIN MEMORY — context for {symbol}]\n"
-            f"{joined}\n"
-            f"[END BRAIN MEMORY]\n"
-        )
+            base_mem = ""
+        else:
+            joined = "\n\n".join(sections)
+            base_mem = f"\n[JARVIS BRAIN MEMORY — context for {symbol}]\n{joined}\n[END BRAIN MEMORY]\n"
+        # Append Neuro core federated recall (Hermes + Vault + AiAnalyst + decisions + neuro local)
+        try:
+            from app.neuro_brain.federated_search import brain_recall_context as _neuro_cx
+            neuro_cx = await _neuro_cx(symbol, max_chars=500)
+            if neuro_cx:
+                if base_mem:
+                    return base_mem + "\n" + neuro_cx
+                return neuro_cx
+        except Exception as _ne:
+            logger.debug(f"[JARVIS brain-recall] neuro append skipped for {symbol}: {_ne}")
+        return base_mem
     except Exception as e:
         logger.debug(f"[JARVIS brain-recall] {symbol}: skipped: {e}")
         return ""
@@ -2745,6 +2765,70 @@ async def get_jarvis_skill(symbol: str = Query(..., min_length=2, description="P
         raise HTTPException(status_code=500, detail=str(e)[:300])
 
 
+# Words that follow "close", "how is", "check", "analyse" in ordinary speech.
+# Without this, "close out for the day" closed a position called OUT and "how is
+# it going" looked up a position called IT.
+_COMMON_WORDS = frozenset("""
+a all an and any anything are as at be but by day do doing down early enough
+everything for from going good how in into is it its it's me market markets my
+now of off on or our out over position positions price prices session shop so
+some stuff that the them these things this those to today trade trades trading
+up us we what where which window with you your yours chart charts news portfolio
+exposure book deal chat app loop call look eye things tonight tomorrow week
+""".split())
+
+
+def _is_instrument(token: str, *, strict: bool = False) -> bool:
+    """True when ``token`` names something tradable rather than an English word.
+
+    ``strict`` refuses bare unknown tickers — used where a false positive would
+    act on an account (closing a position), not just look something up.
+    """
+    tok = (token or "").strip().upper().replace("/", "")
+    if len(tok) < 2 or tok.lower() in _COMMON_WORDS:
+        return False
+    if re.fullmatch(r"[A-Z0-9]{2,12}(?:USDT|USDC|USD|PERP)", tok):
+        return True
+    _, asset_class = market_data.canonicalize_for_analysis(tok)
+    if asset_class != "unknown":
+        return True
+    # Bare small-cap tickers (GWEI, PEPE) are unknown to the canonicaliser;
+    # accept them only when they are short, alphabetic and not a common word.
+    return not strict and tok.isalpha() and len(tok) <= 6
+
+
+def _first_instrument(text: str) -> str:
+    """The first token in ``text`` that names an instrument, canonicalised."""
+    for raw in re.findall(r"[A-Za-z0-9/]{2,15}", text or ""):
+        if raw.lower() in _COMMON_WORDS:
+            continue
+        canon, asset_class = market_data.canonicalize_for_analysis(raw.upper())
+        if asset_class != "unknown" or re.fullmatch(r"[A-Z0-9]{2,12}USDT?", raw.upper()):
+            return canon or raw.upper()
+    return ""
+
+
+def is_conversational_question(text: str) -> bool:
+    """True for an informational question ("should I close BTC?", "how is gold").
+
+    A request phrased politely ("can you close BTCUSDT?") is still an order, so
+    only question words that ask *about* something count — never can/could/would.
+    """
+    return bool(re.match(
+        r"\s*(?:how|what|what's|whats|why|when|where|which|who|should|is|are|"
+        r"do|does|did|was|were|will)\b",
+        (text or "").lower(),
+    ))
+
+
+def parse_close_target(text: str) -> Optional[str]:
+    """Symbol in a "close <symbol> [position]" instruction, or None."""
+    m = re.search(r"\bclose(?:\s+(?:my|the|out))?\s+([a-z0-9/]{2,15})(?:\s+position)?\b", (text or "").lower())
+    if not m or not _is_instrument(m.group(1), strict=True):
+        return None
+    return m.group(1).upper().replace("/", "")
+
+
 async def _dispatch(cmd: str, ex: Optional[str]) -> CommandResult:  # noqa: C901
     """Inner dispatcher — all pattern matching happens here."""
 
@@ -2777,6 +2861,10 @@ async def _dispatch(cmd: str, ex: Optional[str]) -> CommandResult:  # noqa: C901
             cmd,
         )
     )
+    # "should I buy gold 2 weeks from now?" matches the side-first pattern;
+    # a question is never an order.
+    if _exe_m and is_conversational_question(cmd):
+        _exe_m = None
     if _exe_m:
         # Group indices differ between the three patterns above.
         # Detect by checking if group[1] is a direction word.
@@ -2879,12 +2967,17 @@ async def _dispatch(cmd: str, ex: Optional[str]) -> CommandResult:  # noqa: C901
         # GBPUSD into GBPUSDUSDT and made every FX pair, metal and index fail the
         # forex gate below and dead-end on a Bitget lookup.
         _raw_token = ""
-        if _sym_m:
+        if _sym_m and _is_instrument(_sym_m.group(1)):
             _raw_token = _sym_m.group(1)
-        elif _ana_m.lastindex and _ana_m.group(_ana_m.lastindex):
+        elif (_ana_m.lastindex and _ana_m.group(_ana_m.lastindex)
+              and _is_instrument(_ana_m.group(_ana_m.lastindex))):
             _raw_token = _ana_m.group(_ana_m.lastindex).upper()
+        else:
+            # "check the price of gold" — the word after the verb is "the";
+            # the instrument is further along the sentence.
+            _raw_token = _first_instrument(cmd)
 
-        sym_candidate, _ = market_data.canonicalize_for_analysis(_raw_token)
+        sym_candidate, _ = market_data.canonicalize_for_analysis(_raw_token) if _raw_token else ("", "")
 
         if sym_candidate:
             return await _analyze_symbol(sym_candidate, cmd, ex, deep=_wants_deep_research(cmd))
@@ -2939,18 +3032,17 @@ async def _dispatch(cmd: str, ex: Optional[str]) -> CommandResult:  # noqa: C901
         return await _set_sl_price(symbol, price, ex)
 
     # ── close position ─────────────────────────────────────────────────────────
-    m = re.search(r'close(?:\s+my)?\s+(\w+)(?:\s+position)?', cmd)
-    if m:
-        symbol = m.group(1).upper()
-        return await _close_position(symbol, ex)
+    close_sym = None if is_conversational_question(cmd) else parse_close_target(cmd)
+    if close_sym:
+        return await _close_position(close_sym, ex)
 
     # ── list all positions ─────────────────────────────────────────────────────
     if re.search(r'(?:show|list|what(?:\s+are)?|get)\s+(?:my\s+)?(?:open\s+)?positions?', cmd):
         return await _list_positions()
 
     # ── status for a specific symbol ───────────────────────────────────────────
-    m = re.search(r'how\s+is\s+(\w+)(?:\s+doing)?', cmd)
-    if m:
+    m = re.search(r'how\s+is\s+(?:my\s+)?(\w+)(?:\s+doing)?', cmd)
+    if m and _is_instrument(m.group(1)):
         symbol = m.group(1).upper()
         return await _position_status(symbol, ex)
 
@@ -4341,19 +4433,31 @@ async def _analyze_symbol(symbol: str, original_cmd: str, ex_name: Optional[str]
     display_name = coin_name or symbol
 
     # ── Fetch 4H OHLCV (200 candles) ─────────────────────────────────────────
+    # Route through the shared candle resolver first: it walks MT5 → keyless
+    # public spot exchanges → forex/metals, so pairs the Bitget *futures*
+    # connector cannot serve (ETH/USD, BTC/USD, XRP/USD — anything not quoted
+    # in USDT) still return candles instead of "Not enough data".
+    ohlcv = []
     try:
-        ohlcv = await connector.exchange.fetch_ohlcv(
-            f"{ccxt_sym}:USDT", timeframe="4h", limit=200
-        )
-    except Exception:
+        from app.services import candles as _candle_source
+        ohlcv = await _candle_source.fetch(symbol, "4h", 200) or []
+    except Exception as _ce:  # noqa: BLE001
+        logger.debug("[JARVIS] shared candle resolver failed for {}: {}", symbol, _ce)
+        ohlcv = []
+    if not ohlcv or len(ohlcv) < 20:
         try:
             ohlcv = await connector.exchange.fetch_ohlcv(
-                ccxt_sym, timeframe="4h", limit=200
+                f"{ccxt_sym}:USDT", timeframe="4h", limit=200
             )
-        except BaseException as e:
-            if _is_network_error(e):
-                return _err("analyze", "Exchange unreachable — check network.")
-            return _err("analyze", _friendly_exchange_error(e))
+        except Exception:
+            try:
+                ohlcv = await connector.exchange.fetch_ohlcv(
+                    ccxt_sym, timeframe="4h", limit=200
+                )
+            except BaseException as e:
+                if _is_network_error(e):
+                    return _err("analyze", "Exchange unreachable — check network.")
+                return _err("analyze", _friendly_exchange_error(e))
 
     if not ohlcv or len(ohlcv) < 20:
         return _err("analyze", f"Not enough data for {symbol}.")
@@ -5249,8 +5353,10 @@ async def _position_status(symbol: str, ex_name: Optional[str]) -> CommandResult
     try:
         connector, pos = await _find_position(symbol, ex_name)
     except BaseException as e:
+        # ok=False lets the chat UI hand the question to Paul, who can still
+        # answer "how is gold doing" from market data without the exchange.
         friendly = "Exchange connection failed — please check your network."
-        return CommandResult(ok=True, action="position_status", detail=friendly, speech=friendly)
+        return CommandResult(ok=False, action="position_status", detail=friendly, speech=friendly)
 
     if pos is None:
         # No open position — give a live market update instead of a dead-end,
@@ -5282,7 +5388,7 @@ async def _position_status(symbol: str, ex_name: Optional[str]) -> CommandResult
             )
             return CommandResult(ok=True, action="position_status", detail=detail, speech=speech)
         return CommandResult(
-            ok=True, action="position_status",
+            ok=False, action="position_status",
             detail=f"No open position found for {coin_name}",
             speech=f"You have no open position on {coin_name}, Sir.",
         )

@@ -90,9 +90,42 @@ KRONOS_PLUGIN_DIR = (ROOT / "plugins" / "KronosForecastPlugin").resolve()
 KRONOS_SCRIPTS_DIR = KRONOS_PLUGIN_DIR / "scripts"
 KRONOS_SETUP_SH = KRONOS_SCRIPTS_DIR / "setup_kronos.sh"
 KRONOS_SETUP_PS1 = KRONOS_SCRIPTS_DIR / "setup_kronos.ps1"
+KRONOS_FINETUNE_SH = KRONOS_SCRIPTS_DIR / "setup_kronos_finetune.sh"
+KRONOS_FINETUNE_PS1 = KRONOS_SCRIPTS_DIR / "setup_kronos_finetune.ps1"
 KRONOS_VENDOR_MODEL = KRONOS_PLUGIN_DIR / "backend" / "vendor" / "model"
+# Idempotency marker for the fine-tune pipeline (vendored from upstream finetune_csv/).
+KRONOS_VENDOR_FINETUNE = KRONOS_PLUGIN_DIR / "backend" / "vendor" / "finetune_csv" / "train_sequential.py"
+# Records the upstream commit the vendored model/ was copied from, so every run
+# can cheaply check whether shiyu-coder/Kronos moved on and re-vendor if so.
+KRONOS_VENDOR_COMMIT = KRONOS_PLUGIN_DIR / "backend" / "vendor" / ".kronos_commit"
+KRONOS_UPSTREAM_REPO = "https://github.com/shiyu-coder/Kronos"
 # Opt-out with TRADEBOT_SKIP_KRONOS_SETUP=1 (keeps the heuristic fallback).
 KRONOS_SETUP_ENABLED = os.environ.get("TRADEBOT_SKIP_KRONOS_SETUP", "").strip().lower() not in ("1", "true", "yes", "on")
+# Opt-out of the per-run upstream update check with TRADEBOT_SKIP_KRONOS_UPDATE=1.
+KRONOS_UPDATE_ENABLED = os.environ.get("TRADEBOT_SKIP_KRONOS_UPDATE", "").strip().lower() not in ("1", "true", "yes", "on")
+
+# ── Soup LLM finetuning (MakazhanAlpamys/Soup) ──────────────────────────
+# Fine-tune & post-train LLMs in one command. Installed as isolated venv
+# at ~/.tradebot/soup-venv + repo clone at integrations/soup so it never
+# touches backend requirements. Auto-updates on every start like Kronos.
+SOUP_REPO_URL    = os.environ.get("SOUP_REPO_URL", "https://github.com/MakazhanAlpamys/Soup.git")
+SOUP_REPO_DIR    = (ROOT / "integrations" / "soup").resolve()
+SOUP_VERSION_FILE = (ROOT / "integrations" / "soup.version.json").resolve()
+SOUP_VENV_DIR    = Path(os.environ.get("SOUP_VENV_DIR", str(Path.home() / ".tradebot" / "soup-venv"))).expanduser().resolve()
+SOUP_VENV_BIN    = SOUP_VENV_DIR / _VENV_BIN
+SOUP_PY_BIN      = SOUP_VENV_BIN / f"python{_EXE}"
+SOUP_PIP_BIN     = SOUP_VENV_BIN / f"pip{_EXE}"
+SOUP_BIN         = SOUP_VENV_BIN / f"soup{_EXE}"
+# Soup UI (Gradio on 7860) + API/OpenAI-compatible serve (8012) — proxied by backend
+SOUP_UI_PORT     = int(os.environ.get("SOUP_UI_PORT", "7860"))
+SOUP_PORT        = int(os.environ.get("SOUP_PORT", "8012"))
+SOUP_PLUGIN_DIR  = (ROOT / "plugins" / "SoupPlugin").resolve()
+SOUP_SCRIPTS_DIR = SOUP_PLUGIN_DIR / "scripts"
+SOUP_SETUP_SH    = SOUP_SCRIPTS_DIR / "setup_soup.sh"
+SOUP_SETUP_PS1   = SOUP_SCRIPTS_DIR / "setup_soup.ps1"
+SOUP_SETUP_ENABLED = os.environ.get("TRADEBOT_SKIP_SOUP_SETUP", "").strip().lower() not in ("1", "true", "yes", "on")
+SOUP_UPDATE_ENABLED = os.environ.get("TRADEBOT_SKIP_SOUP_UPDATE", "").strip().lower() not in ("1", "true", "yes", "on")
+SOUP_MIN_PYTHON  = (3, 10)  # soup requires 3.10–3.12
 
 # ── Vibe-Trading plugin setup ─────────────────────────────────────────────────
 # HKUDS/Vibe-Trading — personal trading agent with backtesting, alpha zoo,
@@ -160,6 +193,36 @@ HERMES_REPO_URL    = os.environ.get("HERMES_REPO_URL", "https://github.com/NousR
 HERMES_REPO_DIR    = (ROOT / "integrations" / "hermes-agent").resolve()
 HERMES_REPO_VERSION_FILE = (ROOT / "integrations" / "hermes-agent.version.json")
 
+# ── Neuroglancer core brain (google/neuroglancer) ───────────────────────────
+NEURO_REPO_URL = os.environ.get("NEURO_REPO_URL", "https://github.com/google/neuroglancer.git")
+NEURO_REPO_DIR = (ROOT / "integrations" / "neuroglancer").resolve()
+NEURO_REPO_VERSION_FILE = (ROOT / "integrations" / "neuroglancer.version.json")
+NEURO_SETUP_ENABLED = os.environ.get("TRADEBOT_SKIP_NEURO_SETUP", "").strip().lower() not in ("1", "true", "yes", "on")
+NEURO_BRANCH = os.environ.get("NEURO_BRANCH", "master")
+
+# ── Ollama local LLM (tier-aware, fallback for agents + Soup training) ───────
+# Installed as system binary (brew/curl/winget) + models under ~/.ollama.
+# start.py ensures: binary present → service reachable → tier-appropriate model
+# pulled → auto-updates checked. Opt-out: TRADEBOT_SKIP_OLLAMA_SETUP=1.
+OLLAMA_PORT          = int(os.environ.get("OLLAMA_PORT", "11434"))
+OLLAMA_HOST          = os.environ.get("OLLAMA_HOST", "127.0.0.1")
+OLLAMA_URL           = os.environ.get("OLLAMA_URL", f"http://{OLLAMA_HOST}:{OLLAMA_PORT}").rstrip("/")
+OLLAMA_MODEL_ENV    = os.environ.get("OLLAMA_MODEL", "").strip()
+OLLAMA_SETUP_ENABLED = os.environ.get("TRADEBOT_SKIP_OLLAMA_SETUP", "").strip().lower() not in ("1", "true", "yes", "on")
+OLLAMA_UPDATE_ENABLED = os.environ.get("TRADEBOT_SKIP_OLLAMA_UPDATE", "").strip().lower() not in ("1", "true", "yes", "on")
+OLLAMA_AUTO_PULL     = os.environ.get("OLLAMA_AUTO_PULL", "1").strip().lower() not in ("0", "false", "no", "off")
+OLLAMA_MANAGED       = os.environ.get("OLLAMA_MANAGED", "0").strip().lower() in ("1", "true", "yes", "on")
+OLLAMA_FALLBACK_ENABLED = os.environ.get("OLLAMA_FALLBACK_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+# Catalogue must mirror backend/app/services/ollama_service.py:TIER_MODEL_CATALOGUE
+_OLLAMA_CATALOGUE: Dict[str, List[str]] = {
+    "ultra":  ["qwen2.5:14b", "llama3.1:8b", "gemma2:9b", "mistral:7b"],
+    "high":   ["llama3.1:8b", "qwen2.5:7b", "mistral:7b", "gemma2:9b"],
+    "medium": ["llama3.2:3b", "qwen2.5:3b", "phi3:mini", "qwen2.5:1.5b"],
+    "low":    ["qwen2.5:1.5b", "phi3:mini", "llama3.2:1b", "qwen2.5:0.5b"],
+    "minimal":["qwen2.5:0.5b", "llama3.2:1b", "phi3:mini"],
+}
+_TRADEBOT_LOCAL_MODEL = "tradebot-local:latest"
+
 # ── Ports ─────────────────────────────────────────────────────────────────────
 BACKEND_PORT       = int(os.environ.get("BACKEND_PORT", "1448"))
 FRONTEND_PORT      = int(os.environ.get("FRONTEND_PORT", "3000"))
@@ -185,6 +248,8 @@ SIDECARS: List[Dict[str, object]] = [
     {"key": "headroom",      "label": "Headroom proxy",     "port": HEADROOM_PORT,           "kind": "process", "tool": True,  "markers": ["headroom"]},
     {"key": "obsidian",      "label": "Obsidian app",       "port": None,                    "kind": "app",     "tool": True,  "markers": ["obsidian"]},
     {"key": "hermes",        "label": "Hermes gateway",     "port": HERMES_PORT,             "kind": "process", "tool": False, "markers": ["hermes_sidecar", "hermes-gateway"]},
+    {"key": "soup_ui",       "label": "Soup UI",            "port": SOUP_UI_PORT,            "kind": "process", "tool": False, "markers": ["soup", "gradio"]},
+    {"key": "soup",          "label": "Soup API",           "port": SOUP_PORT,               "kind": "process", "tool": False, "markers": ["soup.*serve", "soup-api"]},
     {"key": "speech_engine", "label": "Speech engine",      "port": SPEECH_ENGINE_PORT,      "kind": "process", "tool": False, "markers": ["speech_engine"]},
     {"key": "vibe_trading",  "label": "Vibe-Trading sidecar","port": VIBE_TRADING_SERVE_PORT, "kind": "process", "tool": False, "markers": ["vibe-trading", "vibe_trading"]},
     {"key": "agentmemory",   "label": "agentmemory server", "port": AGENTMEMORY_PORT,        "kind": "process", "tool": False, "markers": ["agentmemory"]},
@@ -447,14 +512,15 @@ def _compute_settings(physical: int, logical: int, ram_gb: float) -> Dict[str, o
         heartbeat_tick_s = 180   # 3 min — more responsive on powerful machines
 
     # ── Local speech-engine (MLX Parakeet-TDT STT + Qwen3-TTS) capability ──────
-    # The local Jarvis voice models are multi-GB (~6 GB resident) and take
-    # seconds-to-minutes per utterance on CPU/MPS — on a 16 GB machine they get
-    # swapped out and thrash the box. Require 32 GB+ so only workstations run the
-    # LOCAL engine; every other machine uses NVIDIA hosted speech (then OpenAI)
-    # and never touches the local models. Force with TRADEBOT_FORCE_SPEECH_ENGINE=1.
-    # detect_resources() further narrows this to Apple-Silicon / CUDA hosts.
+    # Measured on an M2 Pro / 16 GB (2026-09-23): STT 0.1s warm and the most
+    # accurate engine available, TTS ~2s a sentence. Both models warm cost
+    # ~5.5 GB, so below 32 GB the engine runs in LITE mode (STT resident, TTS
+    # loaded on demand, unloaded when idle, never loaded under memory pressure)
+    # — see speech_engine/engine.py. Weaker tiers stay on NVIDIA hosted speech.
+    # Force with TRADEBOT_FORCE_SPEECH_ENGINE=1. detect_resources() further
+    # narrows this to Apple-Silicon / CUDA hosts.
     speech_engine_local = (
-        ui_tier in ("high", "ultra") and ram_gb >= 32 and physical >= 8
+        ui_tier in ("high", "ultra") and ram_gb >= 15.5 and physical >= 8
     )
 
     return {
@@ -593,6 +659,53 @@ def get_resources() -> Dict[str, object]:
     return _RESOURCES
 
 
+def _ollama_model_for_tier(tier: str, ram_gb: float) -> str:
+    """Best Ollama model for this tier/RAM (mirrors ollama_service catalogue)."""
+    # Honour an explicit OLLAMA_MODEL from the shell env OR the .env file — the
+    # module constant is read at import (before .env is parsed), so fall back to
+    # _DOTENV so a user-pinned model (e.g. qwen2.5:0.5b) is respected.
+    forced = OLLAMA_MODEL_ENV or _DOTENV.get("OLLAMA_MODEL", "").split("#")[0].strip()
+    if forced:
+        return forced
+    # Effective RAM with small VRAM bump — mirrors backend tier_for_ram()
+    vram = _ollama_detect_vram_gb()
+    effective = ram_gb + min(vram * 0.5, 8)
+    # Stricter thresholds than UI tier so a 16G machine doesn't get 14b
+    if effective >= 48:
+        tier_key = "ultra"
+    elif effective >= 24:
+        tier_key = "high"
+    elif effective >= 12:
+        tier_key = "medium"
+    elif effective >= 6:
+        tier_key = "low"
+    else:
+        tier_key = "minimal"
+    # If explicit UI tier is weaker than RAM tier, respect the weaker (user forced minimal)
+    ui_tier = str(tier).lower()
+    order = ["minimal", "low", "medium", "high", "ultra"]
+    try:
+        if order.index(ui_tier) < order.index(tier_key):
+            tier_key = ui_tier
+    except ValueError:
+        pass
+    cands = _OLLAMA_CATALOGUE.get(tier_key, _OLLAMA_CATALOGUE["medium"])
+    return cands[0]
+
+
+def _ollama_detect_vram_gb() -> float:
+    if shutil.which("nvidia-smi"):
+        try:
+            r = run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"])
+            if r.returncode == 0:
+                vals = [float(x.strip()) for x in r.stdout.splitlines() if x.strip().replace(".", "", 1).isdigit()]
+                if vals:
+                    return max(vals) / 1024.0
+        except Exception:
+            pass
+    return 0.0
+
+
 def print_resources() -> None:
     r = get_resources()
     header("System resources")
@@ -600,6 +713,14 @@ def print_resources() -> None:
     ok(f"RAM: {r['ram_gb']} GB")
     ok(f"Node heap: {r['node_heap_mb']} MB  ·  ML threads: {r['ml_threads']}  ·  UI tier: {str(r['ui_tier']).upper()}")
     ok(f"Backend workers: {r['backend_workers']}  ·  DB pool: {r['db_pool_size']}  ·  Poll×{r['poll_multiplier']}")
+    # Ollama tier model recommendation
+    try:
+        _olm = _ollama_model_for_tier(str(r.get("ui_tier", "high")), float(r.get("ram_gb", 8)))
+        info(f"Ollama model for this tier: {_olm}  (override with OLLAMA_MODEL=...)")
+        if OLLAMA_MANAGED:
+            info("Ollama managed mode: start.py will spawn `ollama serve`")
+    except Exception:
+        pass
     if r.get("disable_3d"):
         info("Low-power GPU profile: 3D/WebGL effects disabled (robot · orb · 3D graph)")
     if not r.get("enable_charts"):
@@ -657,6 +778,11 @@ def simulate_pc_models() -> None:
     sep()
     print(f"\n  {C.CYAN}Override:  TRADEBOT_PROFILE=minimal|low|medium|high|ultra{C.RESET}")
     print(f"  {C.CYAN}Example:   TRADEBOT_PROFILE=low python3 start.py{C.RESET}")
+    # append Ollama column
+    try:
+        _olm_all = {k: v[0] for k, v in _OLLAMA_CATALOGUE.items()}
+    except Exception:
+        _olm_all = {}
     detected = detect_resources()
     print()
     info(f"This machine → {detected['physical']}c/{detected['ram_gb']}GB → "
@@ -665,6 +791,17 @@ def simulate_pc_models() -> None:
          f"threads {detected['ml_threads']}, "
          f"poll×{detected['poll_multiplier']}, "
          f"workers {detected['backend_workers']}")
+    # also show Ollama recommended model in simulate table header footer
+    try:
+        header("Ollama tier → model (Q4 default, ⊆ catalogue)")
+        for tk in ["minimal", "low", "medium", "high", "ultra"]:
+            cand = _OLLAMA_CATALOGUE.get(tk, ["?"])[0]
+            print(f"  {tk:<8} → {cand}")
+        print(f"  Override: OLLAMA_MODEL=qwen2.5:7b  (takes precedence)")
+        print(f"  Fallback: OLLAMA_FALLBACK_ENABLED=1 (agents use Ollama when providers down)")
+        print(f"  Training: via Soup (schedule {int(os.environ.get('OLLAMA_TRAIN_INTERVAL_HOURS', '24'))}h) → tradebot-local:latest")
+    except Exception:
+        pass
 
 _MT5_URL_RAW = _DOTENV.get("MT5_API_URL", os.environ.get("MT5_API_URL", "")) or ""
 # Guard: an empty / schemeless MT5_API_URL (e.g. MT5_API_URL= in .env) causes
@@ -1007,7 +1144,7 @@ def free_ports_for_startup(
     # ── Pass 2: free every required port by owner ────────────────────────────
     if ports is None:
         ports = [
-            HEADROOM_PORT, HERMES_PORT, SPEECH_ENGINE_PORT, VIBE_TRADING_SERVE_PORT,
+            HEADROOM_PORT, HERMES_PORT, SOUP_UI_PORT, SOUP_PORT, SPEECH_ENGINE_PORT, VIBE_TRADING_SERVE_PORT,
             AGENTMEMORY_PORT, OPENMANUS_MCP_PORT, OPENWA_API_PORT,
             OPENWA_DASHBOARD_PORT, BACKEND_PORT, FRONTEND_PORT,
         ]
@@ -1402,19 +1539,17 @@ def _headroom_env_pairs() -> List[Tuple[str, str]]:
     openai_target = os.environ.get("OPENAI_TARGET_API_URL", "https://api.openai.com/v1")
     anthropic_target = os.environ.get("ANTHROPIC_TARGET_API_URL", "https://api.anthropic.com")
     
+    # Headroom v0.32+ env surface. The old per-message toggles
+    # (HEADROOM_COMPRESS_SYSTEM_MESSAGES / _COMPRESS_USER_MESSAGES /
+    # _FORCE_KOMPRESS / _MIN_TOKENS / _PROTECT_RECENT / _PROTECT_ANALYSIS_CONTEXT /
+    # _INTERCEPT_TOOL_RESULTS / _COMPRESSION_STABLE_AFTER_TURN /
+    # _STALE_READ_COMPRESS_AFTER_TURNS) were removed upstream. The coding
+    # savings profile now compresses user + tool messages by default.
     return [
         ("OPENAI_TARGET_API_URL", openai_target),
         ("ANTHROPIC_TARGET_API_URL", anthropic_target),
-        ("HEADROOM_COMPRESS_SYSTEM_MESSAGES", "1"),
-        ("HEADROOM_COMPRESS_USER_MESSAGES", "1"),
-        ("HEADROOM_MIN_TOKENS", "1"),
         ("HEADROOM_TARGET_RATIO", "0.4"),
-        ("HEADROOM_FORCE_KOMPRESS", "1"),
-        ("HEADROOM_COMPRESSION_STABLE_AFTER_TURN", "0"),
-        ("HEADROOM_STALE_READ_COMPRESS_AFTER_TURNS", "0"),
-        ("HEADROOM_PROTECT_RECENT", "0"),
-        ("HEADROOM_PROTECT_ANALYSIS_CONTEXT", "0"),
-        ("HEADROOM_INTERCEPT_TOOL_RESULTS", "1"),
+        ("HEADROOM_PROTECT_TOOL_RESULTS", "0"),
         ("HEADROOM_DATA_DIR", str(HEADROOM_DATA_DIR)),
         # Only set ANTHROPIC_API_KEY if a real key is available
         # (Removed dummy HEADROOM_PROXY_KEY that breaks auth)
@@ -1551,34 +1686,46 @@ def start_headroom() -> bool:
         if health:
             ok(f"Headroom already running on :{HEADROOM_PORT}")
             return True
+        # Port open but health not responding yet — wait briefly
+        if wait_for_port("127.0.0.1", HEADROOM_PORT, "Headroom proxy", max_wait=10):
+            health = http_json(f"{HEADROOM_URL}/health?include_config=1", timeout=5)
+            if health:
+                ok(f"Headroom already running on :{HEADROOM_PORT}")
+                return True
 
     if not ensure_headroom_launchagent():
-        return False
+        warn("Headroom LaunchAgent setup failed — trying detached fallback")
+        return start_headroom_process()
 
     launch_id = f"gui/{os.getuid()}/ai.headroomlabs.headroom"
     subprocess.run(["launchctl", "unload", str(HEADROOM_PLIST)], capture_output=True)
     load_res = subprocess.run(["launchctl", "load", str(HEADROOM_PLIST)], capture_output=True, text=True)
     if load_res.returncode != 0:
-        fail(f"Failed to load Headroom LaunchAgent: {load_res.stderr.strip()[:200]}")
-        return False
+        warn(f"Headroom LaunchAgent load failed: {load_res.stderr.strip()[:200]} — trying detached fallback")
+        return start_headroom_process()
 
     subprocess.run(["launchctl", "kickstart", "-k", launch_id], capture_output=True)
 
     if not wait_for_port("127.0.0.1", HEADROOM_PORT, "Headroom proxy", max_wait=40):
-        return False
+        warn("Headroom LaunchAgent did not bind port in 40s — trying detached fallback")
+        return start_headroom_process()
 
     health = http_json(f"{HEADROOM_URL}/health?include_config=1", timeout=5)
     if not health:
+        warn("Headroom is listening but health endpoint not ready — continuing (will use detached fallback if needed)")
+        # If health fails but port is open, consider it usable (best-effort)
+        if port_open("127.0.0.1", HEADROOM_PORT, 0.5):
+            ok(f"Headroom proxy listening on :{HEADROOM_PORT} (health pending)")
+            return True
         fail("Headroom is listening but health endpoint failed")
         return False
 
     config = health.get("config", {})
     if not config.get("compress_user_messages"):
-        fail("Headroom started but compress_user_messages is disabled")
-        return False
+        warn("Headroom compress_user_messages is off — continuing with reduced compression")
+        # Not fatal — compression still helps where it is on
     if not config.get("compress_system_messages"):
-        fail("Headroom started but compress_system_messages is disabled")
-        return False
+        warn("Headroom system-message compression is off (v0.32 coding-profile default)")
 
     ok("Headroom healthy with compression enabled")
     return True
@@ -1631,15 +1778,18 @@ def setup_integrations() -> bool:
             warn("Obsidian not installed — get it from https://obsidian.md (optional).")
         return True
 
+    # Headroom + Obsidian are convenience integrations — best-effort on every
+    # platform. A Headroom or Obsidian hiccup must never block the core
+    # DB/backend/frontend from starting (mirrors the Windows/Linux branch).
     if not ensure_headroom_installed():
-        return False
-    if not start_headroom():
-        return False
+        warn("Headroom not installed — continuing without compression (install: headroom update)")
+    elif not start_headroom():
+        warn("Headroom proxy failed to start — continuing without compression (check ~/Library/Logs/headroom.log)")
 
     if not ensure_obsidian():
-        return False
-    if not start_obsidian():
-        return False
+        warn("Obsidian check failed — continuing (vault at obsidian-vault/tradebot)")
+    elif not start_obsidian():
+        warn("Obsidian launch failed — continuing (open Obsidian manually)")
 
     return True
 
@@ -2008,12 +2158,23 @@ def preflight_check(mode: str) -> bool:
             unfixable.append("Docker CLI not found (install Docker Desktop)")
 
         if docker_cli_ok:
+            # `docker info` hangs (then times out) when Docker Desktop is
+            # installed but its daemon isn't running — common on Windows where
+            # the CLI shim exists before the WSL2/HyperV backend is up. A raw
+            # subprocess.run raises TimeoutExpired, which used to crash the whole
+            # preflight; treat any timeout/error as "daemon not reachable".
+            def _docker_daemon_up(timeout: int) -> bool:
+                try:
+                    return subprocess.run(
+                        ["docker", "info"], capture_output=True, timeout=timeout
+                    ).returncode == 0
+                except (OSError, subprocess.SubprocessError):
+                    return False
+
             # Docker Desktop on Windows uses WSL2/HyperV which can take
             # 20-30 s to respond on first call; use a longer timeout there.
             _docker_info_timeout = 30 if IS_WINDOWS else 5
-            r = subprocess.run(["docker", "info"], capture_output=True,
-                               timeout=_docker_info_timeout)
-            daemon_ok = r.returncode == 0
+            daemon_ok = _docker_daemon_up(_docker_info_timeout)
             if not daemon_ok:
                 info("Docker daemon not running — attempting to start Docker Desktop …")
                 # Launching Docker Desktop is platform-specific; wrap each call
@@ -2034,9 +2195,7 @@ def preflight_check(mode: str) -> bool:
                     pass
                 for _ in range(30):
                     time.sleep(2)
-                    if subprocess.run(["docker", "info"],
-                                      capture_output=True,
-                                      timeout=10 if IS_WINDOWS else 3).returncode == 0:
+                    if _docker_daemon_up(10 if IS_WINDOWS else 3):
                         daemon_ok = True
                         fixed_items.append("Docker daemon")
                         break
@@ -2047,11 +2206,14 @@ def preflight_check(mode: str) -> bool:
             if not daemon_ok:
                 unfixable.append("Docker daemon not running")
 
-            r2 = subprocess.run(["docker", "compose", "version"],
-                                capture_output=True, text=True,
-                                timeout=30 if IS_WINDOWS else 5)
-            compose_ok = r2.returncode == 0
-            ver2 = r2.stdout.strip().splitlines()[0] if compose_ok else ""
+            try:
+                r2 = subprocess.run(["docker", "compose", "version"],
+                                    capture_output=True, text=True,
+                                    timeout=30 if IS_WINDOWS else 5)
+                compose_ok = r2.returncode == 0
+                ver2 = r2.stdout.strip().splitlines()[0] if compose_ok else ""
+            except (OSError, subprocess.SubprocessError):
+                compose_ok, ver2 = False, ""
             _check("docker compose (v2 plugin)", compose_ok, ver2,
                    "upgrade Docker Desktop to ≥ 4.x")
             if not compose_ok:
@@ -2204,6 +2366,57 @@ def preflight_check(mode: str) -> bool:
             _check("Python packages (fastapi, uvicorn, sqlalchemy …)", True,
                    "all core packages present")
 
+    # ── scrapegraphai (optional — auto-install for X Monitor AI Scraper tab) ──
+    # Check using PY_BIN (backend venv Python), not start.py's own Python.
+    if venv_exists:
+        _sg_check = subprocess.run(
+            [str(PY_BIN), "-c", "import importlib.metadata; print(importlib.metadata.version('scrapegraphai'))"],
+            capture_output=True, text=True, timeout=10
+        )
+        _sg_installed = _sg_check.returncode == 0
+        _sg_ver = _sg_check.stdout.strip() if _sg_installed else ""
+        if _sg_installed:
+            _check(f"scrapegraphai v{_sg_ver}", True, "X AI Scraper ready")
+        else:
+            info("scrapegraphai not found — installing for X Monitor AI Scraper tab …")
+            # Try up to 3 strategies: normal, --pre (for Python 3.14+), pinned range
+            _sg_ok = False
+            _sg_err = ""
+            for _sg_cmd in [
+                [str(PY_BIN), "-m", "pip", "install", "--quiet", "--upgrade", "scrapegraphai"],
+                [str(PY_BIN), "-m", "pip", "install", "--quiet", "--upgrade", "--pre", "scrapegraphai"],
+                [str(PY_BIN), "-m", "pip", "install", "--quiet", "--upgrade", "scrapegraphai>=1.0,<2.0"],
+            ]:
+                _sg_ok, _sg_err = _spinner_run(_sg_cmd, " ".join(_sg_cmd[-2:]), timeout=360)
+                if _sg_ok:
+                    break
+            if _sg_ok:
+                # playwright browser — background, non-fatal
+                _spinner_run(
+                    [str(PY_BIN), "-m", "pip", "install", "--quiet", "playwright"],
+                    "pip install playwright",
+                    timeout=120,
+                )
+                try:
+                    subprocess.Popen(
+                        [str(PY_BIN), "-m", "playwright", "install", "chromium"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                except Exception:
+                    pass
+                _sg_check2 = subprocess.run(
+                    [str(PY_BIN), "-c", "import importlib.metadata; print(importlib.metadata.version('scrapegraphai'))"],
+                    capture_output=True, text=True, timeout=10
+                )
+                if _sg_check2.returncode == 0:
+                    _check(f"scrapegraphai v{_sg_check2.stdout.strip()}", True, "installed")
+                else:
+                    _check("scrapegraphai", True, "installed (version unconfirmed)")
+            else:
+                _check("scrapegraphai", False,
+                       "all install strategies failed — UI Install button still available",
+                       _sg_err[:120])
+
     # ── npm / Node modules ────────────────────────────────────────────────────
     sep()
     print(f"  {C.BOLD}Frontend dependencies{C.RESET}")
@@ -2249,14 +2462,21 @@ def preflight_check(mode: str) -> bool:
         _check(f"MT5 REST running  (:{mt5_port_val})", True, MT5_API_URL)
     else:
         docker_avail = bool(shutil.which("docker"))
-        daemon_up = docker_avail and \
-            subprocess.run(["docker", "info"], capture_output=True, timeout=5).returncode == 0
+        try:
+            daemon_up = docker_avail and \
+                subprocess.run(["docker", "info"], capture_output=True,
+                               timeout=30 if IS_WINDOWS else 5).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            daemon_up = False
         if daemon_up:
-            r = subprocess.run(
-                ["docker", "inspect", "--format", "{{.State.Status}}", MT5_CONTAINER],
-                capture_output=True, text=True, timeout=5
-            )
-            state = r.stdout.strip() if r.returncode == 0 else "not_found"
+            try:
+                r = subprocess.run(
+                    ["docker", "inspect", "--format", "{{.State.Status}}", MT5_CONTAINER],
+                    capture_output=True, text=True, timeout=10 if IS_WINDOWS else 5
+                )
+                state = r.stdout.strip() if r.returncode == 0 else "not_found"
+            except (OSError, subprocess.SubprocessError):
+                state = "not_found"
             if state in ("exited", "created"):
                 info(f"MT5 container '{MT5_CONTAINER}' stopped — starting it now …")
                 subprocess.run(["docker", "start", MT5_CONTAINER],
@@ -2525,23 +2745,39 @@ def detect_and_sync_mt5_url() -> None:
 
 
 def _docker_available() -> bool:
-    return bool(shutil.which("docker")) and \
-           subprocess.run(["docker", "info"], capture_output=True, timeout=5).returncode == 0
+    # `docker info` hangs when Docker Desktop is installed but its daemon isn't
+    # running (common on Windows). Treat a timeout/error as "not available"
+    # rather than letting TimeoutExpired crash the caller.
+    if not shutil.which("docker"):
+        return False
+    try:
+        return subprocess.run(
+            ["docker", "info"], capture_output=True,
+            timeout=30 if IS_WINDOWS else 5
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def _container_running(name: str) -> bool:
-    r = subprocess.run(
-        ["docker", "inspect", "--format", "{{.State.Running}}", name],
-        capture_output=True, text=True, timeout=5
-    )
+    try:
+        r = subprocess.run(
+            ["docker", "inspect", "--format", "{{.State.Running}}", name],
+            capture_output=True, text=True, timeout=10 if IS_WINDOWS else 5
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
     return r.stdout.strip() == "true"
 
 
 def _container_exists(name: str) -> bool:
-    r = subprocess.run(
-        ["docker", "inspect", "--format", "{{.Name}}", name],
-        capture_output=True, text=True, timeout=5
-    )
+    try:
+        r = subprocess.run(
+            ["docker", "inspect", "--format", "{{.Name}}", name],
+            capture_output=True, text=True, timeout=10 if IS_WINDOWS else 5
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
     return r.returncode == 0
 
 
@@ -3420,6 +3656,17 @@ def setup_tradingagents_sidecar() -> bool:
     pinned requirements. The clone under integrations/ keeps the upstream
     source available for reading; runtime uses the PyPI release.
     """
+    # Skip the heavy langchain/langgraph/pandas venv on low-power machines. The
+    # backend also refuses to auto-spawn the sidecar below `medium` tier
+    # (config.apply_resource_tier), so building it there would just burn disk and
+    # install time for a process that never starts. Opt in explicitly with
+    # TRADINGAGENTS_SERVICE_AUTOSTART=true.
+    _ta_optin = os.environ.get("TRADINGAGENTS_SERVICE_AUTOSTART", "").strip().lower() in ("1", "true", "yes")
+    if not _ta_optin and str(get_resources().get("ui_tier")) == "low":
+        info("TradingAgents sidecar skipped on low-power tier "
+             "(set TRADINGAGENTS_SERVICE_AUTOSTART=true to force)")
+        return False
+
     if TA_VENV_PY.exists():
         return True
 
@@ -3599,6 +3846,42 @@ def ensure_npm_deps() -> bool:
 
 
 # ── Backend ───────────────────────────────────────────────────────────────────
+def _kronos_remote_commit() -> Optional[str]:
+    """Latest upstream commit hash of shiyu-coder/Kronos, or None if unreachable.
+
+    Best-effort network probe: `git ls-remote` with a short timeout so a slow or
+    offline network never delays startup. Returns the 40-char HEAD sha.
+    """
+    git = shutil.which("git")
+    if not git:
+        return None
+    try:
+        r = subprocess.run(
+            [git, "ls-remote", KRONOS_UPSTREAM_REPO, "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    sha = r.stdout.split()[0].strip()
+    return sha if len(sha) >= 7 else None
+
+
+def _kronos_local_commit() -> Optional[str]:
+    try:
+        return KRONOS_VENDOR_COMMIT.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def _kronos_write_commit(sha: str) -> None:
+    try:
+        KRONOS_VENDOR_COMMIT.write_text(sha.strip())
+    except OSError:
+        pass
+
+
 def ensure_kronos_model() -> bool:
     """Run the Kronos plugin's model setup once (cross-platform: macOS/Linux + Windows).
 
@@ -3606,6 +3889,10 @@ def ensure_kronos_model() -> bool:
     this only does real work on the first run. Best-effort: the plugin falls
     back to a heuristic forecast when the model is absent, so a failure here
     never blocks startup. Opt out with TRADEBOT_SKIP_KRONOS_SETUP=1.
+
+    On every run (unless TRADEBOT_SKIP_KRONOS_UPDATE=1) we also check whether the
+    upstream repo moved on and re-vendor the model/ package if so, so local
+    Kronos code never silently drifts behind shiyu-coder/Kronos.
 
     Windows runs the PowerShell port (setup_kronos.ps1); POSIX runs the bash
     script (setup_kronos.sh). The self-test is skipped (--no-test / -NoTest) to
@@ -3615,9 +3902,26 @@ def ensure_kronos_model() -> bool:
         warn("Kronos setup skipped (TRADEBOT_SKIP_KRONOS_SETUP set) — heuristic fallback stays active")
         return True
 
-    # Already vendored → nothing to do (cheap check every run).
+    # Already vendored → still verify it's current against upstream, then skip.
     if KRONOS_VENDOR_MODEL.exists() and any(KRONOS_VENDOR_MODEL.iterdir()):
-        ok("Kronos model already set up (vendored) — skipping")
+        if KRONOS_UPDATE_ENABLED and shutil.which("git"):
+            remote = _kronos_remote_commit()
+            local = _kronos_local_commit()
+            if remote and local and remote != local:
+                info(f"Kronos upstream changed ({local[:7]} → {remote[:7]}) — re-vendoring model/ …")
+                if _run_kronos_setup():
+                    _kronos_write_commit(remote)
+                    ok("Kronos model updated to latest upstream")
+                else:
+                    warn("Kronos re-vendor did not complete — keeping the current model")
+            elif remote and not local:
+                # Vendored before this check existed: record the current head.
+                _kronos_write_commit(remote)
+                ok("Kronos model already set up (vendored) — recorded upstream commit")
+            else:
+                ok("Kronos model already set up (vendored, up to date) — skipping")
+        else:
+            ok("Kronos model already set up (vendored) — skipping")
         return True
 
     if not KRONOS_SCRIPTS_DIR.exists():
@@ -3632,30 +3936,680 @@ def ensure_kronos_model() -> bool:
 
     info("Setting up Kronos ML forecaster (one-time: installs torch + vendors model) …")
 
+    if _run_kronos_setup():
+        ok("Kronos model installed — real ML forecasts enabled after backend start")
+        if KRONOS_UPDATE_ENABLED:
+            remote = _kronos_remote_commit()
+            if remote:
+                _kronos_write_commit(remote)
+        return True
+
+    warn("Kronos setup did not complete. "
+         "Heuristic fallback stays active; you can re-run the setup script later.")
+    return True
+
+
+def _run_kronos_setup() -> bool:
+    """Run the platform Kronos setup script (vendors model/ + installs torch).
+
+    Returns True only when the script succeeded AND the model/ package is present.
+    Assumes callers already verified git + the scripts dir exist.
+    """
     if IS_WINDOWS:
         if not KRONOS_SETUP_PS1.exists():
             warn("setup_kronos.ps1 not found — skipping Kronos setup")
-            return True
+            return False
         pwsh = shutil.which("pwsh") or shutil.which("powershell")
         if not pwsh:
             warn("PowerShell not found — run setup_kronos.ps1 manually to enable Kronos")
-            return True
+            return False
         cmd = [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass",
                "-File", str(KRONOS_SETUP_PS1), "-NoTest"]
     else:
         if not KRONOS_SETUP_SH.exists():
             warn("setup_kronos.sh not found — skipping Kronos setup")
-            return True
+            return False
         bash = shutil.which("bash") or "/bin/bash"
         cmd = [bash, str(KRONOS_SETUP_SH), "--no-test"]
 
     ok_run, err = _spinner_run(cmd, "Kronos model setup", cwd=str(ROOT), timeout=1800)
-    if ok_run and KRONOS_VENDOR_MODEL.exists():
-        ok("Kronos model installed — real ML forecasts enabled after backend start")
+    if ok_run and KRONOS_VENDOR_MODEL.exists() and any(KRONOS_VENDOR_MODEL.iterdir()):
+        return True
+    if err:
+        warn(f"Kronos setup output: {err[:160]}")
+    return False
+
+
+def ensure_kronos_finetune() -> bool:
+    """Vendor the Kronos fine-tuning pipeline once (cross-platform: POSIX + Windows).
+
+    Runs setup_kronos_finetune.sh (POSIX) / .ps1 (Windows), which vendors the
+    upstream finetune_csv/ trainers so `/finetune` can train Kronos on your own
+    OHLCV data. Idempotent: skips when finetune_csv is already vendored.
+    Best-effort: a failure here never blocks startup. Shares the same opt-out
+    (TRADEBOT_SKIP_KRONOS_SETUP=1) as the base model setup.
+    """
+    if not KRONOS_SETUP_ENABLED:
         return True
 
-    warn(f"Kronos setup did not complete ({(err or 'see output above')[:160]}). "
-         "Heuristic fallback stays active; you can re-run the setup script later.")
+    # Already vendored → nothing to do.
+    if KRONOS_VENDOR_FINETUNE.exists():
+        ok("Kronos fine-tune pipeline already set up (vendored) — skipping")
+        return True
+
+    if not KRONOS_SCRIPTS_DIR.exists():
+        return True
+
+    if not shutil.which("git"):
+        warn("Git not found — cannot vendor Kronos fine-tune pipeline. "
+             "Run the setup script manually to enable /finetune.")
+        return True
+
+    if IS_WINDOWS:
+        if not KRONOS_FINETUNE_PS1.exists():
+            warn("setup_kronos_finetune.ps1 not found — skipping Kronos fine-tune setup")
+            return True
+        pwsh = shutil.which("pwsh") or shutil.which("powershell")
+        if not pwsh:
+            warn("PowerShell not found — run setup_kronos_finetune.ps1 manually to enable /finetune")
+            return True
+        cmd = [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(KRONOS_FINETUNE_PS1)]
+    else:
+        if not KRONOS_FINETUNE_SH.exists():
+            warn("setup_kronos_finetune.sh not found — skipping Kronos fine-tune setup")
+            return True
+        bash = shutil.which("bash") or "/bin/bash"
+        cmd = [bash, str(KRONOS_FINETUNE_SH)]
+
+    info("Setting up Kronos fine-tuning pipeline (one-time: vendors finetune_csv/) …")
+    ok_run, err = _spinner_run(cmd, "Kronos fine-tune setup", cwd=str(ROOT), timeout=1800)
+    if ok_run and KRONOS_VENDOR_FINETUNE.exists():
+        ok("Kronos fine-tune pipeline installed — /finetune enabled")
+        return True
+    if err:
+        warn(f"Kronos fine-tune setup output: {err[:160]}")
+    warn("Kronos fine-tune setup did not complete — /finetune stays unavailable until re-run.")
+    return True
+
+
+def _soup_repo_version() -> Dict[str, object]:
+    """Best-effort Soup repo version from integrations/soup git metadata."""
+    if not SOUP_REPO_DIR.exists():
+        return {"cloned": False, "commit": None, "branch": None, "remote": SOUP_REPO_URL, "last_pull": None, "version_file": str(SOUP_VERSION_FILE)}
+    try:
+        r = subprocess.run(["git", "-C", str(SOUP_REPO_DIR), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5)
+        commit = r.stdout.strip()[:12] if r.returncode == 0 else None
+        r2 = subprocess.run(["git", "-C", str(SOUP_REPO_DIR), "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, timeout=5)
+        branch = r2.stdout.strip() if r2.returncode == 0 else None
+        last_pull: Optional[str] = None
+        if SOUP_VERSION_FILE.exists():
+            try:
+                last_pull = json.loads(SOUP_VERSION_FILE.read_text()).get("last_pull") or json.loads(SOUP_VERSION_FILE.read_text()).get("installed_at")
+            except Exception:
+                pass
+        # pip version if installed
+        pkg_version: Optional[str] = None
+        try:
+            if SOUP_PIP_BIN.exists():
+                rr = subprocess.run([str(SOUP_PY_BIN), "-c", "import importlib.metadata as m; print(m.version('soup-cli'))"], capture_output=True, text=True, timeout=5)
+                if rr.returncode == 0:
+                    pkg_version = rr.stdout.strip()
+        except Exception:
+            pass
+        soup_bin_exists = SOUP_BIN.exists() or (SOUP_VENV_BIN / "soup").exists()
+        return {"cloned": True, "commit": commit, "branch": branch, "remote": SOUP_REPO_URL, "last_pull": last_pull, "pkg_version": pkg_version, "soup_bin": str(SOUP_BIN) if soup_bin_exists else None, "path": str(SOUP_REPO_DIR), "venv": str(SOUP_VENV_DIR)}
+    except Exception:
+        return {"cloned": True, "commit": None, "branch": None, "remote": SOUP_REPO_URL, "last_pull": None, "path": str(SOUP_REPO_DIR)}
+
+def _soup_recommend_resources() -> Dict[str, object]:
+    """Hardware-aware Soup training recommendation (best quality for this RAM/VRAM).
+    Uses get_resources() + VRAM probe via torch/nvidia-smi. Returns dict with
+    quantization, stream_layers, batch_size, lora_r, use_mlx, reason."""
+    r = get_resources()
+    ram_gb = float(r.get("ram_gb", 8) or 8)
+    # VRAM probe: prefer torch.cuda, fallback to nvidia-smi, fallback to RAM heuristic
+    vram_gb: Optional[float] = None
+    try:
+        import subprocess as _sp
+        # Try via soup venv python if available
+        if SOUP_PY_BIN.exists():
+            rr = _sp.run([str(SOUP_PY_BIN), "-c", "import torch; print(torch.cuda.get_device_properties(0).total_memory // 1024 // 1024 // 1024) if torch.cuda.is_available() else print('')"], capture_output=True, text=True, timeout=5)
+            if rr.returncode == 0 and rr.stdout.strip().isdigit():
+                vram_gb = float(rr.stdout.strip())
+        # fallback: backend venv torch
+        if vram_gb is None and PY_BIN.exists():
+            rr2 = _sp.run([str(PY_BIN), "-c", "import torch; print(torch.cuda.get_device_properties(0).total_memory // 1024 // 1024 // 1024) if torch.cuda.is_available() else print('')"], capture_output=True, text=True, timeout=5)
+            if rr2.returncode == 0 and rr2.stdout.strip().isdigit():
+                vram_gb = float(rr2.stdout.strip())
+        # fallback: nvidia-smi
+        if vram_gb is None and shutil.which("nvidia-smi"):
+            rr3 = _sp.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5)
+            if rr3.returncode == 0:
+                try:
+                    vram_gb = float(rr3.stdout.splitlines()[0].strip()) / 1024
+                except Exception:
+                    pass
+        # Apple unified memory: treat as <= RAM, prefer mlx path
+    except Exception:
+        vram_gb = None
+    # Decision matrix — whatever makes finetune BEST for this hardware
+    # (see plan 6.4: auto tune)
+    is_apple_silicon = platform.system().lower() == "darwin" and platform.machine().lower() in ("arm64", "aarch64")
+    if vram_gb is not None and vram_gb < 6:
+        rec = {"quantization": "4bit", "stream_layers": True, "batch_size": "auto", "lora_r": 64, "use_mlx": False, "reason": f"low VRAM {vram_gb:.0f}GB → QLoRA+stream_layers (8B on 4GB path)"}
+    elif vram_gb is not None and vram_gb < 16:
+        rec = {"quantization": "4bit", "stream_layers": False, "batch_size": "auto", "lora_r": 64, "use_mlx": False, "reason": f"{vram_gb:.0f}GB VRAM → QLoRA"}
+    elif vram_gb is not None and vram_gb >= 16:
+        rec = {"quantization": None, "stream_layers": False, "batch_size": 8, "lora_r": 64, "use_mlx": False, "reason": f"{vram_gb:.0f}GB VRAM → bf16 full"}
+    elif is_apple_silicon:
+        # Unified memory path: if RAM >=32 use mlx acceleration, else quantized
+        if ram_gb >= 32:
+            rec = {"quantization": None, "stream_layers": False, "batch_size": 4, "lora_r": 32, "use_mlx": True, "reason": f"Apple Silicon {ram_gb:.0f}GB → MLX accelerated"}
+        elif ram_gb >= 16:
+            rec = {"quantization": "4bit", "stream_layers": True, "batch_size": "auto", "lora_r": 32, "use_mlx": True, "reason": f"Apple Silicon {ram_gb:.0f}GB → QLoRA+MLX+stream_layers"}
+        else:
+            rec = {"quantization": "4bit", "stream_layers": True, "batch_size": "auto", "lora_r": 32, "use_mlx": True, "reason": f"Apple Silicon {ram_gb:.0f}GB → QLoRA+stream_layers"}
+    else:
+        # Generic RAM-based heuristic
+        if ram_gb <= 8:
+            rec = {"quantization": "4bit", "stream_layers": True, "batch_size": "auto", "lora_r": 32, "use_mlx": False, "reason": f"{ram_gb:.0f}GB RAM → QLoRA+stream_layers (best for weak host)"}
+        elif ram_gb <= 16:
+            rec = {"quantization": "4bit", "stream_layers": False, "batch_size": "auto", "lora_r": 64, "use_mlx": False, "reason": f"{ram_gb:.0f}GB RAM → QLoRA"}
+        else:
+            rec = {"quantization": None, "stream_layers": False, "batch_size": 8, "lora_r": 64, "use_mlx": False, "reason": f"{ram_gb:.0f}GB RAM → bf16"}
+    rec["vram_gb"] = vram_gb
+    rec["ram_gb"] = ram_gb
+    return rec
+
+def _soup_ensure_repo() -> bool:
+    """Ensure integrations/soup exists and is up-to-date. Always best-effort."""
+    if not shutil.which("git"):
+        warn("Soup: git not found — cannot clone/update Soup repo (manual: git clone https://github.com/MakazhanAlpamys/Soup.git integrations/soup)")
+        return False
+    if not SOUP_REPO_DIR.exists():
+        SOUP_REPO_DIR.parent.mkdir(parents=True, exist_ok=True)
+        info(f"Cloning Soup repo → {SOUP_REPO_DIR} …")
+        clone_cmd = ["git", "clone", "--depth=1", SOUP_REPO_URL, str(SOUP_REPO_DIR)]
+        ok_run, err = _spinner_run(clone_cmd, "Soup clone", cwd=str(ROOT), timeout=120)
+        if not ok_run or not (SOUP_REPO_DIR / ".git").exists():
+            warn(f"Soup clone failed ({(err or '')[:160]}). Backend will use stub.")
+            return False
+        try:
+            v = _soup_repo_version()
+            SOUP_VERSION_FILE.write_text(json.dumps({**v, "last_pull": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, indent=2))
+        except Exception:
+            pass
+        ok(f"Soup repo cloned ✓  ({SOUP_REPO_URL})")
+        return True
+    # Already cloned → pull updates (best-effort, never blocks startup long)
+    try:
+        info("Checking Soup repo for updates …")
+        # Compare local HEAD sha against the remote tip directly. The old path
+        # used `rev-list HEAD..FETCH_HEAD --count`, which returns 0 on a shallow
+        # clone (no common ancestor) even when the remote has advanced — so the
+        # UI showed "update available" but nothing was ever pulled.
+        local = subprocess.run(["git", "-C", str(SOUP_REPO_DIR), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10)
+        local_sha = local.stdout.strip() if local.returncode == 0 else ""
+        lsr = subprocess.run(["git", "ls-remote", SOUP_REPO_URL, "HEAD"], capture_output=True, text=True, timeout=20)
+        remote_sha = lsr.stdout.split()[0].strip() if lsr.returncode == 0 and lsr.stdout.strip() else ""
+        if remote_sha and local_sha and remote_sha != local_sha:
+            info(f"Soup update: {local_sha[:7]} → {remote_sha[:7]} — pulling …")
+            fetch = subprocess.run(["git", "-C", str(SOUP_REPO_DIR), "fetch", "--depth=1", "origin", "HEAD"], capture_output=True, text=True, timeout=60)
+            if fetch.returncode == 0:
+                reset = subprocess.run(["git", "-C", str(SOUP_REPO_DIR), "reset", "--hard", "FETCH_HEAD"], capture_output=True, text=True, timeout=60)
+                if reset.returncode == 0:
+                    # Reinstall the package so the new code is actually used (editable installs pick it up; wheels need it)
+                    try:
+                        soup_pip = SOUP_VENV_DIR / "bin" / "pip"
+                        if soup_pip.exists():
+                            subprocess.run([str(soup_pip), "install", "-e", str(SOUP_REPO_DIR), "-q"], capture_output=True, text=True, timeout=300)
+                    except Exception:
+                        pass
+                    ok(f"Soup repo updated ✓  (now at {remote_sha[:7]})")
+                else:
+                    warn(f"Soup reset failed ({(reset.stderr or '')[:120]}). Using existing checkout.")
+            else:
+                warn(f"Soup fetch failed ({(fetch.stderr or '')[:120]}). Using existing checkout.")
+        elif remote_sha and local_sha:
+            ok("Soup repo up-to-date ✓")
+        else:
+            info("Soup repo: offline or fetch skipped — using existing checkout")
+    except Exception as ex:
+        warn(f"Soup repo update check skipped ({ex}) — using existing checkout")
+    try:
+        v = _soup_repo_version()
+        SOUP_VERSION_FILE.write_text(json.dumps({**v, "last_pull": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, indent=2))
+    except Exception:
+        pass
+    return True
+
+def _soup_ensure_venv() -> bool:
+    """Ensure Soup isolated venv + soup-cli installed. Best-effort."""
+    # Check Python version constraint (3.10–3.12)
+    is_ok = sys.version_info.minor >= 10 and sys.version_info.minor <= 12
+    # Use dedicated venv python if exists, else pick best python
+    venv_py = SOUP_PY_BIN
+    venv_exists = venv_py.exists()
+    if venv_exists:
+        # Check installed
+        check = subprocess.run([str(venv_py), "-c", "import importlib.metadata as m; m.version('soup-cli'); print('ok')"], capture_output=True, text=True, timeout=8)
+        if check.returncode == 0:
+            return True
+        # pip drift → reinstall
+    # Need to run setup script
+    if not SOUP_SCRIPTS_DIR.exists():
+        warn("Soup scripts not found — skipping venv ensure")
+        return False
+    if IS_WINDOWS:
+        if not SOUP_SETUP_PS1.exists():
+            warn("setup_soup.ps1 not found — skipping Soup venv setup")
+            return False
+        pwsh = shutil.which("pwsh") or shutil.which("powershell")
+        if not pwsh:
+            warn("PowerShell not found — run setup_soup.ps1 manually")
+            return False
+        cmd = [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SOUP_SETUP_PS1)]
+    else:
+        if not SOUP_SETUP_SH.exists():
+            warn("setup_soup.sh not found — skipping Soup venv setup")
+            return False
+        bash = shutil.which("bash") or "/bin/bash"
+        cmd = [bash, str(SOUP_SETUP_SH)]
+    info("Setting up Soup (one-time: isolates venv + installs soup-cli) — may take minutes …")
+    ok_run, err = _spinner_run(cmd, "Soup setup", cwd=str(ROOT), timeout=1800)
+    # Verify
+    if SOUP_BIN.exists() or (SOUP_VENV_BIN / "soup").exists():
+        ok("Soup installed ✓  (soup-cli ready)")
+        return True
+    if ok_run:
+        # Script succeeded but binary alternative name?
+        if (SOUP_VENV_BIN / "soup-cli").exists():
+            ok("Soup installed ✓  (soup-cli)")
+            return True
+    if err:
+        warn(f"Soup setup output: {err[:200]}")
+    warn("Soup setup did not complete — Soup Lab will show install banner (run plugins/SoupPlugin/scripts/setup_soup.sh)")
+    return False
+
+def _soup_ensure_ui_token() -> str:
+    """Return stable SOUP_UI_TOKEN, generating and persisting it if missing."""
+    import secrets
+    # Prefer env, then .env file, then generate
+    tok = (_DOTENV.get("SOUP_UI_TOKEN", "").strip() or os.environ.get("SOUP_UI_TOKEN", "").strip())
+    if tok and len(tok) >= 16:
+        return tok
+    # Check .env file directly (may have been written after _DOTENV load)
+    try:
+        env_path = ROOT / ".env"
+        if env_path.exists():
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                if line.strip().startswith("SOUP_UI_TOKEN="):
+                    v = line.strip().partition("=")[2].strip()
+                    if v and len(v) >= 16:
+                        return v
+    except Exception:
+        pass
+    tok = secrets.token_urlsafe(32)
+    try:
+        wrote = _write_env_var("SOUP_UI_TOKEN", tok)
+        if wrote:
+            _DOTENV["SOUP_UI_TOKEN"] = tok
+            os.environ["SOUP_UI_TOKEN"] = tok
+            ok("Soup .env ← SOUP_UI_TOKEN generated (stable proxy token)")
+    except Exception:
+        pass
+    return tok
+
+def _soup_start_ui() -> bool:
+    """Start Soup UI on SOUP_UI_PORT as detached daemon (proxied auth). Best-effort."""
+    # Already running?
+    if port_open("127.0.0.1", SOUP_UI_PORT, 0.5):
+        ok(f"Soup UI already running on :{SOUP_UI_PORT} ✓  (http://127.0.0.1:{SOUP_UI_PORT} → proxied at /api/v1/plugins/soup/ui/proxy)")
+        return True
+    # Resolve soup binary (mirrors soup_utils.soup_bin_path but without import cycle)
+    _soup_bin = None
+    for _cand in (SOUP_BIN, SOUP_VENV_BIN / "soup", SOUP_VENV_BIN / "soup-cli"):
+        if _cand.exists():
+            _soup_bin = str(_cand)
+            break
+    if not _soup_bin:
+        _soup_bin = shutil.which("soup")
+    soup_bin = _soup_bin
+    if not soup_bin or not Path(soup_bin).exists():
+        warn("Soup UI not started — soup binary not found (run setup_soup.sh)")
+        return False
+    # Also need venv python to be 3.11/3.12; but soup_bin already validates
+    tok = _soup_ensure_ui_token()
+    log_path = ROOT / "soup-ui.log"
+    # Build command with stable token so proxy can forward Bearer header
+    cmd = [str(soup_bin), "ui", "--host", "127.0.0.1", "--port", str(SOUP_UI_PORT), "--no-browser", "--auth-token", tok]
+    info(f"Starting Soup UI on :{SOUP_UI_PORT} (proxied at /api/v1/plugins/soup/ui/proxy) …")
+    try:
+        with open(log_path, "ab") as lf:
+            if IS_WINDOWS:
+                DETACHED = 0x00000008
+                CREATE_NEW_PROCESS_GROUP = 0x00000200
+                subprocess.Popen(cmd, env={**os.environ, "SOUP_UI_TOKEN": tok}, stdout=lf, stderr=subprocess.STDOUT, creationflags=DETACHED | CREATE_NEW_PROCESS_GROUP, cwd=str(ROOT))
+            else:
+                subprocess.Popen(cmd, env={**os.environ, "SOUP_UI_TOKEN": tok}, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True, cwd=str(ROOT))
+    except Exception as ex:
+        warn(f"Soup UI failed to launch: {ex} — see {log_path.name}")
+        return False
+    # Wait up to 20s for port to open (UI takes ~3-6s)
+    for _ in range(20):
+        time.sleep(1)
+        if port_open("127.0.0.1", SOUP_UI_PORT, 0.5):
+            ok(f"Soup UI ready on :{SOUP_UI_PORT} ✓  (token proxied, dashboard at http://127.0.0.1:{SOUP_UI_PORT} + /soup-finetune)")
+            # Also confirm proxy health is now reachable (best-effort)
+            time.sleep(1)
+            ph = http_json(f"http://127.0.0.1:{SOUP_UI_PORT}/", timeout=3)
+            # Even if ph is None (HTML not JSON), port_open success is enough
+            return True
+    warn(f"Soup UI didn't bind to :{SOUP_UI_PORT} within 20s — check {log_path.name} (may still be booting; proxy will return 502 until ready)")
+    return False
+
+def _soup_start_api_health() -> bool:
+    """Ensure :8012 health shim is running (so /health never 502 when no model is serving).
+    Uses the lightweight docker/soup_sidecar.py shim if soup serve is not active."""
+    if port_open("127.0.0.1", SOUP_PORT, 0.5):
+        ok(f"Soup API already running on :{SOUP_PORT} ✓")
+        return True
+    # If a real `soup serve` is already handling :8012, port would be open. Otherwise start shim.
+    sidecar = ROOT / "docker" / "soup_sidecar.py"
+    if not sidecar.exists():
+        info("Soup API shim not found — skipping :8012 health (serve will bind it when needed)")
+        return True
+    # Prefer soup venv python, else backend venv
+    py = str(SOUP_PY_BIN) if SOUP_PY_BIN.exists() else (str(PY_BIN) if PY_BIN.exists() else "python3")
+    log_path = ROOT / "soup-api.log"
+    info(f"Starting Soup API health shim on :{SOUP_PORT} …")
+    try:
+        with open(log_path, "ab") as lf:
+            cmd = [py, str(sidecar)]
+            env = {**os.environ, "SOUP_PORT": str(SOUP_PORT), "SOUP_UI_PORT": str(SOUP_UI_PORT), "SOUP_REPO_DIR": str(SOUP_REPO_DIR)}
+            if IS_WINDOWS:
+                DETACHED = 0x00000008
+                CREATE_NEW_PROCESS_GROUP = 0x00000200
+                subprocess.Popen(cmd, env=env, stdout=lf, stderr=subprocess.STDOUT, creationflags=DETACHED | CREATE_NEW_PROCESS_GROUP, cwd=str(ROOT))
+            else:
+                subprocess.Popen(cmd, env=env, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True, cwd=str(ROOT))
+    except Exception as ex:
+        warn(f"Soup API shim failed to launch: {ex}")
+        return False
+    for _ in range(10):
+        time.sleep(1)
+        if port_open("127.0.0.1", SOUP_PORT, 0.5):
+            ok(f"Soup API health shim ready on :{SOUP_PORT} ✓  (real `soup serve` will take over when training serves)")
+            return True
+    warn(f"Soup API shim didn't bind to :{SOUP_PORT} within 10s — check {log_path.name}")
+    return False
+
+def ensure_soup() -> bool:
+    """Ensure Soup repo + venv are ready and auto-updated. Best-effort, never blocks startup.
+    Mirrors ensure_kronos_model() pattern: clone → venv → update-check → record version → start UI/API."""
+    if not SOUP_SETUP_ENABLED:
+        warn("Soup setup skipped (TRADEBOT_SKIP_SOUP_SETUP set) — Soup Lab uses stub")
+        return True
+    # 1) Repo: clone if missing, auto-pull every start if enabled
+    if SOUP_UPDATE_ENABLED:
+        _soup_ensure_repo()
+    else:
+        if not SOUP_REPO_DIR.exists():
+            _soup_ensure_repo()
+        else:
+            ok("Soup repo already cloned — update check skipped (TRADEBOT_SKIP_SOUP_UPDATE=1)")
+    # 2) Venv + pip
+    _soup_ensure_venv()
+    # 3) Ensure .env defaults (only add missing)
+    env_path = ROOT / ".env"
+    if env_path.exists():
+        try:
+            txt = env_path.read_text(encoding="utf-8")
+            missing: List[str] = []
+            if "SOUP_ENABLED" not in txt:
+                missing.append("SOUP_ENABLED=true")
+            if "SOUP_UI_PORT" not in txt:
+                missing.append(f"SOUP_UI_PORT={SOUP_UI_PORT}")
+            if "SOUP_PORT" not in txt:
+                missing.append(f"SOUP_PORT={SOUP_PORT}")
+            if "SOUP_SERVICE_URL" not in txt:
+                missing.append(f"SOUP_SERVICE_URL=http://127.0.0.1:{SOUP_PORT}")
+            if "SOUP_VENV_DIR" not in txt:
+                missing.append(f"SOUP_VENV_DIR={SOUP_VENV_DIR}")
+            if missing:
+                with open(env_path, "a", encoding="utf-8") as f:
+                    f.write("\n# Soup auto-configured by start.py\n" + "\n".join(missing) + "\n")
+                ok(f"Soup .env configured ✓  (added {', '.join(k.split('=')[0] for k in missing)})")
+        except Exception:
+            pass
+    # Ensure stable UI token exists for proxied auth
+    _soup_ensure_ui_token()
+    # 4) Report version
+    ver = _soup_repo_version()
+    if ver.get("cloned"):
+        commit = ver.get("commit") or "unknown"
+        branch = ver.get("branch") or "main"
+        pkg = ver.get("pkg_version") or "?"
+        rec = _soup_recommend_resources()
+        ok(f"Soup ready ✓  {commit} on {branch}  (soup-cli {pkg}) — {rec.get('reason')}")
+    else:
+        info("Soup repo not cloned — run plugins/SoupPlugin/scripts/setup_soup.sh")
+    # 5) Report resource-adaptive config
+    try:
+        rec = _soup_recommend_resources()
+        info(f"Soup training recommendation: {rec.get('reason')} → quantization={rec.get('quantization') or 'bf16'}, stream_layers={rec.get('stream_layers')}, batch={rec.get('batch_size')}")
+    except Exception:
+        pass
+    # 6) Start UI + API health shim (so proxy never 502 after boot)
+    _soup_start_ui()
+    _soup_start_api_health()
+    return True
+
+def _ollama_binary() -> Optional[str]:
+    return shutil.which("ollama")
+
+
+def _ollama_is_running() -> bool:
+    return port_open(OLLAMA_HOST, OLLAMA_PORT, timeout=1.0)
+
+
+def _ollama_tags() -> List[str]:
+    try:
+        url = f"{OLLAMA_URL}/api/tags"
+        with urllib.request.urlopen(url, timeout=3) as resp:  # noqa: S310 — localhost only
+            data = json.loads(resp.read().decode())
+            return [m.get("name", "") for m in (data.get("models") or []) if m.get("name")]
+    except Exception:
+        return []
+
+
+def _ollama_pull_model(model: str) -> bool:
+    ollama_bin = _ollama_binary()
+    if not ollama_bin:
+        warn(f"Ollama binary not found — cannot pull {model}")
+        return False
+    # Prefer CLI pull (handles streaming + progress) over HTTP
+    info(f"Pulling Ollama model {model} … (this may take a few minutes on first run)")
+    try:
+        r = subprocess.run([ollama_bin, "pull", model], timeout=1800)
+        ok_pull = r.returncode == 0
+        if ok_pull:
+            ok(f"Ollama model {model} ready ✓")
+        else:
+            warn(f"ollama pull {model} failed (exit {r.returncode}) — agents will fall back to next candidate")
+        return ok_pull
+    except subprocess.TimeoutExpired:
+        warn(f"ollama pull {model} timed out after 30m — check network and `ollama list`")
+        return False
+    except Exception as exc:
+        warn(f"ollama pull {model} exception: {exc}")
+        return False
+
+
+def _ollama_ensure_serve() -> bool:
+    """Ensure `ollama serve` is reachable. If OLLAMA_MANAGED, spawn it detached."""
+    if _ollama_is_running():
+        ok(f"Ollama reachable on {OLLAMA_HOST}:{OLLAMA_PORT} ✓")
+        return True
+    if not OLLAMA_MANAGED:
+        info(f"Ollama not reachable at {OLLAMA_URL} — OLLAMA_MANAGED=0 so not auto-starting "
+             "(start it with `ollama serve` or set OLLAMA_MANAGED=1)")
+        return False
+    ollama_bin = _ollama_binary()
+    if not ollama_bin:
+        warn("OLLAMA_MANAGED=1 but ollama binary not found — cannot start serve")
+        return False
+    log_path = ROOT / "ollama.log"
+    info(f"Starting `ollama serve` in background (log: {log_path.name}) …")
+    try:
+        kwargs: Dict[str, object] = {
+            "cwd": str(ROOT),
+            "stdout": open(log_path, "a"),
+            "stderr": subprocess.STDOUT,
+        }
+        if IS_WINDOWS:
+            kwargs["creationflags"] = 0x00000008 | 0x00000200  # type: ignore
+            subprocess.Popen([ollama_bin, "serve"], **kwargs)  # type: ignore[arg-type]
+        else:
+            subprocess.Popen([ollama_bin, "serve"], start_new_session=True, **kwargs)  # type: ignore[arg-type]
+    except Exception as exc:
+        warn(f"Could not start ollama serve: {exc}")
+        return False
+    # Wait briefly for it to bind
+    for _ in range(12):
+        time.sleep(1)
+        if _ollama_is_running():
+            ok("Ollama `serve` started and reachable ✓")
+            return True
+    warn(f"Ollama serve didn't bind to :{OLLAMA_PORT} within 12s — check {log_path}")
+    return False
+
+
+def _ollama_install_if_missing() -> bool:
+    """Best-effort install of the ollama binary (brew/curl/winget). Returns True if present afterwards."""
+    if _ollama_binary():
+        return True
+    info("Ollama not found — attempting to install …")
+    system = platform.system().lower()
+    try:
+        if system == "darwin" and shutil.which("brew"):
+            r = subprocess.run([shutil.which("brew"), "install", "ollama"], timeout=600)  # type: ignore
+            if r.returncode == 0 and _ollama_binary():
+                ok("Ollama installed via Homebrew ✓")
+                return True
+            warn("brew install ollama did not yield a binary — try `brew install ollama` manually")
+        elif system == "linux":
+            # Official install script (POSIX)
+            r = subprocess.run(["sh", "-c", "curl -fsSL https://ollama.com/install.sh | sh"], timeout=600)
+            if r.returncode == 0 and _ollama_binary():
+                ok("Ollama installed via install.sh ✓")
+                return True
+            warn("ollama install.sh failed — see https://ollama.com for manual install")
+        elif system == "windows":
+            if shutil.which("winget"):
+                r = subprocess.run(["winget", "install", "-e", "--id", "Ollama.Ollama", "--silent", "--accept-package-agreements"], timeout=600)
+                if r.returncode == 0:
+                    ok("Ollama installed via winget ✓ (may need new shell for PATH)")
+                    _augment_path()
+                    return bool(_ollama_binary())
+            warn("Install Ollama manually on Windows: https://ollama.com/download → OllamaSetup.exe")
+        else:
+            warn(f"Don't know how to auto-install Ollama on {system} — see https://ollama.com")
+    except subprocess.TimeoutExpired:
+        warn("Ollama install timed out — install manually: https://ollama.com")
+    except Exception as exc:
+        warn(f"Ollama install exception: {exc}")
+    return bool(_ollama_binary())
+
+
+def _ollama_update_check() -> None:
+    """If OLLAMA_UPDATE_ENABLED, check `ollama --version` and brew upgrade when stale (macOS). Best-effort only."""
+    if not OLLAMA_UPDATE_ENABLED:
+        return
+    ollama_bin = _ollama_binary()
+    if not ollama_bin:
+        return
+    try:
+        r = subprocess.run([ollama_bin, "--version"], capture_output=True, text=True, timeout=5)
+        ver = (r.stdout or r.stderr or "").strip()
+        if ver:
+            info(f"Ollama version: {ver}")
+    except Exception:
+        pass
+    # On macOS with brew, try `brew upgrade ollama` as background best-effort so users stay current
+    if platform.system().lower() == "darwin" and shutil.which("brew"):
+        try:
+            # Don't block: spawn detached upgrade, but log outcome when it finishes is not needed
+            subprocess.Popen(
+                [shutil.which("brew"), "upgrade", "ollama"],  # type: ignore
+                stdout=open(ROOT / "ollama.log", "a"),
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            info("Ollama update check: `brew upgrade ollama` running in background")
+        except Exception:
+            pass
+
+
+def ensure_ollama() -> bool:
+    """Ensure Ollama is installed, reachable, and a tier-appropriate model is pulled.
+
+    Mirrors ensure_kronos_model / ensure_soup pattern: clone/pull analogue for LLMs.
+    Never blocks startup — every failure degrades to providers/local_analysis fallback.
+    Opt-out: TRADEBOT_SKIP_OLLAMA_SETUP=1.
+    """
+    if not OLLAMA_SETUP_ENABLED:
+        warn("Ollama setup skipped (TRADEBOT_SKIP_OLLAMA_SETUP set) — fallback to providers only")
+        return True
+    # 1) Binary present?
+    if not _ollama_install_if_missing():
+        warn("Ollama not installed — agents will use providers first, then local heuristic (install: https://ollama.com)")
+        return True
+    # 2) Update check
+    _ollama_update_check()
+    # 3) Check disk headroom before pulling large models (warn if <10 GB free on ROOT)
+    try:
+        import shutil as _sh
+        free_gb = _sh.disk_usage(ROOT).free / (1024**3)
+        if free_gb < 10:
+            warn(f"Low disk space ({free_gb:.1f} GB free) — Ollama model pull may fail; free space or set OLLAMA_MODEL to a smaller tag")
+    except Exception:
+        pass
+    # 4) Serve reachable?
+    _ollama_ensure_serve()
+    if not _ollama_is_running():
+        warn(f"Ollama not reachable at {OLLAMA_URL} — pull skipped (agents fall back to providers)")
+        return True
+    # 5) Preferred model (tier-aware, plus tradebot-local if fine-tuned)
+    res = get_resources()
+    preferred = _ollama_model_for_tier(str(res.get("ui_tier", "high")), float(res.get("ram_gb", 8)))
+    models = _ollama_tags()
+    if any(m.startswith("tradebot-local") for m in models):
+        ok("Fine-tuned tradebot-local model present — agents will prefer it when providers are down")
+        # Still ensure catalogue base is present as fallback for fresh cache
+    # 6) Ensure catalogue / preferred model present (auto-pull)
+    if not OLLAMA_AUTO_PULL:
+        info(f"Ollama auto-pull disabled (OLLAMA_AUTO_PULL=0) — preferred {preferred} will be pulled on first agent fallback if missing")
+        return True
+    # If tradebot-local exists, prefer it as default; else preferred catalogue
+    default_model = _TRADEBOT_LOCAL_MODEL if any(m.startswith("tradebot-local") for m in models) else preferred
+    # If already cached, nothing to do
+    if default_model in models or any(default_model.split(":")[0] == m.split(":")[0] for m in models):
+        ok(f"Ollama model {default_model} cached ✓ (fallback ready)")
+        return True
+    # Need to pull — walk catalogue for tier until one succeeds (weak machines avoid 14b retry)
+    tier_key = str(res.get("ui_tier", "high")).lower()
+    cands = _OLLAMA_CATALOGUE.get(tier_key, _OLLAMA_CATALOGUE["medium"])
+    # Start with preferred, then fall back through tier candidates
+    to_try = [preferred] + [c for c in cands if c != preferred]
+    for cand in to_try:
+        if cand in models:
+            ok(f"Ollama model {cand} already cached ✓")
+            return True
+        if _ollama_pull_model(cand):
+            return True
+        # pull failed — try next smaller candidate
+    warn("No Ollama model could be pulled — agents fall back to providers → local heuristic until network recovers")
     return True
 
 
@@ -4022,16 +4976,39 @@ def ensure_speech_engine() -> bool:
     log_path = ROOT / "speech-engine.log"
 
     if port_open("127.0.0.1", SPEECH_ENGINE_PORT, 0.5):
-        ok(f"Speech engine already running on :{SPEECH_ENGINE_PORT}")
-        _report_speech_engine_health()
-        return True
+        se_pidfile = ROOT / "speech-engine.pid"
+        try:
+            sup_pid = int(se_pidfile.read_text().strip()) if se_pidfile.exists() else 0
+        except (ValueError, OSError):
+            sup_pid = 0
+        if sup_pid and _pid_alive(sup_pid):
+            ok(f"Speech engine already running on :{SPEECH_ENGINE_PORT} (supervised)")
+            _report_speech_engine_health()
+            return True
+        # Running, but nothing will restart it if it dies (an older launch, or
+        # started by hand) — replace it with a supervised one.
+        info("Speech engine running unsupervised — restarting it under the supervisor …")
+        for sc in SIDECARS:
+            if sc["key"] == "speech_engine":
+                _reap_sidecar(sc)
+        for _ in range(20):
+            if not port_open("127.0.0.1", SPEECH_ENGINE_PORT, 0.3):
+                break
+            time.sleep(0.5)
 
     if not SPEECH_ENGINE_UVICORN_BIN.exists():
         warn("speech_engine uvicorn binary not found — cannot start sidecar")
         return True
 
-    info(f"Starting speech engine on :{SPEECH_ENGINE_PORT} …")
-    cmd = [str(SPEECH_ENGINE_UVICORN_BIN), "main:app", "--host", "0.0.0.0", "--port", str(SPEECH_ENGINE_PORT)]
+    # Supervised, low-priority launch: speech_engine/supervise.py restarts the
+    # engine if it dies and runs it at nice +10 with capped CPU threads, so it
+    # never competes with trading or the UI. LITE mode below 32 GB keeps only
+    # the small STT model resident (see speech_engine/engine.py).
+    lite = float(caps.get("ram_gb") or 0) < 32
+    info(f"Starting speech engine on :{SPEECH_ENGINE_PORT} "
+         f"({'lite: STT resident, TTS on demand' if lite else 'full'}, low priority, supervised) …")
+    cmd = [str(SPEECH_ENGINE_PY_BIN), "supervise.py", "--port", str(SPEECH_ENGINE_PORT)]
+    os.environ.setdefault("SPEECH_ENGINE_LITE", "1" if lite else "0")
     try:
         if IS_WINDOWS:
             DETACHED = 0x00000008
@@ -4524,6 +5501,132 @@ def _hermes_ensure_best_trader_skills() -> None:
         warn(f"Hermes best-trader skills check skipped ({ex})")
 
 
+def _neuro_repo_version() -> Dict[str, object]:
+    if not NEURO_REPO_DIR.exists():
+        return {"cloned": False, "commit": None, "branch": None, "remote": NEURO_REPO_URL, "last_pull": None, "version_file": str(NEURO_REPO_VERSION_FILE)}
+    try:
+        r = subprocess.run(["git", "-C", str(NEURO_REPO_DIR), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5)
+        commit = r.stdout.strip()[:12] if r.returncode == 0 else None
+        r2 = subprocess.run(["git", "-C", str(NEURO_REPO_DIR), "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, timeout=5)
+        branch = r2.stdout.strip() if r2.returncode == 0 else None
+        last_pull: Optional[str] = None
+        if NEURO_REPO_VERSION_FILE.exists():
+            try: last_pull = json.loads(NEURO_REPO_VERSION_FILE.read_text()).get("last_pull")
+            except Exception: pass
+        pkg_version: Optional[str] = None
+        for cand in [NEURO_REPO_DIR / "package.json", NEURO_REPO_DIR / "pyproject.toml"]:
+            if cand.exists():
+                try:
+                    import re
+                    m = re.search(r'version\s*=\s*["\']([^"\']+)["\']', cand.read_text())
+                    if m: pkg_version = m.group(1); break
+                except Exception: pass
+        return {"cloned": True, "commit": commit, "branch": branch, "remote": NEURO_REPO_URL, "last_pull": last_pull, "pkg_version": pkg_version, "path": str(NEURO_REPO_DIR)}
+    except Exception:
+        return {"cloned": True, "commit": None, "branch": None, "remote": NEURO_REPO_URL, "last_pull": None, "path": str(NEURO_REPO_DIR)}
+
+def _neuro_ensure_repo() -> bool:
+    if not shutil.which("git"):
+        warn("Neuro: git not found — cannot clone/update neuroglancer repo")
+        return False
+    if not NEURO_REPO_DIR.exists():
+        NEURO_REPO_DIR.parent.mkdir(parents=True, exist_ok=True)
+        info(f"Cloning Neuroglancer repo → {NEURO_REPO_DIR} …")
+        clone_cmd = ["git", "clone", "--depth=1", "--branch", NEURO_BRANCH, NEURO_REPO_URL, str(NEURO_REPO_DIR)]
+        ok_run, err = _spinner_run(clone_cmd, "Neuro clone", cwd=str(ROOT), timeout=120)
+        if not ok_run or not (NEURO_REPO_DIR / ".git").exists():
+            warn(f"Neuro clone failed ({(err or '')[:160]})")
+            return False
+        try:
+            v = _neuro_repo_version()
+            NEURO_REPO_VERSION_FILE.write_text(json.dumps({**v, "last_pull": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, indent=2))
+        except Exception: pass
+        ok(f"Neuro repo cloned ✓  ({NEURO_REPO_URL})")
+        return True
+    try:
+        info("Checking Neuroglancer repo for updates …")
+        fetch = subprocess.run(["git", "-C", str(NEURO_REPO_DIR), "fetch", "--depth=1", "origin", NEURO_BRANCH], capture_output=True, text=True, timeout=30)
+        if fetch.returncode == 0:
+            behind = subprocess.run(["git", "-C", str(NEURO_REPO_DIR), "rev-list", "HEAD..FETCH_HEAD", "--count"], capture_output=True, text=True, timeout=10)
+            count = int(behind.stdout.strip()) if behind.returncode == 0 and behind.stdout.strip().isdigit() else 0
+            if count > 0:
+                info(f"Neuro repo has {count} new commit(s) — pulling …")
+                pull = subprocess.run(["git", "-C", str(NEURO_REPO_DIR), "pull", "--ff-only"], capture_output=True, text=True, timeout=60)
+                if pull.returncode == 0: ok(f"Neuro repo updated ✓  ({count} commit(s) pulled)")
+                else: warn(f"Neuro pull failed ({(pull.stderr or '')[:120]})")
+            else: ok("Neuro repo up-to-date ✓")
+        else: info("Neuro repo: offline or fetch skipped")
+    except Exception as ex: warn(f"Neuro repo update check skipped ({ex})")
+    try:
+        v = _neuro_repo_version()
+        NEURO_REPO_VERSION_FILE.write_text(json.dumps({**v, "last_pull": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, indent=2))
+    except Exception: pass
+    return True
+
+def ensure_neuro() -> bool:
+    """Ensure Neuroglancer core brain is cloned, configured, and ready to be the DECIDING brain.
+
+    - Clones/pulls google/neuroglancer to integrations/neuroglancer (if missing)
+    - Writes NEUROGLANCER_* defaults to .env (only missing keys, never overwrites)
+    - Ensures data/ exists and seeds data/neuro_state.db (so the core brain has a
+      store even before the backend boots)
+    - Reports the integrated version so the user sees "neuro running" immediately
+    - The actual auto-sync of *all other brains* + deciding gate is started by
+      the backend lifespan (app/main.py) — verified after backend is up (see
+      post-backend neuro health check in main()).
+    """
+    if not NEURO_SETUP_ENABLED:
+        warn("Neuro setup skipped (TRADEBOT_SKIP_NEURO_SETUP set)"); return True
+    if (_DOTENV.get("NEUROGLANCER_ENABLED", "").strip().lower() in ("0","false","no","off")):
+        info("Neuro disabled via NEUROGLANCER_ENABLED=false — skipping repo ensure"); return True
+    # 1) Repo — clone if missing, pull if behind (best-effort, never blocks)
+    _neuro_ensure_repo()
+    # 2) Data dir + store seed (so brain file exists before backend boots)
+    for d in [ROOT / "data"]:
+        try: d.mkdir(parents=True, exist_ok=True)
+        except Exception: pass
+    try:
+        # Best-effort seed via the venv python so the FTS5 schema exists
+        if PY_BIN.exists():
+            subprocess.run([str(PY_BIN), "-c", "from app.neuro_brain.state_store import ensure_store; ensure_store(); print('neuro store seeded')"], cwd=str(ROOT), capture_output=True, timeout=10)
+    except Exception:
+        pass
+    # 3) .env defaults — only add missing keys, never overwrite user pins
+    env_path = ROOT / ".env"
+    if env_path.exists():
+        try:
+            txt = env_path.read_text(encoding="utf-8")
+            missing: List[str] = []
+            if "NEUROGLANCER_ENABLED" not in txt: missing.append("NEUROGLANCER_ENABLED=true")
+            if "NEUROGLANCER_FEDERATION_ENABLED" not in txt: missing.append("NEUROGLANCER_FEDERATION_ENABLED=true")
+            if "NEUROGLANCER_DECIDING_ENABLED" not in txt: missing.append("NEUROGLANCER_DECIDING_ENABLED=true")
+            if "NEUROGLANCER_AUTO_PULL" not in txt: missing.append("NEUROGLANCER_AUTO_PULL=true")
+            if "NEUROGLANCER_PULL_INTERVAL_S" not in txt: missing.append("NEUROGLANCER_PULL_INTERVAL_S=21600")
+            if "NEUROGLANCER_SYNC_INTERVAL_S" not in txt: missing.append("NEUROGLANCER_SYNC_INTERVAL_S=300")
+            if "NEUROGLANCER_TRADE_LOOP_S" not in txt: missing.append("NEUROGLANCER_TRADE_LOOP_S=600")
+            if missing:
+                with open(env_path, "a", encoding="utf-8") as f:
+                    f.write("\n# Neuro core brain auto-configured by start.py (CORE — deciding brain, federates all)\n" + "\n".join(missing) + "\n")
+                ok(f"Neuro .env configured ✓  (added {', '.join(k.split('=')[0] for k in missing)})")
+        except Exception: pass
+    ver = _neuro_repo_version()
+    if ver.get("cloned"):
+        commit = ver.get("commit") or "unknown"
+        branch = ver.get("branch") or NEURO_BRANCH
+        ok(f"Neuro repo ✓  {commit} on {branch} — auto-updates on each start (CORE brain)")
+        # If the repo was just cloned, also ensure a version file freshness stamp
+        try:
+            if NEURO_REPO_VERSION_FILE.exists():
+                # Touch last_pull so /brain doesn't show stale
+                pass
+        except Exception:
+            pass
+    else:
+        warn("Neuro repo not cloned — will use embedded brain store only (run: git clone https://github.com/google/neuroglancer.git integrations/neuroglancer)")
+    # 4) Note that the *running* check happens after backend is up (see post-backend health probe)
+    info("Neuro core brain setup done — will auto-sync all brains + act as deciding brain once backend is up")
+    return True
+
 def _hermes_ensure_configured() -> None:
     """Ensure Hermes runtime config exists so the sidecar is fully usable."""
     # Ensure data dirs exist
@@ -4844,6 +5947,24 @@ def warmup_kronos_and_openhuman() -> None:
     else:
         info("Vibe-Trading plugin loaded — sidecar starts on first request")
 
+    # Soup LLM finetuning — report repo + install status
+    sj = http_json(f"{base}/plugins/soup/status", timeout=10)
+    if sj is not None:
+        if sj.get("installed") and sj.get("repo_cloned"):
+            ver = sj.get("version") or {}
+            pkg = ver.get("pkg_version") or "?"
+            commit = (ver.get("commit") or "")[:7]
+            rec = sj.get("recommendation") or {}
+            ok(f"Soup ready — soup-cli {pkg} @ {commit} · {rec.get('reason','')} (trysoup.dev)")
+            if sj.get("update_available"):
+                warn(f"Soup update available: {ver.get('commit','')[:7]} → {sj.get('remote_commit','')[:7]} — restart will pull")
+        elif sj.get("repo_cloned"):
+            warn("Soup repo cloned but venv not ready — run plugins/SoupPlugin/scripts/setup_soup.sh")
+        else:
+            warn("Soup not installed — run plugins/SoupPlugin/scripts/setup_soup.sh (or next start.py will clone)")
+    else:
+        info("Soup plugin loaded — will be available after backend fully warms")
+
 
 def start_backend(pg_port: int, redis_port: int, mode: str) -> bool:
     if port_open("localhost", BACKEND_PORT, 0.5):
@@ -4922,6 +6043,22 @@ def start_backend(pg_port: int, redis_port: int, mode: str) -> bool:
     # autostart flags and concurrency caps all scale together. .env / shell still
     # win via setdefault, and TRADEBOT_PROFILE (if the user pinned one) is passed
     # through so both sides resolve the identical tier.
+    # ── Ollama local LLM contract (backend reads OLLAMA_* for tier fallback + training) ──
+    env.setdefault("OLLAMA_ENABLED", "true" if OLLAMA_SETUP_ENABLED else "false")
+    env.setdefault("OLLAMA_URL", OLLAMA_URL)
+    if OLLAMA_MODEL_ENV:
+        env.setdefault("OLLAMA_MODEL", OLLAMA_MODEL_ENV)
+    else:
+        # tier-aware default so backend falls back to the same model start.py just pulled
+        env.setdefault("OLLAMA_MODEL", _ollama_model_for_tier(str(_res["ui_tier"]), float(_res["ram_gb"])))
+    env.setdefault("OLLAMA_FALLBACK_ENABLED", "true" if OLLAMA_FALLBACK_ENABLED else "false")
+    env.setdefault("OLLAMA_AUTO_PULL", "true" if OLLAMA_AUTO_PULL else "false")
+    env.setdefault("OLLAMA_MANAGED", "true" if OLLAMA_MANAGED else "false")
+    env.setdefault("OLLAMA_TIMEOUT_MS", "15000")
+    env.setdefault("OLLAMA_TRAIN_INTERVAL_HOURS", os.environ.get("OLLAMA_TRAIN_INTERVAL_HOURS", "24"))
+    env.setdefault("OLLAMA_MIN_SAMPLES_FOR_TRAIN", os.environ.get("OLLAMA_MIN_SAMPLES_FOR_TRAIN", "200"))
+    env.setdefault("OLLAMA_KEEP_LAST_N", os.environ.get("OLLAMA_KEEP_LAST_N", "2"))
+
     env.setdefault("TRADEBOT_TIER", str(_res["ui_tier"]))
     _tier_profile = os.environ.get("TRADEBOT_PROFILE", "").strip()
     if _tier_profile:
@@ -5137,6 +6274,19 @@ def stop_all(keep_tools: bool = False, hard: bool = False) -> None:
             info(f"Stopped {label} via PID file (pid {pid})")
         pidfile.unlink(missing_ok=True)
 
+    # ── Speech-engine supervisor ─────────────────────────────────────────────
+    # It holds no port, and it restarts the engine the moment the port owner is
+    # reaped below — so it has to go first, via its PID file.
+    se_pidfile = ROOT / "speech-engine.pid"
+    if se_pidfile.exists():
+        try:
+            se_pid = int(se_pidfile.read_text().strip())
+            if _pid_alive(se_pid) and "supervise" in _proc_cmdline(se_pid) and _kill_pid_tree(se_pid):
+                info(f"Stopped speech engine supervisor (pid {se_pid})")
+        except (ValueError, OSError):
+            pass
+        se_pidfile.unlink(missing_ok=True)
+
     # ── Sidecar registry reap ─────────────────────────────────────────────────
     # Every long-lived process this launcher spawns, reaped by port-owner with
     # cmdline verification so a reused port can't kill an unrelated process.
@@ -5164,7 +6314,7 @@ def stop_all(keep_tools: bool = False, hard: bool = False) -> None:
     if hard:
         warn("--hard: sweeping all known ports")
         _sweep_ports([
-            HEADROOM_PORT, HERMES_PORT, SPEECH_ENGINE_PORT, VIBE_TRADING_SERVE_PORT,
+            HEADROOM_PORT, HERMES_PORT, SOUP_UI_PORT, SOUP_PORT, SPEECH_ENGINE_PORT, VIBE_TRADING_SERVE_PORT,
             AGENTMEMORY_PORT, OPENMANUS_MCP_PORT, OPENWA_API_PORT,
             OPENWA_DASHBOARD_PORT, BACKEND_PORT, FRONTEND_PORT,
         ])
@@ -5180,6 +6330,8 @@ def status() -> None:
     checks = [
         ("Headroom proxy", "127.0.0.1", HEADROOM_PORT),
         ("Hermes gateway", "127.0.0.1", HERMES_PORT),
+        ("Soup UI", "127.0.0.1", SOUP_UI_PORT),
+        ("Soup API", "127.0.0.1", SOUP_PORT),
         ("PostgreSQL (brew)", "localhost", 5434),
         ("PostgreSQL (docker)", "localhost", 5433),
         ("Redis (brew)", "localhost", 6379),
@@ -5222,6 +6374,27 @@ def status() -> None:
     else:
         # Fallback when backend not yet up — already shown via port check above, skip duplicate.
         pass
+
+    # Soup API health (best-effort; backend must be up)
+    sj = http_json(f"http://127.0.0.1:{BACKEND_PORT}/api/v1/plugins/soup/status", timeout=10)
+    if sj is not None:
+        soup_inst = bool(sj.get("installed") or sj.get("repo_cloned"))
+        soup_bin = bool(sj.get("soup_bin_exists") or sj.get("installed"))
+        ver = sj.get("version") or {}
+        commit = (ver.get("commit") or "")[:7]
+        sym2 = f"{C.GREEN}●{C.RESET}" if soup_inst and soup_bin else f"{C.YELLOW}○{C.RESET}"
+        state2 = f"installed {commit} · {sj.get('recommendation',{}).get('reason','')}" if soup_inst else "not installed — run setup_soup.sh"
+        print(f"  {sym2}  {'Soup API':<26}  {'-':>5}  {state2}")
+        # Check for updates
+        remote = sj.get("remote_commit")
+        local = (ver.get("commit") or "")
+        if remote and local and remote[:7] != local[:7]:
+            print(f"  {C.YELLOW}!{C.RESET}  Soup update available: {local[:7]} → {remote[:7]} — restart will pull")
+    else:
+        if not port_open("127.0.0.1", BACKEND_PORT, 0.5):
+            pass
+        else:
+            print(f"  {C.YELLOW}○{C.RESET}  {'Soup API':<26}  {'-':>5}  backend not ready yet")
 
 
 
@@ -5339,6 +6512,7 @@ def print_sox_banner(mode: str, pg_port: int, redis_port: int) -> None:
     print(row("MT5 REST", MT5_API_URL, CY))
     print(row("HEADROOM", f"{HEADROOM_URL}/dashboard", CY))
     print(row("HERMES", f"http://localhost:{HERMES_PORT}  ·  /hermes  ·  SOUL merged", CY))
+    print(row("SOUP UI", f"http://localhost:{SOUP_UI_PORT}  ·  /soup-finetune  ·  API :{SOUP_PORT}", CY))
     print(row("OPENAWA", f"{OPENWA_DASHBOARD_URL}/dashboard", CY))
     print(line("╚", "═", "╝"))
     # ── Hermes explicit started line (requested) ───────────────────────────
@@ -5347,6 +6521,43 @@ def print_sox_banner(mode: str, pg_port: int, redis_port: int) -> None:
         print(f"  {C.GREEN}✓{C.RESET}  {C.BOLD}Hermes has started{C.RESET} — gateway on {C.CYAN}http://localhost:{HERMES_PORT}/health{C.RESET}  ·  page {C.CYAN}http://localhost:{FRONTEND_PORT}/hermes{C.RESET}  ·  SOUL {C.CYAN}SOUL.md{C.RESET} (JARVIS/Paul/SOX merged)")
     else:
         print(f"  {C.YELLOW}!{C.RESET}  Hermes gateway not running on :{HERMES_PORT} — backend will use local FTS5 fallback (check {ROOT}/hermes.log)")
+
+    # ── X (Twitter) whale monitor status ──────────────────────────────────────
+    twitter_token = _DOTENV.get("TWITTER_BEARER_TOKEN", "").strip()
+    if twitter_token:
+        # Quick probe using app-only Bearer auth (same type the monitor uses for timelines)
+        import urllib.request, json as _json
+        try:
+            req = urllib.request.Request(
+                "https://api.twitter.com/2/users/by/username/twitter",
+                headers={"Authorization": f"Bearer {twitter_token}"},
+            )
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                _json.loads(resp.read())
+            print(f"  {C.GREEN}✓{C.RESET}  X Monitor token verified (app-only auth)  ·  page {C.CYAN}http://localhost:{FRONTEND_PORT}/x-monitor{C.RESET}")
+        except Exception as _xe:
+            _xe_str = str(_xe)
+            if "401" in _xe_str:
+                print(f"  {C.YELLOW}!{C.RESET}  X Monitor: Bearer token rejected (401) — check TWITTER_BEARER_TOKEN in .env")
+            elif "403" in _xe_str:
+                print(f"  {C.YELLOW}!{C.RESET}  X Monitor: Token set but no Basic-tier access (403) — upgrade your Twitter Developer App plan")
+            else:
+                print(f"  {C.YELLOW}!{C.RESET}  X Monitor: Token set but could not verify ({_xe_str[:60]}) — monitor will still try at runtime")
+    else:
+        print(f"  {C.YELLOW}!{C.RESET}  X Monitor: TWITTER_BEARER_TOKEN not set — X whale monitoring disabled  ·  see {C.CYAN}http://localhost:{FRONTEND_PORT}/x-monitor{C.RESET}")
+
+    # ── X AI Scraper status (ScrapeGraphAI) ───────────────────────────────────
+    _sg_status = subprocess.run(
+        [str(PY_BIN), "-c",
+         "import importlib.metadata; print(importlib.metadata.version('scrapegraphai'))"],
+        capture_output=True, text=True, timeout=8
+    )
+    if _sg_status.returncode == 0:
+        _sg_v = _sg_status.stdout.strip()
+        print(f"  {C.GREEN}✓{C.RESET}  X AI Scraper: scrapegraphai v{_sg_v} ready  ·  AI Scraper tab {C.CYAN}http://localhost:{FRONTEND_PORT}/x-monitor{C.RESET}")
+    else:
+        print(f"  {C.YELLOW}!{C.RESET}  X AI Scraper: scrapegraphai not installed — use the Install button on the AI Scraper tab")
+
     print(f"\n  {DIM}Logs:{RS} {ROOT}/backend.log  |  {ROOT}/frontend.log  |  {ROOT}/hermes.log\n")
 
 
@@ -5522,6 +6733,13 @@ def main() -> None:
     # Kronos ML forecaster — one-time model setup (macOS/Linux + Windows).
     # Best-effort: never blocks startup (heuristic fallback covers failures).
     ensure_kronos_model()
+    # Kronos fine-tuning pipeline — one-time vendoring of finetune_csv/ trainers.
+    ensure_kronos_finetune()
+    # Soup LLM fine-tuning — clone + isolated venv + auto-update every start.
+    # Best-effort: never blocks startup; shows banner in Soup Lab if missing.
+    header("3a/6  Soup LLM finetuning")
+    soup_ok = ensure_soup()
+    results["Soup"] = soup_ok
 
     # Vibe-Trading AI — install vibe-trading-ai into backend venv (one-time).
     # Sidecar auto-starts lazily on first API request to /plugins/vibe-trading/*.
@@ -5556,11 +6774,25 @@ def main() -> None:
         info(f"OpenManus skipped (host RAM < {_SIDECAR_MIN_RAM_GB}GB; "
              "set TRADEBOT_ENABLE_OPENMANUS=1 to force)")
 
+    # Ollama local LLM — install/serve + tier-appropriate model (fallback when providers down)
+    # Best-effort: never blocks startup; agents fall back to providers → heuristic if missing.
+    header("3a½/6  Ollama local LLM")
+    try:
+        ollama_ok = ensure_ollama()
+    except Exception as _e:
+        warn(f"Ollama setup encountered an error (non-blocking): {_e}")
+        ollama_ok = True
+    results["Ollama"] = bool(ollama_ok)
+
+    # Neuro core brain — google/neuroglancer, federates every other brain.
+    header("3b/6  Neuro core brain")
+    neuro_ok = ensure_neuro()
+    results["Neuro core"] = neuro_ok
     # Hermes gateway — self-aware sidecar (episodic+skill+user-model, :8011).
     # Stdlib-only (no heavy ML) so it auto-starts by default and always shows
     # in the startup summary below. Opt-out: TRADEBOT_SKIP_HERMES_SETUP=1 or
     # HERMES_ENABLED=false in .env.
-    header("3b/6  Hermes gateway")
+    header("3c/6  Hermes gateway")
     hermes_ok = ensure_hermes()
     results["Hermes gateway"] = hermes_ok
 
@@ -5568,6 +6800,55 @@ def main() -> None:
     header("4/6  FastAPI backend")
     backend_ok = start_backend(pg_port, redis_port if redis_ok else 6379, mode)
     results["Backend"] = backend_ok
+
+    # ── 4b. Neuro core — verify it's running and auto-synced (CORE + deciding brain)
+    # Backend must be warm before we can probe /api/v1/neuro/health, so this
+    # lives *after* start_backend. If the probe fails we warn but never block —
+    # the in-process sync loop (app/main.py lifespan) will retry.
+    if neuro_ok and backend_ok:
+        header("4b/6  Neuro core — health + auto-sync check")
+        ok_neuro = False
+        for attempt in range(12):
+            time.sleep(1.5)
+            nj = http_json(f"http://127.0.0.1:{BACKEND_PORT}/api/v1/neuro/health", timeout=4)
+            if nj and nj.get("enabled"):
+                st = nj.get("stats", {})
+                ok(f"Neuro core brain running ✓  (enabled, federation={nj.get('federation')}, {st.get('episodes_total',0)} episodes, {st.get('segments_total',0)} segments)")
+                # Trigger an immediate federated sync so the new core is in track
+                # with every other brain right away (don't wait for the 5-min loop).
+                try:
+                    import urllib.request as _ur
+                    import json as _js
+                    _sync_url = f"http://127.0.0.1:{BACKEND_PORT}/api/v1/neuro/sync?limit_per_brain=30"
+                    req = _ur.Request(_sync_url, method="POST")
+                    with _ur.urlopen(req, timeout=30) as resp:
+                        data = _js.loads(resp.read().decode())
+                        if data.get("ok"):
+                            ok(f"Neuro auto-sync ✓  mirrored {data.get('total',0)} episodes from Hermes/Vault/AI/Decisions (core in track)")
+                        else:
+                            info(f"Neuro sync probe: {data}")
+                except Exception as se:
+                    warn(f"Neuro sync trigger skipped ({se}) — periodic loop will sync within 5 min")
+                # Also verify deciding brain
+                try:
+                    dj = nj.get("loops", {}) if isinstance(nj.get("loops"), dict) else {}
+                    deciding = dj.get("deciding", True)
+                    sync_run = dj.get("sync_loop", {}).get("running", False) if isinstance(dj.get("sync_loop"), dict) else False
+                    info(f"Neuro deciding brain: {'ON ✓ (every trade passes through veto)' if deciding else 'OFF'}  ·  sync loop: {'running' if sync_run else 'starting'}")
+                except Exception:
+                    pass
+                ok_neuro = True
+                break
+            elif nj is not None:
+                # Backend up but neuro not yet enabled — will be once lifespan finishes
+                time.sleep(2)
+                continue
+        if not ok_neuro:
+            warn("Neuro core health not yet reachable — backend may still be warming (will auto-sync within 5 min; check /brain)")
+        # Record in summary but never fail startup
+        results["Neuro core (running)"] = ok_neuro
+    elif not neuro_ok:
+        warn("Neuro setup was skipped — core brain not running (set NEUROGLANCER_ENABLED=true)")
 
     # ── 5. Frontend ───────────────────────────────────────────────────────────
     header("5/6  Next.js frontend")

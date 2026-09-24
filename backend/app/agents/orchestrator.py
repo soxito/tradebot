@@ -24,6 +24,8 @@ from app.core.database import AsyncSessionLocal, safe_rollback
 from app.agents.specialists import agent_from_db
 from app.agents.memory import get_past_decisions, build_memory_prompt, try_local_decision
 from app.agents import room
+from app.agents import brain_log
+from app.agents import oblivion_gate
 from app.signals.technical import analyze as technical_analyze
 from app.exchanges.manager import exchange_manager, SupportedExchange
 from app.exchanges.forex_provider import is_forex_symbol, fetch_ohlcv as forex_fetch_ohlcv
@@ -55,6 +57,25 @@ _inflight_symbols: set[str] = set()
 
 def _norm_symbol(symbol: str) -> str:
     return (symbol or "").replace("/", "").upper()
+
+
+def _oblivion_directive(context: Dict[str, Any]) -> str:
+    """The one instruction every seat reads first: OBLIVION leads."""
+    gate = context.get("oblivion_gate") or {}
+    if gate.get("tradeable"):
+        return (
+            f"OBLIVION MANDATE: {str(gate.get('action')).upper()} ({gate.get('kind')}, score {gate.get('score')}) — "
+            f"entry {gate.get('entry')}, stop {gate.get('stop_loss')}, TP1 {gate.get('tp1')}, TP2 {gate.get('tp2')}, "
+            f"TP3 {gate.get('tp3')}. OBLIVION is the desk's main engine. You may CONFIRM this side "
+            "(and tighten entry/stop) or VETO it with a named reason (answer hold). You may NOT trade the "
+            "opposite side — code will turn any opposite call into HOLD."
+        )
+    return (
+        "OBLIVION MANDATE: NO NEW ENTRY — "
+        f"{gate.get('reason') or 'OBLIVION has no confirmed signal on this pair'}. OBLIVION is the desk's "
+        "main engine; without a confirmed signal the room does not open trades. Give your market analysis "
+        "and the level OBLIVION is waiting for, and answer hold for any entry."
+    )
 
 
 def _analysis_window() -> int:
@@ -514,6 +535,16 @@ class AgentOrchestrator:
             "decision": getattr(resp, "decision", None),
             "anchor_price": getattr(resp, "anchor_price", None),
             "note": getattr(resp, "note", None),
+            # What the model IS, so every seat reasons about the forecast
+            # correctly (band = conviction, NO_TRADE = no volume, not bearish).
+            "model_context": (
+                "Kronos (arXiv:2508.02739) — decoder-only foundation model "
+                "pre-trained on 12B K-lines from 45 exchanges. Forecast is the "
+                "mean of many sampled paths; p10/p90 band = model conviction "
+                "(tight=high, wide=low); confidence = path agreement × volume × "
+                "macro; a NO_TRADE decision means volume could not be established, "
+                "NOT a bearish call."
+            ),
         }
         if signal is not None:
             block.update({
@@ -739,6 +770,70 @@ class AgentOrchestrator:
             logger.debug(f"[Orchestrator] cycle context skipped for {symbol}: {exc}")
 
     @staticmethod
+    async def _add_cycle_analogs(context: Dict[str, Any], symbol: str) -> None:
+        """Previous cycles aligned vs current — % from each bottom by day_of_cycle.
+
+        Gives every seat the ghost-vs-current view the bitcoin-cycle page renders
+        (W1/D1). Advisory only; failure is silence.
+        """
+        try:
+            from app.services import market_cycle
+            if not market_cycle.cycle_applies(symbol):
+                return
+            # Use cached daily bars (same as cycle_analogs endpoint) — no extra Yahoo hit
+            bars = await market_cycle.cached_bars()
+            if not bars:
+                return
+            payload = market_cycle.cycle_analogs(
+                market_cycle.parse_anchors(market_cycle.DEFAULT_ANCHORS),
+                bars,
+            )
+            # Keep only summary for prompt (full points are 5k) — ghosts count + current day offset
+            context["cycle_analogs"] = {
+                "cycles": [c["bottom"] for c in payload.get("cycles", [])],
+                "current_bottom": (payload.get("current") or {}).get("bottom"),
+                "bull_days": payload.get("bull_days"),
+                "bear_days": payload.get("bear_days"),
+                "note": "Each cycle as % from its bottom by day_of_cycle; current vs ghosts where attention is due",
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[Orchestrator] cycle_analogs skipped for {symbol}: {exc}")
+
+    @staticmethod
+    async def _add_pattern_signal(context: Dict[str, Any], symbol: str, timeframe: str) -> None:
+        """Hammer / engulfing / morning_star etc as board evidence for signal focus.
+
+        Runs candle_patterns.detect_patterns on the same window the desk sees
+        (200 bars via market_data/candle_resolver). Counts drive signal_generator
+        to focus on that movement.
+        """
+        try:
+            from app.services import candles as candle_resolver
+            from app.signals.candle_patterns import detect_patterns
+            # Use the timeframe the room is actually analysing (H1/H4 get 4y context, but patterns on last 500)
+            rows = await candle_resolver.fetch(symbol, timeframe, limit=500)
+            if not rows or len(rows) < 5:
+                return
+            events = detect_patterns(rows, patterns=None)  # all: hammer, engulfing, etc.
+            if not events:
+                return
+            # Last 20 bars are what matters for "now"
+            recent = [e for e in events if e.get("index", 0) >= len(rows) - 20]
+            counts: Dict[str, int] = {}
+            for e in recent:
+                counts[e["name"]] = counts.get(e["name"], 0) + 1
+            context["pattern_signal"] = {
+                "timeframe": timeframe,
+                "recent_count": len(recent),
+                "counts": counts,
+                "last": recent[-1]["name"] if recent else None,
+                "last_direction": recent[-1]["direction"] if recent else None,
+                "note": "Recent hammer/engulfing/morning_star on this TF — focus signal on this movement",
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[Orchestrator] pattern_signal skipped for {symbol} {timeframe}: {exc}")
+
+    @staticmethod
     async def _add_whales(context: Dict[str, Any], symbol: str) -> None:
         """The curated BTC whale registry as board evidence.
 
@@ -765,6 +860,67 @@ class AgentOrchestrator:
             }
         except Exception as exc:  # noqa: BLE001 — enrichment only
             logger.debug(f"[Orchestrator] whale context skipped for {symbol}: {exc}")
+
+    @staticmethod
+    def _add_oblivion(context: Dict[str, Any], ohlcv: Sequence[Sequence[Any]], timeframe: str) -> None:
+        """OBLIVION MASTER v5 read on the same window the board draws.
+
+        OBLIVION is the room's main engine: every seat gets the same read, and
+        ``oblivion_gate`` is the verdict the board must confirm or veto — a
+        fresh confirmed signal is the only thing the room may trade, and the
+        news window blocks new entries outright.
+        """
+        try:
+            from app.agents import oblivion_gate
+            from app.signals.oblivion import analyze_oblivion, compact_for_prompt
+
+            if not ohlcv or len(ohlcv) < 60:
+                context["oblivion_gate"] = oblivion_gate.verdict(
+                    {"error": f"only {len(ohlcv or [])} bars — OBLIVION needs 60"}
+                )
+                return
+            from app.signals.oblivion_profiles import cfg_for
+
+            res = analyze_oblivion(list(ohlcv), timeframe, cfg_for(timeframe))
+            if res.get("error"):
+                logger.debug(f"[Orchestrator] oblivion skipped for {context.get('symbol')}: {res['error']}")
+                context["oblivion_gate"] = oblivion_gate.verdict(res)
+                return
+            compact = compact_for_prompt(res)
+            price = float(ohlcv[-1][4])
+            gate = oblivion_gate.verdict(compact, price, timeframe)
+            context["oblivion"] = compact
+            context["news_blocked"] = bool((res.get("news") or {}).get("blocked"))
+            context["oblivion_gate"] = gate
+            if (plan := oblivion_gate.mandate(gate)) is not None:
+                context["oblivion_mandate"] = plan
+            try:
+                raw = float(ohlcv[-1][0])
+                bar_time = int(raw // 1000) if raw > 1e11 else int(raw)
+            except (TypeError, ValueError, IndexError):
+                bar_time = None
+            context["_oblivion_pending"] = (timeframe, price, bar_time)
+        except Exception as exc:  # noqa: BLE001 — enrichment must never break the board
+            logger.debug(f"[Orchestrator] oblivion skipped for {context.get('symbol')}: {exc}")
+
+    @staticmethod
+    async def _record_oblivion(context: Dict[str, Any]) -> None:
+        """Store the board's OBLIVION read in the ledger and the AI brain."""
+        pending = context.pop("_oblivion_pending", None)
+        if not pending or not context.get("oblivion"):
+            return
+        try:
+            from app.agents import oblivion_gate
+            from app.agents.scope import normalise
+
+            timeframe, price, bar_time = pending
+            context["oblivion_read_id"] = await oblivion_gate.store_read(
+                normalise(context.get("symbol")), str(timeframe).lower(), "room_context",
+                context["oblivion"], context["oblivion"], context.get("oblivion_gate") or {},
+                price, bar_time, None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[Orchestrator] OBLIVION read not recorded for {context.get('symbol')}: {exc}")
 
     @staticmethod
     def _add_momentum(context: Dict[str, Any], ohlcv: Sequence[Sequence[Any]]) -> None:
@@ -1126,6 +1282,8 @@ class AgentOrchestrator:
                     )
                     await AgentOrchestrator._add_structure(context, symbol, ohlcv, db)
                     AgentOrchestrator._add_momentum(context, ohlcv)
+                    AgentOrchestrator._add_oblivion(context, ohlcv, timeframe)
+                    await AgentOrchestrator._record_oblivion(context)
                     AgentOrchestrator._label_technical(context)
                 else:
                     logger.warning(
@@ -1141,6 +1299,8 @@ class AgentOrchestrator:
 
             await AgentOrchestrator._add_forecast(context, symbol, timeframe)
             await AgentOrchestrator._add_cycle(context, symbol)
+            await AgentOrchestrator._add_cycle_analogs(context, symbol)
+            await AgentOrchestrator._add_pattern_signal(context, symbol, timeframe)
             await AgentOrchestrator._add_whales(context, symbol)
 
             # Sentiment stub (no exchange needed)
@@ -1163,23 +1323,27 @@ class AgentOrchestrator:
             return context
 
         # ── Branch: Crypto symbols via Bitget ─────────────────────────────────
+        # A configured venue is preferred but never required: the public keyless
+        # resolver (Yahoo / public CCXT / kronos) can chart any crypto, so a
+        # missing Bitget key must fall through to it rather than fail the whole
+        # meeting with "Exchange bitget not initialized".
         connector = exchange_manager.get_exchange(exchange)
-        if not connector:
-            return {"error": f"Exchange {exchange.value} not initialized", "symbol": symbol}
 
         # OHLCV + TA
         try:
-            try:
-                ohlcv = await connector.get_ohlcv(
-                    symbol=symbol, timeframe=timeframe, limit=max(200, window)
-                )
-            except Exception as exc:  # noqa: BLE001 — one venue, not the market
-                logger.debug(f"[Orchestrator] {symbol} venue OHLCV failed: {exc}")
-                ohlcv = []
+            ohlcv = []
+            if connector:
+                try:
+                    ohlcv = await connector.get_ohlcv(
+                        symbol=symbol, timeframe=timeframe, limit=max(200, window)
+                    )
+                except Exception as exc:  # noqa: BLE001 — one venue, not the market
+                    logger.debug(f"[Orchestrator] {symbol} venue OHLCV failed: {exc}")
+                    ohlcv = []
             if not ohlcv:
-                # The configured venue may not list this spelling. Public
-                # keyless exchanges usually do, and an empty chart is the one
-                # input that guarantees a neutral read.
+                # No venue, or the configured one does not list this spelling.
+                # Public keyless exchanges usually do, and an empty chart is the
+                # one input that guarantees a neutral read.
                 ohlcv = await AgentOrchestrator._resolve_ohlcv(
                     symbol, timeframe, max(200, window)
                 )
@@ -1192,6 +1356,8 @@ class AgentOrchestrator:
                 context["current_price"] = ohlcv[-1][4]
                 await AgentOrchestrator._add_structure(context, symbol, ohlcv, db)
                 AgentOrchestrator._add_momentum(context, ohlcv)
+                AgentOrchestrator._add_oblivion(context, ohlcv, timeframe)
+                await AgentOrchestrator._record_oblivion(context)
                 AgentOrchestrator._label_technical(context)
             else:
                 logger.warning(
@@ -1204,6 +1370,8 @@ class AgentOrchestrator:
 
         await AgentOrchestrator._add_forecast(context, symbol, timeframe)
         await AgentOrchestrator._add_cycle(context, symbol)
+        await AgentOrchestrator._add_cycle_analogs(context, symbol)
+        await AgentOrchestrator._add_pattern_signal(context, symbol, timeframe)
         await AgentOrchestrator._add_whales(context, symbol)
 
         # Sentiment (basic — detailed sentiment comes from the pipeline context)
@@ -1271,7 +1439,7 @@ class AgentOrchestrator:
         answer; without the research the board can buy straight into an NFP
         print the research loop flagged fifteen minutes earlier.
         """
-        context["accounts"] = await AgentOrchestrator._gather_account_state(db)
+        context["accounts"] = await AgentOrchestrator._gather_account_state(db, symbol=symbol)
 
         if db is not None:
             try:
@@ -1434,8 +1602,8 @@ class AgentOrchestrator:
         )
 
     @staticmethod
-    async def _gather_account_state(db: AsyncSession) -> Dict[str, Any]:
-        """Live equity, free margin and open exposure across every venue."""
+    async def _gather_account_state(db: AsyncSession, symbol: str = "") -> Dict[str, Any]:
+        """Live equity, free margin, leverage and margin health across every venue."""
         state: Dict[str, Any] = {"mt5": [], "crypto": None, "sim": None, "policy": None}
 
         try:
@@ -1452,6 +1620,7 @@ class AgentOrchestrator:
                     if s.dry_run else "demo and live accounts take every trade together"
                 ),
                 "risk_pct": s.risk_pct,
+                "min_margin_level_pct": float(getattr(s, "min_margin_level_pct", 0) or 0) or 500.0,
                 "max_open_positions": s.max_open_positions,
                 "max_leverage": s.max_leverage,
                 "trades_today": trades_today(),
@@ -1468,19 +1637,43 @@ class AgentOrchestrator:
         try:
             from plugins.MT5TradingPlugin.backend.models import MT5Account
             rows = (await db.execute(select(MT5Account))).scalars().all()
-            state["mt5"] = [
-                {
+            _acct_list = []
+            for a in rows:
+                _eq = float(a.equity or a.balance or 0)
+                _margin = float(getattr(a, "margin", 0) or 0)
+                _free = float(getattr(a, "free_margin", 0) or 0)  # correct field name
+                _ml = float(getattr(a, "margin_level", 0) or 0)
+                # Derive margin level when the broker hasn't sent it yet.
+                if _ml <= 0 and _margin > 0:
+                    _ml = round((_eq / _margin) * 100, 1)
+                _lev = int(getattr(a, "leverage", 0) or 0)
+                # Human-readable health label so agents can reason about capacity.
+                if _ml <= 0:
+                    _health = "no open margin"
+                elif _ml < 150:
+                    _health = "CRITICAL — near stop-out, NO new trades"
+                elif _ml < 300:
+                    _health = "DANGER — well below safe floor, NO new trades"
+                elif _ml < 500:
+                    _health = "WARNING — below 500% floor, orders will be blocked"
+                elif _ml < 1000:
+                    _health = "caution — monitor closely"
+                else:
+                    _health = "healthy"
+                _acct_list.append({
                     "account_id": a.id,
                     "name": a.name,
                     "balance": a.balance,
-                    "equity": a.equity,
-                    "free_margin": getattr(a, "margin_free", None),
+                    "equity": _eq,
+                    "margin_used": _margin,
+                    "free_margin": _free,
+                    "margin_level_pct": _ml,
+                    "margin_health": _health,
                     "currency": a.currency,
-                    "leverage": a.leverage,
+                    "leverage": _lev,
                     "open_positions": getattr(a, "position_count", 0),
-                }
-                for a in rows
-            ]
+                })
+            state["mt5"] = _acct_list
         except Exception as exc:  # noqa: BLE001 - plugin-optional
             logger.debug(f"[Orchestrator] MT5 account state unavailable: {exc}")
             await safe_rollback(db)
@@ -1500,6 +1693,42 @@ class AgentOrchestrator:
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"[Orchestrator] sim account state unavailable: {exc}")
             await safe_rollback(db)
+
+        # ── Lot preview per MT5 account ───────────────────────────────────────
+        # Give risk_manager and trade_executor a concrete sizing anchor for the
+        # symbol being analysed (1% risk at the account's equity and leverage).
+        if symbol and state["mt5"]:
+            try:
+                from plugins.TelegramSignalNewsPlugin.backend.services.sniper_service import (
+                    affordable_mt5_lot,
+                )
+                from app.services import market_data as _md
+                _price = 0.0
+                try:
+                    _q = await _md.get_quote(symbol, db=db)
+                    _price = float(getattr(_q, "price", 0) or 0)
+                except Exception:
+                    pass
+                for _acct in state["mt5"]:
+                    if _price > 0 and _acct.get("equity", 0) > 0:
+                        # Use a 1% stop-distance estimate (ATR proxy) for the preview.
+                        _est_sl = _price * 0.99
+                        _lot, _note = affordable_mt5_lot(
+                            equity=_acct["equity"],
+                            free_margin=_acct.get("free_margin"),
+                            leverage=_acct.get("leverage"),
+                            risk_pct=float((state.get("policy") or {}).get("risk_pct", 1.0) or 1.0),
+                            entry=_price,
+                            stop_loss=_est_sl,
+                            symbol=symbol,
+                            floor_lot=0.01,
+                            max_risk_pct=5.0,
+                            small_account_mode=True,  # match _place_on default so preview matches execution
+                        )
+                        _acct["lot_preview_1pct_stop"] = _lot
+                        _acct["lot_preview_note"] = f"~{_lot:g} lot at 1% stop from {_price:g}" if _lot else _note
+            except Exception:  # noqa: BLE001
+                pass
 
         return state
 
@@ -1675,10 +1904,30 @@ class AgentOrchestrator:
         # Account state so sizing advice is grounded in real equity, not a guess.
         accounts = context.get("accounts") if isinstance(context, dict) else None
         if accounts and agent.role in ("risk_manager", "trade_executor", "signal_generator"):
+            # Build a concise summary before the full dump so agents parse key facts first.
+            _mt5_summaries = []
+            for _a in (accounts.get("mt5") or []):
+                _ml = _a.get("margin_level_pct", 0)
+                _lev = _a.get("leverage", 0)
+                _lot = _a.get("lot_preview_1pct_stop")
+                _health = _a.get("margin_health", "")
+                _mt5_summaries.append(
+                    f"  {_a.get('name','MT5')}: equity={_a.get('equity',0):.2f} {_a.get('currency','USD')}, "
+                    f"free_margin={_a.get('free_margin',0):.2f}, leverage=1:{_lev}, "
+                    f"margin_level={_ml:.0f}% [{_health}]"
+                    + (f", lot_preview={_lot:g}" if _lot else ", lot_preview=<below floor>")
+                )
+            _pol = accounts.get("policy") or {}
             memory_prompt += (
                 "\n### Live account state\n"
-                f"{json.dumps(accounts, default=str)[:2000]}\n"
+                + "\n".join(_mt5_summaries) + "\n"
+                f"Risk policy: {_pol.get('risk_pct',1)}% per trade, "
+                f"min_margin_level={_pol.get('min_margin_level_pct',150):.0f}%, "
+                f"max_positions={_pol.get('max_open_positions',3)}, "
+                f"trades_today={_pol.get('trades_today',0)}/{_pol.get('max_trades_per_day',10)}\n"
+                "NOTE: lot_preview uses 1% price stop as estimate; actual lot uses the real SL distance.\n"
                 "Size every recommendation against this equity and these limits.\n"
+                "DO NOT recommend a trade when margin_health is CRITICAL, DANGER, or WARNING.\n"
             )
 
         # Inject stored knowledge + Graphify code map (plugin-optional)
@@ -1703,10 +1952,9 @@ class AgentOrchestrator:
                 logger.debug(f"[Orchestrator] Vault context skipped: {_vault_exc}")
 
         # ── Agent-Reach live research (plugin-optional) ────────────────────────
-        # market_analyst/sentiment_analyst only: the other 4 roles already see
-        # this indirectly via signal_context["agent_analyses"], so injecting it
-        # again downstream would just add latency without new information.
-        if settings.AGENT_REACH_INJECT_CONTEXT and agent.role in ("market_analyst", "sentiment_analyst"):
+        # Per 2026-08-31 plan, enabled for all 7 seats so every agent can research the focused pair.
+        # Previously only market_analyst/sentiment_analyst got it; now all roles get direct web context.
+        if settings.AGENT_REACH_INJECT_CONTEXT:
             try:
                 from app.services import agent_reach_client
                 research_summary = await agent_reach_client.research_summary_for_symbol(
@@ -1838,9 +2086,17 @@ class AgentOrchestrator:
                 "decisions": [],
             }
 
-        # ── Guard: Circuit breaker — skip entire pipeline if OpenAI is down ──
+        # ── Guard: Circuit breaker — skip the pipeline only for background work ──
+        # A person who typed /room is watching for an answer; bailing here is
+        # what gave them "Agents: 0 · AI calls: 0". The live triggers run the
+        # meeting anyway — each seat bypasses the breaker for connected providers
+        # (bypass_circuits=live) or falls back to a local read — so they get a
+        # complete verdict instead of an empty stub. Only the automated triggers,
+        # which will come round again once the breaker resets, skip.
         from app.agents.base import _circuit_is_open, _circuit_reason
-        if _circuit_is_open():
+        # An OBLIVION signal is still acted on with the AI down: the seats fall
+        # back to local reads, and a board that cannot answer defers to OBLIVION.
+        if _circuit_is_open() and trigger not in LIVE_TRIGGERS and trigger != "oblivion":
             logger.debug(f"[Orchestrator] Skipping {symbol} — AI circuit breaker open: {_circuit_reason}")
             return {
                 "error": f"AI circuit breaker open: {_circuit_reason}",
@@ -1851,7 +2107,13 @@ class AgentOrchestrator:
                 "final_confidence": 0,
                 "final_reasoning": "AI unavailable — circuit breaker tripped",
                 "ai_calls": 0,
+                "decisions": [],
             }
+        if _circuit_is_open():
+            logger.info(
+                f"[Orchestrator] {symbol} — circuit breaker open but {trigger} is live; "
+                "running with connected-provider bypass and local fallback"
+            )
 
         session_id = str(uuid.uuid4())[:12]
         logger.info(f"[Orchestrator:{session_id}] Starting analysis for {symbol} ({timeframe})")
@@ -1876,6 +2138,7 @@ class AgentOrchestrator:
         context = await AgentOrchestrator._gather_context(symbol, timeframe, db=db)
         if "error" in context and "technical" not in context:
             return {"error": context["error"], "symbol": symbol}
+        context = {"OBLIVION_DIRECTIVE": _oblivion_directive(context), **context}
 
         # Scalp Bot read — computed once here (a few candle fetches) and shared
         # with the analyst + signal seats so entries are timed against the
@@ -1916,7 +2179,7 @@ class AgentOrchestrator:
                     all_errors.append(f"{agent.name}: {res}")
                     continue
                 decisions.append(res)
-                db.add(AgentDecision(
+                brain_log.log_decision(db,
                     agent_id=agent.agent_id,
                     agent_name=agent.name,
                     agent_role=agent.role,
@@ -1928,7 +2191,7 @@ class AgentOrchestrator:
                     session_id=session_id,
                     ai_called=res.get("ai_called", True),
                     memory_context_used=res.get("memory_context_used", 0),
-                ))
+                )
 
         # Build enriched context for signal generator
         signal_context = {**context}
@@ -1942,7 +2205,7 @@ class AgentOrchestrator:
                     db, agent, signal_context, symbol, session_id, live=live,
                 )
                 decisions.append(signal_decision)
-                db.add(AgentDecision(
+                brain_log.log_decision(db,
                     agent_id=agent.agent_id,
                     agent_name=agent.name,
                     agent_role=agent.role,
@@ -1954,23 +2217,75 @@ class AgentOrchestrator:
                     session_id=session_id,
                     ai_called=signal_decision.get("ai_called", True),
                     memory_context_used=signal_decision.get("memory_context_used", 0),
-                ))
+                )
             except Exception as e:
                 all_errors.append(f"Signal Generator: {e}")
             break  # use first active signal generator
 
+        # ── OBLIVION mandate: the engine leads, the board confirms or vetoes ──
+        action = (signal_decision or {}).get("action", "hold")
+        gate = context.get("oblivion_gate") or oblivion_gate.verdict(context.get("oblivion"))
+        read_id = context.get("oblivion_read_id")
+        board_action = action
+        action, gate_reason, gate_origin = oblivion_gate.enforce(action, gate)
+        oblivion_led = False
+        if (
+            not gate_reason and gate.get("tradeable") and action not in ("buy", "sell")
+            and oblivion_gate.abstained(signal_decision)
+        ):
+            # The signal seat produced no usable answer. A veto needs a named
+            # reason, so the engine's confirmed signal stands.
+            action = str(gate.get("action"))
+            oblivion_led = True
+            brain_log.log_decision(
+                db, agent_name="OBLIVION Gate", agent_role="oblivion_gate", symbol=symbol,
+                action=action, confidence=oblivion_gate.engine_confidence(gate),
+                reasoning=(f"signal seat gave no usable answer — a veto needs a named reason, so "
+                           f"{gate.get('reason')} stands"),
+                market_data=gate, session_id=session_id, ai_called=False,
+                origin="oblivion_led", oblivion_read_id=read_id,
+            )
+        if gate_reason:
+            brain_log.log_decision(
+                db, agent_name="OBLIVION Gate", agent_role="oblivion_gate", symbol=symbol,
+                action="hold", confidence=0.0,
+                reasoning=f"board said {str(board_action).upper()} → HOLD: {gate_reason}",
+                market_data=gate, session_id=session_id, ai_called=False,
+                origin=gate_origin, oblivion_read_id=read_id,
+            )
+        elif oblivion_led:
+            pass
+        elif gate.get("tradeable") and action not in ("buy", "sell"):
+            brain_log.log_decision(
+                db, agent_name="OBLIVION Gate", agent_role="oblivion_gate", symbol=symbol,
+                action="veto", confidence=0.0,
+                reasoning=f"board vetoed {gate.get('reason')}",
+                market_data=gate, session_id=session_id, ai_called=False,
+                origin="board_veto", oblivion_read_id=read_id,
+            )
+        elif action in ("buy", "sell"):
+            brain_log.log_decision(
+                db, agent_name="OBLIVION Gate", agent_role="oblivion_gate", symbol=symbol,
+                action=action, confidence=float(gate.get("score") or 0) / 12.0,
+                reasoning=f"board confirmed {gate.get('reason')}",
+                market_data=gate, session_id=session_id, ai_called=False,
+                origin="oblivion_confirmed", oblivion_read_id=read_id,
+            )
+
         # ── Phase 3: Risk Manager (if BUY or SELL) ──
         risk_decision = None
-        action = (signal_decision or {}).get("action", "hold")
         if action in ("buy", "sell") and agents_by_role.get("risk_manager"):
-            risk_context = {**signal_context, "proposed_trade": signal_decision}
+            proposed = signal_decision
+            if oblivion_led:
+                proposed = {"action": action, "source": "OBLIVION", **(oblivion_gate.mandate(gate) or {})}
+            risk_context = {**signal_context, "proposed_trade": proposed}
             for agent in agents_by_role["risk_manager"]:
                 try:
                     risk_decision = await AgentOrchestrator._run_agent_with_memory(
                         db, agent, risk_context, symbol, session_id, live=live,
                     )
                     decisions.append(risk_decision)
-                    db.add(AgentDecision(
+                    brain_log.log_decision(db,
                         agent_id=agent.agent_id,
                         agent_name=agent.name,
                         agent_role=agent.role,
@@ -1982,7 +2297,7 @@ class AgentOrchestrator:
                         session_id=session_id,
                         ai_called=risk_decision.get("ai_called", True),
                         memory_context_used=risk_decision.get("memory_context_used", 0),
-                    ))
+                    )
                 except Exception as e:
                     all_errors.append(f"Risk Manager: {e}")
                 break
@@ -2002,7 +2317,7 @@ class AgentOrchestrator:
                         db, agent, exec_context, symbol, session_id, live=live,
                     )
                     decisions.append(exec_decision)
-                    db.add(AgentDecision(
+                    brain_log.log_decision(db,
                         agent_id=agent.agent_id,
                         agent_name=agent.name,
                         agent_role=agent.role,
@@ -2014,7 +2329,7 @@ class AgentOrchestrator:
                         session_id=session_id,
                         ai_called=exec_decision.get("ai_called", True),
                         memory_context_used=exec_decision.get("memory_context_used", 0),
-                    ))
+                    )
                 except Exception as e:
                     all_errors.append(f"Trade Executor: {e}")
                 break
@@ -2027,7 +2342,7 @@ class AgentOrchestrator:
                     db, agent, opt_context, symbol, session_id, live=live,
                 )
                 decisions.append(opt_decision)
-                db.add(AgentDecision(
+                brain_log.log_decision(db,
                     agent_id=agent.agent_id,
                     agent_name=agent.name,
                     agent_role=agent.role,
@@ -2039,7 +2354,7 @@ class AgentOrchestrator:
                     session_id=session_id,
                     ai_called=opt_decision.get("ai_called", True),
                     memory_context_used=opt_decision.get("memory_context_used", 0),
-                ))
+                )
             except Exception as e:
                 all_errors.append(f"Strategy Optimizer: {e}")
             break
@@ -2047,20 +2362,32 @@ class AgentOrchestrator:
         # ── Save signal to DB if actionable ──
         saved_signal = None
         final_action = action
-        if risk_action == "reject":
+        risk_abstained = gate.get("tradeable") and oblivion_gate.abstained(risk_decision)
+        if risk_action == "reject" and not risk_abstained:
             final_action = "hold"
+        elif risk_action == "reject" and final_action in ("buy", "sell"):
+            brain_log.log_decision(
+                db, agent_name="OBLIVION Gate", agent_role="oblivion_gate", symbol=symbol,
+                action=final_action, confidence=oblivion_gate.engine_confidence(gate),
+                reasoning="risk seat gave no usable answer — not counted as a rejection of OBLIVION's signal",
+                market_data=gate, session_id=session_id, ai_called=False,
+                origin="oblivion_led", oblivion_read_id=read_id,
+            )
+            oblivion_led = True
 
         if final_action in ("buy", "sell"):
             confidence = signal_decision.get("confidence", 0) if signal_decision else 0
+            if oblivion_led:
+                confidence = max(float(confidence or 0), oblivion_gate.engine_confidence(gate))
             sig = Signal(
-                source=SignalSource.SYSTEM.value,
+                source=SignalSource.SYSTEM,
                 symbol=symbol,
-                action=SignalAction.BUY.value if final_action == "buy" else SignalAction.SELL.value,
+                action=SignalAction.BUY if final_action == "buy" else SignalAction.SELL,
                 price=context.get("current_price", 0),
                 timeframe=timeframe,
                 strength=confidence,
                 confidence=confidence,
-                status=SignalStatus.PENDING.value,
+                status=SignalStatus.PENDING,
                 raw_data=json.dumps({
                     "session_id": session_id,
                     "agent_decisions": [d.get("reasoning", "") for d in decisions],
@@ -2068,8 +2395,8 @@ class AgentOrchestrator:
                     "execution_plan": exec_decision,
                 }, default=str),
                 indicators=json.dumps({
-                    "sl_pct": signal_decision.get("stop_loss_pct", 2),
-                    "tp_pct": signal_decision.get("take_profit_pct", 4),
+                    "sl_pct": (signal_decision or {}).get("stop_loss_pct", 2),
+                    "tp_pct": (signal_decision or {}).get("take_profit_pct", 4),
                     "risk_score": (risk_decision or {}).get("risk_score", 5),
                     "position_size_pct": (risk_decision or {}).get("position_size_pct", 2),
                     "max_leverage": (risk_decision or {}).get("max_leverage", 10),
@@ -2098,6 +2425,15 @@ class AgentOrchestrator:
         # Derive confidence & reasoning from Signal Generator decision
         final_confidence = signal_decision.get("confidence", 0) if signal_decision else 0
         final_reasoning = signal_decision.get("reasoning", "") if signal_decision else ""
+        if gate_reason:
+            final_confidence = 0
+            final_reasoning = f"{gate_reason}\n\n{reasoning_text(final_reasoning)}"
+        elif oblivion_led and final_action in ("buy", "sell"):
+            final_confidence = max(float(final_confidence or 0), oblivion_gate.engine_confidence(gate))
+            final_reasoning = (
+                f"OBLIVION-led: {gate.get('reason')}. The board gave no usable answer to veto it."
+                + (f"\n\n{reasoning_text(final_reasoning)}" if str(final_reasoning or "").strip() else "")
+            )
 
         # ── Persist an insight to the agent knowledge store (plugin-optional) ──
         await AgentOrchestrator._store_decision_knowledge(
@@ -2133,6 +2469,14 @@ class AgentOrchestrator:
             # bubbles and printed under the verdict so the room's read and its
             # conclusion travel together.
             "smc_structure": context.get("smc_structure"),
+            # The OBLIVION engine read (score, bias, signal + levels, session,
+            # news) the seats were prompted with, so the room card, Telegram
+            # and the chart quote the same plan the board argued from.
+            "oblivion": context.get("oblivion"),
+            "news_blocked": bool(context.get("news_blocked", False)),
+            "oblivion_gate": gate,
+            "oblivion_read_id": read_id,
+            "oblivion_led": bool(oblivion_led and final_action in ("buy", "sell")),
             # Best-trader skill the seats argued from — so /trading-room + /hermes
             # + Telegram all quote the same stock playbook the AI was prompted with.
             "hermes_skill": context.get("hermes_skill"),
@@ -2166,8 +2510,13 @@ class AgentOrchestrator:
         # ── Execution: gated, sized and dry-run by default (see agents/execution.py)
         try:
             from app.agents import execution
+            consensus = room.consensus_from(decisions)
+            if result_payload.get("oblivion_led"):
+                # The engine carried the call; the seats did not vote.
+                consensus = {**consensus, "agreement": 1.0, "leader": final_action,
+                             "note": "OBLIVION-led — the board gave no usable answer"}
             result_payload["execution"] = await execution.execute_decision(
-                db, result_payload, room.consensus_from(decisions)
+                db, result_payload, consensus
             )
         except Exception as exc:  # noqa: BLE001 - never let execution break analysis
             logger.warning(f"[Orchestrator:{session_id}] execution step failed: {exc}")
@@ -2259,7 +2608,7 @@ class AgentOrchestrator:
                 )
                 decisions.append(decision)
                 market_data = AgentOrchestrator._augment_market_data({"validation": True, **decision}, context)
-                db.add(AgentDecision(
+                brain_log.log_decision(db,
                     agent_id=agent.agent_id,
                     agent_name=agent.name,
                     agent_role=agent.role,
@@ -2271,7 +2620,7 @@ class AgentOrchestrator:
                     session_id=session_id,
                     ai_called=decision.get("ai_called", True),
                     memory_context_used=decision.get("memory_context_used", 0),
-                ))
+                )
             except Exception as e:
                 logger.warning(f"[Orchestrator] Signal validation agent error: {e}")
 
@@ -2286,7 +2635,7 @@ class AgentOrchestrator:
                     )
                     decisions.append(risk_decision)
                     market_data = AgentOrchestrator._augment_market_data({"validation": True, **risk_decision}, risk_context)
-                    db.add(AgentDecision(
+                    brain_log.log_decision(db,
                         agent_id=agent.agent_id,
                         agent_name=agent.name,
                         agent_role=agent.role,
@@ -2298,7 +2647,7 @@ class AgentOrchestrator:
                         session_id=session_id,
                         ai_called=risk_decision.get("ai_called", True),
                         memory_context_used=risk_decision.get("memory_context_used", 0),
-                    ))
+                    )
                 except Exception as e:
                     logger.warning(f"[Orchestrator] Risk validation agent error: {e}")
 
@@ -2521,7 +2870,7 @@ class AgentOrchestrator:
                 )
                 decisions.append(decision)
                 market_data = AgentOrchestrator._augment_market_data({"trade_validation": True, **decision}, context)
-                db.add(AgentDecision(
+                brain_log.log_decision(db,
                     agent_id=agent.agent_id,
                     agent_name=agent.name,
                     agent_role=agent.role,
@@ -2533,7 +2882,7 @@ class AgentOrchestrator:
                     session_id=session_id,
                     ai_called=decision.get("ai_called", True),
                     memory_context_used=decision.get("memory_context_used", 0),
-                ))
+                )
             except Exception as e:
                 logger.warning(f"[Orchestrator] Trade Risk Manager error: {e}")
 
@@ -2547,7 +2896,7 @@ class AgentOrchestrator:
                     )
                     decisions.append(exec_decision)
                     market_data = AgentOrchestrator._augment_market_data({"trade_validation": True, **exec_decision}, exec_context)
-                    db.add(AgentDecision(
+                    brain_log.log_decision(db,
                         agent_id=agent.agent_id,
                         agent_name=agent.name,
                         agent_role=agent.role,
@@ -2559,7 +2908,7 @@ class AgentOrchestrator:
                         session_id=session_id,
                         ai_called=exec_decision.get("ai_called", True),
                         memory_context_used=exec_decision.get("memory_context_used", 0),
-                    ))
+                    )
                 except Exception as e:
                     logger.warning(f"[Orchestrator] Trade Executor error: {e}")
 
@@ -2784,7 +3133,7 @@ class AgentOrchestrator:
                 try:
                     market_dec = await custom_market_analyst(db, context, symbol)
                     decisions.append(market_dec)
-                    db.add(AgentDecision(
+                    brain_log.log_decision(db,
                         agent_id=0,
                         agent_name=market_dec.get("agent_name", "Custom Market Analyst"),
                         agent_role="market_analyst",
@@ -2796,7 +3145,7 @@ class AgentOrchestrator:
                         session_id=session_id,
                         ai_called=False,
                         memory_context_used=0,
-                    ))
+                    )
                 except Exception as e:
                     logger.warning(f"[Orchestrator] Custom Market Analyst error for {symbol}: {e}")
 
@@ -2805,7 +3154,7 @@ class AgentOrchestrator:
                         db, context, symbol, exchange_pos or {"holdSide": hold_side, "openPriceAvg": entry_price}
                     )
                     decisions.append(review)
-                    db.add(AgentDecision(
+                    brain_log.log_decision(db,
                         agent_id=0,
                         agent_name=review.get("agent_name", "Custom Position Reviewer"),
                         agent_role="position_reviewer",
@@ -2817,7 +3166,7 @@ class AgentOrchestrator:
                         session_id=session_id,
                         ai_called=False,
                         memory_context_used=0,
-                    ))
+                    )
                 except Exception as e:
                     logger.warning(f"[Orchestrator] Custom Position Reviewer error for {symbol}: {e}")
             else:
@@ -2829,7 +3178,7 @@ class AgentOrchestrator:
                             db, agent, context, symbol
                         )
                         decisions.append(decision)
-                        db.add(AgentDecision(
+                        brain_log.log_decision(db,
                             agent_id=agent.agent_id,
                             agent_name=agent.name,
                             agent_role=agent.role,
@@ -2841,7 +3190,7 @@ class AgentOrchestrator:
                             session_id=session_id,
                             ai_called=decision.get("ai_called", True),
                             memory_context_used=decision.get("memory_context_used", 0),
-                        ))
+                        )
                     except Exception as e:
                         logger.warning(f"[Orchestrator] Market Analyst error for {symbol}: {e}")
 
@@ -2853,7 +3202,7 @@ class AgentOrchestrator:
                             db, agent, review_context, symbol
                         )
                         decisions.append(review)
-                        db.add(AgentDecision(
+                        brain_log.log_decision(db,
                             agent_id=agent.agent_id,
                             agent_name=agent.name,
                             agent_role=agent.role,
@@ -2865,7 +3214,7 @@ class AgentOrchestrator:
                             session_id=session_id,
                             ai_called=review.get("ai_called", True),
                             memory_context_used=review.get("memory_context_used", 0),
-                        ))
+                        )
                     except Exception as e:
                         logger.warning(f"[Orchestrator] Position Reviewer error for {symbol}: {e}")
 
@@ -2898,14 +3247,14 @@ class AgentOrchestrator:
                 # Ensure close signals always pass the 0.3 confidence threshold
                 close_confidence = max(review_decision.get("confidence", 0.5), 0.5)
                 close_sig = Signal(
-                    source=SignalSource.SYSTEM.value,
+                    source=SignalSource.SYSTEM,
                     symbol=symbol,
-                    action=close_action.value,
+                    action=close_action,
                     price=current_price,
                     timeframe="1h",
                     strength=close_confidence,
                     confidence=close_confidence,
-                    status=SignalStatus.PENDING.value,
+                    status=SignalStatus.PENDING,
                     raw_data=json.dumps({
                         "source": "position_review",
                         "session_id": session_id,
@@ -3127,7 +3476,7 @@ class AgentOrchestrator:
                 try:
                     decision = await AgentOrchestrator._run_agent_with_memory(db, agent, context, symbol)
                     decisions.append(decision)
-                    db.add(AgentDecision(
+                    brain_log.log_decision(db,
                         agent_id=agent.agent_id, agent_name=agent.name, agent_role=agent.role,
                         symbol=symbol, action=decision.get("action", "neutral"),
                         confidence=decision.get("confidence", 0),
@@ -3136,7 +3485,7 @@ class AgentOrchestrator:
                         session_id=session_id,
                         ai_called=decision.get("ai_called", True),
                         memory_context_used=decision.get("memory_context_used", 0),
-                    ))
+                    )
                 except Exception as e:
                     logger.warning(f"[Orchestrator] Sim Market Analyst error for {symbol}: {e}")
 
@@ -3146,7 +3495,7 @@ class AgentOrchestrator:
                 try:
                     review = await AgentOrchestrator._run_agent_with_memory(db, agent, review_context, symbol)
                     decisions.append(review)
-                    db.add(AgentDecision(
+                    brain_log.log_decision(db,
                         agent_id=agent.agent_id, agent_name=agent.name, agent_role=agent.role,
                         symbol=symbol, action=review.get("action", "hold"),
                         confidence=review.get("confidence", 0),
@@ -3155,7 +3504,7 @@ class AgentOrchestrator:
                         session_id=session_id,
                         ai_called=review.get("ai_called", True),
                         memory_context_used=review.get("memory_context_used", 0),
-                    ))
+                    )
                 except Exception as e:
                     logger.warning(f"[Orchestrator] Sim Position Reviewer error for {symbol}: {e}")
 
@@ -3177,12 +3526,12 @@ class AgentOrchestrator:
             if review_action == "close" and review_decision.get("urgency") in ("high", "medium"):
                 close_action = SignalAction.SELL if pos.side == "long" else SignalAction.BUY
                 db.add(Signal(
-                    source=SignalSource.SYSTEM.value, symbol=symbol,
-                    action=close_action.value, price=current_price,
+                    source=SignalSource.SYSTEM, symbol=symbol,
+                    action=close_action, price=current_price,
                     timeframe="1h",
                     strength=review_decision.get("confidence", 0.5),
                     confidence=review_decision.get("confidence", 0.5),
-                    status=SignalStatus.PENDING.value,
+                    status=SignalStatus.PENDING,
                     raw_data=json.dumps({
                         "source": "sim_position_review", "session_id": session_id,
                         "position_id": pos.id, "review_action": review_action,
@@ -3329,7 +3678,7 @@ class AgentOrchestrator:
                     logger.warning(f"[Orchestrator] MT5 review failed for {pos.symbol}: {exc}")
                     continue
 
-                db.add(AgentDecision(
+                brain_log.log_decision(db,
                     agent_id=reviewer.agent_id,
                     agent_name=reviewer.name,
                     agent_role=reviewer.role,
@@ -3341,7 +3690,7 @@ class AgentOrchestrator:
                     session_id=session_id,
                     ai_called=review.get("ai_called", True),
                     memory_context_used=review.get("memory_context_used", 0),
-                ))
+                )
 
                 applied = await AgentOrchestrator._apply_mt5_review(
                     account, pos, review, send=send, client=mt5_client,
@@ -3577,7 +3926,7 @@ class AgentOrchestrator:
                 decision = await AgentOrchestrator._run_agent_with_memory(
                     db, analyst, order_context, display_sym,
                 )
-                db.add(AgentDecision(
+                brain_log.log_decision(db,
                     agent_id=analyst.agent_id,
                     agent_name=analyst.name,
                     agent_role=analyst.role,
@@ -3589,7 +3938,7 @@ class AgentOrchestrator:
                     session_id=session_id,
                     ai_called=decision.get("ai_called", True),
                     memory_context_used=decision.get("memory_context_used", 0),
-                ))
+                )
             except Exception as e:
                 logger.warning(f"[Orchestrator:{session_id}] AI analysis failed for {display_sym} order {order_id}: {e}")
                 continue
@@ -3983,7 +4332,7 @@ class AgentOrchestrator:
                 decision = await AgentOrchestrator._run_agent_with_memory(
                     db, analyst, position_context, display_sym,
                 )
-                db.add(AgentDecision(
+                brain_log.log_decision(db,
                     agent_id=analyst.agent_id,
                     agent_name=analyst.name,
                     agent_role=analyst.role,
@@ -3999,7 +4348,7 @@ class AgentOrchestrator:
                     session_id=session_id,
                     ai_called=decision.get("ai_called", True),
                     memory_context_used=decision.get("memory_context_used", 0),
-                ))
+                )
             except Exception as e:
                 logger.warning(
                     f"[Orchestrator:{session_id}] AI position analysis failed for "

@@ -107,7 +107,7 @@ async def test_the_resolver_tries_every_source_before_reporting_none(monkeypatch
 
     async def alive(symbol, timeframe, limit):
         tried.append("alive")
-        return [[i * 60_000, 1.0, 1.1, 0.9, 1.05, 10.0] for i in range(50)]
+        return [[i * 3_600_000, 1.0, 1.1, 0.9, 1.05, 10.0] for i in range(50)]
 
     monkeypatch.setattr(candles, "_SOURCES", (("dead", dead), ("alive", alive)))
     rows = await candles.fetch("XAUUSD", "1h", 50)
@@ -165,7 +165,7 @@ async def test_a_source_that_raises_does_not_stop_the_chain(monkeypatch):
         raise RuntimeError("provider down")
 
     async def alive(symbol, timeframe, limit):
-        return [[i * 60_000, 1.0, 1.1, 0.9, 1.05, 10.0] for i in range(50)]
+        return [[i * 3_600_000, 1.0, 1.1, 0.9, 1.05, 10.0] for i in range(50)]
 
     # _from_* wrappers guard their own imports; a raising source here proves the
     # loop itself is not the single point of failure.

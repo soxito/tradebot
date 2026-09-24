@@ -1,0 +1,31 @@
+---
+type: decision
+agent: signal_generator
+symbol: NAS100
+action: hold
+confidence: 0.249
+ai_called: False
+date: 2026-09-14
+tags:
+  - decision
+  - NAS100
+  - signal_generator
+  - hold
+---
+
+            # Decision: signal_generator → NAS100 — HOLD @ 2026-09-14
+
+            ## Summary
+            **Agent**: `signal_generator` | **Action**: `HOLD` | **Confidence**: 25%
+            **AI Called**: No (local memory)
+
+            ## Reasoning
+            NAS100: local technical read is HOLD. EMA50 below EMA200 by 0.40%; MACD histogram -30.64 (bearish);
+ADX 37.1 with +DI 10.2 / -DI 32.6; RSI 31.1 — neutral; %B 0.19 within the bands; Stoch RSI 0.00;
+volume ×0.51 of average, buy share 48%; Kronos forecasts up +1.80% over 24×1h (confidence 57%).
+Composite +0.17 across 8 evaluators (4/8 agreeing). Computed locally — Connected AI providers
+returned no usable answer.
+
+            ## Related
+            - [[_daily/2026-09-14]]
+            - [[signals/NAS100]] ← Recent signals for this symbol

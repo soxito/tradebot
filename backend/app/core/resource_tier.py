@@ -19,9 +19,11 @@ from typing import Dict, List, Optional
 TIER_ORDER: List[str] = ["minimal", "low", "medium", "high", "ultra"]
 
 # Multiply every base loop interval by this. Weak machines poll far less often.
+# Aligned with frontend pollMultiplier() (low 3.0, medium 2.0, high/ultra 1.0)
+# and backend 30s SLA for price_tick — see plan §10.1/10.2.
 INTERVAL_MULTIPLIER: Dict[str, float] = {
     "minimal": 6.0,
-    "low": 4.0,
+    "low": 3.0,
     "medium": 2.0,
     "high": 1.0,
     "ultra": 1.0,
@@ -94,6 +96,8 @@ TASK_TIER_POLICY: Dict[str, Dict[str, object]] = {
     "paul_subconscious": {"min_tier": "low", "critical": False, "category": "learning"},
     "hermes_memory": {"min_tier": "minimal", "critical": False, "category": "learning"},
     "hermes_gateway": {"min_tier": "low", "critical": False, "category": "learning"},
+    "ollama_train": {"min_tier": "medium", "critical": False, "category": "learning"},
+    "ollama_serve": {"min_tier": "minimal", "critical": False, "category": "learning"},
 }
 
 

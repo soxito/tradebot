@@ -28,6 +28,7 @@ import { useVoiceTurn, type BargeInReason, type VoiceTurnState } from '@/hooks/u
 import { detectStaticTier, threeDisabled, pollMultiplier } from '@/utils/devicePerformance'
 import { flattenMath } from '@/utils/mathText'
 import { renderMarkdown } from '@/utils/renderMarkdown'
+import { collapseSpelledLetters, contentWords, isSelfEchoText, normSpeech, stripSelfEcho } from '@/utils/selfEcho'
 
 // 3D robot avatar — loaded client-side only (Three.js needs the DOM/WebGL).
 const JarvisRobotAvatar = dynamic(() => import('./JarvisRobotAvatar'), { ssr: false })
@@ -58,9 +59,18 @@ function isSniperIntent(text: string): boolean {
 // Words that follow "analyze"/"check" but are not instruments. Without this the
 // analysis pattern below fires on "check the market" and routes a conversational
 // question to the command endpoint, which answers it with a symbol error.
+// Mirrors _COMMON_WORDS in backend/app/api/jarvis.py.
 const NON_SYMBOL_WORDS =
-  'the|my|this|that|it|a|an|market|markets|news|portfolio|chart|charts|' +
-  'position|positions|price|prices|trade|trades|everything|things|stuff|us|out|on|for'
+  'the|my|this|that|it|its|a|an|market|markets|news|portfolio|chart|charts|' +
+  'position|positions|price|prices|trade|trades|trading|everything|things|stuff|us|out|on|for|' +
+  'your|you|me|all|up|down|off|over|now|today|day|session|window|shop|app|chat|going|doing|good|' +
+  'in|of|to|and|or|so|some|any|anything|our|we|exposure|book|deal|week|tonight|tomorrow'
+
+// Informational questions are answered by the AI, never run as orders.
+// Mirrors is_conversational_question() in backend/app/api/jarvis.py.
+function isQuestion(s: string): boolean {
+  return /^\s*(?:how|what|what's|whats|why|when|where|which|who|should|is|are|do|does|did|was|were|will)\b/.test(s)
+}
 
 // True when the user is issuing a direct trade command or asking for market
 // analysis — these MUST be routed to the real /jarvis/command backend endpoint
@@ -70,13 +80,15 @@ const NON_SYMBOL_WORDS =
 // backend/app/api/jarvis.py (see the `_ana_m` regex) — keep the two in step.
 function isTradingCommand(text: string): boolean {
   const s = text.toLowerCase()
+  const notWord = `(?!(?:${NON_SYMBOL_WORDS})\\b)`
+  const question = isQuestion(s)
   return (
     // Direct execute: "execute SOLUSDT long 5 lot at 68.2; set SL 67.11; TP1 74.873"
-    /(?:execute|open|place|trade|enter)\s+\w{3,15}\s+(?:long|short|buy|sell)/.test(s) ||
+    (!question && /(?:execute|open|place|trade|enter)\s+\w{3,15}\s+(?:long|short|buy|sell)/.test(s)) ||
     // Side-first: "short BTCUSDT 2 at 65000"
     /^(?:long|short|buy|sell)\s+\w{3,15}\s+[\d$]/.test(s) ||
     // Go long/short: "go long SOLUSDT"
-    /go\s+(?:long|short)(?:\s+on)?\s+\w{3,15}/.test(s) ||
+    (!question && /go\s+(?:long|short)(?:\s+on)?\s+\w{3,15}/.test(s)) ||
     // Monitor / analysis: "monitor SOL", "analyze XAUUSD", "find buy entries".
     // The token must look like an instrument, not an ordinary English word.
     new RegExp(
@@ -84,8 +96,9 @@ function isTradingCommand(text: string): boolean {
     ).test(s) ||
     /find\s+(?:(?:more|a|some)\s+)?(?:buy|sell|long|short)\s+entr(?:y|ies)/.test(s) ||
     // Position management: "close GWEIUSDT", "how is SOLUSDT doing", "set SL..."
-    /close(?:\s+my)?\s+[a-z]{3,15}(?:usdt?)?(?:\s+position)?/.test(s) ||
-    /how\s+is\s+\w{3,15}(?:\s+doing)?/.test(s) ||
+    // "close out for the day" / "how is your day" are conversation, not commands.
+    (!question && new RegExp(`\\bclose(?:\\s+(?:my|the|out))?\\s+${notWord}[a-z0-9/]{2,15}\\b`).test(s)) ||
+    new RegExp(`how\\s+is\\s+(?:my\\s+)?${notWord}\\w{3,15}(?:\\s+doing)?`).test(s) ||
     /(?:set\s+)?(?:tp|take[\s-]profit)\s+at\s+[\d.]/.test(s) ||
     /set\s+(?:stop[\s-]loss|sl)\s+at/.test(s) ||
     // Show positions
@@ -663,47 +676,47 @@ function cleanForSpeech(text: string): string {
     .trim()
 }
 
-// Normalise a transcript for self-echo comparison: lowercase, strip punctuation.
-function normSpeech(s: string): string {
-  return String(s || '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim()
+const SPEECH_LANGS: [string, string][] = [
+  ['en-ZA', 'English (South Africa)'],
+  ['en-GB', 'English (UK)'],
+  ['en-US', 'English (US)'],
+  ['en-AU', 'English (Australia)'],
+  ['en-IN', 'English (India)'],
+  ['en-NG', 'English (Nigeria)'],
+  ['en-KE', 'English (Kenya)'],
+]
+
+/** Saved choice, else the browser's English variant, else US English. */
+function defaultSpeechLang(): string {
+  try {
+    const saved = typeof window !== 'undefined' ? localStorage.getItem('paul.speechLang') : null
+    if (saved) return saved
+  } catch { /* storage blocked */ }
+  const nav = typeof navigator !== 'undefined' ? navigator.language || '' : ''
+  const hit = SPEECH_LANGS.find(([code]) => code.toLowerCase() === nav.toLowerCase())
+  return hit ? hit[0] : 'en-US'
 }
 
-// True when `transcript` is mostly words JARVIS just spoke — i.e. it is our own
-// TTS echoing back through the mic, not the user.
-//
-// Matching rules (deliberately conservative — this gate can eat GENUINE user
-// speech, so a false positive means "I talk to JARVIS and he ignores me"):
-//   • Whole-word comparison only. The old substring test (`reply.includes(word)`)
-//     matched fragments anywhere in a long reply ("cat" in "concatenate"), so a
-//     short follow-up reusing two or three ordinary words of the previous answer
-//     was misclassified as echo and silently dropped.
-//   • A transcript that appears CONTIGUOUSLY inside the reply is an echo — real
-//     echoes reproduce runs of the readout verbatim ("yes sir", a lifted phrase).
-//   • Otherwise require BOTH a heavy overlap (≥70%) AND at least 4 shared content
-//     words. A human rephrasing a question almost never clears both bars; a mic
-//     that caught a stretch of the speaker almost always does.
-function isSelfEchoText(transcript: string, lastSpoken: string): boolean {
-  if (!lastSpoken) return false
-  const t = normSpeech(transcript)
-  const l = normSpeech(lastSpoken)
-  if (!t || !l) return false
-  // Verbatim containment: the whole utterance (or any 5+-word run of it) was
-  // just spoken by us. Check the full transcript first, then sliding windows so
-  // an echo padded with a stray word is still caught.
-  if (l.includes(t)) return true
-  const tWords = t.split(' ').filter(w => w.length > 2)
-  const lWords = l.split(' ').filter(w => w.length > 2)
-  if (tWords.length >= 5) {
-    for (let i = 0; i + 5 <= tWords.length; i++) {
-      if (l.includes(tWords.slice(i, i + 5).join(' '))) return true
-    }
+/**
+ * A reply split into sentences for incremental synthesis. Very short pieces
+ * ("Sir.", a lone number) ride with a neighbour — every TTS request has fixed
+ * overhead. Only ". ! ?" followed by a space or the end split, so "4,284.33"
+ * stays whole.
+ */
+function splitForSpeech(text: string): string[] {
+  const raw = text.split(/(?<=[.!?])\s+/)
+  const out: string[] = []
+  for (const piece of raw.map(x => x.trim()).filter(Boolean)) {
+    const prev = out[out.length - 1]
+    const words = (x: string) => x.split(/\s+/).length
+    if (prev && (words(prev) < 5 || words(piece) < 3)) out[out.length - 1] = `${prev} ${piece}`
+    else out.push(piece)
   }
-  if (tWords.length === 0 || lWords.length === 0) return false
-  const vocab = new Set(lWords)
-  let hit = 0
-  for (const w of tWords) if (vocab.has(w)) hit++
-  return hit >= 4 && hit / tWords.length >= 0.7
+  return out.length ? out : [text]
 }
+
+// Self-echo detection lives in utils/selfEcho (shared with tests and mirrored
+// in the extension): normSpeech, isSelfEchoText, stripSelfEcho, contentWords.
 
 // Detect a deliberate wake phrase. By default the bare name ("Jarvis, ...")
 // wakes the assistant; when `requireGreeting` is true a greeting word MUST
@@ -873,6 +886,12 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
   // Barge-in threshold: the mic RMS the user must clear, while JARVIS is
   // talking, to be accepted as an interruption rather than as JARVIS's own echo.
   // (Replaces the old post-speech mic blackout — the mic is now never gated.)
+  // Recognition language. Every recogniser used to be hard-coded to en-US,
+  // which mishears other English accents; the default is now the browser's own
+  // English variant (en-ZA here), overridable in the voice settings.
+  const [speechLangPref, setSpeechLangPref] = useState<string>(() => defaultSpeechLang())
+  const speechLangRef = useRef(speechLangPref)
+  speechLangRef.current = speechLangPref
   const [bargeInGate, setBargeInGate] = useState<number>(
     () => Number((typeof window !== 'undefined' && localStorage.getItem('paul.bargeInGate')) || '0.085')
   )
@@ -1044,7 +1063,24 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
   const lastSpeakStartedAtRef = useRef(0)
   // ms of speaker reverb + recognition lag after speech ends during which
   // JARVIS's own words may still reach the mic. Matches the extension's guard.
-  const ECHO_TAIL_MS = 1200
+  // 2s, not 1.2: Chrome delivers the *final* transcript of the last words up to
+  // ~1.5s after they were spoken, and that late final is exactly the echo that
+  // used to slip through as a new command.
+  const ECHO_TAIL_MS = 2000
+  // The user's part of a transcript heard while JARVIS was talking (or in his
+  // echo tail): his own words are cut out, anything left is theirs. Returns ''
+  // when nothing meaningful remains. Every path that turns speech into a
+  // command goes through this, so no route can dispatch JARVIS's own voice.
+  const withoutEcho = useCallback((text: string): string => {
+    const raw = (text || '').trim()
+    const inWindow = voiceStateRef.current === 'SPEAKING'
+      || Date.now() < selfEchoUntilRef.current + 1000
+    if (!raw || !inWindow || !lastSpokenTextRef.current) return raw
+    if (isSelfEchoText(raw, lastSpokenTextRef.current)) return ''
+    const rest = stripSelfEcho(raw, lastSpokenTextRef.current)
+    if (!contentWords(rest).length) return ''
+    return rest === normSpeech(raw) ? raw : rest   // untouched → keep original casing
+  }, [])
   // Live LEVEL (0–1) of what JARVIS is emitting this instant, sampled from the
   // same TTS tap as `ttsBandsRef` (which is shape-normalised and so carries no
   // loudness). The turn machine subtracts it from the barge-in threshold, so the
@@ -1064,6 +1100,10 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
   const bargeInFallbackRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const BARGE_IN_CAPTURE_MS = 6000
   const turn = useVoiceTurn({
+    // Loudness only pauses the reply; a transcript that is really the user
+    // confirms the interruption (see the wake listener). Through speakers,
+    // JARVIS's own voice is loud enough to pass any energy gate.
+    confirmBargeIn: true,
     speakingGate: bargeInGate,
     getReferenceLevel: () => ttsLevelRef.current,
     isSelfEcho: () => echoDetectedRef.current,
@@ -1470,7 +1510,9 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
         // let the AI chat answer instead of showing a dead-end error card.
         // Order placement still surfaces its error: silently rerouting a trade
         // to a chatbot would be far worse than an error message.
-        if (!d.ok && (d.action === 'unknown' || d.action === 'analyze')) {
+        // Same for a status check with nothing to report ("how is gold doing"
+        // with no position open): the AI can still answer it from market data.
+        if (!d.ok && (d.action === 'unknown' || d.action === 'analyze' || d.action === 'position_status')) {
           setMessages(prev => prev.filter(m => m.id !== loadingMsg.id && m.id !== userMsg.id))
         } else {
           let reply: string
@@ -1603,7 +1645,9 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ messages: historyForApi, pathname: router.pathname, session_key: sessionKeyRef.current, image: pendingImage }),
+          // voice: the reply will be read aloud, so the backend keeps it short
+          // and speakable rather than a markdown card.
+          body: JSON.stringify({ messages: historyForApi, pathname: router.pathname, session_key: sessionKeyRef.current, image: pendingImage, voice: voiceEnabledRef.current }),
           signal: abortRef.current.signal,
         }
       )
@@ -1778,7 +1822,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
   // corrected text. This is the single entry point for every voice path so the
   // assistant learns your words and self-corrects the more you talk to it.
   const learnAndCorrect = useCallback((text: string): string => {
-    const t = (text || '').trim()
+    const t = collapseSpelledLetters((text || '').trim())
     if (!t) return t
     const words = learnedWordsRef.current
     const corrected = correctWithVocab(t, words)
@@ -1898,9 +1942,12 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     dgInFlightRef.current = true
     try {
       const res = await apiClient.deepgram.sttFallback(clip)
-      if (res?.used_deepgram && res.text && res.text.trim()) {
+      // Any engine's rescue counts. The backend tries NVIDIA's hosted ASR and
+      // the local engine before Deepgram, and answers used_deepgram=false for
+      // those — which this used to discard, so a rescued clip was thrown away.
+      if (res?.text && res.text.trim()) {
         dgMissCountRef.current = 0
-        setDgFallbackState('armed')
+        if (res.used_deepgram) setDgFallbackState('armed')
         // Belt-and-suspenders: even a self-voice clip that slipped through must
         // not be dispatched if it matches what JARVIS just said.
         if (isSelfEchoText(res.text, lastSpokenTextRef.current)) return
@@ -2251,81 +2298,107 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
       } catch { /* noop */ }
     }
 
-    // A: High-quality AI Voice (OpenAI TTS)
+    // A: High-quality AI voice (backend /voice/tts — the local engine first)
+    //
+    // Spoken sentence by sentence: the first sentence is synthesised and played
+    // while the next one renders. Synthesis runs faster than real time (13.5s
+    // of speech in ~8s on an M2 Pro) but waiting for the whole reply meant 8-16s
+    // of silence before JARVIS said anything; this way he starts in ~2-3s and
+    // never pauses between sentences.
     if (aiVoiceEnabled) {
       const ttsAbort = new AbortController()
       // Enter SPEAKING *before* the request: a barge-in during synthesis must
-      // cancel the request itself, not just whatever eventually plays.
+      // cancel the request itself, not just whatever eventually plays. The same
+      // controller stays on the turn for every sentence, so a barge-in at any
+      // point aborts the rest.
       t.beginSpeaking({ ttsAbort })
       emitSpeaking(true)
-      let url: string | null = null
+      const urls: string[] = []
       let settled = false
       const finish = (spokenFully: boolean) => {
         if (settled) return
         settled = true
+        if (!ttsAbort.signal.aborted && !spokenFully) { try { ttsAbort.abort() } catch { /* noop */ } }
         if (activeSpeechRef.current === token) activeSpeechRef.current = null
         detachTtsReference()
         emitSpeaking(false)
         // Speaker echo lingers after playback stops — hold the self-echo filter
         // open for the tail so the mic never transcribes our own trailing words.
         selfEchoUntilRef.current = Date.now() + ECHO_TAIL_MS
-        if (url) { try { URL.revokeObjectURL(url) } catch { /* noop */ } ; url = null }
+        for (const u of urls.splice(0)) { try { URL.revokeObjectURL(u) } catch { /* noop */ } }
         if (spokenFully) onEnd?.()
       }
       // Invoked by the machine after it has ducked playback and aborted the
-      // request — this is only the bookkeeping half of a barge-in.
+      // request — this is only the bookkeeping half of a barge-in. Also how a
+      // newer utterance supersedes this one, so it must stop the sentence loop.
       const token = { cancel: () => finish(false) }
       activeSpeechRef.current = token
       // True only while THIS utterance is the one on the speakers. A superseded
       // utterance must never end the turn — its late onended/onerror would drop
       // the machine out of SPEAKING while the *next* reply is still playing.
       const isCurrent = () => activeSpeechRef.current === token
-      try {
+      const stopped = () => settled || ttsAbort.signal.aborted
+      const synth = async (part: string): Promise<string> => {
         const formData = new FormData()
-        formData.append('text', clean)
+        formData.append('text', part)
         formData.append('voice', aiVoice)
-
-        const resp = await fetch(
-          `${getApiBaseUrl()}/voice/tts`,
-          {
-            method: 'POST',
-            body: formData,
-            signal: ttsAbort.signal,
-          }
-        )
+        const resp = await fetch(`${getApiBaseUrl()}/voice/tts`, {
+          method: 'POST', body: formData, signal: ttsAbort.signal,
+        })
         if (!resp.ok) throw new Error('AI TTS failed')
-        const blob = await resp.blob()
-        // Cut in while the audio was still being rendered — never start playing.
-        if (ttsAbort.signal.aborted) { finish(false); return }
-        url = URL.createObjectURL(blob)
-        const audio = new Audio(url)
-        const endTurn = (spokenFully: boolean) => {
-          const mine = isCurrent()
-          finish(spokenFully)
-          if (!mine) return
-          turnRef.current.endSpeaking()
-          resumeListeningAfterSpeech()
+        const u = URL.createObjectURL(await resp.blob())
+        urls.push(u)
+        return u
+      }
+      // Resolves when a clip ends (true) or fails / the turn is cut (false).
+      const playClip = (audio: HTMLAudioElement) => new Promise<boolean>(resolve => {
+        const onAbort = () => resolve(false)
+        ttsAbort.signal.addEventListener('abort', onAbort, { once: true })
+        const done = (ok: boolean) => {
+          ttsAbort.signal.removeEventListener('abort', onAbort)
+          resolve(ok)
         }
-        audio.onerror  = () => endTurn(false)
-        audio.onended  = () => endTurn(true)
-        // Tap the outgoing audio so the mic analyser knows, frame by frame,
-        // exactly what JARVIS is emitting — and can discard it on the way back
-        // in. Must be attached before play() so no audio escapes untracked.
-        attachTtsReference(audio)
-        // Hand the element to the machine (so barge-in can duck and flush it)
-        // and restart the grace window from the moment audio really starts.
-        t.beginSpeaking({ audio, ttsAbort: null })
-        try {
-          await audio.play()
-        } catch {
-          // Autoplay blocked / element detached — don't leave the turn open.
-          endTurn(false)
+        audio.onended = () => done(true)
+        audio.onerror = () => done(false)
+        audio.play().catch(() => done(false))  // autoplay blocked / detached
+      })
+      const endTurn = (spokenFully: boolean) => {
+        const mine = isCurrent()
+        finish(spokenFully)
+        if (!mine) return
+        turnRef.current.endSpeaking()
+        resumeListeningAfterSpeech()
+      }
+      const parts = splitForSpeech(clean)
+      let spokeAny = false
+      try {
+        let next: Promise<string> | null = synth(parts[0])
+        for (let i = 0; i < parts.length; i++) {
+          const url = await next!
+          if (stopped()) { finish(false); return }
+          // Render the following sentence while this one plays.
+          next = i + 1 < parts.length ? synth(parts[i + 1]) : null
+          next?.catch(() => { /* surfaced when awaited */ })
+          const audio = new Audio(url)
+          // Tap the outgoing audio so the mic analyser knows, frame by frame,
+          // exactly what JARVIS is emitting — and can discard it on the way
+          // back in. Must be attached before play() so no audio escapes.
+          attachTtsReference(audio)
+          // Hand the clip to the machine (so barge-in can pause and flush it)
+          // and restart the grace window from the moment audio really starts.
+          t.beginSpeaking({ audio, ttsAbort })
+          spokeAny = true
+          const ok = await playClip(audio)
+          if (!isCurrent()) return          // superseded — the new reply owns the turn
+          if (!ok) { endTurn(false); return }
         }
+        endTurn(true)
         return
       } catch (err) {
         // An abort is a barge-in, not a failure: the machine is already back in
         // LISTENING, so don't fall through and start talking again.
-        if (ttsAbort.signal.aborted) { finish(false); return }
+        if (stopped()) { finish(false); return }
+        if (spokeAny) { endTurn(false); return }   // part-way: don't restart in another voice
         finish(false)
         console.error('AI TTS failed, falling back to system voice', err)
       }
@@ -2414,11 +2487,11 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     try { activeSpeechRef.current?.cancel() } catch { /* noop */ }
     activeSpeechRef.current = null
     detachTtsReference()
-    // The machine only barges in on confirmed USER speech — so from this instant
-    // the self-echo filter must stand down. Its window was armed for the reply
-    // we just cancelled; leaving it open would eat exactly the words the user is
-    // saying right now (the classic "I interrupted and JARVIS ignored me").
-    selfEchoUntilRef.current = 0
+    // Keep the self-echo guard armed through the speaker tail. It used to be
+    // switched off here, which let the recogniser's buffered copy of the reply
+    // arrive as the user's command and JARVIS answered himself. The filter now
+    // strips only JARVIS's own words, so the user's interruption survives it.
+    selfEchoUntilRef.current = Date.now() + ECHO_TAIL_MS
     // Abort the in-flight chat stream too — the user has moved on, and a reply
     // that keeps streaming would be spoken over the new question.
     try { abortRef.current?.abort() } catch { /* noop */ }
@@ -3532,8 +3605,10 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     // gate used to silently swallow valid commands ("I talk and nothing
     // happens"). Without a live analyser we trust the extension's own capture.
     if (voiceMatchEnabledRef.current && voiceAudioCtxRef.current && !voiceMatchRef.current) return
+    // The extension filters its own echo, but only against what it knows was
+    // spoken; run the page's filter too before anything is dispatched.
     // Learn the user's words + auto-correct toward their vocabulary.
-    const t = learnAndCorrect(text)
+    const t = learnAndCorrect(withoutEcho(text))
     if (!t) return
     // The user addressed JARVIS through the extension — open the follow-up
     // window so the next utterance needs no wake word here either.
@@ -3556,7 +3631,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     }
     // AI intent fallback: try to resolve natural phrasing to an action before chat.
     resolveIntentRef.current(t).then(done => { if (!done) sendRef.current(t) })
-  }, [speak, learnAndCorrect, touchConversation])
+  }, [speak, learnAndCorrect, touchConversation, withoutEcho])
 
   // Send a notification to the extension → shows as a desktop notification.
   const notifyExtension = useCallback((title: string, body: string) => {
@@ -4021,7 +4096,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     // Stop wake listener while actively dictating (avoid double-capture).
     try { wakeRef.current?.stop() } catch { /* noop */ }
     const rec = new SR()
-    rec.lang = 'en-US'
+    rec.lang = speechLangRef.current
     rec.continuous = false
     rec.interimResults = true
     rec.maxAlternatives = 3   // give the vocab-aware picker alternatives to choose from
@@ -4086,13 +4161,10 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
       // Final self-echo backstop: if everything captured this turn was JARVIS's
       // own words leaking in (within the echo window), discard it — never dispatch
       // or write it to the chat, and clear the stray input it may have shown.
-      if (
-        finalText.trim() &&
-        Date.now() < selfEchoUntilRef.current + 500 &&
-        isSelfEchoText(finalText, lastSpokenTextRef.current)
-      ) {
-        finalText = ''
-        setInput('')
+      if (finalText.trim()) {
+        const kept = withoutEcho(finalText)
+        if (!kept) setInput('')
+        finalText = kept
       }
       // Learn the user's words + auto-correct toward their vocabulary.
       const text = learnAndCorrect(finalText)
@@ -4152,7 +4224,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
       dictationRef.current = null
       markCapturingRef.current(false, 'page')
     }
-  }, [aiSpeechEnabled, speak, noteAndGetThreshold, learnAndCorrect, pickAlternative, cameraSeesUserTalking, mouthGateOpen, touchConversation, endConversation, inConversation])
+  }, [aiSpeechEnabled, speak, noteAndGetThreshold, learnAndCorrect, pickAlternative, cameraSeesUserTalking, mouthGateOpen, touchConversation, endConversation, inConversation, withoutEcho])
 
   // ── Shared one-shot command dispatcher ────────────────────────────────────
   // Mirrors the dictation pipeline so a single-utterance wake ("Jarvis,
@@ -4160,7 +4232,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
   // → AI intent → chat fallback.
   const dispatchVoiceCommand = useCallback((text: string) => {
     // Learn the user's words + auto-correct toward their vocabulary.
-    const cmd = learnAndCorrect(text)
+    const cmd = learnAndCorrect(withoutEcho(text))
     if (!cmd) return
     dgMissCountRef.current = 0  // a dispatched command is a hit → reset miss streak
     // The user just spoke to JARVIS — open (or extend) the follow-up window so
@@ -4183,7 +4255,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     } else {
       resolveIntentRef.current(cmd).then(done => { if (!done) sendRef.current(cmd) })
     }
-  }, [speak, learnAndCorrect, touchConversation])
+  }, [speak, learnAndCorrect, touchConversation, withoutEcho])
   dispatchVoiceCommandRef.current = dispatchVoiceCommand
 
   // ── Wake-word listener ("Hi Jarvis") — continuous background recognition ──
@@ -4205,7 +4277,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     wakeRef.current = null
     wakeStartedRef.current = false
     const rec = new SR()
-    rec.lang = 'en-US'
+    rec.lang = speechLangRef.current
     rec.continuous = true
     rec.interimResults = true
     rec.onresult = (e: any) => {
@@ -4243,6 +4315,26 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
         // actually SEE the user talking before honouring any speech.
         if (voiceStateRef.current === 'SPEAKING' && faceFresh() && !cameraSeesUserTalking()) continue
 
+        // Confirm gate: loud sound has paused the reply and we are waiting to
+        // hear whether it was the user. Words that are not JARVIS's own (two
+        // or more meaningful ones, interim is fine — speed matters here) make
+        // it a real interruption; the post-barge-in window below then carries
+        // the command. Anything else and the machine resumes the reply itself.
+        if (voiceStateRef.current === 'SPEAKING' && turnRef.current.isHolding()) {
+          const theirs = withoutEcho(t)
+          if (contentWords(theirs).length >= 2 || hasWakeWord(t, wakeRequireGreetingRef.current)) {
+            turnRef.current.bargeIn('voice')
+            if (e.results[i].isFinal && theirs && !hasWakeWord(t, wakeRequireGreetingRef.current)) {
+              bargeInAtRef.current = 0
+              if (bargeInFallbackRef.current) { clearTimeout(bargeInFallbackRef.current); bargeInFallbackRef.current = null }
+              if (!openRef.current) setOpen(true)
+              dispatchVoiceCommandRef.current(theirs)
+              return
+            }
+          }
+          if (voiceStateRef.current === 'SPEAKING') continue
+        }
+
         // Interrupt gate: the wake name spoken over a reply. The energy monitor
         // has almost always already barged in by the time a transcript arrives —
         // this path exists for the case where it hasn't (very quiet speaker,
@@ -4268,7 +4360,9 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
         // because they are already mid-sentence.
         if (bargeInAtRef.current && Date.now() - bargeInAtRef.current < BARGE_IN_CAPTURE_MS) {
           if (!e.results[i].isFinal) continue
-          const spoken = stripWakePhrase(t, false).trim() || t.trim()
+          // A final that is only JARVIS's buffered echo leaves the window open
+          // for the user's actual words instead of spending it.
+          const spoken = withoutEcho(stripWakePhrase(t, false).trim() || t.trim())
           if (spoken.length < 2) continue
           bargeInAtRef.current = 0
           if (bargeInFallbackRef.current) { clearTimeout(bargeInFallbackRef.current); bargeInFallbackRef.current = null }
@@ -4337,7 +4431,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     wakeStartedRef.current = false
     wakeStartAtRef.current = Date.now()
     try { rec.start() } catch { /* noop */ }
-  }, [speak, noteAndGetThreshold, mouthGateOpen, faceFresh, cameraSeesUserTalking])
+  }, [speak, noteAndGetThreshold, mouthGateOpen, faceFresh, cameraSeesUserTalking, withoutEcho])
 
   startDictationRef.current = startDictation
   startWakeRef.current = startWake
@@ -4599,7 +4693,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
     if (!SR) return
     try { diagRecRef.current?.stop() } catch { /* noop */ }
     const rec = new SR()
-    rec.lang = 'en-US'; rec.continuous = true; rec.interimResults = false
+    rec.lang = speechLangRef.current; rec.continuous = true; rec.interimResults = false
     rec.onresult = (e: any) => {
       for (let i = e.resultIndex; i < e.results.length; i++) {
         if (!e.results[i].isFinal) continue
@@ -4940,7 +5034,7 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
                         const SR = getSpeechRecognition()
                         if (!SR) return
                         const rec = new SR()
-                        rec.lang = 'en-US'; rec.continuous = true; rec.interimResults = true
+                        rec.lang = speechLangRef.current; rec.continuous = true; rec.interimResults = true
                         let samples: number[] = []; let timeout: any
                         rec.onresult = (e: any) => {
                           for (let i = e.resultIndex; i < e.results.length; i++) {
@@ -5002,9 +5096,9 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
               <div className="border-t border-gray-800 pt-3 space-y-2">
                 <div className="text-[11px] font-semibold text-purple-300 uppercase tracking-wide">Interrupting JARVIS</div>
                 <p className="text-[9px] text-gray-500 leading-relaxed">
-                  The mic now stays open while JARVIS talks, so you can cut in at any time.
-                  This sets how loudly you must speak to be taken as an interruption rather
-                  than as JARVIS hearing his own voice. Lower = easier to interrupt.
+                  The mic stays open while JARVIS talks. Speaking over him pauses him;
+                  he stops for good once he hears words that aren't his own, and
+                  otherwise carries on. This sets how loud that has to be.
                 </p>
 
                 <div>
@@ -5030,6 +5124,29 @@ const PaulChat = memo(function PaulChat({ hideRobot = false }: { hideRobot?: boo
                   Turn state: <span className="text-cyan-300">{turn.state}</span>
                   {turn.captureLive ? ' · mic open' : ' · mic closed'}
                 </div>
+              </div>
+
+              {/* ── Recognition accent ─────────────────────────────────── */}
+              <div className="border-t border-gray-800 pt-3 space-y-2">
+                <label className="flex items-center justify-between text-[10px] text-gray-400">
+                  <span>Speech accent</span>
+                  <select
+                    value={speechLangPref}
+                    onChange={e => {
+                      setSpeechLangPref(e.target.value)
+                      try { localStorage.setItem('paul.speechLang', e.target.value) } catch { /* private mode */ }
+                    }}
+                    className="bg-gray-900 border border-gray-700 rounded px-1.5 py-0.5 text-[10px] text-gray-200"
+                  >
+                    {SPEECH_LANGS.map(([code, label]) => (
+                      <option key={code} value={code}>{label}</option>
+                    ))}
+                  </select>
+                </label>
+                <p className="text-[9px] text-gray-500">
+                  Matching the recogniser to how you speak is the biggest single
+                  accuracy gain. Applies from the next thing you say.
+                </p>
               </div>
 
               {/* ── Wake activation: require greeting ─────────────────── */}

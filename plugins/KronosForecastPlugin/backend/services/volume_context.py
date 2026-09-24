@@ -392,6 +392,22 @@ def build_volume_context(
     exactly why) whenever the data cannot support the 24h statistics — the
     caller must treat that as NO_TRADE.
     """
+    # Equities/ETFs trade only during their exchange session (~6.5h/day), so a
+    # rolling 24-clock-hour window spans several days and the hourly gate
+    # misfires (a closed market reads as STALE). Treat volume as not-applicable
+    # and forecast on price/structure — the basis cash indices already use.
+    try:
+        from app.exchanges.yahoo_provider import is_equity as _is_equity
+        if _is_equity(symbol):
+            return VolumeContext(
+                status="NOT_APPLICABLE", symbol=symbol, source=source,
+                volume_unit=volume_unit,
+                detail="Equity/ETF trades only during its exchange session — "
+                       "forecasting on price/structure.",
+            )
+    except Exception:  # noqa: BLE001 — never let classification block a forecast
+        pass
+
     now = time.time() if now is None else now
     bar_seconds = tf_seconds(timeframe)
 
@@ -712,7 +728,11 @@ def volume_evidence_lines(ctx: VolumeContext) -> List[str]:
         + (f", z-score {ctx.z_score:+.2f}" if ctx.z_score is not None else "")
         + f" → {ctx.regime} regime.",
     ]
-    if ctx.divergence != "NEUTRAL" and ctx.price_change_pct is not None:
+    if (
+        ctx.divergence not in ("NEUTRAL", "UNKNOWN")
+        and ctx.price_change_pct is not None
+        and ctx.volume_slope_norm is not None
+    ):
         lines.append(
             f"Over the last {ctx.divergence_bars}h price moved "
             f"{ctx.price_change_pct:+.2f}% while volume trended "
