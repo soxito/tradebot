@@ -2,7 +2,7 @@
 type: community
 name: Pump Monitor (c56)
 node_count: 23
-synced: 2026-09-14
+synced: 2026-09-24
 tags:
   - community
   - Pump-Monitor-c56
@@ -10,7 +10,7 @@ tags:
 
             # Pump Monitor (c56)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-24.
 
 
             ## Key Nodes (23 total)

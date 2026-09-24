@@ -102,6 +102,38 @@ def _resample(rows: Sequence[Sequence[float]], src_tf: str, dst_tf: str) -> List
     return out
 
 
+def _true_spacing_s(rows: Sequence[Sequence[float]]) -> Optional[int]:
+    """The series' real bar spacing: the most common gap between bars."""
+    gaps: dict[int, int] = {}
+    tail = rows[-400:]
+    for a, b in zip(tail, tail[1:]):
+        try:
+            g = int((int(b[0]) - int(a[0])) // 1000)
+        except (TypeError, ValueError, IndexError):
+            continue
+        if g > 0:
+            gaps[g] = gaps.get(g, 0) + 1
+    return max(gaps, key=gaps.get) if gaps else None
+
+
+def _conform(rows: List[list], tf: str) -> List[list]:
+    """Fold a source that answered with finer bars than asked up to ``tf``.
+
+    A provider asked for 2h gold returned hourly bars labelled 2h; every
+    engine reading them saw a different market from the one it was asked about.
+    """
+    want = timeframe_seconds(tf)
+    got = _true_spacing_s(rows)
+    if not got or not want or got >= want or want % got:
+        return rows
+    src = next((k for k, v in _TF_SECONDS.items() if v == got), None)
+    if src is None:
+        return rows
+    folded = _resample(rows, src, tf)
+    logger.info("[Candles] source sent {} bars for {} — folded {} → {}", src, tf, len(rows), len(folded))
+    return folded
+
+
 # ── Individual sources ───────────────────────────────────────────────────────
 # Each returns [] rather than raising: a source that is down is a routing fact,
 # not an error the caller should have to handle.
@@ -193,6 +225,8 @@ async def fetch(
 
     for name, source in _SOURCES:
         rows = await source(sym, tf, limit)
+        if _valid(rows, minimum) and tf != "MN1":
+            rows = _conform(list(rows), tf)
         if _valid(rows, minimum):
             logger.info(
                 "[Candles] {} {} — {} bars via {}", sym, tf, len(rows), name

@@ -2,7 +2,7 @@
 type: community
 name: MT5 & Chart (c50)
 node_count: 24
-synced: 2026-09-14
+synced: 2026-09-24
 tags:
   - community
   - MT5-Chart-c50
@@ -10,7 +10,7 @@ tags:
 
             # MT5 & Chart (c50)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-24.
 
 
             ## Key Nodes (24 total)

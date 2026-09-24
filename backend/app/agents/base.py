@@ -412,26 +412,55 @@ class BaseAgent:
                 return {**_hit, "from_cache": True, "ai_called": False,
                         "agent_name": self.name, "agent_role": self.role}
 
-        # ── Option B: Route through connected providers (telegram-signals) ──
+        # ── Option B / B½: Local LLM is default for text — providers for deeper research only ──
+        # When OLLAMA_PREFER_LOCAL=1 (default), agents use tradebot-local first; providers are
+        # escalated only when context asks for deeper research (deep_research flag or live+research).
+        # This keeps image generation on its image LLM and prevents training-provider reuse in the room.
+        import os as _os
+        _prefer_local = _os.getenv("OLLAMA_PREFER_LOCAL", "1").strip().lower() not in ("0","false","no","off")
+        _is_deep = bool(context.get("deep_research") or context.get("deeper_research") or context.get("research_deep"))
+        _is_image = str(context.get("task") or "").lower() in ("image", "image_generation", "image_gen")
         pool_active = False
-        if db is not None:
-            provider_decision, pool_active = await self._try_provider_chat(
-                db, context, memory_prompt, live=live,
-            )
-            if provider_decision is not None:
-                if _sym:
-                    _store_cached_decision(self.role, _sym, provider_decision)
-                return provider_decision
-
-        # ── Option B½: Ollama local LLM fallback (when providers are down/absent) ──
-        # Sits between the pool and the raw OPENAI_API_KEY / local hold so a
-        # machine with a pulled Ollama model keeps making model-backed decisions
-        # even with no cloud provider configured or when all are backing off.
-        if not pool_active or True:  # always try Ollama before raw key when enabled
+        provider_decision = None
+        # For image tasks never use local LLM — route directly to provider pool
+        if _is_image:
+            if db is not None:
+                provider_decision, pool_active = await self._try_provider_chat(db, context, memory_prompt, live=live)
+                if provider_decision is not None:
+                    if _sym:
+                        _store_cached_decision(self.role, _sym, provider_decision)
+                    return provider_decision
+        elif _prefer_local and not _is_deep:
+            # Local-first: try Ollama before providers (default path)
             try:
                 from app.services.ollama_service import is_fallback_enabled as _ollama_fallback
-
                 if _ollama_fallback():
+                    ollama_decision = await self._try_ollama_chat(context, memory_prompt)
+                    if ollama_decision is not None:
+                        if _sym:
+                            _store_cached_decision(self.role, _sym, ollama_decision)
+                        return ollama_decision
+            except Exception as _e:
+                logger.debug(f"[Agent:{self.name}] ollama fallback skipped: {_e}")
+            # Local unavailable → escalate to providers for this turn
+            if db is not None:
+                provider_decision, pool_active = await self._try_provider_chat(db, context, memory_prompt, live=live)
+                if provider_decision is not None:
+                    if _sym:
+                        _store_cached_decision(self.role, _sym, provider_decision)
+                    return provider_decision
+        else:
+            # Deeper research or prefer_local off: providers first, then local fallback
+            if db is not None:
+                provider_decision, pool_active = await self._try_provider_chat(db, context, memory_prompt, live=live)
+                if provider_decision is not None:
+                    if _sym:
+                        _store_cached_decision(self.role, _sym, provider_decision)
+                    return provider_decision
+            # Ollama as fallback (still buffered for training)
+            try:
+                from app.services.ollama_service import is_fallback_enabled as _ollama_fallback2
+                if _ollama_fallback2():
                     ollama_decision = await self._try_ollama_chat(context, memory_prompt)
                     if ollama_decision is not None:
                         if _sym:
@@ -654,7 +683,8 @@ class BaseAgent:
         try:
             from app.services.ollama_service import ollama_available as _ollama_avail
             from app.services.ollama_service import ollama_chat as _ollama_chat
-            from app.services.ollama_service import resolve_model as _ollama_model
+            # prefer trained tradebot-local when present, fall back to configured tier model
+            from app.services.ollama_service import resolve_fallback_model as _ollama_model
             from app.utils.headroom_compress import compress_messages as _compress
         except Exception:
             return None
@@ -699,6 +729,29 @@ class BaseAgent:
                 f"[Agent:{self.name}] (ollama={model}) → "
                 f"{decision.get('action', '?')} (confidence={decision.get('confidence', '?')})"
             )
+            # Buffer for self-improvement: every local LLM use becomes training data
+            try:
+                from pathlib import Path as _P
+                import json as _js
+                buf_dir = _P(__file__).resolve().parents[3] / "data" / "ollama_training"
+                # fallback to plugins path if packed differently
+                if not buf_dir.exists():
+                    buf_dir = _P("/Users/sakhilematsimela/Sites/tradebot/data/ollama_training")
+                buf_dir.mkdir(parents=True, exist_ok=True)
+                buf = buf_dir / "interaction_buffer.jsonl"
+                # Cap buffer at 10k lines — rotate oldest
+                try:
+                    if buf.exists():
+                        line_count = sum(1 for _ in buf.open(encoding="utf-8", errors="ignore"))
+                        if line_count > 10000:
+                            lines = buf.read_text(encoding="utf-8", errors="ignore").splitlines()[-8000:]
+                            buf.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                except: pass
+                row = {"messages": [{"role": "system", "content": self.system_prompt[:1200]}, {"role": "user", "content": user_msg[:1800]}, {"role": "assistant", "content": raw[:1200]}]}
+                with open(buf, "a", encoding="utf-8") as _f:
+                    _f.write(_js.dumps(row, ensure_ascii=False) + "\n")
+            except Exception as _e:
+                logger.debug(f"[Agent:{self.name}] buffer append skipped: {_e}")
             return decision
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"[Agent:{self.name}] ollama chat failed: {exc}")

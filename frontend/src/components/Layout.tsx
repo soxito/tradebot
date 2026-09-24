@@ -79,6 +79,10 @@ const navItems: NavItem[] = [
   { href: '/rug-pulled', label: 'Rug Pulled', icon: Skull },
   { href: '/sniper-signals', label: 'Sniper Signals', icon: Crosshair },
   { href: '/smart-money-concepts', label: 'Smart Money Concepts', icon: CandlestickChart },
+  { href: '/oblivion', label: 'Oblivion AI', icon: Sparkles, children: [
+    { href: '/backtest', label: 'Backtest', icon: FlaskConical },
+  ],
+  },
   { href: '/kronos-forecast', label: 'Kronos Forecast', icon: Telescope, children: [
     { href: '/kronos-finetune', label: 'Fine-tune Lab', icon: Sparkles },
     { href: '/soup-finetune', label: 'Soup Lab', icon: FlaskConical },
@@ -152,72 +156,63 @@ export default function Layout({ children }: { children: React.ReactNode }) {
           )}
         </div>
 
-        {/* Nav Links */}
-        <nav className="flex-1 py-3 overflow-y-auto">
-          {navItems.map((item) => {
+        {/* Nav Links — suppressHydrationWarning is belt-and-braces against a
+            server/client bundle skew in dev (see turbopack.root in
+            next.config.js, which is what actually prevents one). */}
+        <nav className="flex-1 py-3 overflow-y-auto" suppressHydrationWarning>
+          {navItems.map((item, idx) => {
             const isActive =
               item.href === '/'
                 ? router.pathname === '/'
                 : router.pathname === item.href || router.pathname.startsWith(`${item.href}/`);
             const Icon = item.icon;
+            const children = item.children ?? [];
 
-            if (item.children && item.children.length > 0) {
-              return (
-                <div key={item.href}>
-                  <Link
-                    href={item.href}
-                    className={`flex items-center gap-3 mx-2 px-3 py-2.5 rounded-lg text-sm transition-colors ${
-                      isActive
-                        ? 'bg-tradebot-accent/15 text-tradebot-accent font-semibold'
-                        : 'text-gray-400 hover:text-white hover:bg-gray-800/60'
-                    }`}
-                    title={sidebarOpen ? undefined : item.label}
-                  >
-                    <Icon className="w-5 h-5 shrink-0" />
-                    {sidebarOpen && <span className="whitespace-nowrap">{item.label}</span>}
-                    {sidebarOpen && <ChevronDown className="w-4 h-4 ml-auto opacity-50" />}
-                  </Link>
-                  {sidebarOpen && (
-                    <div className="ml-2 mt-1 space-y-1">
-                      {item.children.map((child) => {
-                        const childActive =
-                          router.pathname === child.href || router.pathname.startsWith(`${child.href}/`);
-                        const ChildIcon = child.icon;
-                        return (
-                          <Link
-                            key={child.href}
-                            href={child.href}
-                            className={`flex items-center gap-3 mx-2 px-3 py-2 rounded-lg text-sm transition-colors ${
-                              childActive
-                                ? 'bg-tradebot-accent/15 text-tradebot-accent font-semibold'
-                                : 'text-gray-500 hover:text-white hover:bg-gray-800/60'
-                            }`}
-                          >
-                            <ChildIcon className="w-4 h-4 shrink-0" />
-                            <span className="whitespace-nowrap">{child.label}</span>
-                          </Link>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-              );
-            }
-
+            // Every entry renders the same <div><Link/>…</div> shape whether or
+            // not it has children: a server/client skew in navItems can then
+            // only differ in text and attributes (which suppressHydrationWarning
+            // covers), never in element type, which React cannot recover from.
             return (
-              <Link
-                key={item.href}
-                href={item.href}
-                className={`flex items-center gap-3 mx-2 px-3 py-2.5 rounded-lg text-sm transition-colors ${
-                  isActive
-                    ? 'bg-tradebot-accent/15 text-tradebot-accent font-semibold'
-                    : 'text-gray-400 hover:text-white hover:bg-gray-800/60'
-                }`}
-                title={sidebarOpen ? undefined : item.label}
-              >
-                <Icon className="w-5 h-5 shrink-0" />
-                {sidebarOpen && <span className="whitespace-nowrap">{item.label}</span>}
-              </Link>
+              <div key={`${item.href}-${idx}`} suppressHydrationWarning>
+                <Link
+                  href={item.href}
+                  className={`flex items-center gap-3 mx-2 px-3 py-2.5 rounded-lg text-sm transition-colors ${
+                    isActive
+                      ? 'bg-tradebot-accent/15 text-tradebot-accent font-semibold'
+                      : 'text-gray-400 hover:text-white hover:bg-gray-800/60'
+                  }`}
+                  title={sidebarOpen ? undefined : item.label}
+                >
+                  <Icon className="w-5 h-5 shrink-0" />
+                  {sidebarOpen && <span className="whitespace-nowrap">{item.label}</span>}
+                  {sidebarOpen && children.length > 0 && (
+                    <ChevronDown className="w-4 h-4 ml-auto opacity-50" />
+                  )}
+                </Link>
+                {sidebarOpen && children.length > 0 && (
+                  <div className="ml-2 mt-1 space-y-1" suppressHydrationWarning>
+                    {children.map((child) => {
+                      const childActive =
+                        router.pathname === child.href || router.pathname.startsWith(`${child.href}/`);
+                      const ChildIcon = child.icon;
+                      return (
+                        <Link
+                          key={`${child.href}-${idx}`}
+                          href={child.href}
+                          className={`flex items-center gap-3 mx-2 px-3 py-2 rounded-lg text-sm transition-colors ${
+                            childActive
+                              ? 'bg-tradebot-accent/15 text-tradebot-accent font-semibold'
+                              : 'text-gray-500 hover:text-white hover:bg-gray-800/60'
+                          }`}
+                        >
+                          <ChildIcon className="w-4 h-4 shrink-0" />
+                          <span className="whitespace-nowrap">{child.label}</span>
+                        </Link>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
             );
           })}
 

@@ -1,0 +1,31 @@
+---
+type: decision
+agent: signal_generator
+symbol: UK100
+action: hold
+confidence: 0.293
+ai_called: False
+date: 2026-09-21
+tags:
+  - decision
+  - UK100
+  - signal_generator
+  - hold
+---
+
+            # Decision: signal_generator → UK100 — HOLD @ 2026-09-21
+
+            ## Summary
+            **Agent**: `signal_generator` | **Action**: `HOLD` | **Confidence**: 29%
+            **AI Called**: No (local memory)
+
+            ## Reasoning
+            UK100: local technical read is HOLD. EMA50 below EMA200 by 0.16%; MACD histogram +5.148 (bullish);
+ADX 17.9 with +DI 31.1 / -DI 20.9; RSI 58.7 — neutral; %B 0.65 within the bands; Stoch RSI 0.95;
+volume ×1.00 of average, buy share 75%; Kronos forecasts down -1.20% over 24×1h (confidence 83%);
+Oblivion WAIT (bull 3/bear 2 need 6, bias BEARISH). Composite -0.21 across 9 evaluators (5/9
+agreeing). Computed locally — Connected AI providers returned no usable answer.
+
+            ## Related
+            - [[_daily/2026-09-21]]
+            - [[signals/UK100]] ← Recent signals for this symbol

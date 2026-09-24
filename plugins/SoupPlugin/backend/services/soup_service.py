@@ -131,6 +131,10 @@ class SoupManager:
             job = await db.get(SoupFinetuneJob, job_id)
             if not job: return
             dataset_path = getattr(req, "dataset_path", None) or job.dataset_path
+            # Persist dataset_path so API shows it even when passed via req
+            if getattr(req, "dataset_path", None) and not job.dataset_path:
+                job.dataset_path = str(getattr(req, "dataset_path"))
+                await db.commit()
             # If still none, try to use job's ohlcv path generation did not happen, leave None
             config_path = base_dir / "soup.yaml"
             # Build soup.yaml
@@ -140,6 +144,14 @@ class SoupManager:
             quantization = getattr(req, "quantization", None) or job.quantization
             stream = bool(getattr(req, "stream_layers", False) or job.stream_layers)
             # Map to soup YAML: handle batch_size auto, quantization etc
+            _raw_batch = getattr(req, "batch_size", job.batch_size) or "auto"
+            # Soup 0.75+ forbids stream_layers with batch_size='auto' — coerce to concrete
+            if stream and str(_raw_batch).lower() == "auto":
+                _raw_batch = "4"
+            # Persist the concrete batch back to job so UI reflects reality
+            try:
+                job.batch_size = str(_raw_batch)
+            except: pass
             cfg = {
                 "base": getattr(req, "base", None) or job.base_model,
                 "task": getattr(req, "task", None) or job.task,
@@ -151,7 +163,7 @@ class SoupManager:
                 "training": {
                     "epochs": int(getattr(req, "epochs", job.epochs) or 3),
                     "lr": float(getattr(req, "learning_rate", job.learning_rate) or 2e-5),
-                    "batch_size": getattr(req, "batch_size", job.batch_size) or "auto",
+                    "batch_size": _raw_batch,
                     "lora": {"r": int(getattr(req, "lora_r", job.lora_r) or 64), "alpha": int(getattr(req, "lora_alpha", job.lora_alpha) or 16)},
                 },
                 "output": str(output_dir),
@@ -190,7 +202,7 @@ class SoupManager:
                         j.finished_at = _now()
                         await db.commit()
                 return
-        cmd = [soup_bin, "train", "--config", str(config_path)]
+        cmd = [soup_bin, "train", "--config", str(config_path), "--yes"]
         env = {**os.environ, "PYTHONPATH": os.environ.get("PYTHONPATH","")}
         # Ensure soup venv on PATH
         env["PATH"] = f"{SOUP_VENV_BIN}{os.pathsep}{env.get('PATH','')}"

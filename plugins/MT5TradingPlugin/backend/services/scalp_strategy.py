@@ -186,6 +186,8 @@ STRICTNESS_PRESETS: Dict[str, Dict[str, float]] = {
         "min_fusion_score": 0.66,
         "kronos_veto": 0.25,
         "kronos_align_bonus": 0.12,
+        "oblivion_veto": 1.0,
+        "oblivion_align_bonus": 0.10,
     },
     "balanced": {
         "min_confidence": 0.58,
@@ -198,6 +200,8 @@ STRICTNESS_PRESETS: Dict[str, Dict[str, float]] = {
         "min_fusion_score": 0.55,
         "kronos_veto": 0.40,
         "kronos_align_bonus": 0.10,
+        "oblivion_veto": 1.0,
+        "oblivion_align_bonus": 0.10,
     },
     "aggressive": {
         "min_confidence": 0.50,
@@ -210,6 +214,8 @@ STRICTNESS_PRESETS: Dict[str, Dict[str, float]] = {
         "min_fusion_score": 0.42,
         "kronos_veto": 0.55,
         "kronos_align_bonus": 0.08,
+        "oblivion_veto": 1.0,
+        "oblivion_align_bonus": 0.10,
     },
     # "scalper" preset — ultra-fast entries for volatile/fast markets.
     # Lowers every threshold to the practical floor so the bot enters on the
@@ -226,6 +232,8 @@ STRICTNESS_PRESETS: Dict[str, Dict[str, float]] = {
         "min_fusion_score": 0.28,
         "kronos_veto": 0.70,
         "kronos_align_bonus": 0.05,
+        "oblivion_veto": 0.0,
+        "oblivion_align_bonus": 0.10,
     },
 }
 DEFAULT_STRICTNESS = "balanced"
@@ -246,6 +254,17 @@ class ScalpBias:
     sell_pressure_pct: float  # % of recent volume attributable to down candles
     volume_imbalance: float   # buy_volume_pct - sell_volume_pct (-1..1)
     reason: str
+    # ── OBLIVION v4 engine read on the primary TF ────────────────────────────
+    oblivion_score: float = 0.0          # (bull-bear)/required, -1..1
+    oblivion_signal: str = "wait"        # buy | sell | wait (fresh signal on the latest bar)
+    oblivion_kind: str = ""              # scalp | sniper — a sniper carries more weight
+    oblivion_bias: int = 0               # market bias from last BOS/CHOCH
+    oblivion_bull: int = 0
+    oblivion_bear: int = 0
+    oblivion_session: str = "OFF"
+    news_blocked: bool = False
+    oblivion_summary: str = ""
+    oblivion_plan: Optional[Dict[str, Any]] = None   # entry/sl/tp1-3 when it has a signal
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -873,6 +892,11 @@ class ScalpStrategyEngine:
         self.min_fusion_score = float(preset["min_fusion_score"])
         self.kronos_veto = float(preset["kronos_veto"])
         self.kronos_align_bonus = float(preset["kronos_align_bonus"])
+        # OBLIVION v4 engine: a fresh opposite signal vetoes (1.0) or is only
+        # weighed (0.0 — the scalper preset trades through it); an aligned
+        # signal lifts conviction by ``oblivion_align_bonus``.
+        self.oblivion_veto = bool(float(preset.get("oblivion_veto", 1.0)))
+        self.oblivion_align_bonus = float(preset.get("oblivion_align_bonus", 0.10))
         self.sl_atr_mult = sl_atr_mult
         self.tp_atr_mult = tp_atr_mult
         self.point_size = point_size_for_symbol(symbol)
@@ -979,19 +1003,51 @@ class ScalpStrategyEngine:
         # Directional flow from candle bodies on the primary TF
         vol_body_score = (vol_imbalance * 0.5) if abs(vol_imbalance) > 0.05 else 0.0
 
+        # ── Signal 8: OBLIVION AI engine v4.0 on the primary TF ───────────────
+        # The house SMC score (trend/structure/BOS/FVG/OB/sweep/fib/session/
+        # candle) as a signed -1..1 read, plus its fresh signal, session and
+        # news state. Guarded: the core import must never break the bot.
+        obl_score = 0.0
+        obl_sig, obl_bias, obl_bull, obl_bear = "wait", 0, 0, 0
+        obl_kind = ""
+        obl_session, obl_news, obl_summary, obl_plan = "OFF", False, "", None
+        try:
+            from app.signals.oblivion import analyze_oblivion as _obl, candles_to_rows as _rows, oblivion_score as _obl_score
+            if len(m5) >= 60:
+                _r = _obl(_rows(m5), self.primary_tf)
+                if not _r.get("error"):
+                    obl_score = float(_obl_score(_r))
+                    _sg = _r.get("signal") or {}
+                    obl_sig = str(_sg.get("action") or "wait") if _sg.get("new") else "wait"
+                    obl_kind = str(_sg.get("kind") or "") if obl_sig != "wait" else ""
+                    obl_bias = int(_r.get("market_bias") or 0)
+                    _sc = _r.get("score") or {}
+                    obl_bull = int(_sc.get("buy", _sc.get("bull")) or 0)
+                    obl_bear = int(_sc.get("sell", _sc.get("bear")) or 0)
+                    obl_session = str((_r.get("session") or {}).get("name") or "OFF")
+                    obl_news = bool((_r.get("news") or {}).get("blocked"))
+                    obl_summary = str(_r.get("summary") or "")
+                    if _sg.get("entry") is not None:
+                        obl_plan = {k: _sg.get(k) for k in ("action", "entry", "stop_loss", "tp1", "tp2", "tp3", "confirmed", "score")}
+        except Exception:  # noqa: BLE001 — enrichment only
+            pass
+
         # ── Weighted fusion of all 7 signals ──────────────────────────────────
         # Weights reflect reliability and signal quality:
         #   SMC primitives + EMA stack are the primary trend anchors (highest weight)
         #   Market structure is the cornerstone of SMC trading
         #   OBV, RSI, volume confirm direction
         #   Premium/discount tunes entry timing
-        WEIGHT_SMC  = 0.30
-        WEIGHT_EMA  = 0.20
-        WEIGHT_MS   = 0.20
-        WEIGHT_OBV  = 0.10
-        WEIGHT_RSI  = 0.10
-        WEIGHT_PD   = 0.05
-        WEIGHT_VOL  = 0.05
+        #   OBLIVION takes 0.15; the original seven are scaled by 0.85 so the
+        #   weights still sum to 1.
+        WEIGHT_SMC  = 0.30 * 0.85
+        WEIGHT_EMA  = 0.20 * 0.85
+        WEIGHT_MS   = 0.20 * 0.85
+        WEIGHT_OBV  = 0.10 * 0.85
+        WEIGHT_RSI  = 0.10 * 0.85
+        WEIGHT_PD   = 0.05 * 0.85
+        WEIGHT_VOL  = 0.05 * 0.85
+        WEIGHT_OBL  = 0.15
 
         fused = (
             smc_norm   * WEIGHT_SMC
@@ -1001,6 +1057,7 @@ class ScalpStrategyEngine:
             + rsi_score  * WEIGHT_RSI
             + pd_score   * WEIGHT_PD
             + vol_body_score * WEIGHT_VOL
+            + obl_score  * WEIGHT_OBL
             + choch_boost   # direct boost, not weighted
             + sweep_boost   # direct boost, not weighted
         )
@@ -1048,7 +1105,11 @@ class ScalpStrategyEngine:
             f"zone={pd_zone}({pd_pct:.2f})",
             f"vol={buy_vol_pct*100:.0f}/{sell_vol_pct*100:.0f}(imb {vol_imbalance:+.2f})",
             f"vol-z {vol_z:+.1f}",
+            f"oblivion {obl_score:+.2f}({obl_bull}/{obl_bear}{' ' + obl_sig.upper() + (f'/{obl_kind}' if obl_kind else '') if obl_sig != 'wait' else ''})",
+            f"session={obl_session}",
         ]
+        if obl_news:
+            reason_parts.append("[NEWS WINDOW]")
         reason = "; ".join(reason_parts)
 
         return ScalpBias(
@@ -1062,6 +1123,16 @@ class ScalpStrategyEngine:
             sell_pressure_pct=round(sell_vol_pct * 100, 1),
             volume_imbalance=round(vol_imbalance, 3),
             reason=reason,
+            oblivion_score=round(obl_score, 3),
+            oblivion_signal=obl_sig,
+            oblivion_kind=obl_kind,
+            oblivion_bias=obl_bias,
+            oblivion_bull=obl_bull,
+            oblivion_bear=obl_bear,
+            oblivion_session=obl_session,
+            news_blocked=obl_news,
+            oblivion_summary=obl_summary,
+            oblivion_plan=obl_plan,
         )
 
     # -- sizing ----------------------------------------------------------------
@@ -1406,6 +1477,38 @@ class ScalpStrategyEngine:
             bias.reason += f" | {self.primary_tf} bullish: execution TF blocks sell"
             return None, bias
 
+        # ── OBLIVION news window: hard gate, every preset ─────────────────────
+        # Managing open trades is fine; opening into the release is not.
+        if bias.news_blocked:
+            bias.reason += " | Oblivion news window: entries blocked"
+            return None, bias
+
+        # ── OBLIVION alignment ───────────────────────────────────────────────
+        # A fresh engine signal the other way is a veto (unless the preset
+        # trades through it); the same way lifts conviction.
+        if bias.oblivion_signal in ("buy", "sell"):
+            if bias.oblivion_signal != side:
+                if self.oblivion_veto:
+                    bias.reason += f" | Oblivion {bias.oblivion_signal.upper()} veto"
+                    return None, bias
+                bias.reason += f" | Oblivion {bias.oblivion_signal.upper()} opposes (weighed only)"
+            else:
+                # A sniper cleared the higher bar and every hard requirement,
+                # so it is worth more than a scalp that merely cleared its own.
+                bump = self.oblivion_align_bonus * (1.5 if bias.oblivion_kind == "sniper" else 1.0)
+                confidence = min(1.0, confidence + bump)
+                confluence.append(
+                    f"oblivion:{bias.oblivion_signal}"
+                    f"{':' + bias.oblivion_kind if bias.oblivion_kind else ''}"
+                    f":{max(bias.oblivion_bull, bias.oblivion_bear)}"
+                )
+        elif (side == "buy" and bias.oblivion_score <= -0.5) or (side == "sell" and bias.oblivion_score >= 0.5):
+            if self.oblivion_veto:
+                bias.reason += f" | Oblivion score {bias.oblivion_score:+.2f} against {side}"
+                return None, bias
+        elif abs(bias.oblivion_score) >= 0.34 and ((side == "buy") == (bias.oblivion_score > 0)):
+            confluence.append(f"oblivion:{bias.oblivion_score:+.2f}")
+
         # Hard directional volume gate so buy/sell decisions are confirmed by
         # recent directional flow, not confidence alone.
         # Exception: standalone live-momentum entries (no HTF bias) already
@@ -1549,6 +1652,7 @@ class ScalpStrategyEngine:
                     "volume_imbalance": bias.volume_imbalance,
                 },
             )
+            self._annotate_oblivion(entry, bias)
             return entry, bias
 
         # No in-range zone → engage the current move with a market-adjacent entry.
@@ -1558,7 +1662,21 @@ class ScalpStrategyEngine:
             kronos_score=kronos_score, momentum_aligned=momentum_aligned,
             mkt_analysis=mkt,
         )
+        self._annotate_oblivion(entry, bias)
         return entry, bias
+
+    @staticmethod
+    def _annotate_oblivion(entry: Optional[ScalpEntry], bias: ScalpBias) -> None:
+        """Surface the engine read in the entry's gate diagnostics for the UI."""
+        if entry is None:
+            return
+        entry.gate_results["oblivion"] = {
+            "score": bias.oblivion_score, "signal": bias.oblivion_signal, "kind": bias.oblivion_kind,
+            "bull": bias.oblivion_bull, "bear": bias.oblivion_bear,
+            "bias": bias.oblivion_bias, "session": bias.oblivion_session,
+            "plan": bias.oblivion_plan,
+        }
+        entry.gate_results["news"] = "blocked" if bias.news_blocked else "clear"
 
     # -- recovery --------------------------------------------------------------
 

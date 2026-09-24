@@ -9,6 +9,14 @@ const isDesktop = process.env.TRADEBOT_DESKTOP === '1'
 
 const nextConfig = {
   pageExtensions: ['ts', 'tsx', 'js', 'jsx', 'md', 'mdx'],
+  // Pin Turbopack's workspace root. Without this it walks up past the repo to
+  // ~/package-lock.json and roots itself at the home directory; watching all of
+  // $HOME makes client-side rebuilds silently miss edits, so the server renders
+  // new code while the browser still runs the old bundle — which shows up as a
+  // "server rendered HTML didn't match the client" hydration error on every edit.
+  turbopack: {
+    root: __dirname,
+  },
   typescript: {
     ignoreBuildErrors: false,
   },
@@ -19,6 +27,9 @@ const nextConfig = {
     optimizePackageImports: ['lucide-react', 'recharts', 'three', 'date-fns'],
   },
   async headers() {
+    // Dev chunk filenames are not content-hashed, so an immutable cache pins the
+    // browser to whatever it saw first and edits never appear. Prod builds only.
+    if (process.env.NODE_ENV !== 'production') return [];
     return [
       {
         source: '/_next/static/:path*',

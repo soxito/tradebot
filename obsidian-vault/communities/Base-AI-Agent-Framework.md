@@ -2,7 +2,7 @@
 type: community
 name: Base AI Agent Framework
 node_count: 42
-synced: 2026-09-14
+synced: 2026-09-24
 tags:
   - community
   - Base-AI-Agent-Framework
@@ -10,7 +10,7 @@ tags:
 
             # Base AI Agent Framework
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-24.
 
 
             ## Key Nodes (42 total)

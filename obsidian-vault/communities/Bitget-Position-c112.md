@@ -2,7 +2,7 @@
 type: community
 name: Bitget & Position (c112)
 node_count: 10
-synced: 2026-09-14
+synced: 2026-09-24
 tags:
   - community
   - Bitget-Position-c112
@@ -10,7 +10,7 @@ tags:
 
             # Bitget & Position (c112)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-24.
 
 
             ## Key Nodes (10 total)

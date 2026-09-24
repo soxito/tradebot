@@ -525,6 +525,31 @@ class RoomSettingsUpdate(BaseModel):
     cycle_auto_risk: Optional[bool] = None
     cycle_risk_multiplier: Optional[float] = None
     cycle_history_years: Optional[int] = None
+    # Real-time trade management (app.agents.trade_manager)
+    manage_tick_s: Optional[int] = None
+    margin_warn_pct: Optional[float] = None
+    margin_critical_pct: Optional[float] = None
+    max_account_drawdown_pct: Optional[float] = None
+    shift_atr_mult: Optional[float] = None
+    shift_take_profit_fraction: Optional[float] = None
+    # Weekly profit target
+    weekly_target_usd: Optional[float] = None
+    target_pacing: Optional[bool] = None
+    target_max_multiplier: Optional[float] = None
+    target_stop_when_hit: Optional[bool] = None
+    daily_target_margin_pct: Optional[float] = None
+    target_per_pair: Optional[bool] = None
+    min_risk_pct: Optional[float] = None
+    max_risk_pct: Optional[float] = None
+    news_pre_min: Optional[int] = None
+    news_cooloff_min: Optional[int] = None
+    universe_enabled: Optional[bool] = None
+    universe_symbols: Optional[str] = None
+    pair_min_win_rate: Optional[float] = None
+    daily_min_win_rate: Optional[float] = None
+    daily_recovery_min_wr: Optional[float] = None
+    daily_target_min_pct: Optional[float] = None
+    daily_target_max_pct: Optional[float] = None
 
 
 def _settings_payload(s, db_extra: dict | None = None) -> dict:
@@ -556,6 +581,28 @@ def _settings_payload(s, db_extra: dict | None = None) -> dict:
         "cycle_auto_risk": getattr(s, "cycle_auto_risk", False),
         "cycle_risk_multiplier": getattr(s, "cycle_risk_multiplier", 0.5),
         "cycle_history_years": getattr(s, "cycle_history_years", 15) or 15,
+        "manage_tick_s": getattr(s, "manage_tick_s", 5) or 5,
+        "margin_warn_pct": getattr(s, "margin_warn_pct", 300.0),
+        "margin_critical_pct": getattr(s, "margin_critical_pct", 150.0),
+        "max_account_drawdown_pct": getattr(s, "max_account_drawdown_pct", 5.0),
+        "shift_atr_mult": getattr(s, "shift_atr_mult", 1.5),
+        "shift_take_profit_fraction": getattr(s, "shift_take_profit_fraction", 0.5),
+        "weekly_target_usd": getattr(s, "weekly_target_usd", 3000.0),
+        "target_pacing": getattr(s, "target_pacing", True),
+        "target_max_multiplier": getattr(s, "target_max_multiplier", 2.0),
+        "daily_target_margin_pct": getattr(s, "daily_target_margin_pct", 200.0),
+        "target_per_pair": getattr(s, "target_per_pair", True),
+        "min_risk_pct": getattr(s, "min_risk_pct", 1.0),
+        "max_risk_pct": getattr(s, "max_risk_pct", 5.0),
+        "news_pre_min": getattr(s, "news_pre_min", 30),
+        "news_cooloff_min": getattr(s, "news_cooloff_min", 120),
+        "universe_enabled": getattr(s, "universe_enabled", False),
+        "universe_symbols": getattr(s, "universe_symbols", "") or "",
+        "pair_min_win_rate": getattr(s, "pair_min_win_rate", 0.8),
+        "daily_min_win_rate": getattr(s, "daily_min_win_rate", 0.9),
+        "daily_recovery_min_wr": getattr(s, "daily_recovery_min_wr", 0.97),
+        "daily_target_min_pct": getattr(s, "daily_target_min_pct", 10.0),
+        "daily_target_max_pct": getattr(s, "daily_target_max_pct", 20.0),
         **(db_extra or {}),
     }
 
@@ -721,13 +768,60 @@ async def update_room_settings(data: RoomSettingsUpdate, db: AsyncSession = Depe
             detail="copy_max_drawdown_pct must be between 0 and 100",
         )
 
+    if data.manage_tick_s is not None and not (3 <= data.manage_tick_s <= 60):
+        raise HTTPException(status_code=400, detail="manage_tick_s must be 3–60 seconds")
+    if data.margin_critical_pct is not None and not (50 <= data.margin_critical_pct <= 1000):
+        raise HTTPException(status_code=400, detail="margin_critical_pct must be 50–1000")
+    if data.margin_warn_pct is not None and not (50 <= data.margin_warn_pct <= 2000):
+        raise HTTPException(status_code=400, detail="margin_warn_pct must be 50–2000")
+    warn = data.margin_warn_pct if data.margin_warn_pct is not None else getattr(s, "margin_warn_pct", 300.0)
+    crit = data.margin_critical_pct if data.margin_critical_pct is not None else getattr(s, "margin_critical_pct", 150.0)
+    if crit >= warn:
+        raise HTTPException(status_code=400, detail="the critical margin level must be below the warning level")
+    if data.max_account_drawdown_pct is not None and not (0.5 <= data.max_account_drawdown_pct <= 50):
+        raise HTTPException(status_code=400, detail="max_account_drawdown_pct must be 0.5–50")
+    if data.shift_atr_mult is not None and not (0.3 <= data.shift_atr_mult <= 10):
+        raise HTTPException(status_code=400, detail="shift_atr_mult must be 0.3–10")
+    if data.weekly_target_usd is not None and not (0 <= data.weekly_target_usd <= 10_000_000):
+        raise HTTPException(status_code=400, detail="weekly_target_usd must be 0–10,000,000 (0 = no target)")
+    lo = data.min_risk_pct if data.min_risk_pct is not None else getattr(s, "min_risk_pct", 1.0)
+    hi = data.max_risk_pct if data.max_risk_pct is not None else getattr(s, "max_risk_pct", 5.0)
+    if not (0.1 <= lo <= hi <= 10):
+        raise HTTPException(status_code=400, detail="risk band must satisfy 0.1 ≤ min ≤ max ≤ 10 (%)")
+    if data.pair_min_win_rate is not None and not (0.5 <= data.pair_min_win_rate <= 1.0):
+        raise HTTPException(status_code=400, detail="pair_min_win_rate must be 0.5–1.0")
+    lo_d = data.daily_target_min_pct if data.daily_target_min_pct is not None else getattr(s, "daily_target_min_pct", 10.0)
+    hi_d = data.daily_target_max_pct if data.daily_target_max_pct is not None else getattr(s, "daily_target_max_pct", 20.0)
+    if not (0 <= lo_d <= 100 and 0 <= hi_d <= 100) or (hi_d > 0 and lo_d > hi_d):
+        raise HTTPException(status_code=400,
+                            detail="daily portfolio target must satisfy 0 ≤ minimum ≤ cap ≤ 100 (%; cap 0 = no cap)")
+    for name in ("daily_min_win_rate", "daily_recovery_min_wr"):
+        v = getattr(data, name)
+        if v is not None and not (0.0 <= v <= 1.0):
+            raise HTTPException(status_code=400, detail=f"{name} must be 0–1 (0 switches it off)")
+    if data.universe_symbols is not None:
+        data.universe_symbols = ",".join(
+            sorted({p.strip().upper().replace("/", "") for p in data.universe_symbols.split(",") if p.strip()}))
+    if data.news_pre_min is not None and not (0 <= data.news_pre_min <= 240):
+        raise HTTPException(status_code=400, detail="news_pre_min must be 0–240")
+    if data.news_cooloff_min is not None and not (0 <= data.news_cooloff_min <= 480):
+        raise HTTPException(status_code=400, detail="news_cooloff_min must be 0–480")
+    if data.daily_target_margin_pct is not None and not (0 <= data.daily_target_margin_pct <= 5000):
+        raise HTTPException(status_code=400, detail="daily_target_margin_pct must be 0–5000 (0 = no daily target)")
+    if data.target_max_multiplier is not None and not (1 <= data.target_max_multiplier <= 5):
+        raise HTTPException(status_code=400, detail="target_max_multiplier must be 1–5")
+    if data.shift_take_profit_fraction is not None and not (0.1 <= data.shift_take_profit_fraction <= 1):
+        raise HTTPException(status_code=400, detail="shift_take_profit_fraction must be 0.1–1")
+
     # Boolean fields must be settable to False, not just truthy values.
     _bool_fields = {
         "execution_enabled", "dry_run", "allow_sim", "allow_crypto",
         "allow_mt5", "worker_enabled", "mt5_live_mode", "cycle_auto_risk",
-        "manage_copy_profiles",
+        "manage_copy_profiles", "target_pacing", "target_per_pair", "universe_enabled",
     }
     updates = data.model_dump(exclude_unset=True)
+    # Targets are minimums: nothing may make reaching one stop the room trading.
+    updates.pop("target_stop_when_hit", None)
     # The anchors column is TEXT; the API contract is a list.
     if "cycle_anchors" in updates and updates["cycle_anchors"] is not None:
         updates["cycle_anchors"] = json.dumps(updates["cycle_anchors"])
@@ -735,8 +829,30 @@ async def update_room_settings(data: RoomSettingsUpdate, db: AsyncSession = Depe
         if value is not None or field in _bool_fields:
             setattr(s, field, value)
 
+    # The single "live account" field predates per-account switches; picking
+    # an account there switches that account's live trading on.
+    if data.mt5_account_id:
+        from app.models.database import RoomTradingAccount
+
+        row = (await db.execute(select(RoomTradingAccount).where(
+            RoomTradingAccount.venue == "mt5", RoomTradingAccount.account_id == data.mt5_account_id,
+        ))).scalar_one_or_none()
+        if row is None:
+            db.add(RoomTradingAccount(venue="mt5", account_id=data.mt5_account_id, live_enabled=True))
+        else:
+            row.live_enabled = True
+
     await db.commit()
     await db.refresh(s)
+
+    if "pair_min_win_rate" in updates:
+        from app.agents import pair_gate
+
+        await pair_gate.rejudge_all(db)
+    if any(k.startswith(("weekly_target", "target_", "daily_target", "min_risk", "max_risk")) for k in updates):
+        from app.agents import target_pacer
+
+        target_pacer.reset_cache()
 
     # The cached snapshot was built from the previous anchors — drop it so the
     # next read (and every agent seat) sees the new calendar immediately.
@@ -771,6 +887,16 @@ async def update_room_settings(data: RoomSettingsUpdate, db: AsyncSession = Depe
             )
         else:
             stop_room_worker()
+    if data.dry_run is not None or data.execution_enabled is not None:
+        from app.agents import brain_log
+
+        await brain_log.record_decision(
+            agent_name="Operator", agent_role="settings", symbol="*",
+            action=f"live_trading_{'off' if s.dry_run else 'on'}",
+            reasoning=(f"room execution {'ON' if s.execution_enabled else 'OFF'}, live trading "
+                       f"{'OFF (demo accounts only)' if s.dry_run else 'ON (demo + enabled live accounts)'}"),
+            ai_called=False, origin="settings",
+        )
     logger.warning(
         f"[room] execution policy updated — enabled={s.execution_enabled} "
         f"dry_run={s.dry_run} risk={s.risk_pct}% venues="

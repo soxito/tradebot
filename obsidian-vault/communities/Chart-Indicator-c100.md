@@ -2,7 +2,7 @@
 type: community
 name: Chart & Indicator (c100)
 node_count: 12
-synced: 2026-09-14
+synced: 2026-09-24
 tags:
   - community
   - Chart-Indicator-c100
@@ -10,7 +10,7 @@ tags:
 
             # Chart & Indicator (c100)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-24.
 
 
             ## Key Nodes (12 total)

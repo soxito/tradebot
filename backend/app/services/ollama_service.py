@@ -112,6 +112,10 @@ OLLAMA_TO_HF: Dict[str, str] = {
     "gemma2:9b": "google/gemma-2-9b-it",
     "mistral:7b": "mistralai/Mistral-7B-Instruct-v0.3",
     "phi3:mini": "microsoft/Phi-3-mini-4k-instruct",
+    "kimi-vl-a3b": "moonshotai/Kimi-VL-A3B-Instruct",
+    "kimi-vl-a3b-thinking": "moonshotai/Kimi-VL-A3B-Thinking",
+    "kimi-k2": "moonshotai/Kimi-K2-Instruct",
+    "moonlight-16b-a3b": "moonshotai/Moonlight-16B-A3B-Instruct",
 }
 SOUP_FALLBACK_BASE = "Qwen/Qwen2.5-0.5B-Instruct"
 
@@ -317,6 +321,21 @@ async def ollama_list_models(timeout: float = 5.0) -> List[str]:
             return [m.get("name", "") for m in (data.get("models") or []) if m.get("name")]
     except Exception:
         return []
+
+
+def resolve_fallback_model() -> str:
+    """Model the agents actually use as local fallback.
+
+    Prefer the fine-tuned ``tradebot-local`` when it exists in Ollama (so training
+    is actually used); otherwise the configured/tier base from resolve_model().
+    """
+    try:
+        tags = ollama_list_models_sync(timeout=3.0)
+        if any(t == TRADEBOT_LOCAL_MODEL or t.split(":")[0] == TRADEBOT_LOCAL_MODEL_ALT for t in tags):
+            return TRADEBOT_LOCAL_MODEL
+    except Exception:
+        pass
+    return resolve_model()
 
 
 def ensure_model_pulled_sync(model: str, timeout: float = 600.0) -> bool:

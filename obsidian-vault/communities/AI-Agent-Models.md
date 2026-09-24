@@ -2,7 +2,7 @@
 type: community
 name: AI Agent Models
 node_count: 36
-synced: 2026-09-14
+synced: 2026-09-24
 tags:
   - community
   - AI-Agent-Models
@@ -10,7 +10,7 @@ tags:
 
             # AI Agent Models
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-24.
 
 
             ## Key Nodes (36 total)

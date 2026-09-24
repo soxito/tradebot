@@ -2,7 +2,7 @@
 type: community
 name: Bitget (c147)
 node_count: 4
-synced: 2026-09-14
+synced: 2026-09-24
 tags:
   - community
   - Bitget-c147
@@ -10,7 +10,7 @@ tags:
 
             # Bitget (c147)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-24.
 
 
             ## Key Nodes (4 total)

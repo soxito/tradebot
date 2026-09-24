@@ -414,3 +414,78 @@ describe('useVoiceTurn — capture and full duplex', () => {
     expect(trackStop).toHaveBeenCalled()
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Two-step barge-in (confirmBargeIn). Through laptop speakers JARVIS's own voice
+// clears any energy gate, so loudness may only PAUSE him; a transcript that is
+// really the user confirms. Without this he cut himself off mid-sentence and
+// then answered his own echo.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('useVoiceTurn — confirmed barge-in', () => {
+  const startCapture = async (result: { current: ReturnType<typeof useVoiceTurn> }) => {
+    await act(async () => { await result.current.start() })
+  }
+  const playable = () => {
+    const el = fakeAudio()
+    ;(el as unknown as { play: () => Promise<void> }).play = vi.fn(() => {
+      (el as unknown as { paused: boolean }).paused = false
+      return Promise.resolve()
+    })
+    return el
+  }
+  const opts = { frameMs: 20, graceMs: 0, bargeInFrames: 3, speakingGate: 0.085, confirmBargeIn: true, bargeInHoldMs: 400 }
+
+  it('loud sound pauses the reply instead of cancelling it', async () => {
+    const onBargeIn = vi.fn()
+    const onBargeInHold = vi.fn()
+    const { result } = renderHook(() => useVoiceTurn({ ...opts, onBargeIn, onBargeInHold }))
+    await startCapture(result)
+    const audio = playable()
+    const ttsAbort = new AbortController()
+    act(() => { result.current.beginSpeaking({ audio, ttsAbort }) })
+
+    micRms = 0.4                                   // JARVIS's own voice, loud
+    act(() => { vi.advanceTimersByTime(20 * 3) })
+
+    expect(audio.pause).toHaveBeenCalled()
+    expect(result.current.isHolding()).toBe(true)
+    expect(onBargeInHold).toHaveBeenCalledWith(true)
+    expect(onBargeIn).not.toHaveBeenCalled()
+    expect(ttsAbort.signal.aborted).toBe(false)
+    expect(result.current.state).toBe('SPEAKING')
+  })
+
+  it('an unconfirmed hold resumes the reply where it paused', async () => {
+    const { result } = renderHook(() => useVoiceTurn(opts))
+    await startCapture(result)
+    const audio = playable()
+    act(() => { result.current.beginSpeaking({ audio }) })
+    micRms = 0.4
+    act(() => { vi.advanceTimersByTime(20 * 3) })
+    micRms = 0                                     // it was only echo / a cough
+
+    act(() => { vi.advanceTimersByTime(500) })
+
+    expect((audio as unknown as { play: ReturnType<typeof vi.fn> }).play).toHaveBeenCalled()
+    expect(result.current.isHolding()).toBe(false)
+    expect(result.current.state).toBe('SPEAKING')
+  })
+
+  it('a confirming transcript turns the hold into a real barge-in', async () => {
+    const onBargeIn = vi.fn()
+    const { result } = renderHook(() => useVoiceTurn({ ...opts, onBargeIn }))
+    await startCapture(result)
+    const audio = playable()
+    act(() => { result.current.beginSpeaking({ audio }) })
+    micRms = 0.4
+    act(() => { vi.advanceTimersByTime(20 * 3) })
+
+    act(() => { result.current.bargeIn('voice') })   // the caller heard the user
+
+    expect(onBargeIn).toHaveBeenCalledWith('voice')
+    expect(result.current.isHolding()).toBe(false)
+    expect(result.current.state).toBe('LISTENING')
+    act(() => { vi.advanceTimersByTime(1000) })
+    expect((audio as unknown as { play: ReturnType<typeof vi.fn> }).play).not.toHaveBeenCalled()
+  })
+})

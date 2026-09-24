@@ -2,7 +2,7 @@
 type: community
 name: Sniper & Rug Pull (c83)
 node_count: 15
-synced: 2026-09-14
+synced: 2026-09-24
 tags:
   - community
   - Sniper-Rug-Pull-c83
@@ -10,7 +10,7 @@ tags:
 
             # Sniper & Rug Pull (c83)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-24.
 
 
             ## Key Nodes (15 total)

@@ -1,7 +1,7 @@
 ---
 type: strategy
 name: SMC Smart Money
-updated: 2026-09-14
+updated: 2026-09-24
 tags:
   - strategy
   - SMC-Smart-Money

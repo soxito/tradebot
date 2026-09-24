@@ -460,3 +460,24 @@ def render_plan_chart(
     except Exception as exc:  # noqa: BLE001
         logger.warning("[ChartRender] could not draw chart: {}", exc)
         return None
+
+
+# ── OBLIVION dedicated chart ───────────────────────────────────────────────
+
+
+def render_oblivion_chart(
+    candles: Sequence[Sequence[float]],
+    oblivion_result: dict[str, Any] | None,
+    *,
+    symbol: str,
+    timeframe: str,
+    candle_count: int | None = 120,
+    source: str = "",
+) -> bytes | None:
+    """The dedicated OBLIVION AI v4.0 analysis image — see :mod:`oblivion_chart`."""
+    from plugins.AiMarketAnalyst.backend.services.oblivion_chart import render_oblivion_chart as _render
+
+    return _render(
+        candles, oblivion_result, symbol=symbol, timeframe=timeframe,
+        candle_count=candle_count, source=source,
+    )

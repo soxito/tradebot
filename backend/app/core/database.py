@@ -260,7 +260,40 @@ async def init_db():
             ("room_settings", "room_exec_bootstrap_v1", "BOOLEAN DEFAULT FALSE"),
             # Dedicates an AI provider profile to a single task category.
             ("ai_llm_providers", "assigned_task", "VARCHAR"),
+            # AI brain: who made each decision and the OBLIVION read behind it.
+            ("agent_decisions", "origin", "VARCHAR DEFAULT 'board'"),
+            ("trades", "crypto_account_id", "INTEGER"),
+            ("room_trade_plans", "trail_atr", "FLOAT"),
+            ("room_settings", "weekly_target_usd", "FLOAT DEFAULT 3000.0"),
+            ("room_settings", "target_pacing", "BOOLEAN DEFAULT TRUE"),
+            ("room_settings", "target_max_multiplier", "FLOAT DEFAULT 2.0"),
+            ("room_settings", "target_stop_when_hit", "BOOLEAN DEFAULT FALSE"),
+            ("room_settings", "daily_target_margin_pct", "FLOAT DEFAULT 200.0"),
+            ("room_settings", "target_per_pair", "BOOLEAN DEFAULT TRUE"),
+            ("room_settings", "min_risk_pct", "FLOAT DEFAULT 1.0"),
+            ("room_settings", "max_risk_pct", "FLOAT DEFAULT 5.0"),
+            ("room_settings", "news_pre_min", "INTEGER DEFAULT 30"),
+            ("room_settings", "news_cooloff_min", "INTEGER DEFAULT 120"),
+            ("room_trade_plans", "trail_from", "INTEGER DEFAULT 1"),
+            ("room_settings", "universe_enabled", "BOOLEAN DEFAULT FALSE"),
+            ("room_settings", "universe_symbols", "TEXT"),
+            ("room_settings", "pair_min_win_rate", "FLOAT DEFAULT 0.95"),
+            ("room_settings", "daily_min_win_rate", "FLOAT DEFAULT 0.90"),
+            ("room_settings", "daily_recovery_min_wr", "FLOAT DEFAULT 0.97"),
+            ("room_settings", "daily_target_min_pct", "FLOAT DEFAULT 10.0"),
+            ("room_settings", "daily_target_max_pct", "FLOAT DEFAULT 20.0"),
+            ("room_trade_plans", "floor_at_tp1", "BOOLEAN DEFAULT FALSE"),
+            ("agent_decisions", "oblivion_read_id", "INTEGER"),
+            # Real-time trade management.
+            ("room_settings", "manage_tick_s", "INTEGER DEFAULT 5"),
+            ("room_settings", "margin_warn_pct", "FLOAT DEFAULT 300.0"),
+            ("room_settings", "margin_critical_pct", "FLOAT DEFAULT 150.0"),
+            ("room_settings", "max_account_drawdown_pct", "FLOAT DEFAULT 5.0"),
+            ("room_settings", "shift_atr_mult", "FLOAT DEFAULT 1.5"),
+            ("room_settings", "shift_take_profit_fraction", "FLOAT DEFAULT 0.5"),
         ]
+        _VALID_TABLES.add("agent_decisions")
+        _VALID_TABLES.add("room_trade_plans")
         _VALID_TABLES.add("signal_monitor_pairs")
         _VALID_TABLES.add("ngrok_config")
         # Created by create_all above; whitelisted so later columns can be added

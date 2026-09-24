@@ -24,6 +24,25 @@ def quiet_bus(monkeypatch):
     return published
 
 
+@pytest.fixture(autouse=True)
+def oblivion_agrees(monkeypatch):
+    """These tests are about the gates after OBLIVION; the engine agrees here.
+
+    The OBLIVION gate itself is covered in test_oblivion_gate.py.
+    """
+    async def _agree(s, *, symbol, action, timeframe=None, session_id=None):
+        return {"verdict": {"tradeable": True, "action": action}, "read_id": None,
+                "timeframe": timeframe or "1h", "price": None}
+
+    monkeypatch.setattr(execution, "oblivion_recheck", _agree)
+
+    async def _open(db, symbol, timeframe):
+        return None
+
+    # Pair approval / news / weekly-minimum gates are covered in their own tests.
+    monkeypatch.setattr(execution, "_room_entry_gates", _open)
+
+
 def _result(**over):
     base = {
         "symbol": "XAUUSD",

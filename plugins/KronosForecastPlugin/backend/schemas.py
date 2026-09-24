@@ -1,7 +1,7 @@
 """
 Kronos Forecast Plugin — Pydantic Schemas (API contracts)
 """
-from typing import List, Optional, Literal
+from typing import Any, Dict, List, Optional, Literal
 from pydantic import BaseModel, Field
 
 
@@ -180,6 +180,13 @@ class ForecastResponse(BaseModel):
     hlc3_kaufman: Optional[HLC3KaufmanSignal] = None
     sr_signals: Optional[SRSignalsSchema] = None
 
+    # OBLIVION AI engine v4.0 read on the same candles the model saw (see
+    # backend/app/signals/oblivion.py for the shape) and its chart overlay
+    # bundle: boxes (FVG/OB), labels (HH/HL/LH/LL, BOS/CHOCH, LIQ), diamond
+    # markers, fib + entry/SL/TP price lines, session bands, dashboard.
+    oblivion: Optional[Dict[str, Any]] = None
+    overlay_bundle: Optional[Dict[str, Any]] = None
+
     # Historical candles used to run this forecast (lightweight-charts format).
     # Populated for forex/metals where the exchange has no data; empty for crypto
     # (the frontend fetches crypto OHLCV directly for better resolution).
@@ -283,6 +290,58 @@ class SniperSignal(BaseModel):
     relative_volume: Optional[float] = None
     volume_regime: VolumeRegimeT = "UNKNOWN"
     volume_divergence: VolumeDivergenceT = "UNKNOWN"
+
+
+class OblivionTfSignal(BaseModel):
+    """One timeframe's OBLIVION read, fused with the Kronos forecast."""
+    timeframe: str
+    action: Literal["buy", "sell", "wait"] = "wait"
+    confirmed: bool = False
+    new: bool = False
+    score: int = 0
+    required: int = 6
+    bull: int = 0
+    bear: int = 0
+    market_bias: int = 0
+    bias_label: str = "NEUTRAL"
+    entry: Optional[float] = None
+    stop_loss: Optional[float] = None
+    tp1: Optional[float] = None
+    tp2: Optional[float] = None
+    tp3: Optional[float] = None
+    risk_reward: Optional[float] = None
+    confidence: float = 0.0
+    kronos_direction: Optional[str] = None
+    kronos_pct_change: Optional[float] = None
+    kronos_confidence: Optional[float] = None
+    kronos_aligned: Optional[bool] = None
+    vetoed_by: Optional[str] = None          # "kronos" | "news" | None
+    news_blocked: bool = False
+    session: str = "OFF"
+    structure: str = "WAIT"
+    last_signal: Optional[Dict[str, Any]] = None
+    summary: str = ""
+    error: Optional[str] = None
+
+
+class OblivionConsensus(BaseModel):
+    action: Literal["buy", "sell", "wait"] = "wait"
+    score: float = 0.0                        # signed, -1..1, timeframe-weighted
+    agreeing_tfs: List[str] = Field(default_factory=list)
+    opposing_tfs: List[str] = Field(default_factory=list)
+    vetoed_tfs: List[str] = Field(default_factory=list)
+    note: str = ""
+
+
+class OblivionMultiTfResponse(BaseModel):
+    exchange: str
+    symbol: str
+    generated_at: int
+    with_kronos: bool = True
+    consensus: OblivionConsensus = Field(default_factory=OblivionConsensus)
+    per_tf: List[OblivionTfSignal] = Field(default_factory=list)
+    news_blocked: bool = False
+    note: Optional[str] = None
 
 
 class SniperSignalsResponse(BaseModel):

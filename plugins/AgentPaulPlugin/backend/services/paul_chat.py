@@ -36,7 +36,40 @@ Personality:
 - Confident and sharp, like Tony Stark's JARVIS
 - Concise: get to the point, cite real data, no filler
 - Risk-aware: always flag danger before opportunity
-- Address the user as "Sir" when appropriate for flavour
+- Address the user as "Sir" now and then for flavour — not in every reply
+
+## HOW TO TALK — THIS IS A CONVERSATION, NOT A REPORT
+Talk the way a sharp, friendly colleague would across the desk:
+- ANSWER THE LATEST MESSAGE. Everything else in this prompt is background; the
+  user's newest message is the thing to respond to.
+- MATCH THE USER'S REGISTER AND LENGTH. A greeting or small talk gets one or two
+  natural sentences back, in your own words. Never answer "how are you" with
+  "functioning optimally" or a list of your capabilities, and don't volunteer a
+  market rundown nobody asked for.
+- EVERY NUMBER YOU SAY MUST BE COPIED FROM THE LIVE DATA. A price comes from
+  the LIVE Market Prices block or a tool result, never from a position's entry
+  price, an old conversation, or memory. If you haven't got the figure, leave
+  it out rather than estimate it.
+- A quick question gets a quick answer: lead with the answer itself in the first
+  sentence, then at most two or three sentences of the why. "What's gold doing?"
+  is price, direction, the one level that matters — then offer to go deeper.
+  Only use the full structured market read (below) when the user asks for an
+  analysis, a setup, a plan, or "the full picture".
+- FOLLOW THE THREAD. Read the earlier turns. "And bitcoin?", "what about the 4h?",
+  "why?", "do it" refer to what was just discussed — answer in that context and
+  never ask the user to repeat themselves.
+- If the user is vague, make the most sensible reading and answer it; mention
+  the assumption in a few words instead of interrogating them.
+- If they sound frustrated, stressed or excited, acknowledge it in a few words
+  like a person would, then help.
+- Never say you are "about to" check, pull or look at something. This reply is
+  your only turn: fetch it now with a tool and give the result, or answer from
+  what you already have.
+- Never mention your tools, prompts, context sections or data sources by their
+  internal names, and never write bracketed citation marks like 【…】 or
+  [source]. Say "on the 4-hour chart" or "per Reuters" the way a person would.
+- No sign-off boilerplate ("Let me know if you need anything else!"). Ask a
+  follow-up question only when it genuinely moves things forward.
 
 ## YOUR SCOPE IS EVERYTHING — READ THIS BEFORE ANYTHING ELSE
 You are NOT a crypto-only or trading-only bot. Trading is one of your jobs, not
@@ -102,9 +135,10 @@ Behaviour rules:
   When you do confirm a trade, state only: symbol, side, size, price, order ID.
   Keep it to two or three lines. No Position Summary blocks, no fake status fields.
   Fabricated trade confirmations cause real financial harm.
-- **HOW TO DELIVER A MARKET READ.** When you analyse a specific instrument,
-  answer in the trading room's voice, in this order, and skip any part you have
-  no real data for rather than padding it:
+- **HOW TO DELIVER A MARKET READ.** Only when the user asks for an analysis,
+  a read, a setup or a plan (not for "what's gold doing" or "and BTC?", which
+  get a few conversational sentences), answer in the trading room's voice, in
+  this order, and skip any part you have no real data for rather than padding it:
     1. 👁‍🗨 Structure — the timeframe and what price is doing: trending with
        higher lows / lower highs, or consolidating and waiting for a break of
        structure.
@@ -381,6 +415,49 @@ the expanded form where it adds clarity, but mirror their shorthand naturally.
 """
 
 
+#: Prompt sections to drop, first to last, when the system prompt is over its
+#: cap. Matched against the start of the "## " heading. The persona's own
+#: sections and the live account/price blocks are deliberately absent: those
+#: are what the answer has to be built from.
+_SHED_ORDER = (
+    "Brain Map Stats", "Available Analysis Tools", "Configured AI Providers",
+    "AI Agent Performance", "Brain Learning Status", "Brain Map Nodes",
+    "Recent Brain State Snapshots", "Agent Decision History", "Vault Market Notes",
+    "Recent Live Actions", "Past conversations", "🧭 Context Bundle",
+    "Trading Terminology", "Your Track Record", "Live News", "Recent Signals",
+    "Active JARVIS Skills", "LIVE RESEARCH",
+)
+
+
+def _shed_sections(prompt: str, cap: int) -> str:
+    """Drop whole low-priority "## " sections until ``prompt`` fits ``cap``."""
+    sections = re.split(r"(?=\n## )", prompt)
+    for heading in _SHED_ORDER:
+        if sum(map(len, sections)) <= cap:
+            break
+        sections = [
+            s for s in sections
+            if not s.lstrip("\n").startswith(f"## {heading}")
+        ]
+    return "".join(sections)
+
+
+def _is_transcript_memory(entry: dict) -> bool:
+    """True for a stored copy of a past exchange rather than a learned fact.
+
+    Every chat turn and JARVIS command is logged to the knowledge base as
+    "Q: … → A: …" / "JARVIS chat …". Those are a record of what was said, with
+    the prices and positions of that moment baked in — useful for history, but
+    injected as memory they get parroted back as the answer.
+    """
+    content = (entry.get("content") or "").lstrip()
+    if entry.get("source") == "jarvis-command":
+        # Command/request logs ("JARVIS close OUT: …"); research ticks are
+        # the one kind that carries findings rather than a transcript.
+        return not content.startswith("JARVIS research")
+    return content.startswith("Q:") or (entry.get("source") == "chat" and "→ A:" in content)
+
+
 async def _get_open_positions(db: AsyncSession) -> list[dict]:
     """Fetch MT5 open positions from the synced DB.
 
@@ -407,6 +484,7 @@ async def _get_open_positions(db: AsyncSession) -> list[dict]:
                 "sl": p.sl,
                 "tp": p.tp,
                 "ticket": p.mt5_ticket,
+                "synced_at": getattr(p, "updated_at", None),
             })
     except Exception as exc:
         logger.debug(f"[JARVIS] MT5 positions DB fetch error: {exc}")
@@ -706,8 +784,31 @@ async def build_jarvis_system_prompt(
     positions = await _get_open_positions(db)
     if positions:
         parts.append(f"\n## Open MT5 Positions ({len(positions)})")
+        # Say how old the snapshot is. A sync that stopped a day ago still
+        # lists every position as open, and without the age the model reports
+        # it as "right now".
+        _synced = [p["synced_at"] for p in positions if p.get("synced_at")]
+        if _synced:
+            from datetime import datetime as _dt
+            _last = max(_synced)
+            _age_h = (_dt.utcnow() - _last.replace(tzinfo=None)).total_seconds() / 3600
+            if _age_h >= 1:
+                parts.append(
+                    f"Snapshot from the last MT5 sync at {_last:%Y-%m-%d %H:%M} UTC "
+                    f"({_age_h:.0f}h ago) — positions may have closed since. When "
+                    f"asked about 'now', give these figures AND say how old they are."
+                )
         total_pnl = sum(p.get("profit") or 0 for p in positions)
         parts.append(f"Total floating P&L: {total_pnl:+.2f}")
+        # Counted here, not by the model: asked for a breakdown it miscounted
+        # 6 SELL / 1 BUY on gold as 4 / 3.
+        _tally: dict[str, dict[str, int]] = {}
+        for p in positions:
+            _tally.setdefault(p["symbol"], {"BUY": 0, "SELL": 0})[p["direction"]] += 1
+        parts.append("By symbol: " + "; ".join(
+            f"{sym} {c['BUY'] + c['SELL']} ({c['SELL']} SELL, {c['BUY']} BUY)"
+            for sym, c in _tally.items()
+        ))
         for p in positions[:12]:
             pnl_str = f"P&L {p['profit']:+.2f}" if p.get("profit") is not None else ""
             sl_str = f"SL={p['sl']}" if p.get("sl") else ""
@@ -969,15 +1070,21 @@ async def build_jarvis_system_prompt(
     # fact the model then completes by guessing.
     try:
         if user_msg:
-            learned = await knowledge_base.search_knowledge(db, user_msg, limit=8)
+            learned = await knowledge_base.search_knowledge(db, user_msg, limit=16)
+            # Old chat transcripts and command logs are not knowledge: fed back
+            # as "established", the model re-sent a past answer word for word
+            # (to a different question) and repeated a stale "no open
+            # positions" while eleven were open in the live block above.
+            learned = [k for k in learned if not _is_transcript_memory(k)][:8]
             if learned:
                 parts.append(
                     "\n## Learned Knowledge (your permanent long-term memory)\n"
                     "Things you have previously been told or worked out, across "
-                    "ALL subjects. Treat these as established between you and the "
-                    "user, and build on them rather than starting fresh:"
+                    "ALL subjects. Build on them rather than starting fresh — but "
+                    "they can be out of date: for prices, positions, balances and "
+                    "market structure the LIVE sections above always win."
                 )
-                for k in learned[:8]:
+                for k in learned:
                     src = f"[{k['source']}] " if k.get("source") else ""
                     when = f"({k['ts'][:10]}) " if k.get("ts") else ""
                     parts.append(f"  - {when}{src}{k['content'][:320]}")
@@ -1057,6 +1164,7 @@ async def stream_jarvis_chat(
     pathname: str = "/",
     session_key: str = "",
     image: str | None = None,
+    voice: bool = False,
 ) -> AsyncIterator[str]:
     """Yield SSE-formatted data chunks for the JARVIS chat response.
 
@@ -1089,13 +1197,25 @@ async def stream_jarvis_chat(
             r'(?:set\s+)?(?:sl|stop[\s\-]loss)\s+at\s+[\d.]+',
             # SL by pct:    "set 5% stop loss"
             r'set\s+\d+(?:\.\d+)?\s*%\s*(?:stop|sl|stop[\s\-]loss)',
-            # Close:        "close GWEIUSDT"  /  "close my GWEIUSDT position"
-            r'\bclose(?:\s+my)?\s+\w+(?:\s+position)?\b',
         )
-        _OPEN_TRADE = r"\b(execute|just do it|go ahead|place (the|a) (trade|order)|open (a |the |)trade|buy now|sell now)\b"
+        # Orders only on an instruction, never on conversation. "go ahead" and
+        # "just do it" used to fire on their own, so "go ahead and tell me about
+        # gold" placed a gold trade; they now need a trade word alongside them.
+        _OPEN_TRADE = (
+            r"^\s*(?:please\s+)?(?:execute|place|open|enter)\b.*\b(?:trade|order|position|long|short|buy|sell)\b"
+            r"|\b(?:buy|sell)\s+now\b"
+            r"|\b(?:go\s+ahead|just\s+do\s+it)\b.*\b(?:trade|order|buy|sell|long|short|execute)\b"
+        )
+        from app.api.jarvis import is_conversational_question, parse_close_target
 
-        is_tpsl_cmd = user_msg and any(_re2.search(p, user_msg.lower()) for p in _JARVIS_PATTERNS)
-        is_open_cmd = user_msg and _re2.search(_OPEN_TRADE, user_msg, _re2.I)
+        _is_question = is_conversational_question(user_msg or "")
+        is_tpsl_cmd = bool(user_msg) and not _is_question and (
+            any(_re2.search(p, user_msg.lower()) for p in _JARVIS_PATTERNS)
+            # Close only when an instrument is named — "close out for the day"
+            # used to close a position called OUT.
+            or parse_close_target(user_msg) is not None
+        )
+        is_open_cmd = bool(user_msg) and not _is_question and _re2.search(_OPEN_TRADE, user_msg, _re2.I)
 
         if is_tpsl_cmd:
             # Route to jarvis.execute_command which actually hits the exchange
@@ -1256,7 +1376,14 @@ async def stream_jarvis_chat(
                         f"  - [{h['note_type']}] {h.get('excerpt','')[:130]}"
                         for h in learning_hits
                     )
-                    system_prompt += f"\n\n## Past JARVIS Learnings (Vault — persistent memory)\n{past}"
+                    # These are past exchanges, not facts: labelled as such so
+                    # the model uses them for continuity instead of re-sending
+                    # an old answer with that day's prices in it.
+                    system_prompt += (
+                        "\n\n## Past conversations on related topics (continuity only — "
+                        "may be out of date; never repeat an old answer, live data wins)\n"
+                        f"{past}"
+                    )
                 if action_hits:
                     acts = "\n".join(
                         f"  - {h.get('excerpt','')[:120]}"
@@ -1389,6 +1516,12 @@ async def stream_jarvis_chat(
         # characters) and truncate the oldest / least-important sections first.
         _SYS_CHAR_CAP = 24_000
         sys_content = full_messages[0].get("content", "") if full_messages else ""
+        # Shed whole low-value sections first. Cutting the middle out blindly
+        # dropped the live MT5 positions block, so "how many positions do I
+        # have" was answered from the two rows that survived in the tail.
+        if len(sys_content) > _SYS_CHAR_CAP:
+            sys_content = _shed_sections(sys_content, _SYS_CHAR_CAP)
+            full_messages[0]["content"] = sys_content
         if len(sys_content) > _SYS_CHAR_CAP:
             # The head must cover the WHOLE persona. It used to be a flat 8 000
             # chars, which happened to fit — but the persona holds the operating
@@ -1410,6 +1543,19 @@ async def stream_jarvis_chat(
             logger.debug(
                 f"[JARVIS] system prompt capped: {len(sys_content):,} → "
                 f"{_head_size + _tail_size:,} chars (head {_head_size:,}/tail {_tail_size:,})"
+            )
+
+        # Appended after the length cap so it can never be the part trimmed away.
+        if voice:
+            full_messages[0]["content"] += (
+                "\n\n## THIS REPLY WILL BE SPOKEN ALOUD\n"
+                "The user is talking to you by voice and will hear your answer, "
+                "not read it. Reply the way you would speak: two to four short "
+                "sentences, no markdown, no bullet lists, no tables, no emoji, "
+                "no URLs. Say numbers the way a person says them (\"about "
+                "forty-two eighty-four\" is fine for 4284.33 unless precision "
+                "matters). If there is more worth saying, offer it in one "
+                "sentence instead of saying it all."
             )
 
         # Tool-enabled: the prompt already carries prices for whatever the user
@@ -1436,6 +1582,9 @@ async def stream_jarvis_chat(
             return
 
         content: str = result.get("content") or result.get("text") or ""
+        # Nemotron cites the prompt's own section names as 【Live Market Prices】
+        # even when told not to; they mean nothing to the user.
+        content = re.sub(r"\s?【[^】]{0,60}】", "", content).strip()
         if not content:
             yield f"data: {json.dumps({'error': 'No response from AI provider. Configure a provider on the Telegram → Connect AI tab.'})}\n\n"
             return

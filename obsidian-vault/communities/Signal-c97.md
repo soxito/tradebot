@@ -2,7 +2,7 @@
 type: community
 name: Signal (c97)
 node_count: 13
-synced: 2026-09-14
+synced: 2026-09-24
 tags:
   - community
   - Signal-c97
@@ -10,7 +10,7 @@ tags:
 
             # Signal (c97)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-24.
 
 
             ## Key Nodes (13 total)

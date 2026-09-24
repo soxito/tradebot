@@ -1,0 +1,29 @@
+---
+type: decision
+agent: sentiment_analyst
+symbol: ETHUSD
+action: hold
+confidence: 0.55
+ai_called: True
+date: 2026-09-15
+tags:
+  - decision
+  - ETHUSD
+  - sentiment_analyst
+  - hold
+---
+
+            # Decision: sentiment_analyst → ETHUSD — HOLD @ 2026-09-15
+
+            ## Summary
+            **Agent**: `sentiment_analyst` | **Action**: `HOLD` | **Confidence**: 55%
+            **AI Called**: Yes
+
+            ## Reasoning
+            ETHUSD exhibits oversold RSI (36.8) and StochRSI at 0 near lower Bollinger Band, suggesting
+potential bounce pressure. However, SMC structure remains bearish with price in discount zone, and
+kronos forecast favors downside. Mixed signals create neutral bias.
+
+            ## Related
+            - [[_daily/2026-09-15]]
+            - [[signals/ETHUSD]] ← Recent signals for this symbol

@@ -128,6 +128,10 @@ async def parse_and_execute(
         # photo — the same reason /room is special-cased.
         if cmd == "forecast" and args.strip():
             return _start_forecast(args.strip(), token, chat_id, db)
+        # /analyze is handled here for the same reason: it now sends a dedicated
+        # OBLIVION chart alongside the Jarvis analysis, which needs token+chat_id.
+        if cmd == "analyze" and args.strip():
+            return _start_analyze(args.strip(), token, chat_id, db)
         return await _dispatch(cmd, args.strip(), db)
 
     # ── "Yes" to a command the last reply offered ─────────────────────────────
@@ -180,6 +184,17 @@ async def parse_and_execute(
             "HTML",
             None,
         )
+    # Any free-text pair question gets the OBLIVION read as its own image +
+    # card, detached from this reply so the answer is never held up by the
+    # render. Only when the user's own message names a pair and reads like an
+    # analysis question — a passing "long" in the model's reply is not enough.
+    try:
+        if token and chat_id and _PAIR_ANALYSIS_RE.search(text):
+            syms = _symbols_in(text)
+            if syms:
+                _detach(_send_oblivion_for_free_text(token, chat_id, syms[0], _timeframe_in(text)))
+    except Exception as exc:  # noqa: BLE001 — a bonus image never breaks the reply
+        logger.debug("[Oblivion] free-text hook skipped: {}", exc)
     return fallback[0], fallback[1], fallback[2]
 
 
@@ -1488,6 +1503,38 @@ def _timeframe_in(text: str, default: str = "1h") -> str:
     return default
 
 
+#: A free-text message that is asking for a read on a pair, not placing an
+#: order or asking about the account.
+_PAIR_ANALYSIS_RE = re.compile(
+    r"\b(analy[sz]e|analysis|forecast|predict|prediction|outlook|bias|setup|entry|"
+    r"support|resistance|bull(?:ish)?|bear(?:ish)?|trend|structure|levels?|"
+    r"buy|sell|long|short|going (?:up|down)|where is|what do you think|thoughts on|"
+    r"chart|smc|oblivion|liquidity|order block|fvg)\b",
+    re.I,
+)
+_DETACHED: set = set()
+
+
+def _detach(coro) -> None:
+    """Fire-and-forget without the per-chat /room lock, logging failures."""
+    async def _guard() -> None:
+        try:
+            await coro
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[Oblivion] detached job failed: {}", exc)
+
+    task = asyncio.create_task(_guard())
+    _DETACHED.add(task)
+    task.add_done_callback(_DETACHED.discard)
+
+
+async def _send_oblivion_for_free_text(token: str, chat_id: str, symbol: str, timeframe: str) -> None:
+    """The OBLIVION image + card for a pair named in ordinary chat."""
+    from plugins.TelegramSignalNewsPlugin.backend.services import room_bridge
+
+    await room_bridge.send_oblivion_analysis(token, chat_id, symbol, timeframe)
+
+
 async def _method_note(text: str, db: AsyncSession) -> str | None:
     """Two or three sentences on the method, to sit above the live forecast."""
     try:
@@ -2112,6 +2159,9 @@ def _start_forecast(
                     token, chat_id, chart,
                     caption=f"🔮 {symbol} {timeframe} {direction} — Kronos forecast",
                 )
+            # The OBLIVION AI read as its own image + card, always — the
+            # forecast above is Kronos; this is the house engine on the same pair.
+            await room_bridge.send_oblivion_analysis(token, chat_id, symbol, timeframe)
         except Exception as exc:  # noqa: BLE001 — chart is a bonus, never a gate
             logger.debug("[ForecastCmd] forecast chart skipped: {}", exc)
 
@@ -2120,6 +2170,54 @@ def _start_forecast(
     room_bridge.spawn(_run(), chat_id, token)
     return (
         "🔮 Running the Kronos forecast — I'll send the read and a chart in a moment.",
+        "HTML", None,
+    )
+
+
+def _start_analyze(
+    args: str, token: str, chat_id: str, db: AsyncSession,
+) -> tuple[str, str, dict | None]:
+    """Run /analyze and send a dedicated OBLIVION chart alongside the text.
+
+    The text reply and the chart are both produced in a background task
+    because the OBLIVION render fetches candles; an acknowledgement returns
+    immediately so the bot stays responsive.
+    """
+    async def _run() -> None:
+        from plugins.TelegramSignalNewsPlugin.backend.services import bot_service, room_bridge
+        from app.core.database import AsyncSessionLocal
+
+        try:
+            async with AsyncSessionLocal() as _adb:
+                text, mode = await _handle_analyze(args, _adb)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[AnalyzeCmd] /analyze failed: {}", exc)
+            await bot_service.send_message(token, chat_id, f"❌ Analyze failed: {exc}")
+            return
+        if text:
+            await bot_service.send_message(token, chat_id, text, mode)
+
+        # The OBLIVION AI read as its own image + card.
+        try:
+            tokens = args.split()
+            if not tokens:
+                return
+            symbol = _norm_sym(tokens[0])
+            tf = _timeframe_in(args, default="1h")
+            from app.services import market_data
+
+            can, _ = market_data.canonicalize_for_analysis(symbol)
+            if not can:
+                return
+            await room_bridge.send_oblivion_analysis(token, chat_id, symbol, tf)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[AnalyzeCmd] oblivion skipped: {}", exc)
+
+    from plugins.TelegramSignalNewsPlugin.backend.services import room_bridge
+
+    room_bridge.spawn(_run(), chat_id, token)
+    return (
+        "🔍 Running deep analysis — I'll send the read and an OBLIVION chart in a moment.",
         "HTML", None,
     )
 
@@ -3129,22 +3227,40 @@ async def _handle_order(args: str, db: AsyncSession) -> tuple[str, str]:
             ), "HTML"
         # MT5 is configured — fall through; the room execution engine routes it there.
 
-    # ── Get sniper signals to find entry/SL/TP ────────────────────────────────
+    # ── Get sniper signals to find entry/SL/TP (Kronos first, then OBLIVION fallback) ─
+    resp = None
+    match = None
     try:
         from plugins.KronosForecastPlugin.backend.services.forecast_service import (
             generate_sniper_signals,
         )
         resp = await generate_sniper_signals(exchange, symbol, "1h")
+        match = next(
+            (s for s in resp.signals if s.side == side and s.order_kind == order_kind),
+            next((s for s in resp.signals if s.side == side), None),
+        )
     except ImportError:
         return "⚠️ KronosForecastPlugin not installed.", "HTML"
     except Exception as exc:  # noqa: BLE001
-        return f"❌ Kronos error: {exc}", "HTML"
+        # Kronos failed — fall through to OBLIVION
+        logger.debug(f"[Order] Kronos sniper failed for {symbol}: {exc}")
+        resp = None
+        match = None
 
-    # Find the matching signal (matching side + order_kind, else matching side)
-    match = next(
-        (s for s in resp.signals if s.side == side and s.order_kind == order_kind),
-        next((s for s in resp.signals if s.side == side), None),
-    )
+    # OBLIVION fallback — standalone signals work for every pair (crypto + MT5) even when Kronos is NO_TRADE/flat
+    if not match:
+        try:
+            from plugins.KronosForecastPlugin.backend.services.oblivion_signals import generate_oblivion_sniper_signals
+            obl_resp = await generate_oblivion_sniper_signals(exchange, symbol, "1h")
+            obl_match = next(
+                (s for s in obl_resp.signals if s.side == side and s.order_kind == order_kind),
+                next((s for s in obl_resp.signals if s.side == side), None),
+            )
+            if obl_match:
+                match = obl_match
+                resp = obl_resp
+        except Exception as exc:
+            logger.debug(f"[Order] OBLIVION sniper fallback failed for {symbol}: {exc}")
 
     if match:
         entry = match.entry
@@ -3152,19 +3268,47 @@ async def _handle_order(args: str, db: AsyncSession) -> tuple[str, str]:
         tp = match.take_profit_1
         leverage = leverage_override or match.leverage
     else:
-        # No pre-built sniper signal — check if forecast direction at least aligns
-        expected_side = "short" if resp.direction == "down" else ("long" if resp.direction == "up" else None)
+        # No pre-built signal from either engine — check direction alignment
+        # Prefer OBLIVION direction when Kronos is flat/no_trade, else Kronos
+        direction = None
+        if resp is not None and getattr(resp, "direction", None) in ("up", "down"):
+            direction = resp.direction
+        else:
+            # Try standalone OBLIVION direction
+            try:
+                from app.services.candles import fetch as _cfetch
+                from app.signals.oblivion import analyze_oblivion as _oana
+                _cand = await _cfetch(symbol, "1h", limit=220)
+                if _cand:
+                    _obl = _oana(_cand, "1h")
+                    act = (_obl.get("signal") or {}).get("action")
+                    if act == "buy":
+                        direction = "up"
+                    elif act == "sell":
+                        direction = "down"
+            except Exception:
+                direction = None
+
+        expected_side = "short" if direction == "down" else ("long" if direction == "up" else None)
         if expected_side and expected_side != side:
-            # Direction opposes the requested side — warn the user
+            engine_name = "OBLIVION" if resp is None or getattr(resp, "engine", "") == "oblivion" else "Kronos"
             return (
-                f"⚠️ Kronos direction is <b>{resp.direction.upper()}</b> — suggests <b>{expected_side.upper()}</b>, not {side.upper()}.\n\n"
+                f"⚠️ {engine_name} direction is <b>{direction.upper()}</b> — suggests <b>{expected_side.upper()}</b>, not {side.upper()}.\n\n"
                 f"Execute the aligned direction:\n"
                 f"<code>/order {expected_side} {raw_sym} {margin_usd}</code>"
             ), "HTML"
         # Direction aligns (or flat) but no pre-built signal — synthesize from anchor price
-        entry = resp.anchor_price
-        sl_pct = 0.015  # default 1.5% stop loss
-        tp_pct = 0.030  # default 3.0% take profit
+        anchor = float(getattr(resp, "anchor_price", 0) or 0) if resp else 0
+        if anchor <= 0:
+            try:
+                from app.services.candles import fetch as _cfetch2
+                _cand2 = await _cfetch2(symbol, "1h", limit=20)
+                anchor = float(_cand2[-1][4]) if _cand2 else 0
+            except Exception:
+                anchor = 0
+        entry = anchor if anchor > 0 else 1.0
+        sl_pct = 0.015
+        tp_pct = 0.030
         if side == "short":
             sl = round(entry * (1 + sl_pct), 8)
             tp = round(entry * (1 - tp_pct), 8)

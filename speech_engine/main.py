@@ -37,7 +37,14 @@ async def _startup():
 
 @app.get("/health")
 async def health():
-    return {"ready": engine.is_ready(), "stt_backend": engine.STT_BACKEND, "tts_backend": engine.TTS_BACKEND}
+    return {
+        "ready": engine.is_ready(),
+        "stt_backend": engine.STT_BACKEND,
+        "tts_backend": engine.TTS_BACKEND,
+        "lite": engine.LITE,
+        "tts_loaded": engine.tts_loaded(),
+        "memory_free_pct": engine.free_memory_pct(),
+    }
 
 
 @app.post("/stt")
@@ -70,6 +77,11 @@ async def tts(text: str = Form(...), voice: str = Form("default")):
         async with _tts_lock:
             audio = await asyncio.to_thread(engine.synthesize, text)
         return Response(content=audio, media_type="audio/wav")
+    except engine.LowMemory as e:
+        # Not an error: the laptop is busy, so this reply uses the backend's
+        # next voice (NVIDIA) instead of pushing the machine into swap.
+        logger.info(f"speech_engine TTS skipped: {e}")
+        raise HTTPException(status_code=503, detail=f"low memory: {e}")
     except Exception as e:
         logger.error(f"speech_engine TTS error: {e}")
         raise HTTPException(status_code=500, detail=str(e))

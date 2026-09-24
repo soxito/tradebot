@@ -1,0 +1,7 @@
+{
+  "symbol": "BTCUSD",
+  "action": "sell",
+  "agreement": 1.0,
+  "created_at": 1790203717.102765,
+  "source": "hermes_bridge"
+}

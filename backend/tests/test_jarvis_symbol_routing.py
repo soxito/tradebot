@@ -105,3 +105,80 @@ def test_crypto_still_routes_to_the_catalog(spoken):
     symbol, asset_class = md.canonicalize_for_analysis(spoken)
     assert asset_class == md.CRYPTO
     assert not md.is_universal_symbol(symbol)
+
+
+# ── Conversation must not be run as a command ────────────────────────────────
+# "close out for the day" closed a position called OUT, and "how is it going"
+# looked up a position called IT. Orders only ever come from instructions.
+
+from app.api.jarvis import (  # noqa: E402
+    _first_instrument,
+    _is_instrument,
+    is_conversational_question,
+    parse_close_target,
+)
+
+
+@pytest.mark.parametrize("text", [
+    "is it a good time to close out for the day",
+    "close the window",
+    "close out",
+    "remind me to close my laptop",
+])
+def test_conversation_about_closing_is_not_a_close_order(text):
+    assert parse_close_target(text) is None
+
+
+@pytest.mark.parametrize("text,symbol", [
+    ("close BTCUSDT", "BTCUSDT"),
+    ("close my GWEIUSDT position", "GWEIUSDT"),
+    ("close gold", "GOLD"),
+])
+def test_close_instructions_still_name_their_instrument(text, symbol):
+    assert parse_close_target(text) == symbol
+
+
+@pytest.mark.parametrize("word", ["it", "out", "the", "your", "market", "everything"])
+def test_common_words_are_not_instruments(word):
+    assert not _is_instrument(word)
+
+
+@pytest.mark.parametrize("word", ["gold", "XAUUSD", "BTC", "EURUSD", "US30", "GWEIUSDT"])
+def test_instruments_are_instruments(word):
+    assert _is_instrument(word)
+
+
+def test_instrument_is_found_past_the_verb():
+    assert _first_instrument("can you check the price of gold for me") == "XAUUSD"
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("should I close BTCUSDT?", True),
+    ("how is gold doing", True),
+    ("can you close BTCUSDT?", False),  # a polite request is still an order
+    ("close BTCUSDT", False),
+])
+def test_questions_are_told_apart_from_requests(text, expected):
+    assert is_conversational_question(text) is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", [
+    "hey paul how are you",
+    "how is it going",
+    "how is your day",
+    "is it a good time to close out for the day",
+    "should i buy gold 2 weeks from now?",
+])
+async def test_small_talk_never_reaches_an_exchange_handler(text, monkeypatch):
+    from app.api import jarvis
+
+    async def _boom(*a, **k):
+        raise AssertionError(f"{text!r} reached an exchange handler")
+
+    for name in ("_execute_order", "_close_position", "_position_status",
+                 "_list_positions", "_analyze_symbol", "_handle_live_news_query"):
+        monkeypatch.setattr(jarvis, name, _boom)
+
+    result = await jarvis._dispatch(text, None)
+    assert result.action == "unknown"

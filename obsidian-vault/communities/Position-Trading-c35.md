@@ -2,7 +2,7 @@
 type: community
 name: Position & Trading (c35)
 node_count: 30
-synced: 2026-09-14
+synced: 2026-09-24
 tags:
   - community
   - Position-Trading-c35
@@ -10,7 +10,7 @@ tags:
 
             # Position & Trading (c35)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-24.
 
 
             ## Key Nodes (30 total)

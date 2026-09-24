@@ -67,10 +67,12 @@ class BitgetClient:
     Handles authentication, rate limiting, and error parsing.
     """
 
-    def __init__(self, api_key: str, api_secret: str, passphrase: str):
+    def __init__(self, api_key: str, api_secret: str, passphrase: str, demo: bool = False):
         self.api_key = api_key
         self.api_secret = api_secret
         self.passphrase = passphrase
+        #: Bitget demo trading: same host, demo API keys, ``paptrading: 1`` header.
+        self.demo = demo
         self._client: Optional[httpx.AsyncClient] = None
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -90,7 +92,10 @@ class BitgetClient:
         timestamp = str(int(time.time() * 1000))
         message = _pre_hash(timestamp, method, request_path, body)
         sign = _sign(message, self.api_secret)
-        return _get_header(self.api_key, sign, timestamp, self.passphrase)
+        headers = _get_header(self.api_key, sign, timestamp, self.passphrase)
+        if self.demo:
+            headers["paptrading"] = "1"
+        return headers
 
     async def get(self, path: str, params: Optional[Dict] = None) -> Dict[str, Any]:
         """Authenticated GET request"""

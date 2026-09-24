@@ -512,14 +512,15 @@ def _compute_settings(physical: int, logical: int, ram_gb: float) -> Dict[str, o
         heartbeat_tick_s = 180   # 3 min — more responsive on powerful machines
 
     # ── Local speech-engine (MLX Parakeet-TDT STT + Qwen3-TTS) capability ──────
-    # The local Jarvis voice models are multi-GB (~6 GB resident) and take
-    # seconds-to-minutes per utterance on CPU/MPS — on a 16 GB machine they get
-    # swapped out and thrash the box. Require 32 GB+ so only workstations run the
-    # LOCAL engine; every other machine uses NVIDIA hosted speech (then OpenAI)
-    # and never touches the local models. Force with TRADEBOT_FORCE_SPEECH_ENGINE=1.
-    # detect_resources() further narrows this to Apple-Silicon / CUDA hosts.
+    # Measured on an M2 Pro / 16 GB (2026-09-23): STT 0.1s warm and the most
+    # accurate engine available, TTS ~2s a sentence. Both models warm cost
+    # ~5.5 GB, so below 32 GB the engine runs in LITE mode (STT resident, TTS
+    # loaded on demand, unloaded when idle, never loaded under memory pressure)
+    # — see speech_engine/engine.py. Weaker tiers stay on NVIDIA hosted speech.
+    # Force with TRADEBOT_FORCE_SPEECH_ENGINE=1. detect_resources() further
+    # narrows this to Apple-Silicon / CUDA hosts.
     speech_engine_local = (
-        ui_tier in ("high", "ultra") and ram_gb >= 32 and physical >= 8
+        ui_tier in ("high", "ultra") and ram_gb >= 15.5 and physical >= 8
     )
 
     return {
@@ -4143,25 +4144,34 @@ def _soup_ensure_repo() -> bool:
     # Already cloned → pull updates (best-effort, never blocks startup long)
     try:
         info("Checking Soup repo for updates …")
-        fetch = subprocess.run(["git", "-C", str(SOUP_REPO_DIR), "fetch", "--depth=1", "origin"], capture_output=True, text=True, timeout=30)
-        if fetch.returncode == 0:
-            behind = subprocess.run(["git", "-C", str(SOUP_REPO_DIR), "rev-list", "HEAD..FETCH_HEAD", "--count"], capture_output=True, text=True, timeout=10)
-            count = int(behind.stdout.strip()) if behind.returncode == 0 and behind.stdout.strip().isdigit() else 0
-            if count > 0:
-                info(f"Soup repo has {count} new commit(s) — pulling …")
-                # Shallow clone (depth 1) can't fast-forward via pull; reset to FETCH_HEAD instead
-                pull = subprocess.run(["git", "-C", str(SOUP_REPO_DIR), "reset", "--hard", "FETCH_HEAD"], capture_output=True, text=True, timeout=60)
-                if pull.returncode == 0:
-                    ok(f"Soup repo updated ✓  ({count} commit(s) pulled)")
+        # Compare local HEAD sha against the remote tip directly. The old path
+        # used `rev-list HEAD..FETCH_HEAD --count`, which returns 0 on a shallow
+        # clone (no common ancestor) even when the remote has advanced — so the
+        # UI showed "update available" but nothing was ever pulled.
+        local = subprocess.run(["git", "-C", str(SOUP_REPO_DIR), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10)
+        local_sha = local.stdout.strip() if local.returncode == 0 else ""
+        lsr = subprocess.run(["git", "ls-remote", SOUP_REPO_URL, "HEAD"], capture_output=True, text=True, timeout=20)
+        remote_sha = lsr.stdout.split()[0].strip() if lsr.returncode == 0 and lsr.stdout.strip() else ""
+        if remote_sha and local_sha and remote_sha != local_sha:
+            info(f"Soup update: {local_sha[:7]} → {remote_sha[:7]} — pulling …")
+            fetch = subprocess.run(["git", "-C", str(SOUP_REPO_DIR), "fetch", "--depth=1", "origin", "HEAD"], capture_output=True, text=True, timeout=60)
+            if fetch.returncode == 0:
+                reset = subprocess.run(["git", "-C", str(SOUP_REPO_DIR), "reset", "--hard", "FETCH_HEAD"], capture_output=True, text=True, timeout=60)
+                if reset.returncode == 0:
+                    # Reinstall the package so the new code is actually used (editable installs pick it up; wheels need it)
+                    try:
+                        soup_pip = SOUP_VENV_DIR / "bin" / "pip"
+                        if soup_pip.exists():
+                            subprocess.run([str(soup_pip), "install", "-e", str(SOUP_REPO_DIR), "-q"], capture_output=True, text=True, timeout=300)
+                    except Exception:
+                        pass
+                    ok(f"Soup repo updated ✓  (now at {remote_sha[:7]})")
                 else:
-                    # fallback to pull --ff-only for non-shallow
-                    pull2 = subprocess.run(["git", "-C", str(SOUP_REPO_DIR), "pull", "--ff-only"], capture_output=True, text=True, timeout=60)
-                    if pull2.returncode == 0:
-                        ok(f"Soup repo updated ✓  ({count} commit(s) pulled)")
-                    else:
-                        warn(f"Soup pull failed ({(pull.stderr or pull2.stderr or '')[:120]}). Using existing checkout.")
+                    warn(f"Soup reset failed ({(reset.stderr or '')[:120]}). Using existing checkout.")
             else:
-                ok("Soup repo up-to-date ✓")
+                warn(f"Soup fetch failed ({(fetch.stderr or '')[:120]}). Using existing checkout.")
+        elif remote_sha and local_sha:
+            ok("Soup repo up-to-date ✓")
         else:
             info("Soup repo: offline or fetch skipped — using existing checkout")
     except Exception as ex:
@@ -4966,16 +4976,39 @@ def ensure_speech_engine() -> bool:
     log_path = ROOT / "speech-engine.log"
 
     if port_open("127.0.0.1", SPEECH_ENGINE_PORT, 0.5):
-        ok(f"Speech engine already running on :{SPEECH_ENGINE_PORT}")
-        _report_speech_engine_health()
-        return True
+        se_pidfile = ROOT / "speech-engine.pid"
+        try:
+            sup_pid = int(se_pidfile.read_text().strip()) if se_pidfile.exists() else 0
+        except (ValueError, OSError):
+            sup_pid = 0
+        if sup_pid and _pid_alive(sup_pid):
+            ok(f"Speech engine already running on :{SPEECH_ENGINE_PORT} (supervised)")
+            _report_speech_engine_health()
+            return True
+        # Running, but nothing will restart it if it dies (an older launch, or
+        # started by hand) — replace it with a supervised one.
+        info("Speech engine running unsupervised — restarting it under the supervisor …")
+        for sc in SIDECARS:
+            if sc["key"] == "speech_engine":
+                _reap_sidecar(sc)
+        for _ in range(20):
+            if not port_open("127.0.0.1", SPEECH_ENGINE_PORT, 0.3):
+                break
+            time.sleep(0.5)
 
     if not SPEECH_ENGINE_UVICORN_BIN.exists():
         warn("speech_engine uvicorn binary not found — cannot start sidecar")
         return True
 
-    info(f"Starting speech engine on :{SPEECH_ENGINE_PORT} …")
-    cmd = [str(SPEECH_ENGINE_UVICORN_BIN), "main:app", "--host", "0.0.0.0", "--port", str(SPEECH_ENGINE_PORT)]
+    # Supervised, low-priority launch: speech_engine/supervise.py restarts the
+    # engine if it dies and runs it at nice +10 with capped CPU threads, so it
+    # never competes with trading or the UI. LITE mode below 32 GB keeps only
+    # the small STT model resident (see speech_engine/engine.py).
+    lite = float(caps.get("ram_gb") or 0) < 32
+    info(f"Starting speech engine on :{SPEECH_ENGINE_PORT} "
+         f"({'lite: STT resident, TTS on demand' if lite else 'full'}, low priority, supervised) …")
+    cmd = [str(SPEECH_ENGINE_PY_BIN), "supervise.py", "--port", str(SPEECH_ENGINE_PORT)]
+    os.environ.setdefault("SPEECH_ENGINE_LITE", "1" if lite else "0")
     try:
         if IS_WINDOWS:
             DETACHED = 0x00000008
@@ -6240,6 +6273,19 @@ def stop_all(keep_tools: bool = False, hard: bool = False) -> None:
         if _pid_alive(pid) and _kill_pid_tree(pid):
             info(f"Stopped {label} via PID file (pid {pid})")
         pidfile.unlink(missing_ok=True)
+
+    # ── Speech-engine supervisor ─────────────────────────────────────────────
+    # It holds no port, and it restarts the engine the moment the port owner is
+    # reaped below — so it has to go first, via its PID file.
+    se_pidfile = ROOT / "speech-engine.pid"
+    if se_pidfile.exists():
+        try:
+            se_pid = int(se_pidfile.read_text().strip())
+            if _pid_alive(se_pid) and "supervise" in _proc_cmdline(se_pid) and _kill_pid_tree(se_pid):
+                info(f"Stopped speech engine supervisor (pid {se_pid})")
+        except (ValueError, OSError):
+            pass
+        se_pidfile.unlink(missing_ok=True)
 
     # ── Sidecar registry reap ─────────────────────────────────────────────────
     # Every long-lived process this launcher spawns, reaped by port-owner with

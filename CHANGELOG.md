@@ -8,6 +8,132 @@ entries are grouped under `[Unreleased]` and dated milestone headings.
 
 ## [Unreleased]
 
+### Added — 2026-09-15 → 2026-09-24
+
+#### OBLIVION MASTER v5 — the house strategy
+- **One engine for every consumer.** The Pine v6 "OBLIVION MASTER v5 – Scalper +
+  Sniper" strategy is ported to `backend/app/signals/oblivion.py`
+  (`analyze_oblivion`, `oblivion_score`, `compact_for_prompt`,
+  `oblivion_to_overlays`, `is_news_blocked`), verified causal (no lookahead). The
+  trading room, `technical.analyze`, the MT5 scalp bot and SMC sniper, Kronos
+  (`ForecastResponse.oblivion`, `/plugins/kronos/oblivion/…`, OBLIVION leads and
+  Kronos confirms or vetoes) and Telegram (`/forecast`, `/room`, `/analyze` via a
+  dedicated chart image) all run the same function on the bars they draw or trade.
+- **Global settings.** `GET/PUT /oblivion/settings` + `POST /reset`
+  (`services/oblivion_settings.py`, one cached row, field spec mirroring Pine input
+  groups 01–20) and the settings popup (`OblivionSettingsModal`); a save changes
+  every consumer at once. `OBLIVION_*` env knobs are the bottom layer.
+- **Overlay everywhere.** `OblivionPrimitive.ts` draws boxes, labels, diamonds,
+  fib + entry/SL/TP lines, session bands and the dashboard on every
+  lightweight-charts surface; `/market/oblivion-overlay` accepts the chart's own
+  candles for parity. New `/oblivion` page with a multi-timeframe read panel.
+
+#### OBLIVION leads the trading room
+- **OBLIVION triggers, agents confirm or veto.** `agents/oblivion_gate.py` is the
+  room's only entry to the engine: every read is stored (`oblivion_reads`), the
+  verdict hard-blocks on no fresh signal, weak score or the news window, and the
+  board may only confirm the OBLIVION side or hold — an opposite call is rewritten
+  to hold and logged. Execution re-reads the pair before routing and refuses a
+  trade OBLIVION has not seen or no longer supports.
+- **Scanner.** `room_worker._oblivion_loop` scans the pinned pairs plus an optional
+  trading universe (`universe_enabled`, `universe_symbols`) on
+  4h/2h/1h/30m/15m/5m with per-timeframe pacing; a confirmed signal convenes the
+  board with trigger `oblivion`.
+- **Per-timeframe room profiles** (`signals/oblivion_profiles.py`): wide stops,
+  pullback limit entry (0.5 ATR), stop jumps to TP1 once reached, trail from TP2,
+  no broker take-profit — the trade rides past TP3 until the trail is hit. Live
+  plans and backtests share `entry_plan`.
+- **High-impact news gate** (`signals/news_gate.py`): no new room entries from
+  30 min before to 120 min after a high-impact release on the pair's currencies;
+  a still-fresh signal is taken after the cool-off.
+- **Everything goes into the AI brain** (`agents/brain_log.py`): every OBLIVION
+  read, board decision, order, execution block, trade-manager action and backtest,
+  with `agent_decisions.origin` / `oblivion_read_id`.
+
+#### Multi-account execution and trade management
+- **Demo always on, live per account.** `execution.mt5_targets` routes to every
+  demo MT5 account plus each live account switched on under the master "Live
+  trading" switch (`room_trading_accounts`); exchange accounts live in
+  `crypto_accounts` (Bitget, demo via demo trading). `GET/POST
+  /agents/room/accounts…` and the Trading accounts panel in Room Settings.
+- **Credentials encrypted at rest.** `core/secrets_box.py` (Fernet,
+  `CREDENTIALS_KEY` or `backend/data/.credentials_key`); stored MT5 passwords are
+  migrated on startup.
+- **Real-time trade manager** (`agents/trade_manager.py`, every 5 s): TP ladder
+  and trailing stop, break-even, margin warning/critical actions (worst loser cut
+  first), account drawdown flatten, and take-profit when OBLIVION turns against the
+  trade. The MT5 auto-manager skips room positions so the two never fight.
+
+#### Backtesting
+- **OBLIVION backtest engine + `/backtest` page** (`app/backtest/`): pick pairs,
+  timeframe, balance and risk; costs per pair, stop-before-target inside a bar,
+  news gate, the agents' confirm/veto book, trades on a chart, PDF report to
+  Telegram and every trade stored in the AI brain.
+- **Pair approval** (`agents/pair_gate.py`, `pair_approvals`): a pair/timeframe
+  trades only when its own backtest clears the approval bar (default 95%) with
+  ≥10 trades and positive expectancy, and an account lists it; untested pairs are
+  backtested automatically. Reports show the **traded book** beside all pairs,
+  with total profit, total losses and net P&L across every pair.
+- **Backtest my accounts** (`app/backtest/portfolio.py`, `POST
+  /backtest/portfolio`): the traded pairs replayed on every configured MT5/crypto
+  account's real equity with the live risk band, day target and cap, daily floor
+  and position cap — an honest walk-forward book (pairs chosen only on data before
+  the window) beside today's approved book, per account and for the whole
+  portfolio, with a PDF to Telegram.
+
+#### Targets and risk
+- Weekly minimum per pair (default $15,000, no cap) with pacing inside a **1–5%
+  risk band** per trade; JPY-cross sizing converted to dollars; orders clamped to
+  the broker's maximum lot and kept above the margin-level warning.
+- **Portfolio day band**: default 10% minimum / 20% cap of the portfolio's value at
+  00:00 UTC — paced toward the minimum, at the band floor once it is banked, no new
+  entries after the cap (the day is locked in). Replaces the "200% of margin" daily
+  minimum.
+- **Daily win-rate floor**: once today's closed room trades win less than 90%, only
+  pairs whose backtest won ≥97% may open for the rest of the day.
+
+#### Other
+- `scripts/run_soup_training.py`: trains `tradebot-local` on every app data source
+  and all tradeable pairs.
+- Speech engine runs in LITE mode on <32 GB machines under
+  `speech_engine/supervise.py` (low priority, auto-restart, TTS unloaded when idle).
+
+### Changed — 2026-09-15 → 2026-09-24
+- **Win rate over trade count.** Tested on history the approvals never saw, the
+  old book won 89.8%. 2h now trades only with the daily trend and OBLIVION's
+  structure, 1h only with the structure, 15m uses wider stops, and the approval bar
+  is 95%: the unseen-data book won 92.3% (80% of days at 90%+). Fewer trades
+  (~1.5 a weekday across the universe). No setting guarantees every day ≥90%.
+- Backtest runs execute one at a time; runs cut off by a restart are marked as
+  errors on startup; `POST /backtest/runs/{id}/cancel`; up to 80 pairs per run.
+- Paul chat: human chat is exempt from `TRAINING_PROVIDER`, a retired NVIDIA model
+  id drops only that model, low-value prompt sections are shed first so live MT5
+  positions survive the cap, saved chat transcripts are no longer injected as
+  memory, and the local Ollama fallback fits its context window.
+- Room seat prompts moved to "confirm or veto the OBLIVION mandate"; stock prompts
+  from between rewrites are now recognised and upgraded.
+
+### Fixed — 2026-09-15 → 2026-09-24
+- **JARVIS answered himself**: loud audio now only pauses his reply; a transcript
+  that is not his own echo confirms the barge-in (`utils/selfEcho.ts`, mirrored in
+  the browser extension).
+- **Dev frontend served stale chunks**: no immutable cache header in development,
+  and Turbopack is rooted at the frontend instead of `$HOME` (hydration errors,
+  "is not a function").
+- Gold "2h" candles that were really 1h bars are folded by their real spacing
+  (`candles._conform`).
+- A candle fetch that stalled blocked the whole OBLIVION scan (40 s timeout).
+- Empty answers from local model seats counted as vetoes; they now abstain.
+- JPY-cross orders were sized in yen (~150× too small); lot floor rounding.
+- A near-zero stop on flat data could size an enormous position (a 5m backtest
+  lost 1,185R on one fill); plans with a stop closer than 0.04% of price are
+  refused, live and in backtests.
+- Tests could write to the production database through the startup backfill.
+
+### Removed
+- Kronos fine-tune job 12 artifacts (model weights, training CSV) from the
+  repository.
+
 ### Added — 2026-09-14
 
 #### Local LLM fallback + self-training (Ollama × Soup)

@@ -7,13 +7,23 @@ via Hugging Face Hub/Transformers (no `nemo_toolkit` install required). Its
 TTS is **Qwen3-TTS**. On Apple Silicon both run through the `mlx`/`mlx-audio`
 backends — no CUDA needed.
 
-**This is the slow, offline-capable fallback tier, not the primary path.**
-`backend/app/api/voice.py`'s `/voice/stt` and `/voice/tts` try **NVIDIA NIM
-hosted speech first** (hosted Parakeet ASR + Magpie TTS — ~1-2s, since the
-NVIDIA API key is already configured), fall back to this local engine if
-NVIDIA is unavailable, and fall back to OpenAI Whisper/TTS last. On this
-Mac's CPU/MPS this local engine takes ~30-60s per utterance (measured), so
-enable it only as an offline/privacy fallback, not for interactive latency.
+**Measured on an M2 Pro / 16 GB (2026-09-23):** STT 0.1–1.3s per utterance and
+the most accurate engine available here, so `/voice/stt` tries it **first**
+(NVIDIA hosted ASR, then Deepgram/Whisper, are the fallbacks). TTS renders
+faster than real time (~2–3s for a sentence), and the web chat plays replies
+sentence by sentence so speech starts within a few seconds.
+
+**Lite mode (default below 32 GB RAM).** Both models warm cost ~5.5 GB. In lite
+mode only STT (~2.8 GB) stays resident; TTS loads on first use, unloads after
+`SPEECH_ENGINE_TTS_IDLE_S` (600s) idle, and refuses to load when macOS reports
+under `SPEECH_ENGINE_MIN_FREE_PCT` (15%) memory free — that reply then uses the
+next voice in the chain. MLX's buffer cache is capped (`SPEECH_ENGINE_MLX_CACHE_MB`,
+256) and released after every request.
+
+**start.py runs it for you** on Apple-Silicon/CUDA machines of the high tier with
+16 GB+, via `supervise.py`: nice +10, CPU helper threads capped at 2, restarted
+automatically if it crashes (with back-off), and stopped by `start.py --stop`
+through `speech-engine.pid`.
 
 This runs as its own isolated service (own venv, own process) so its heavy ML
 dependencies never touch `backend/requirements.txt`.
@@ -29,7 +39,7 @@ python3.12 -m venv .venv   # misaki (a transitive TTS dep) requires Python <3.13
 ## Run
 
 ```bash
-cd speech_engine && .venv/bin/uvicorn main:app --host 0.0.0.0 --port 8790
+cd speech_engine && .venv/bin/python supervise.py --port 8790   # supervised, low priority
 ```
 
 (or use the `speech-engine` entry in `.claude/launch.json`).

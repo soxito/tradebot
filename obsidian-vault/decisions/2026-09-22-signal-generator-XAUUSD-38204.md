@@ -1,0 +1,32 @@
+---
+type: decision
+agent: signal_generator
+symbol: XAUUSD
+action: hold
+confidence: 0.224
+ai_called: False
+date: 2026-09-22
+tags:
+  - decision
+  - XAUUSD
+  - signal_generator
+  - hold
+---
+
+            # Decision: signal_generator → XAUUSD — HOLD @ 2026-09-22
+
+            ## Summary
+            **Agent**: `signal_generator` | **Action**: `HOLD` | **Confidence**: 22%
+            **AI Called**: No (local memory)
+
+            ## Reasoning
+            XAUUSD: local technical read is HOLD — reads as bearish structure. EMA50 below EMA200 by 0.01%; MACD
+histogram -2.662 (bearish); ADX 13.7 — no directional trend; RSI 35.9 — neutral; price below the
+lower band (%B -0.08); Stoch RSI 0.00; volume ×0.79 of average, buy share 38%; Kronos forecasts up
++6.51% over 24×1h (confidence 77%); Oblivion WAIT (bull 3/bear 7 need 6, bias BEARISH). Composite
++0.15 across 9 evaluators (4/9 agreeing). | volatile regime ATR expansion 1.28x (elevated, need
+level) — bar raised to 0.38 Computed locally — Connected AI providers returned no usable answer.
+
+            ## Related
+            - [[_daily/2026-09-22]]
+            - [[signals/XAUUSD]] ← Recent signals for this symbol

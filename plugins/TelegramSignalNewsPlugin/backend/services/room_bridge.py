@@ -1232,6 +1232,248 @@ async def build_forecast_chart(symbol: str, timeframe: str, resp: Any) -> bytes 
     )
 
 
+async def oblivion_read(
+    symbol: str, timeframe: str, candles: list[list] | None = None,
+) -> tuple[dict[str, Any] | None, list[list]]:
+    """Run the OBLIVION engine on the feed the charts draw. ``(result, candles)``.
+
+    400 bars so the EMA200, the 92-bar dealing range and the swing history
+    match the app's own charts; the same rows are handed to the renderer, so
+    picture and text agree.
+    """
+    try:
+        from app.signals.oblivion import analyze_oblivion
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[Oblivion] engine unavailable: {}", exc)
+        return None, []
+    if candles is None or len(candles) < 200:
+        candles = await _fetch_candles(symbol, timeframe, limit=400) or candles or []
+    if not candles or len(candles) < 60:
+        return None, candles or []
+    try:
+        res = analyze_oblivion(candles, timeframe)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Oblivion] engine failed for {} {}: {}", symbol, timeframe, exc)
+        return None, candles
+    if res.get("error"):
+        logger.debug("[Oblivion] {} {}: {}", symbol, timeframe, res.get("error"))
+        return None, candles
+    return res, candles
+
+
+async def build_oblivion_chart(
+    symbol: str, timeframe: str, candles: list[list] | None = None,
+) -> bytes | None:
+    """The dedicated OBLIVION image (PNG bytes) for ``symbol``/``timeframe``."""
+    obl, rows = await oblivion_read(symbol, timeframe, candles)
+    if not obl:
+        return None
+    try:
+        from plugins.AiMarketAnalyst.backend.services.oblivion_chart import render_oblivion_chart
+
+        return render_oblivion_chart(rows, obl, symbol=symbol, timeframe=timeframe)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Oblivion] chart failed for {} {}: {}", symbol, timeframe, exc)
+        return None
+
+
+def oblivion_caption(symbol: str, timeframe: str, obl: dict[str, Any]) -> str:
+    sig = obl.get("signal") or {}
+    sc = obl.get("score") or {}
+    oc = obl.get("outcomes") or {}
+    action = str(sig.get("action") or "wait").upper()
+    kind = sig.get("kind")
+    if action != "WAIT":
+        if kind:
+            action += f" ({kind})"
+        if not sig.get("confirmed"):
+            action += " — forming"
+    cap = (
+        f"🔮 OBLIVION MASTER v5 {obl.get('mode', 'HYBRID')} — {symbol} {timeframe}: {action} · "
+        f"buy {sc.get('buy', 0)} / sell {sc.get('sell', 0)} (scalp ≥{sc.get('scalp_min', 6)}, sniper ≥{sc.get('sniper_min', 9)}) · "
+        f"bias {obl.get('bias_label', 'NEUTRAL')} · {(obl.get('session') or {}).get('name', 'OFF')}"
+    )
+    if oc.get("win_rate") is not None:
+        cap += f" · win rate {oc['win_rate'] * 100:.0f}% of {oc.get('count', 0)}"
+    if (obl.get("news") or {}).get("blocked"):
+        cap += " · NEWS WINDOW — no new entries"
+    return cap[:1000]
+
+
+def oblivion_card(symbol: str, timeframe: str, obl: dict[str, Any]) -> str:
+    """The engine read as a Telegram HTML card — same dict as the image."""
+    sc = obl.get("score") or {}
+    comps = sc.get("components") or {}
+    sig = obl.get("signal") or {}
+    last = obl.get("last_signal") or {}
+    dash = obl.get("dashboard") or {}
+    oc = obl.get("outcomes") or {}
+    news = obl.get("news") or {}
+    action = str(sig.get("action") or "wait").upper()
+    icon = "🟢" if action == "BUY" else "🔴" if action == "SELL" else "⚪"
+
+    def chips(d: dict) -> str:
+        return ", ".join(f"{k} +{v}" for k, v in (d or {}).items()) or "none"
+
+    head = action
+    if action != "WAIT":
+        if sig.get("kind"):
+            head += f" ({sig['kind']})"
+        head += "" if sig.get("confirmed") else " · forming bar"
+    lines = [
+        f"{icon} <b>OBLIVION MASTER v5 — {html.escape(symbol)} {timeframe}</b>  <i>{obl.get('mode', 'HYBRID')}</i>",
+        f"<b>{head}</b> · bias <b>{html.escape(str(obl.get('bias_label') or 'NEUTRAL'))}</b> · {html.escape(str(dash.get('Structure') or 'WAIT'))}",
+        "",
+        f"<b>Score</b>  buy <code>{sc.get('buy', 0)}</code> / sell <code>{sc.get('sell', 0)}</code> · "
+        f"scalp ≥<code>{sc.get('scalp_min', 6)}</code>, sniper ≥<code>{sc.get('sniper_min', 9)}</code>",
+        f"  buy: <i>{html.escape(chips(comps.get('buy')))}</i>",
+        f"  sell: <i>{html.escape(chips(comps.get('sell')))}</i>",
+        "",
+        f"Trend {html.escape(str(dash.get('Trend') or '—'))} · HTF {html.escape(str(dash.get('HTF') or '—'))} · "
+        f"VWAP {html.escape(str(dash.get('VWAP') or '—'))} · {html.escape(str(dash.get('Zone') or '—')).lower()} · "
+        f"OTE {html.escape(str(dash.get('OTE') or 'NONE'))}",
+        f"FVG {html.escape(str(dash.get('FVG') or 'NONE'))} · liquidity {html.escape(str(dash.get('Liquidity') or 'NONE'))} · "
+        f"session {html.escape(str(dash.get('Session') or 'OFF'))} · volume {html.escape(str(dash.get('Volume') or 'N/A'))} · "
+        f"news {'<b>BLOCKED</b>' if news.get('blocked') else 'clear'}",
+    ]
+    plan = sig if sig.get("entry") is not None else last
+    if plan and plan.get("entry") is not None:
+        title = "Plan" if plan is sig else f"Last {str(plan.get('action', '')).upper()} ({plan.get('kind', '')}) · {plan.get('bars_since', '?')} bars ago"
+        lines += [
+            "",
+            f"<b>{title}</b>",
+            f"Entry <code>{_fmt_level(plan['entry'])}</code>  SL <code>{_fmt_level(plan['stop_loss'])}</code>",
+            f"TP1 <code>{_fmt_level(plan['tp1'])}</code>  TP2 <code>{_fmt_level(plan['tp2'])}</code>  TP3 <code>{_fmt_level(plan['tp3'])}</code>"
+            f"  ({plan.get('kind') and ''}0.5R / 1R / 1.5R)",
+        ]
+        outcome = (plan.get("outcome") or {}).get("status")
+        if outcome and plan is not sig:
+            lines.append(f"Outcome: <b>{str(outcome).upper()}</b>")
+        if sig.get("blocked_by_news"):
+            lines.append("⛔ entry blocked by the news window")
+        elif sig.get("gate"):
+            lines.append(f"⏸ {html.escape(str(sig['gate']))}")
+    else:
+        lines += ["", "No active signal — a side must clear its minimum, beat the other side and pass the gates on a closed bar."]
+    if oc.get("count"):
+        lines += [
+            "",
+            f"<b>Outcomes</b> ({oc['count']} signals: {oc.get('scalp', 0)} scalp / {oc.get('sniper', 0)} sniper) — "
+            f"TP1 {oc.get('tp1', 0)} · TP2 {oc.get('tp2', 0)} · TP3 {oc.get('tp3', 0)} · SL {oc.get('sl', 0)} · open {oc.get('open', 0)}"
+            + (f" · win rate <b>{oc['win_rate'] * 100:.0f}%</b>" if oc.get("win_rate") is not None else ""),
+        ]
+    return "\n".join(lines)[:3900]
+
+
+async def send_oblivion_analysis(
+    token: str,
+    chat_id: str,
+    symbol: str,
+    timeframe: str,
+    *,
+    candles: list[list] | None = None,
+    deep: bool = True,
+) -> dict[str, Any] | None:
+    """Send the OBLIVION read for a pair: the dedicated image, then the card.
+
+    One code path for /forecast, /room, /analyze and free-text pair questions,
+    so every surface shows the same engine on the same candles. Never raises;
+    returns the engine result (or None) so callers can reuse it.
+    """
+    from plugins.TelegramSignalNewsPlugin.backend.services import bot_service
+
+    obl, rows = await oblivion_read(symbol, timeframe, candles)
+    if not obl:
+        logger.debug("[Oblivion] nothing to send for {} {}", symbol, timeframe)
+        return None
+
+    # 1. the image — the deliverable
+    try:
+        from plugins.AiMarketAnalyst.backend.services.oblivion_chart import render_oblivion_chart
+
+        png = render_oblivion_chart(rows, obl, symbol=symbol, timeframe=timeframe)
+        if png:
+            await bot_service.send_photo(token, chat_id, png, caption=oblivion_caption(symbol, timeframe, obl))
+        else:
+            logger.warning("[Oblivion] image not produced for {} {}", symbol, timeframe)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Oblivion] image send failed for {} {}: {}", symbol, timeframe, exc)
+
+    # 2. the card, with 1-click entries when the engine has a plan
+    markup = None
+    try:
+        from plugins.KronosForecastPlugin.backend.services.oblivion_signals import build_oblivion_standalone_signals
+
+        signals = build_oblivion_standalone_signals(obl, symbol)
+        if signals:
+            markup = _oblivion_keyboard(symbol, signals)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[Oblivion] keyboard skipped: {}", exc)
+    try:
+        await bot_service.send_message(token, chat_id, oblivion_card(symbol, timeframe, obl), "HTML", markup)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Oblivion] card send failed: {}", exc)
+
+    # 3. narrative on the same read — the model's words only when they quote
+    # this read and do not loop; otherwise the engine's own structured read.
+    if deep:
+        try:
+            from plugins.KronosForecastPlugin.backend.services.oblivion_analysis import (
+                _fallback_analysis, analyze_oblivion as _deep,
+            )
+
+            text = ""
+            try:
+                res = await _deep(symbol, timeframe, "bitget", obl=obl)
+                text = str(getattr(res, "analysis", "") or "")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[Oblivion] LLM narrative failed: {}", exc)
+            if not narrative_is_faithful(text, obl):
+                logger.info("[Oblivion] narrative rejected for {} {} — using the engine's own read", symbol, timeframe)
+                text = _fallback_analysis(obl, symbol, timeframe, None, None)
+            await bot_service.send_message(
+                token, chat_id,
+                f"🧠 <b>OBLIVION read — {html.escape(symbol)} {timeframe}</b>\n\n"
+                + format_for_telegram(text[:3500], limit=3700),
+                "HTML",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[Oblivion] narrative skipped: {}", exc)
+    return obl
+
+
+def narrative_is_faithful(text: str, obl: dict[str, Any]) -> bool:
+    """See :func:`oblivion_analysis.narrative_is_faithful` — one gate everywhere."""
+    from plugins.KronosForecastPlugin.backend.services.oblivion_analysis import narrative_is_faithful as _gate
+
+    return _gate(text, obl)
+
+
+def _oblivion_keyboard(symbol: str, signals: list) -> dict | None:
+    """Inline buttons that hand the entry to the existing /order flow.
+
+    Same callback convention as the Kronos sniper card (``cq_order``), so the
+    order is sized and routed exactly like every other one-tap entry.
+    """
+    try:
+        from plugins.KronosForecastPlugin.backend.services.forecast_service import is_order_placeable
+
+        placeable = is_order_placeable(symbol)
+    except Exception:  # noqa: BLE001
+        placeable = symbol.upper().replace("/", "").endswith(("USDT", "USDC"))
+    rows: list[list[dict]] = []
+    for s in signals[:2]:
+        side = "LONG" if s.side == "long" else "SHORT"
+        kind = "market" if s.order_kind == "market" else "limit"
+        base = f"cq_order:{s.side}:{s.order_kind}:{symbol}:5"
+        rows.append([
+            {"text": f"{side} {kind} @ {_fmt_level(s.entry)} — $5 paper", "callback_data": base},
+            {"text": "🔴 LIVE $5" if placeable else "📈 LIVE MT5", "callback_data": f"{base}:live"},
+            {"text": "✏️ custom", "callback_data": f"cq_custom_order:{s.side}:{s.order_kind}:{symbol}"},
+        ])
+    return {"inline_keyboard": rows} if rows else None
+
+
 async def run_pair(token: str, chat_id: str, symbol: str, timeframe: str) -> None:
     """Convene the room on ``symbol`` and reply with the verdict and a chart."""
     from app.agents.orchestrator import AgentOrchestrator
@@ -1314,6 +1556,11 @@ async def run_pair(token: str, chat_id: str, symbol: str, timeframe: str) -> Non
         await bot_service.send_photo(
             token, chat_id, chart, caption=f"{symbol} {timeframe} — trading room plan"
         )
+
+    # The OBLIVION AI v5 read as its own image + card, after the room's plan
+    # so the two are never confused: the plan is what the board decided, this
+    # is what the house engine sees on the same candles.
+    await send_oblivion_analysis(token, chat_id, symbol, timeframe, candles=candles)
 
 
 def _execution_note(report: dict) -> str:

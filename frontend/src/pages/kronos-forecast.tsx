@@ -19,6 +19,8 @@ import { useJarvisSpeak } from '@/hooks/useJarvisSpeak';
 
 // Chart is client-only (lightweight-charts touches window)
 const TradingViewChart = dynamic(() => import('@/components/TradingViewChart'), { ssr: false });
+const OblivionMultiTfPanel = dynamic(() => import('@/components/OblivionMultiTfPanel'), { ssr: false });
+const OblivionSettingsModal = dynamic(() => import('@/components/OblivionSettingsModal'), { ssr: false });
 
 const TIMEFRAMES = ['5m', '15m', '1h', '4h', '1d'];
 const EXCHANGES = ['bitget', 'binance', 'bybit', 'okx', 'kucoin'];
@@ -289,6 +291,7 @@ export default function KronosForecastPage() {
   const [exchange, setExchange] = useState('bitget');
   const [timeframe, setTimeframe] = useState('1h');
   const [marginMode, setMarginMode] = useState<'crossed' | 'isolated'>('isolated');
+  const [kronosSettingsOpen, setKronosSettingsOpen] = useState(false);
   const [predLen, setPredLen] = useState(24);
   const [samples, setSamples] = useState(10);
   const [temperature, setTemperature] = useState(1.0);
@@ -1038,6 +1041,12 @@ export default function KronosForecastPage() {
           </div>
 
           <button
+            onClick={() => setKronosSettingsOpen(true)}
+            className="flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-700 text-slate-300 hover:bg-slate-800 text-xs font-semibold"
+          >
+            <Settings2 className="w-3.5 h-3.5" /> Oblivion settings
+          </button>
+          <button
             onClick={refetch}
             disabled={loading}
             className="ml-auto flex items-center gap-2 px-4 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 text-white text-sm font-medium disabled:opacity-50"
@@ -1068,6 +1077,11 @@ export default function KronosForecastPage() {
                 strategyAction={sig?.direction}
                 strategyScore={sig ? sig.confidence : undefined}
                 initialCandles={data?.candles?.length ? data.candles : undefined}
+                // OBLIVION engine overlay: when the backend supplied the bars it
+                // analysed (FX / metals), draw the bundle it computed on them;
+                // otherwise the chart runs the engine on the bars it fetched.
+                oblivionBundle={data?.candles?.length ? (data as any)?.overlay_bundle ?? null : undefined}
+                showOblivion={!data?.candles?.length}
                 // Zoom the viewport onto the current/live bar (with room on the
                 // right for the forecast projection) instead of fitting all history.
                 fitMode="forecast"
@@ -1111,6 +1125,9 @@ export default function KronosForecastPage() {
               mt5ExecResults={mt5ExecResults}
               onMT5Execute={executeOnMT5}
             />
+
+            {/* OBLIVION engine on every timeframe, Kronos-confirmed */}
+            <OblivionMultiTfPanel exchange={exchange} symbol={symbol} />
           </div>
 
           {/* Forecast metrics */}
@@ -1348,6 +1365,7 @@ export default function KronosForecastPage() {
             Open fine-tune lab <ChevronRight className="w-4 h-4" />
           </span>
         </Link>
+        <OblivionSettingsModal open={kronosSettingsOpen} onClose={() => setKronosSettingsOpen(false)} onSaved={() => window.dispatchEvent(new CustomEvent('oblivion-settings-changed', { detail: { version: Date.now() }}))} />
       </div>
     </>
   );

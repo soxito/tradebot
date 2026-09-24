@@ -470,6 +470,10 @@ class MT5SmcAnalyzeResponse(BaseModel):
     # for a pair the dollar says nothing about, and the endpoints splat the
     # analysis dict into this model, so an unmodelled key would be dropped.
     macro: Optional[Dict[str, Any]] = None
+    # OBLIVION AI engine v4.0 read on the same candles: score, bias, signal
+    # with Entry/SL/TP1-3, session, news window and the chart overlay bundle
+    # (boxes / labels / diamonds / price lines / session bands / dashboard).
+    oblivion: Optional[Dict[str, Any]] = None
     ai: Optional[Dict[str, Any]] = None
     kronos: Optional[Dict[str, Any]] = None
     error: Optional[str] = None

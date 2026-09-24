@@ -248,6 +248,18 @@ async def guard_mt5_positions(
     if not accounts:
         return acts
 
+    # Trades running an OBLIVION plan (TP1 floor + trailing) are managed by
+    # app.agents.trade_manager exactly as backtested; the guard leaves them be.
+    planned: set = set()
+    try:
+        from app.models.database import RoomTradePlan
+
+        planned = {str(t) for (t,) in (await db.execute(
+            select(RoomTradePlan.ticket).where(RoomTradePlan.status.in_(("pending", "open")))
+        )).all()}
+    except Exception:  # noqa: BLE001
+        planned = set()
+
     for account in accounts:
         positions = (await db.execute(
             select(MT5Position).where(MT5Position.account_id == account.id)
@@ -255,6 +267,8 @@ async def guard_mt5_positions(
 
         for pos in positions:
             if not is_app_order(getattr(pos, "comment", "")):
+                continue
+            if str(pos.mt5_ticket) in planned:
                 continue
             key = f"mt5:{account.id}:{pos.mt5_ticket}"
             if not _cooled(key):
@@ -390,7 +404,10 @@ def _position_size(pos: Dict[str, Any]) -> float:
     return 0.0
 
 
-async def guard_crypto_positions(db: AsyncSession, *, send: bool = True) -> List[Dict[str, Any]]:
+async def guard_crypto_positions(
+    db: AsyncSession, *, send: bool = True, connector: Any = None,
+    crypto_account_id: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     """Watch the exchange side of the book the same way the broker side is watched.
 
     The guard only ever covered MT5, which was defensible while the crypto venue
@@ -408,15 +425,22 @@ async def guard_crypto_positions(db: AsyncSession, *, send: bool = True) -> List
     from app.models.database import Trade
 
     acts: List[Dict[str, Any]] = []
-    connector = exchange_manager.get_exchange(SupportedExchange.BITGET)
+    connector = connector or exchange_manager.get_exchange(SupportedExchange.BITGET)
     if connector is None:
         return acts
 
+    # Each exchange account manages only the trades it holds; NULL is the
+    # .env account.
+    owner = (
+        Trade.crypto_account_id == crypto_account_id
+        if crypto_account_id is not None else Trade.crypto_account_id.is_(None)
+    )
     rows = (await db.execute(
         select(Trade).where(
             Trade.exchange == "bitget",
             Trade.status == "open",
             Trade.trade_side == "open",
+            owner,
         ).limit(50)
     )).scalars().all()
     if not rows:
@@ -435,7 +459,7 @@ async def guard_crypto_positions(db: AsyncSession, *, send: bool = True) -> List
     }
 
     for trade in rows:
-        key = f"crypto:{trade.id}"
+        key = f"crypto:{crypto_account_id or 0}:{trade.id}"
         if not _cooled(key):
             continue
         live_pos = by_symbol.get(str(trade.symbol or "").upper().replace("/", ""))
@@ -716,8 +740,24 @@ async def guard_cycle(db: AsyncSession) -> Dict[str, Any]:
         # when it is armed — the same rule that stops it *opening* crypto in a
         # dry run. Managing a position the room did not open would be reaching
         # into the user's own book.
-        if not dry_run:
-            summary["crypto"] = await guard_crypto_positions(db, send=send)
+        from app.services.crypto_accounts import connector_for, crypto_targets
+
+        crypto_routing = await crypto_targets(db, s)
+        if not crypto_routing["has_accounts"]:
+            if not dry_run:
+                summary["crypto"] = await guard_crypto_positions(db, send=send)
+        else:
+            # Every account the room trades is an account it manages: demo
+            # accounts always, live ones only while live trading is on.
+            crypto_acts: List[Dict[str, Any]] = []
+            for acct in crypto_routing["targets"]:
+                try:
+                    crypto_acts += await guard_crypto_positions(
+                        db, send=send, connector=connector_for(acct), crypto_account_id=acct.id,
+                    )
+                except Exception as exc:  # noqa: BLE001 — one account, not all
+                    summary["errors"].append(f"crypto account {acct.id}: {exc}")
+            summary["crypto"] = crypto_acts
     except Exception as exc:  # noqa: BLE001
         logger.debug(f"[Guardian] crypto pass failed: {exc}")
         summary["errors"].append(f"crypto: {exc}")

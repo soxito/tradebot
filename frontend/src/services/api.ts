@@ -13,7 +13,7 @@ const DEFAULT_API_BASE_URL = 'http://127.0.0.1:1448/api/v1';
  * platform without affecting LAN / remote hostnames.
  */
 const normalizeBrowserHost = (url: string): string => {
-  if (typeof window === 'undefined' || !url) return url;
+  if (!url) return url;
   return url.replace('://localhost:', '://127.0.0.1:').replace('://localhost/', '://127.0.0.1/');
 };
 
@@ -604,7 +604,9 @@ export const apiClient = {
   getAgentStatus: () => api.get('/agents/status'),
   toggleAiAgents: () => api.post('/agents/toggle'),
   analyzeSymbol: (data: { symbol: string; timeframe?: string }) =>
-    api.post('/agents/analyze', { symbol: data.symbol, timeframe: data.timeframe || '1h' }),
+    // A full seven-seat session runs for minutes; the default 30 s timeout
+    // made the page report a failure while the room was still sitting.
+    api.post('/agents/analyze', { symbol: data.symbol, timeframe: data.timeframe || '1h' }, { timeout: 420000 }),
   analyzeMultipleSymbols: (data: { symbols: string[]; timeframe?: string }) =>
     api.post('/agents/analyze-multiple', { symbols: data.symbols, timeframe: data.timeframe || '1h' }),
   getAgentDecisions: (params?: { limit?: number; symbol?: string; session_id?: string }) =>
@@ -1200,6 +1202,28 @@ export const apiClient = {
       symbol: string,
       params?: { timeframe?: string; limit?: number; indicators?: string },
     ) => api.get(`/market/indicator-overlay/${exchange}/${symbol.replace('/', '')}`, { params }),
+    /** OBLIVION AI engine v4.0 read + overlay bundle, computed on the feed the
+     *  chart's own OHLCV route resolves for this exchange/symbol. */
+    oblivionOverlay: (
+      exchange: string,
+      symbol: string,
+      params?: { timeframe?: string; limit?: number },
+    ) => api.get(`/market/oblivion-overlay/${exchange}/${symbol.replace('/', '')}`, { params, timeout: 30000 }),
+    /** Same read on caller-supplied candles — the bars the chart is drawing,
+     *  so every box / label / level lands on what the user sees. */
+    oblivionOverlayFromCandles: (
+      symbol: string,
+      timeframe: string,
+      candles: { time: number; open: number; high: number; low: number; close: number; volume?: number }[],
+      config?: Record<string, unknown>,
+    ) => api.post('/market/oblivion-overlay', { symbol, timeframe, candles, config }, { timeout: 30000 }),
+  },
+
+  oblivion: {
+    getSettings: () => api.get('/oblivion/settings', { timeout: 15000 }),
+    updateSettings: (patch: Record<string, unknown>) => api.put('/oblivion/settings', { settings: patch }),
+    resetSettings: () => api.post('/oblivion/settings/reset'),
+    getVersion: () => api.get('/oblivion/settings/version'),
   },
 
   kronos: {
@@ -1225,6 +1249,21 @@ export const apiClient = {
       symbol: string,
       params?: { timeframe?: string; pred_len?: number; samples?: number },
     ) => api.get(`/plugins/kronos/overlay/${exchange}/${symbol.replace('/', '')}`, { params, timeout: 120000 }),
+    /** OBLIVION engine signals on every timeframe, each confirmed by its Kronos forecast. */
+    oblivion: (
+      exchange: string,
+      symbol: string,
+      params?: { timeframes?: string; with_kronos?: boolean },
+    ) => api.get(`/plugins/kronos/oblivion/${exchange}/${symbol.replace('/', '')}`, { params, timeout: 180000 }),
+    /** AI narrative of the OBLIVION read (gated: only a faithful answer, else the engine's own summary). */
+    oblivionAnalysis: (exchange: string, symbol: string, params?: { timeframe?: string }) =>
+      api.get(`/plugins/kronos/oblivion/analysis/${exchange}/${symbol.replace('/', '')}`, { params, timeout: 180000 }),
+    /** Same narrative on the read the chart already computed — keeps text and picture on one feed. */
+    oblivionAnalysisFor: (body: { symbol: string; timeframe: string; exchange: string; oblivion: unknown }) =>
+      api.post('/plugins/kronos/oblivion/analysis', body, { timeout: 180000 }),
+    /** Route one OBLIVION timeframe signal to every configured venue. */
+    executeOblivion: (params: { symbol: string; side: 'buy' | 'sell'; entry: number; stop_loss: number; take_profit: number; timeframe?: string }) =>
+      api.post('/plugins/kronos/oblivion/execute', null, { params, timeout: 60000 }),
     /** Compact speech-friendly forecast for JARVIS. */
     jarvis: (symbol: string, params?: { exchange?: string; timeframe?: string; pred_len?: number }) =>
       api.get(`/plugins/kronos/jarvis/${symbol.replace('/', '')}`, { params, timeout: 120000 }),
@@ -1564,9 +1603,18 @@ export const apiClient = {
     status: () => api.get('/plugins/soup/status'),
     health: () => api.get('/plugins/soup/health'),
     models: () => api.get('/plugins/soup/models'),
+    modelsCatalogue: () => api.get('/plugins/soup/models/catalogue'),
+    compat: (model: string) => api.get('/plugins/soup/models/compat', { params: { model } }),
+    bestModel: () => api.get('/plugins/soup/models/best'),
+    pullModel: (model: string) => api.post('/plugins/soup/models/pull', { model }, { timeout: 30000 }),
+    pullStatus: (model: string) => api.get('/plugins/soup/models/pull/status', { params: { model } }),
+    pullCancel: (model: string) => api.delete('/plugins/soup/models/pull', { params: { model } }),
+    tradebotLocalTrain: (data?: { base?: string; epochs?: number; auto_download?: boolean; symbols?: string[] }) => api.post('/plugins/soup/tradebot-local/train', data || {}, { timeout: 60000 }),
+    tradebotLocalStatus: () => api.get('/plugins/soup/tradebot-local/status'),
     recipes: () => api.get('/plugins/soup/recipes'),
     kronosOverview: () => api.get('/plugins/soup/kronos/overview'),
     checkUpdate: () => api.get('/plugins/soup/check-update'),
+    pullSoupUpdate: () => api.post('/plugins/soup/check-update/pull', {}, { timeout: 180000 }),
     uiStatus: () => api.get('/plugins/soup/ui/status'),
     uiProxyUrl: (path?: string) => `${getApiBaseUrl()}/plugins/soup/ui/proxy${path ? `/${path}` : ''}`,
     start: (data: {
@@ -1585,7 +1633,7 @@ export const apiClient = {
       return api.post('/plugins/soup/data/upload', form, { headers: { 'Content-Type': 'multipart/form-data' }, timeout: 120000 });
     },
     uploadJson: (samples: any[]) => api.post('/plugins/soup/data/upload', { samples }, { timeout: 60000 }),
-    ohlcvExport: (data: { symbol: string; timeframe?: string; limit?: number }) => api.post('/plugins/soup/ohlcv/export', data, { timeout: 120000 }),
+    ohlcvExport: (data: { symbol?: string; symbols?: string[]; timeframe?: string; limit?: number }) => api.post('/plugins/soup/ohlcv/export', data, { timeout: 300000 }),
     ohlcvPreview: (symbol: string, timeframe?: string, limit?: number) => api.get('/plugins/soup/ohlcv/preview', { params: { symbol, timeframe, limit } }),
     serveStart: (model: string) => api.post('/plugins/soup/serve/start', { model }, { timeout: 30000 }),
   },

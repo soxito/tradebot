@@ -55,6 +55,9 @@ function fmtWhen(iso?: string | null): string {
 }
 
 export default function KronosFinetunePage() {
+  const [mounted, setMounted] = useState(false);
+  useEffect(()=> setMounted(true), []);
+  const proxyUrl = mounted ? apiClient.soup.uiProxyUrl() : 'http://127.0.0.1:1448/api/v1/plugins/soup/ui/proxy';
   const [tab, setTab] = useState<'kronos'|'soup'>('kronos');
   const [setup, setSetup] = useState<{ vendored: boolean; setup_command?: string } | null>(null);
   const [soupStatus, setSoupStatus] = useState<any>(null);
@@ -300,8 +303,8 @@ export default function KronosFinetunePage() {
                           <td className="py-2 pr-3"><span className={`px-1.5 py-0.5 rounded-full text-[10px] font-semibold uppercase ${FT_STATUS_STYLE[j.status] || ''}`}>{j.status}</span></td>
                           <td className="py-2 pr-3 text-right tabular-nums text-gray-300">{j.rows_exported ?? '—'}</td>
                           <td className="py-2 pr-3 text-right tabular-nums text-gray-300">{j.status === 'completed' && j.disk_size_mb ? `${j.disk_size_mb} MB` : '—'}</td>
-                          <td className="py-2 pr-3 text-gray-500">{fmtWhen(j.started_at || j.created_at)}</td>
-                          <td className="py-2 pr-3 text-right tabular-nums text-gray-400">{fmtDuration(j.started_at, j.finished_at)}</td>
+                          <td className="py-2 pr-3 text-gray-500" suppressHydrationWarning>{fmtWhen(j.started_at || j.created_at)}</td>
+                          <td className="py-2 pr-3 text-right tabular-nums text-gray-400" suppressHydrationWarning>{fmtDuration(j.started_at, j.finished_at)}</td>
                           <td className="py-2 text-right"><span className="inline-flex items-center gap-1.5">
                             {j.status === 'completed' && <button onClick={(e) => { e.stopPropagation(); doLoad(j.id); }} disabled={loadingId === j.id} title="Load this model for forecasts" className="p-1 rounded bg-green-600/80 hover:bg-green-500 text-white disabled:opacity-50">{loadingId === j.id ? <Loader2 className="w-3 h-3 animate-spin" /> : <Check className="w-3 h-3" />}</button>}
                             {(j.status === 'running' || j.status === 'exporting' || j.status === 'pending') && <button onClick={(e) => { e.stopPropagation(); doCancel(j.id); }} title="Cancel" className="p-1 rounded bg-red-600/70 hover:bg-red-500 text-white"><X className="w-3 h-3" /></button>}
@@ -369,7 +372,7 @@ export default function KronosFinetunePage() {
             <div className="bg-gray-900/60 border border-gray-700/50 rounded-xl p-4">
               <div className="flex items-center justify-between mb-2"><p className="text-sm font-semibold text-white">Soup jobs <span className="text-gray-500 font-normal">({soupJobs.length})</span></p><button onClick={refreshSoupJobs} className="text-gray-500 hover:text-gray-300"><RefreshCw className="w-4 h-4"/></button></div>
               {soupJobs.length===0? <p className="text-xs text-gray-600">No Soup jobs yet — start one above or in the full lab.</p> : (
-                <div className="overflow-x-auto"><table className="w-full text-xs"><thead><tr className="text-gray-500 uppercase text-[10px] border-b border-gray-800"><th className="text-left py-2 pr-3">#</th><th className="text-left py-2 pr-3">Base</th><th className="text-left py-2 pr-3">Task</th><th className="text-left py-2 pr-3">Status</th><th className="text-right py-2 pr-3">Dur</th></tr></thead><tbody>{soupJobs.slice(0,8).map((j:any)=><tr key={j.id} onClick={()=>setSoupSelected(j)} className={`cursor-pointer border-b border-gray-800/60 ${soupSelected?.id===j.id?'bg-fuchsia-500/[0.06]':''}`}><td className="py-1.5 pr-3 text-gray-500">{j.id}</td><td className="py-1.5 pr-3 text-fuchsia-300 truncate max-w-[14rem]">{j.base_model?.split('/').pop()}</td><td className="py-1.5 pr-3 text-gray-400">{j.task}</td><td className="py-1.5 pr-3"><span className={`px-1 py-0.5 rounded-full text-[10px] ${FT_STATUS_STYLE[j.status]||''}`}>{j.status}</span></td><td className="py-1.5 pr-3 text-right text-gray-500">{fmtDuration(j.started_at,j.finished_at)}</td></tr>)}</tbody></table></div>
+                <div className="overflow-x-auto"><table className="w-full text-xs"><thead><tr className="text-gray-500 uppercase text-[10px] border-b border-gray-800"><th className="text-left py-2 pr-3">#</th><th className="text-left py-2 pr-3">Base</th><th className="text-left py-2 pr-3">Task</th><th className="text-left py-2 pr-3">Status</th><th className="text-right py-2 pr-3">Dur</th></tr></thead><tbody>{soupJobs.slice(0,8).map((j:any)=><tr key={j.id} onClick={()=>setSoupSelected(j)} className={`cursor-pointer border-b border-gray-800/60 ${soupSelected?.id===j.id?'bg-fuchsia-500/[0.06]':''}`}><td className="py-1.5 pr-3 text-gray-500">{j.id}</td><td className="py-1.5 pr-3 text-fuchsia-300 truncate max-w-[14rem]">{j.base_model?.split('/').pop()}</td><td className="py-1.5 pr-3 text-gray-400">{j.task}</td><td className="py-1.5 pr-3"><span className={`px-1 py-0.5 rounded-full text-[10px] ${FT_STATUS_STYLE[j.status]||''}`}>{j.status}</span></td><td className="py-1.5 pr-3 text-right text-gray-500" suppressHydrationWarning>{fmtDuration(j.started_at,j.finished_at)}</td></tr>)}</tbody></table></div>
               )}
               {soupSelected && <pre className="mt-2 bg-black/50 border border-gray-800 rounded-lg p-2 text-[10px] text-gray-300 h-32 overflow-auto whitespace-pre-wrap">{soupSelected.log_tail || '(no log yet)'}</pre>}
             </div>
@@ -383,7 +386,7 @@ export default function KronosFinetunePage() {
                   <Link href="/soup-finetune" className="text-xs px-2 py-1 rounded bg-fuchsia-600 text-white">Full Lab</Link>
                 </div>
               </div>
-              {showSoupUi && <div className="border border-gray-800 rounded-lg overflow-hidden bg-white" style={{height: 420}}><iframe src={apiClient.soup.uiProxyUrl()} title="Soup UI" className="w-full h-full border-0" sandbox="allow-same-origin allow-scripts allow-forms allow-popups"/></div>}
+              {showSoupUi && <div className="border border-gray-800 rounded-lg overflow-hidden bg-white" style={{height: 420}}><iframe src={proxyUrl} title="Soup UI" className="w-full h-full border-0" sandbox="allow-same-origin allow-scripts allow-forms allow-popups" suppressHydrationWarning/></div>}
               <p className="mt-1 text-[10px] text-gray-600">Via <code className="bg-black/40 px-1 rounded">/api/v1/plugins/soup/ui/proxy</code> — server injects <code className="bg-black/40 px-1 rounded">SOUP_UI_TOKEN</code>. Direct UI also at <code className="bg-black/40 px-1 rounded">http://localhost:7860</code> when running.</p>
             </div>
 

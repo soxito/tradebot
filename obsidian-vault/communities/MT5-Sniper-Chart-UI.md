@@ -2,7 +2,7 @@
 type: community
 name: MT5 Sniper Chart UI
 node_count: 42
-synced: 2026-09-14
+synced: 2026-09-24
 tags:
   - community
   - MT5-Sniper-Chart-UI
@@ -10,7 +10,7 @@ tags:
 
             # MT5 Sniper Chart UI
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-24.
 
 
             ## Key Nodes (42 total)

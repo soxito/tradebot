@@ -119,6 +119,33 @@ async def send_photo(
         return {"ok": False, "description": str(exc)}
 
 
+async def send_document(
+    token: str,
+    chat_id: str | int,
+    document: bytes,
+    filename: str,
+    caption: str = "",
+    parse_mode: str = "HTML",
+    mime: str = "application/pdf",
+) -> dict[str, Any]:
+    """Send a file (e.g. a PDF report) to chat_id as a multipart upload."""
+    if _under_test():
+        logger.debug("[BotService] sendDocument suppressed under test")
+        return {"ok": False, "description": "suppressed: test environment"}
+
+    url = f"{_base(token)}/sendDocument"
+    data: dict[str, Any] = {"chat_id": str(chat_id), "parse_mode": parse_mode}
+    if caption:
+        data["caption"] = caption[:1024]
+    try:
+        async with httpx.AsyncClient(timeout=max(_HTTP_TIMEOUT, 60)) as client:
+            resp = await client.post(url, data=data, files={"document": (filename, document, mime)})
+            return resp.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[BotService] sendDocument failed: {}", exc)
+        return {"ok": False, "description": str(exc)}
+
+
 async def answer_callback_query(
     token: str,
     callback_query_id: str,

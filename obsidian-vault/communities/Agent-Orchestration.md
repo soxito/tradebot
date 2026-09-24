@@ -2,7 +2,7 @@
 type: community
 name: Agent Orchestration
 node_count: 41
-synced: 2026-09-14
+synced: 2026-09-24
 tags:
   - community
   - Agent-Orchestration
@@ -10,7 +10,7 @@ tags:
 
             # Agent Orchestration
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-24.
 
 
             ## Key Nodes (41 total)

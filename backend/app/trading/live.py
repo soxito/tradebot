@@ -1885,7 +1885,14 @@ class LiveTradeEngine:
     # ── Execute Single Signal ──────────────────────────────
 
     @staticmethod
-    async def execute_signal(db: AsyncSession, signal_id: int) -> Dict[str, Any]:
+    async def execute_signal(
+        db: AsyncSession,
+        signal_id: int,
+        *,
+        connector: Optional[BitgetConnector] = None,
+        crypto_account_id: Optional[int] = None,
+        demo: bool = False,
+    ) -> Dict[str, Any]:
         """
         Execute a single signal on live, using the same logic as auto_trade_cycle:
         - Reads leverage, margin mode, risk %, etc. from LiveTradeSettings
@@ -1893,16 +1900,20 @@ class LiveTradeEngine:
         - Calculates smart SL/TP
         - Places order with correct leverage
         - Records Trade in DB
+
+        ``connector`` / ``crypto_account_id`` route the order to one connected
+        exchange account instead of the .env account. A ``demo`` account (Bitget
+        demo trading) always places its order — it holds no real money.
         """
         s = await LiveTradeEngine.get_or_create_settings(db)
-        dry_run = bool(s.dry_run)
+        dry_run = False if demo else bool(s.dry_run)
 
-        if not settings.ENABLE_AUTO_TRADING and not dry_run:
+        if not settings.ENABLE_AUTO_TRADING and not dry_run and not demo:
             return {"error": "ENABLE_AUTO_TRADING is disabled in config"}
 
         connector = cast(
             Optional[BitgetConnector],
-            exchange_manager.get_exchange(SupportedExchange.BITGET),
+            connector or exchange_manager.get_exchange(SupportedExchange.BITGET),
         )
         if not connector:
             return {"error": "Bitget connector not available"}
@@ -1971,6 +1982,9 @@ class LiveTradeEngine:
                     Trade.side == side,
                     Trade.trade_side == "open",
                     Trade.status == "open",
+                    # Each exchange account counts its own entries.
+                    (Trade.crypto_account_id == crypto_account_id)
+                    if crypto_account_id is not None else Trade.crypto_account_id.is_(None),
                 )
             )
             dca_count = dca_result.scalar() or 0
@@ -2156,6 +2170,7 @@ class LiveTradeEngine:
                     exchange="bitget",
                     exchange_order_id=order_id,
                     signal_id=sig.id,
+                    crypto_account_id=crypto_account_id,
                     symbol=symbol,
                     side=side,
                     trade_side="open",

@@ -2,7 +2,7 @@
 type: community
 name: Monitor & Pump Monitor (c148)
 node_count: 4
-synced: 2026-09-14
+synced: 2026-09-24
 tags:
   - community
   - Monitor-Pump-Monitor-c148
@@ -10,7 +10,7 @@ tags:
 
             # Monitor & Pump Monitor (c148)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-24.
 
 
             ## Key Nodes (4 total)

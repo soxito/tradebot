@@ -1,0 +1,7 @@
+{
+  "symbol": "CHFJPY",
+  "action": "sell",
+  "agreement": 1.0,
+  "created_at": 1790264934.9031832,
+  "source": "hermes_bridge"
+}

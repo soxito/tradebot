@@ -33,10 +33,10 @@ WEIGHTS: Dict[str, float] = {
     "macd": 0.85,       # histogram sign and slope
     "adx": 0.90,        # directional movement — raised after 2026-08-28 miss where -DI> +DI was ignored and a BUY fired into a heavy sell-off
     "rsi": 0.65,        # overbought / oversold
-    "bollinger": 0.30,  # position within the band — lowered: %B near lower band in a downtrend is breakdown, not bounce
-    "stoch_rsi": 0.30,
+    "bollinger": 0.35,  # position within the band — lowered: %B near lower band in a downtrend is breakdown, not bounce
+    "stoch_rsi": 0.40,
     "volume": 0.65,     # relative volume + buy/sell split — raised: 61% sell flow must veto a weak bullish EMA spread
-    "chart_pattern": 0.75,  # chart pattern confluence — flags, wedges, H&S, double tops
+    "oblivion": 0.90,   # OBLIVION MASTER v5 scalp/sniper score — the board's mandated engine
 }
 
 #: Below this the agents report "hold" rather than pick a side.
@@ -206,24 +206,6 @@ def _has_structural_level(context: Dict[str, Any], price: Optional[float]) -> tu
     atr = _num(_indicators(context).get("atr"))
     # distance that counts as "at the level" — 0.6 ATR or 0.4% of price, whichever larger
     tol = max((atr or 0) * 0.6, price * 0.004) if atr else price * 0.006
-    # 0) Chart pattern levels (neckline, flag edge, wedge rail) — check first
-    try:
-        cpe = context.get("chart_patterns") or {}
-        for pat in (cpe.get("patterns") or [])[:3]:
-            for key in ("neckline", "top", "bottom", "flag_high", "flag_low", "upper_now", "lower_now"):
-                lv = _num(pat.get(key))
-                if lv and abs(price - lv) <= tol:
-                    return True, f"chart {pat.get('kind','pattern')} level {lv:.2f}"
-            for pts_key in ("neckline_points", "peaks", "troughs"):
-                pts = pat.get(pts_key)
-                if isinstance(pts, list):
-                    for pt in pts:
-                        if isinstance(pt, dict):
-                            lv = _num(pt.get("price"))
-                            if lv and abs(price - lv) <= tol:
-                                return True, f"chart {pat.get('kind','pattern')} point {lv:.2f}"
-    except Exception:
-        pass
     # 1) Fib golden zone
     try:
         fib = context.get("fib") or {}
@@ -237,6 +219,29 @@ def _has_structural_level(context: Dict[str, Any], price: Optional[float]) -> tu
             dist = min(abs(price - low), abs(price - high))
             if dist <= tol * 1.2:
                 return True, f"near fib golden zone {low:.2f}-{high:.2f} ({dist:.2f} away)"
+    except Exception:
+        pass
+    # 1b) OBLIVION engine: an active signal entry, or price inside its FVG / OB
+    try:
+        obl = context.get("oblivion") or {}
+        if isinstance(obl, dict) and obl:
+            sig = obl.get("signal") or {}
+            ent = _num(sig.get("entry"))
+            if ent and sig.get("action") in ("buy", "sell") and abs(price - ent) <= tol:
+                return True, f"Oblivion {sig['action'].upper()} entry {ent:.2f}"
+            fvg = obl.get("fvg") or {}
+            for side in ("bull", "bear"):
+                if fvg.get(f"inside_{side}") and isinstance(fvg.get(side), dict):
+                    z = fvg[side]
+                    return True, f"Oblivion {side} FVG {_num(z.get('bottom')) or 0:.2f}-{_num(z.get('top')) or 0:.2f}"
+            ob = obl.get("order_blocks") or {}
+            for side in ("bull", "bear"):
+                if ob.get(f"inside_{side}") and isinstance(ob.get(side), dict):
+                    z = ob[side]
+                    return True, f"Oblivion {side} OB {_num(z.get('bottom')) or 0:.2f}-{_num(z.get('top')) or 0:.2f}"
+            fib = obl.get("fib") or {}
+            if fib.get("in_zone") and _num(fib.get("lower")) and _num(fib.get("upper")):
+                return True, f"Oblivion fib zone {_num(fib['lower']):.2f}-{_num(fib['upper']):.2f}"
     except Exception:
         pass
     # 2) SMC zones (order blocks / FVGs the chart draws)
@@ -297,6 +302,46 @@ _READERS = {
     "stoch_rsi": _read_stoch_rsi,
     "volume": _read_volume,
 }
+
+
+def _read_oblivion(obl: Dict[str, Any]) -> Optional[tuple[float, str]]:
+    """The OBLIVION MASTER v5 engine as a signed conviction score.
+
+    A fresh sniper signal counts at full strength, a scalp a little less (it
+    clears a lower bar); otherwise the buy-sell spread over the scalp minimum,
+    nudged by market bias. A news-blocked bar returns 0 with a note — the room
+    may describe the chart but not enter.
+    """
+    if not isinstance(obl, dict) or not obl:
+        return None
+    sc = obl.get("score") or {}
+    buy = _num(sc.get("buy", sc.get("bull"))) or 0.0
+    sell = _num(sc.get("sell", sc.get("bear"))) or 0.0
+    smin = max(1.0, _num(sc.get("scalp_min") or sc.get("required")) or 6.0)
+    nmin = max(1.0, _num(sc.get("sniper_min")) or 9.0)
+    sig = obl.get("signal") or {}
+    news = obl.get("news") or {}
+    mode = obl.get("mode") or "HYBRID"
+    label = (f"buy {int(buy)}/sell {int(sell)} (scalp ≥{int(smin)}, sniper ≥{int(nmin)}), "
+             f"{mode}, bias {obl.get('bias_label', 'NEUTRAL')}")
+    if news.get("blocked"):
+        return 0.0, f"Oblivion news window BLOCKED — no new entries ({label})"
+    action = str(sig.get("action") or "wait").lower()
+    kind = str(sig.get("kind") or "")
+    if action in ("buy", "sell") and sig.get("new"):
+        sign = 1.0 if action == "buy" else -1.0
+        pts = _num(sig.get("score")) or smin
+        strength = min(1.0, pts / (nmin if kind == "sniper" else smin))
+        floor = 0.75 if kind == "sniper" else 0.6
+        lvl = f" entry {sig.get('entry')} SL {sig.get('stop_loss')} TP1 {sig.get('tp1')}" if sig.get("entry") is not None else ""
+        state = "confirmed" if sig.get("confirmed") else "forming"
+        gate = f", gated: {sig['gate']}" if sig.get("gate") else ""
+        return sign * max(floor, strength), f"Oblivion {kind or 'signal'} {action.upper()} {state} ({label}){lvl}{gate}"
+    raw = (buy - sell) / smin
+    bias = _num(obl.get("market_bias")) or 0.0
+    score = max(-1.0, min(1.0, raw + 0.15 * bias))
+    why = obl.get("wait_reason")
+    return score, f"Oblivion WAIT ({label})" + (f" — {why}" if why else "")
 
 
 def _read_kronos(fc: Dict[str, Any]) -> Optional[tuple[float, str]]:
@@ -405,20 +450,16 @@ def analyze_locally(
             scored["kronos"], note = got
             notes.append(note)
 
-    # Chart patterns from context (populated by orchestrator _add_chart_patterns)
-    cpe = context.get("chart_patterns")
-    if isinstance(cpe, dict) and cpe.get("patterns"):
+    # The OBLIVION engine also lives on the context; same treatment as Kronos.
+    obl = context.get("oblivion")
+    if isinstance(obl, dict) and obl:
         try:
-            _cscore = cpe.get("score", 0)
-            if _cscore is not None:
-                sv = float(_cscore)
-                # volume gate: unconfirmed breakout without volume confirm downsized
-                # bilateral pending already 0, so no action here — chart_pattern=0 yields no contribution
-                scored["chart_pattern"] = max(-1.0, min(1.0, sv))
-                best = cpe.get("best") or (cpe.get("patterns") or [{}])[0]
-                notes.append(f"Chart {best.get('kind','pattern')} {best.get('signal','')} conf {best.get('confidence',0):.2f} {'broken' if best.get('broken') else 'pending'}")
-        except Exception:
-            pass
+            got = _read_oblivion(obl)
+        except Exception:  # noqa: BLE001 — a bad engine payload must not kill the read
+            got = None
+        if got is not None:
+            scored["oblivion"], note = got
+            notes.append(note)
 
     if not scored:
         # Genuinely nothing to analyse — say so honestly rather than guess.
@@ -456,6 +497,13 @@ def analyze_locally(
             composite = min(composite, 0.15)  # drag below threshold so action becomes hold
     except Exception:
         pass
+
+    # ── OBLIVION news window: the no-LLM signal seat never opens into it ──
+    # The room's LLM seats are only advised; this fallback has no judgement to
+    # exercise, so it applies the engine's rule literally.
+    if role in ("signal_generator", "trade_executor") and context.get("news_blocked"):
+        veto_note += " NEWS WINDOW: Oblivion news filter active — no new entries, forced to HOLD."
+        composite = max(min(composite, 0.10), -0.10)
 
     # ── Volatility + level quality gate — the "wait for the right moment" ──
     # The desk's edge is at levels (fib golden zone, order block, FVG, channel edge),

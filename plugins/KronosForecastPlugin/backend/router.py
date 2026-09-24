@@ -3,14 +3,16 @@ Kronos Forecast Plugin — API Router
 
 All routes are mounted at /api/v1/plugins/kronos by the plugin loader.
 """
-from typing import Optional
+from typing import Any, Dict, Optional
+
+from pydantic import BaseModel
 
 from fastapi import APIRouter, Query
 from loguru import logger
 
 from plugins.KronosForecastPlugin.backend.schemas import (
     ForecastResponse, ForecastStatus, BatchForecastRequest, JarvisAnalysisResponse,
-    SniperSignalsResponse,
+    SniperSignalsResponse, OblivionMultiTfResponse,
     FinetuneStartRequest, FinetuneExportRequest, FinetuneExportResponse,
     FinetuneJobResponse, FinetuneSetupStatus, FinetuneCombineResponse,
     DrawingsDoc, SaveDrawingsRequest, RefineDrawingsResponse,
@@ -19,6 +21,24 @@ from plugins.KronosForecastPlugin.backend.services import forecast_service, jarv
 from plugins.KronosForecastPlugin.backend.config import KRONOS_MODELS
 
 router = APIRouter(prefix="/plugins/kronos", tags=["Kronos Forecast"])
+
+
+def _news_window_refusal() -> Optional[dict]:
+    """The OBLIVION news filter refuses new entries inside its window."""
+    try:
+        import time as _time
+        from app.signals.oblivion import is_news_blocked, oblivion_config_from_env
+
+        cfg = oblivion_config_from_env()
+        if is_news_blocked(int(_time.time() * 1000), cfg):
+            return {
+                "ok": False, "placed": [], "errors": [],
+                "reason": f"OBLIVION news window ({cfg.news_window} {cfg.news_tz}) — no new entries",
+                "news_blocked": True,
+            }
+    except Exception:  # noqa: BLE001 — a broken filter must not block trading outright
+        return None
+    return None
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -353,6 +373,8 @@ async def execute_mt5_sniper(
         from fastapi import HTTPException
         raise HTTPException(status_code=400, detail="side must be 'buy' or 'sell'")
     direction = "long" if side_lower == "buy" else "short"
+    if not dry_run and (refusal := _news_window_refusal()):
+        return refusal
 
     try:
         from plugins.TelegramSignalNewsPlugin.backend.services.sniper_service import (
@@ -527,6 +549,8 @@ async def execute_sniper_order(
     if action not in {"buy", "sell"}:
         from fastapi import HTTPException
         raise HTTPException(status_code=400, detail="side must be 'buy' or 'sell'")
+    if refusal := _news_window_refusal():
+        return refusal
 
     async with AsyncSessionLocal() as db:
         s = await get_settings(db)
@@ -565,6 +589,123 @@ async def execute_sniper_order(
         "orders": orders,
         "ok": len(placed) > 0,
     }
+
+
+@router.get("/oblivion/{exchange}/{symbol}", response_model=OblivionMultiTfResponse)
+async def get_oblivion_multi_tf(
+    exchange: str,
+    symbol: str,
+    timeframes: Optional[str] = Query(None, description="Comma list, default all: 1m,5m,15m,30m,1h,4h,1d,1w"),
+    with_kronos: bool = Query(True, description="Confirm each timeframe's call with its Kronos forecast"),
+) -> OblivionMultiTfResponse:
+    """OBLIVION AI engine signals on every timeframe, Kronos-confirmed.
+
+    Oblivion leads (BUY / SELL + Entry / SL / TP1-3 per timeframe); the Kronos
+    forecast lifts confidence when aligned and vetoes when it opposes
+    decisively. The news window vetoes every timeframe. ``consensus`` is the
+    timeframe-weighted vote.
+    """
+    from plugins.KronosForecastPlugin.backend.services import oblivion_signals
+
+    tfs = [t.strip() for t in timeframes.split(",")] if timeframes else None
+    return await oblivion_signals.oblivion_multi_tf(
+        exchange, _normalize_symbol(symbol), timeframes=tfs, with_kronos=with_kronos,
+    )
+
+
+@router.get("/oblivion/analysis/{exchange}/{symbol}", response_model=JarvisAnalysisResponse)
+async def get_oblivion_analysis(
+    exchange: str,
+    symbol: str,
+    timeframe: str = Query("1h"),
+) -> JarvisAnalysisResponse:
+    """AI narrative of the OBLIVION read for one pair / timeframe.
+
+    The engine runs on the same feed the page charts; the model's answer is
+    only returned when it quotes the engine's score and plan (otherwise the
+    deterministic summary is returned and ``note`` says why).
+    """
+    from plugins.KronosForecastPlugin.backend.services.oblivion_analysis import analyze_oblivion
+
+    return await analyze_oblivion(_normalize_symbol(symbol), timeframe, exchange)
+
+
+class OblivionAnalysisRequest(BaseModel):
+    symbol: str
+    timeframe: str = "1h"
+    exchange: str = "bitget"
+    #: The engine read the caller's chart already computed on the bars it
+    #: draws. Passing it keeps the narrative on the same feed as the picture
+    #: (server-side refetching would pick its own source — see the
+    #: data-source parity note).
+    oblivion: Optional[Dict[str, Any]] = None
+
+
+@router.post("/oblivion/analysis", response_model=JarvisAnalysisResponse)
+async def post_oblivion_analysis(req: OblivionAnalysisRequest) -> JarvisAnalysisResponse:
+    """AI narrative of a caller-supplied OBLIVION read (chart parity)."""
+    from plugins.KronosForecastPlugin.backend.services.oblivion_analysis import analyze_oblivion
+
+    obl = req.oblivion if (req.oblivion and req.oblivion.get("score")) else None
+    return await analyze_oblivion(_normalize_symbol(req.symbol), req.timeframe, req.exchange, obl=obl)
+
+
+@router.post("/oblivion/execute")
+async def execute_oblivion_signal(
+    symbol: str = Query(..., description="Instrument, e.g. ETHUSD or XAUUSD"),
+    side: str = Query(..., description="buy | sell"),
+    entry: float = Query(...),
+    stop_loss: float = Query(...),
+    take_profit: float = Query(...),
+    timeframe: str = Query("1h"),
+):
+    """Route an OBLIVION timeframe signal to every configured venue.
+
+    Same execution engine as ``/execute``; the row is tagged
+    ``kronos_oblivion`` so the journal shows which strategy fired. Refused
+    inside the news window.
+    """
+    import json
+    from app.core.database import AsyncSessionLocal
+    from app.agents.execution import _route, get_settings
+    from app.models.database import Signal, SignalAction, SignalSource, SignalStatus
+
+    sym = _normalize_symbol(symbol)
+    action = side.lower()
+    if action not in {"buy", "sell"}:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="side must be 'buy' or 'sell'")
+    if refusal := _news_window_refusal():
+        return refusal
+
+    async with AsyncSessionLocal() as db:
+        s = await get_settings(db)
+        if not s.execution_enabled:
+            return {"ok": False, "placed": [], "reason": "execution is switched off in room settings"}
+        sig = Signal(
+            source=SignalSource.SYSTEM,
+            symbol=sym,
+            action=SignalAction.BUY if action == "buy" else SignalAction.SELL,
+            price=entry, timeframe=timeframe,
+            strength=0.8, confidence=0.8,
+            status=SignalStatus.PENDING,
+            raw_data=json.dumps({"source": "kronos_oblivion", "strategy": "oblivion_v4"}),
+            indicators=json.dumps({"stop_loss": stop_loss, "take_profit": take_profit}),
+        )
+        db.add(sig)
+        await db.flush()
+        orders = await _route(
+            db, s,
+            symbol=sym, action=action,
+            price=entry, stop_loss=stop_loss, take_profit=take_profit,
+            level_source="kronos_oblivion", signal_id=sig.id,
+        )
+        await db.commit()
+
+    placed = [o for o in orders if o.get("status") == "placed"]
+    errors = [o for o in orders if o.get("status") == "error"]
+    return {"symbol": sym, "side": action, "placed": placed, "errors": errors, "orders": orders,
+            "ok": len(placed) > 0}
 
 
 @router.post("/batch")

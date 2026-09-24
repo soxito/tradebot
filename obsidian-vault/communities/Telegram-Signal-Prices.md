@@ -2,7 +2,7 @@
 type: community
 name: Telegram Signal Prices
 node_count: 40
-synced: 2026-09-14
+synced: 2026-09-24
 tags:
   - community
   - Telegram-Signal-Prices
@@ -10,7 +10,7 @@ tags:
 
             # Telegram Signal Prices
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-24.
 
 
             ## Key Nodes (40 total)

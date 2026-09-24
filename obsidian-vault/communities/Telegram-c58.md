@@ -2,7 +2,7 @@
 type: community
 name: Telegram (c58)
 node_count: 22
-synced: 2026-09-14
+synced: 2026-09-24
 tags:
   - community
   - Telegram-c58
@@ -10,7 +10,7 @@ tags:
 
             # Telegram (c58)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-24.
 
 
             ## Key Nodes (22 total)

@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 from fastapi import APIRouter, Query
 from loguru import logger
+from pydantic import BaseModel, Field
 
 from app.exchanges.yahoo_provider import (
     fetch_candles as yahoo_candles,
@@ -739,4 +740,109 @@ async def pattern_overlay(
         }
     except Exception as e:  # noqa: BLE001 - an overlay must never break the chart
         logger.warning(f"[Market] pattern overlay {exchange}/{symbol}: {e}")
+        return empty
+
+
+# ── OBLIVION AI engine overlay ──────────────────────────────────────────────
+
+
+class OblivionOverlayRequest(BaseModel):
+    """Candles the chart is drawing, so the overlay is computed on that exact
+    series (data-source parity). ``candles`` are lightweight-charts bars with
+    ``time`` in seconds, or ccxt rows ``[ms, o, h, l, c, v]``."""
+    symbol: str
+    timeframe: str = "1h"
+    candles: List[Any] = Field(default_factory=list)
+    config: Optional[Dict[str, Any]] = None
+
+
+def _oblivion_overlay_payload(symbol: str, timeframe: str, rows: List[Any],
+                              config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    from app.signals.oblivion import analyze_oblivion, compact_for_prompt, config_from_dict, oblivion_to_overlays
+
+    empty = {"symbol": symbol, "timeframe": timeframe, "oblivion": None, "overlay_bundle": None, "error": None}
+    if not rows or len(rows) < 60:
+        empty["error"] = f"need at least 60 candles, got {len(rows or [])}"
+        return empty
+    res = analyze_oblivion(rows, timeframe, config_from_dict(config))
+    if res.get("error"):
+        empty["error"] = res["error"]
+        return empty
+    read = compact_for_prompt(res)
+    read["signals_history"] = res.get("signals_history") or []
+    return {
+        "symbol": symbol, "timeframe": timeframe,
+        "oblivion": read,
+        "overlay_bundle": oblivion_to_overlays(res, timeframe),
+        "error": None,
+    }
+
+
+@router.post("/oblivion-overlay")
+async def oblivion_overlay_from_candles(req: OblivionOverlayRequest):
+    """OBLIVION AI engine v4.0 read + chart overlay bundle on caller-supplied candles.
+
+    The chart POSTs the bars it is drawing so every box, label and level lands
+    on the candles the user sees (see the data-source parity note in the
+    project memory). Returns ``{oblivion, overlay_bundle}``.
+    """
+    try:
+        rows: List[List[float]] = []
+        for c in req.candles or []:
+            if isinstance(c, dict):
+                t = c.get("time") or c.get("timestamp")
+                if t is None or c.get("close") is None:
+                    continue
+                t = float(t)
+                rows.append([int(t * 1000) if t < 1e11 else int(t), float(c.get("open", c["close"])),
+                             float(c.get("high", c["close"])), float(c.get("low", c["close"])),
+                             float(c["close"]), float(c.get("volume") or 0.0)])
+            elif isinstance(c, (list, tuple)) and len(c) >= 5:
+                t = float(c[0])
+                rows.append([int(t * 1000) if t < 1e11 else int(t), float(c[1]), float(c[2]), float(c[3]), float(c[4]),
+                             float(c[5]) if len(c) > 5 and c[5] is not None else 0.0])
+        rows.sort(key=lambda r: r[0])
+        return _oblivion_overlay_payload(req.symbol, req.timeframe, rows, req.config)
+    except Exception as e:  # noqa: BLE001 - an overlay must never break the chart
+        logger.warning(f"[Market] oblivion overlay (candles) {req.symbol}: {e}")
+        return {"symbol": req.symbol, "timeframe": req.timeframe, "oblivion": None, "overlay_bundle": None,
+                "error": str(e)}
+
+
+@router.get("/oblivion-overlay/{exchange}/{symbol}")
+async def oblivion_overlay(
+    exchange: str,
+    symbol: str,
+    timeframe: str = Query(default="1h"),
+    limit: int = Query(default=400, ge=60, le=5000),
+):
+    """OBLIVION AI engine v4.0 overlay for a chart that fetched its own bars via
+    ``/exchanges/{exchange}/ohlcv/{symbol}``.
+
+    Resolves candles through that same route function, so the engine runs on
+    the feed the chart drew (Bitget for crypto, MT5/Swissquote-anchored Yahoo
+    for FX & metals) rather than the server-side resolver's own pick.
+    """
+    empty = {"symbol": symbol, "timeframe": timeframe, "oblivion": None, "overlay_bundle": None, "error": None}
+    try:
+        from app.api.exchanges import get_ohlcv as _chart_ohlcv
+        from app.exchanges.manager import SupportedExchange
+
+        try:
+            venue = SupportedExchange(exchange.lower())
+        except Exception:
+            venue = SupportedExchange.BITGET
+        payload = await _chart_ohlcv(venue, symbol, timeframe=timeframe, limit=limit)
+        bars = (payload or {}).get("data") or []
+        rows = [[int(b["time"]) * 1000, float(b["open"]), float(b["high"]), float(b["low"]), float(b["close"]),
+                 float(b.get("volume") or 0.0)] for b in bars if b.get("close") is not None]
+        if not rows:
+            from app.services import candles as candle_resolver
+            rows = list(await candle_resolver.fetch(symbol, timeframe, limit) or [])
+        out = _oblivion_overlay_payload(symbol, timeframe, rows)
+        out["source"] = (payload or {}).get("exchange") or exchange
+        return out
+    except Exception as e:  # noqa: BLE001 - an overlay must never break the chart
+        logger.warning(f"[Market] oblivion overlay {exchange}/{symbol}: {e}")
+        empty["error"] = str(e)
         return empty

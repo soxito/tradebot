@@ -2,7 +2,7 @@
 type: community
 name: SMC Analysis Frontend
 node_count: 34
-synced: 2026-09-14
+synced: 2026-09-24
 tags:
   - community
   - SMC-Analysis-Frontend
@@ -10,7 +10,7 @@ tags:
 
             # SMC Analysis Frontend
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-24.
 
 
             ## Key Nodes (34 total)

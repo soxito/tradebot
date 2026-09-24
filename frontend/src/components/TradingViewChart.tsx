@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { createChart, IChartApi, ISeriesApi, SeriesMarker, Time } from 'lightweight-charts';
 import { attachZonesOverlay, type ZonesOverlay } from '@/utils/zonesOverlay';
+import { attachOblivionPrimitive, type OblivionPrimitive, type OblivionOverlayBundle } from '@/components/OblivionPrimitive';
 import { useZonesData } from '@/hooks/useZonesData';
 import type { CycleWindowBox, ZonesData } from '@/utils/zonesOverlay';
-import { apiClient } from '@/services/api';
+import { api, apiClient } from '@/services/api';
 import { calcMinMove, calcChartPrecision } from '@/utils/price';
 import { formatTimeZA } from '@/utils/datetime';
 import ChartDrawingLayer from '@/components/ChartDrawingLayer';
@@ -99,6 +100,23 @@ interface TradingViewChartProps {
   drawingsExchange?: string;
   drawingsSymbol?: string;
   drawingsTimeframe?: string;
+  /** OBLIVION AI engine overlay. `showOblivion` makes the chart compute it on
+   *  the very candles it draws (POST /market/oblivion-overlay); `oblivionBundle`
+   *  supplies a bundle already computed on those candles (Kronos page). */
+  showOblivion?: boolean;
+  oblivionBundle?: OblivionOverlayBundle | null;
+  /** Called with the engine read whenever the chart computed its own overlay. */
+  onOblivion?: (read: any | null) => void;
+  /** Hide the header toggle (a wrapper renders its own). */
+  hideOblivionToggle?: boolean;
+  /** Controlled visibility of the overlay, when a wrapper owns the toggle. */
+  oblivionVisibleOverride?: boolean;
+}
+
+const OBLIVION_VISIBLE_KEY = 'tv_oblivion_visible';
+function loadOblivionVisible(): boolean {
+  if (typeof window === 'undefined') return true;
+  try { return window.localStorage.getItem(OBLIVION_VISIBLE_KEY) !== '0'; } catch { return true; }
 }
 
 /**
@@ -175,12 +193,37 @@ export default function TradingViewChart({
   drawingsExchange,
   drawingsSymbol,
   drawingsTimeframe,
+  showOblivion = false,
+  oblivionBundle,
+  onOblivion,
+  hideOblivionToggle = false,
+  oblivionVisibleOverride,
 }: TradingViewChartProps) {
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartWrapRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candlestickSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const zonesOverlayRef = useRef<ZonesOverlay | null>(null);
+  const oblivionRef = useRef<OblivionPrimitive | null>(null);
+  const [oblivionVisible, setOblivionVisible] = useState<boolean>(loadOblivionVisible);
+  // The bars currently drawn (for the parity POST and diamond anchoring).
+  const drawnBarsRef = useRef<{ time: number; open: number; high: number; low: number; close: number; volume?: number }[]>([]);
+  const [drawnVersion, setDrawnVersion] = useState(0);
+  const [selfBundle, setSelfBundle] = useState<OblivionOverlayBundle | null>(null);
+  // Which instrument the drawn bars belong to. Bars live in a ref, so without
+  // this tag a symbol switch would hand the Oblivion parity POST the *previous*
+  // pair's candles under the new pair's name — the read, the levels and the
+  // trade plan would all still describe the old instrument.
+  const instrumentKey = `${exchange}|${symbol}|${timeframe}`;
+  const drawnKeyRef = useRef<string | null>(null);
+  const noteDrawnBars = (data: any[], key: string) => {
+    drawnBarsRef.current = (data || []).map((c: any) => ({
+      time: Number(c.time), open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume,
+    }));
+    drawnKeyRef.current = key;
+    try { oblivionRef.current?.setBars(drawnBarsRef.current); } catch {}
+    setDrawnVersion(v => v + 1);
+  };
   // The hook always runs (rules of hooks) but only fetches when enabled; the
   // ref lets the primitive hydrate from the latest data at attach time.
   const zonesData = useZonesData(symbol, timeframe, showZones);
@@ -282,6 +325,9 @@ export default function TradingViewChart({
     const targetChart = chartRef.current;
     const isStale = () =>
       candlestickSeriesRef.current !== targetSeries || chartRef.current !== targetChart;
+    // The instrument this fetch is for — stamped onto the bars it draws so the
+    // Oblivion read can never be computed from another pair's candles.
+    const fetchKey = instrumentKey;
 
     const fitAndScale = () => {
       if (!didFitRef.current) {
@@ -361,6 +407,7 @@ export default function TradingViewChart({
           }));
           if (isStale()) return;
           targetSeries.setData(data);
+          noteDrawnBars(data, fetchKey);
           rememberLastBar(data[data.length - 1]?.time as number, data[data.length - 1]?.close as number, true);
           setLastUpdate(new Date());
           setLoading(false);
@@ -375,6 +422,7 @@ export default function TradingViewChart({
         }));
         if (isStale()) return;
         targetSeries.setData(data);
+        noteDrawnBars(data, fetchKey);
         rememberLastBar(data[data.length - 1]?.time as number, data[data.length - 1]?.close as number, true);
         const allPrices = data.flatMap((c) => [c.open, c.high, c.low, c.close]).filter((p) => p > 0);
         if (allPrices.length > 0) {
@@ -406,6 +454,7 @@ export default function TradingViewChart({
       const data = response.data?.data;
       if (Array.isArray(data) && data.length > 0) {
         targetSeries.setData(data);
+        noteDrawnBars(data, fetchKey);
         rememberLastBar((data[data.length - 1] as any)?.time as number, (data[data.length - 1] as any)?.close as number, true);
 
         // Auto-detect price precision from OHLCV data (handles PEPE, SHIB etc.)
@@ -433,6 +482,9 @@ export default function TradingViewChart({
         // No data for this symbol (e.g. unknown/invalid pair). Clear any stale
         // candles so we never show the previous symbol's chart, and surface why.
         targetSeries.setData([]);
+        // Drop the previous pair's bars too, or the engine read and trade plan
+        // would keep describing it while the chart sits empty.
+        noteDrawnBars([], fetchKey);
         rememberLastBar(0, 0, true);
         lastBarTimeRef.current = 0;
         setError(response.data?.error || `No chart data for ${symbol}`);
@@ -445,6 +497,7 @@ export default function TradingViewChart({
       // Clear stale candles on error too, so a failed load can't leave the
       // previous symbol's chart on screen under the new symbol's label.
       try { targetSeries?.setData([]); } catch {}
+      noteDrawnBars([], fetchKey);
       // FastAPI returns detail as an array of objects for 422 validation errors — coerce to string.
       const rawDetail = err.response?.data?.detail;
       const detail = Array.isArray(rawDetail) ? rawDetail.map((d: any) => d?.msg ?? JSON.stringify(d)).join('; ') : rawDetail;
@@ -504,6 +557,8 @@ export default function TradingViewChart({
     zonesOverlayRef.current.setData(
       composeOverlayData(zonesDataRef.current, cycleWindowsRef.current, showZones && zonesVisible),
     );
+    // OBLIVION engine overlay rides the same pane; fed by the effect below.
+    oblivionRef.current = attachOblivionPrimitive(candlestickSeries);
 
     // Initial data fetch
     fetchChartData();
@@ -548,6 +603,7 @@ export default function TradingViewChart({
       resizeObserver.disconnect();
       clearInterval(refreshInterval);
       zonesOverlayRef.current = null;
+      oblivionRef.current = null;
       chart.remove();
     };
   }, [symbol, exchange, timeframe, maximized, initialCandles]);
@@ -620,6 +676,57 @@ export default function TradingViewChart({
     // The chart repaints primitives on view changes; nudge it after data swap.
     chartRef.current?.timeScale().applyOptions({});
   }, [zonesData, zonesVisible, cycleWindows]);
+
+  useEffect(() => {
+    const h = () => setDrawnVersion(v => v + 1);
+    window.addEventListener('oblivion-settings-changed', h as any);
+    return () => window.removeEventListener('oblivion-settings-changed', h as any);
+  }, []);
+
+  // OBLIVION: when asked to self-compute, POST the drawn candles so the read
+  // and every box / label / level are on exactly the bars on screen.
+  useEffect(() => {
+    // Clearing the read (not just the bundle) is what makes the dashboard and
+    // the trade plan blank out the moment the pair changes, instead of keeping
+    // the previous instrument's levels on screen until new bars arrive.
+    const clear = () => { setSelfBundle(null); onOblivion?.(null); };
+    if (!showOblivion) { clear(); return; }
+    // The bars are only usable if they are *this* instrument's bars. On a pair
+    // switch this effect re-runs before the new candles have loaded, and the ref
+    // still holds the old pair's — computing on those would produce a read (and
+    // a trade plan) for the old instrument labelled with the new symbol.
+    if (drawnKeyRef.current !== instrumentKey) { clear(); return; }
+    const bars = drawnBarsRef.current;
+    if (!bars || bars.length < 60) { clear(); return; }
+    let cancelled = false;
+    const _oblFetch = (apiClient as any)?.technical?.oblivionOverlayFromCandles
+      ? (apiClient as any).technical.oblivionOverlayFromCandles(symbol, timeframe ?? '1h', bars)
+      : (api as any).post('/market/oblivion-overlay', { symbol, timeframe: timeframe ?? '1h', candles: bars });
+    _oblFetch
+      .then((res: any) => {
+        // Also drop a response that landed after the user moved on.
+        if (cancelled || drawnKeyRef.current !== instrumentKey) return;
+        const payload = res?.data ?? {};
+        setSelfBundle(payload.overlay_bundle ?? null);
+        onOblivion?.(payload.oblivion ?? null);
+      })
+      .catch(() => { if (!cancelled) clear(); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showOblivion, instrumentKey, drawnVersion]);
+
+  useEffect(() => {
+    const prim = oblivionRef.current;
+    if (!prim) return;
+    const bundle = oblivionBundle ?? selfBundle ?? null;
+    const visible = oblivionVisibleOverride ?? oblivionVisible;
+    prim.setBundle(visible ? bundle : null);
+    chartRef.current?.timeScale().applyOptions({});
+  }, [oblivionBundle, selfBundle, oblivionVisible, oblivionVisibleOverride, chartInitCount]);
+
+  useEffect(() => {
+    try { window.localStorage.setItem(OBLIVION_VISIBLE_KEY, oblivionVisible ? '1' : '0'); } catch {}
+  }, [oblivionVisible]);
 
   // Draw indicator overlays on the chart.
   // Custom mode does not support true multi-pane rendering, so non-main panes
@@ -1060,6 +1167,20 @@ export default function TradingViewChart({
               title="Toggle supply/demand zones, fib bands and channels"
             >
               Zones
+            </button>
+          )}
+          {(showOblivion || oblivionBundle) && !hideOblivionToggle && (
+            <button
+              type="button"
+              onClick={() => setOblivionVisible((v) => !v)}
+              className={`text-xs px-2 py-1 rounded border transition-colors ${
+                oblivionVisible
+                  ? 'border-lime-500/60 bg-lime-500/10 text-lime-300'
+                  : 'border-gray-600 text-gray-400 hover:text-gray-200'
+              }`}
+              title="Toggle the OBLIVION AI engine overlay (FVG/OB, structure, sweeps, fib, entry/SL/TP, sessions, dashboard)"
+            >
+              Oblivion
             </button>
           )}
           {strategyScore !== undefined && (

@@ -962,8 +962,13 @@ def affordable_mt5_lot(
     floor_lot: float,
     max_risk_pct: float,
     small_account_mode: bool = False,
+    quote_to_usd: float = 1.0,
 ) -> tuple[float | None, str]:
     """Largest lot that fits BOTH the risk budget and the margin actually free.
+
+    ``quote_to_usd`` converts the pair's quote currency into the account's
+    (USD): 1/USDJPY for any ``…JPY`` pair, 1/price for ``USD…`` pairs. Without
+    it a yen loss is counted as dollars and a JPY cross is sized ~150× small.
 
     Returns ``(lot, note)``, or ``(None, reason)`` when even one floor lot is
     more than the account can afford — in which case the trade must not be
@@ -981,7 +986,8 @@ def affordable_mt5_lot(
     if distance <= 0 or contract <= 0:
         return floor_lot, "no stop distance — floor lot"
 
-    loss_per_lot = distance * contract
+    q2usd = float(quote_to_usd or 1.0)
+    loss_per_lot = distance * contract * q2usd
     risk_budget = max(equity, 0.0) * (max(risk_pct, 0.0) / 100.0)
     risk_lot = risk_budget / loss_per_lot if loss_per_lot > 0 else 0.0
 
@@ -990,13 +996,13 @@ def affordable_mt5_lot(
     margin_lot = None
     lev = int(leverage or 0)
     if lev > 0 and entry:
-        margin_per_lot = (contract * float(entry)) / lev
+        margin_per_lot = (contract * float(entry) * q2usd) / lev
         usable = float(free_margin if free_margin is not None else equity) * 0.80
         if margin_per_lot > 0:
             margin_lot = max(usable, 0.0) / margin_per_lot
 
     lot = risk_lot if margin_lot is None else min(risk_lot, margin_lot)
-    lot = math.floor(lot / 0.01) * 0.01  # never round UP past the budget
+    lot = math.floor(lot / 0.01 + 1e-9) * 0.01  # never round UP past the budget (tolerating float error)
     lot = round(lot, 2)
 
     if lot >= floor_lot:

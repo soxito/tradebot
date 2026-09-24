@@ -2,7 +2,7 @@
 type: community
 name: Risk Ratio Response (c137)
 node_count: 6
-synced: 2026-09-14
+synced: 2026-09-24
 tags:
   - community
   - Risk-Ratio-Response-c137
@@ -10,7 +10,7 @@ tags:
 
             # Risk Ratio Response (c137)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-24.
 
 
             ## Key Nodes (6 total)

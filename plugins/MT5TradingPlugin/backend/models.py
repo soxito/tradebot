@@ -10,6 +10,8 @@ from sqlalchemy import (
     Enum as SQLEnum, Index, BigInteger, UniqueConstraint
 )
 from sqlalchemy.orm import DeclarativeBase
+
+from app.core.secrets_box import EncryptedText
 import enum
 
 
@@ -88,8 +90,8 @@ class MT5Account(MT5Base):
     name = Column(String(100), nullable=False)
     server = Column(String(200), nullable=False)
     login = Column(String(50), nullable=False)
-    # Password stored encrypted; decrypt at runtime only
-    password_encrypted = Column(Text, nullable=False)
+    # Fernet-encrypted in the database, plaintext in Python (app.core.secrets_box).
+    password_encrypted = Column(EncryptedText, nullable=False)
     account_type = Column(
         SQLEnum(MT5AccountType, name="mt5_account_type"),
         default=MT5AccountType.DEMO,

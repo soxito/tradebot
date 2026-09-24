@@ -2,7 +2,7 @@
 type: community
 name: Frontend Chart Components
 node_count: 43
-synced: 2026-09-14
+synced: 2026-09-24
 tags:
   - community
   - Frontend-Chart-Components
@@ -10,7 +10,7 @@ tags:
 
             # Frontend Chart Components
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-24.
 
 
             ## Key Nodes (43 total)

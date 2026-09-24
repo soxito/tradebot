@@ -870,6 +870,30 @@ def _attach_hlc3_kaufman_overlays(
     return schema, overlays, markers
 
 
+def _attach_oblivion(
+    rows: List[list], timeframe: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """OBLIVION AI engine v4.0 on the exact rows the forecast used.
+
+    Returns ``(compact_read, overlay_bundle)``; both None when the engine
+    cannot run (short series, import failure). Never raises.
+    """
+    try:
+        from app.signals.oblivion import analyze_oblivion, compact_for_prompt, oblivion_to_overlays
+
+        if not rows or len(rows) < 60:
+            return None, None
+        res = analyze_oblivion(rows, timeframe)
+        if res.get("error"):
+            return None, None
+        read = compact_for_prompt(res)
+        read["signals_history"] = res.get("signals_history") or []
+        return read, oblivion_to_overlays(res, timeframe)
+    except Exception as exc:  # noqa: BLE001 — enrichment only
+        logger.debug(f"[Kronos] oblivion skipped: {exc}")
+        return None, None
+
+
 def _attach_sr_overlays(
     rows: List[list],
 ) -> Tuple[Optional["SRSignalsSchema"], List[OverlaySeries], List[OverlayMarker]]:
@@ -1088,6 +1112,7 @@ async def run_forecast(
     )
     hlc3_schema, hlc3_overlays, hlc3_markers = _attach_hlc3_kaufman_overlays(rows, timeframe)
     sr_schema, sr_overlays, sr_markers = _attach_sr_overlays(rows)
+    oblivion_read, oblivion_bundle = _attach_oblivion(rows, timeframe)
     overlays.extend(hlc3_overlays)
     overlays.extend(sr_overlays)
     markers.extend(hlc3_markers)
@@ -1100,6 +1125,7 @@ async def run_forecast(
         forecast=forecast, upper_band=upper, lower_band=lower, signal=signal,
         overlays=overlays, markers=markers, candles=_historical_candles(rows, symbol),
         hlc3_kaufman=hlc3_schema, sr_signals=sr_schema,
+        oblivion=oblivion_read, overlay_bundle=oblivion_bundle,
         volume=vol_ctx, decision=signal.decision,
         note=None if engine == "kronos" else _heuristic_note(heuristic_reason),
     )
@@ -1239,6 +1265,7 @@ async def forecast_from_rows(
     )
     hlc3_schema, hlc3_overlays, hlc3_markers = _attach_hlc3_kaufman_overlays(rows, timeframe)
     sr_schema, sr_overlays, sr_markers = _attach_sr_overlays(rows)
+    oblivion_read, oblivion_bundle = _attach_oblivion(rows, timeframe)
     overlays.extend(hlc3_overlays)
     overlays.extend(sr_overlays)
     markers.extend(hlc3_markers)
@@ -1250,6 +1277,7 @@ async def forecast_from_rows(
         forecast=forecast, upper_band=upper, lower_band=lower, signal=signal,
         overlays=overlays, markers=markers,
         hlc3_kaufman=hlc3_schema, sr_signals=sr_schema,
+        oblivion=oblivion_read, overlay_bundle=oblivion_bundle,
         volume=vol_ctx, decision=signal.decision,
         note=None if engine == "kronos" else _heuristic_note(),
     )
@@ -1572,6 +1600,102 @@ def _sniper_indicator_adjustments(
     return conf_mult, sr_tp, sr_sl_guard
 
 
+#: A Kronos path this confident *against* an Oblivion signal vetoes it; the
+#: same threshold the MT5 scalp bot uses for its Kronos veto.
+OBLIVION_KRONOS_VETO = 0.45
+#: Confidence lift when the forecast agrees with the engine (× |kronos conf|).
+OBLIVION_KRONOS_BONUS = 0.25
+
+
+def fuse_oblivion_with_kronos(
+    obl_signal: Dict[str, Any], score: Dict[str, Any], kronos_sig: Optional[ForecastSignal],
+) -> Tuple[float, Optional[bool], Optional[str]]:
+    """Oblivion leads, Kronos confirms.
+
+    Returns ``(confidence, kronos_aligned, vetoed_by)``. Base confidence is the
+    engine score over 12; an agreeing forecast adds ``OBLIVION_KRONOS_BONUS``
+    × its confidence, a decisively opposing one (>= ``OBLIVION_KRONOS_VETO``)
+    vetoes. A flat / absent forecast leaves the engine's call untouched.
+    """
+    action = str(obl_signal.get("action") or "wait")
+    req = max(1, int(score.get("required") or 6))
+    pts = int(obl_signal.get("score") or 0)
+    base = max(0.0, min(1.0, pts / 12.0))
+    if action not in ("buy", "sell"):
+        return round(base, 3), None, None
+    if kronos_sig is None or kronos_sig.direction not in ("up", "down"):
+        return round(base, 3), None, None
+    kdir = "buy" if kronos_sig.direction == "up" else "sell"
+    kconf = float(kronos_sig.confidence or 0.0)
+    if kdir == action:
+        return round(min(1.0, base + OBLIVION_KRONOS_BONUS * kconf), 3), True, None
+    if kconf >= OBLIVION_KRONOS_VETO:
+        return round(base, 3), False, "kronos"
+    return round(max(0.0, base - 0.10 * kconf), 3), False, None
+
+
+def _oblivion_sniper_entries(resp: ForecastResponse, max_leverage: Optional[int]) -> List[SniperSignal]:
+    """The engine's Entry / SL / TP1-3 as the first sniper entry, Kronos-fused."""
+    obl = resp.oblivion or {}
+    obl_sig = obl.get("signal") or {}
+    action = str(obl_sig.get("action") or "wait")
+    if action not in ("buy", "sell") or obl_sig.get("entry") is None:
+        return []
+    entry = float(obl_sig["entry"])
+    sl = float(obl_sig["stop_loss"])
+    tp1 = float(obl_sig["tp1"])
+    tp2 = float(obl_sig.get("tp2") or tp1)
+    tp3 = obl_sig.get("tp3")
+    risk = abs(entry - sl)
+    if risk <= 0 or (action == "buy" and tp1 <= entry) or (action == "sell" and tp1 >= entry):
+        return []
+    conf, aligned, vetoed = fuse_oblivion_with_kronos(obl_sig, obl.get("score") or {}, resp.signal)
+    if vetoed:
+        return []
+    vol = resp.volume
+    if max_leverage and max_leverage > 0:
+        leverage = int(max_leverage)
+    else:
+        leverage = 10 if conf >= 0.7 else (5 if conf >= 0.5 else 3)
+    sc = obl.get("score") or {}
+    reasons = [
+        f"OBLIVION v4 {action.upper()} on {resp.timeframe}: bull {sc.get('bull', 0)} / bear {sc.get('bear', 0)} "
+        f"(need {sc.get('required', 6)}), bias {obl.get('bias_label', 'NEUTRAL')}, "
+        f"{(obl.get('structure') or {}).get('now', 'WAIT')}, session {(obl.get('session') or {}).get('name', 'OFF')}.",
+        f"Stop {_fmt_price(sl)} = structural swing or 1.5×ATR (whichever is wider); "
+        f"TP1 {_fmt_price(tp1)} = 1R, TP2 {_fmt_price(tp2)} = 2R" + (f", TP3 {_fmt_price(float(tp3))} = 3R." if tp3 else "."),
+    ]
+    if not obl_sig.get("confirmed"):
+        reasons.append("Signal bar has not closed — rest at the entry rather than chase it.")
+    if resp.signal is not None and resp.signal.direction in ("up", "down"):
+        if aligned:
+            reasons.append(
+                f"Kronos confirms: projects {resp.signal.direction.upper()} {resp.signal.pct_change:+.2f}% "
+                f"({int(resp.signal.confidence * 100)}% path agreement) — confidence lifted."
+            )
+        else:
+            reasons.append(
+                f"Kronos leans {resp.signal.direction.upper()} ({int(resp.signal.confidence * 100)}%) against the "
+                f"engine — below the veto line, confidence trimmed."
+            )
+    else:
+        reasons.append("Kronos is flat — the engine's call stands on its own.")
+    if obl.get("summary"):
+        reasons.append(str(obl["summary"]))
+    side = "long" if action == "buy" else "short"
+    return [SniperSignal(
+        id=f"{resp.symbol}-{side}-oblivion", side=side,
+        order_kind="market" if obl_sig.get("confirmed") else "limit",
+        label=f"Oblivion {action.upper()}",
+        entry=round(entry, 8), stop_loss=round(sl, 8), take_profit_1=round(tp1, 8),
+        take_profit_2=round(tp2, 8), risk_reward=round(abs(tp1 - entry) / risk, 2),
+        confidence=round(conf, 3), leverage=leverage, reasons=reasons,
+        volume_24h=getattr(vol, "volume_24h", None), volume_1h=getattr(vol, "volume_1h", None),
+        relative_volume=getattr(vol, "relative_volume", None),
+        volume_regime=getattr(vol, "regime", "UNKNOWN"), volume_divergence=getattr(vol, "divergence", "UNKNOWN"),
+    )]
+
+
 def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = None) -> List[SniperSignal]:
     """Turn a Kronos forecast into concrete, executable sniper entries.
 
@@ -1598,8 +1722,21 @@ def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = N
     vol = resp.volume
     if vol is None or vol.status not in ("OK", "NOT_APPLICABLE"):
         return []
-    if sig.decision != "OK":
+
+    # ── OBLIVION news window: no entries of any kind ─────────────────────────
+    obl = resp.oblivion or {}
+    if bool((obl.get("news") or {}).get("blocked")):
         return []
+
+    # ── OBLIVION leads, Kronos confirms ──────────────────────────────────────
+    # A fresh engine BUY / SELL is the first entry regardless of the path
+    # decision: its structural stop and 1R/2R/3R ladder are the plan; the
+    # forecast lifts confidence when it agrees and vetoes only when it opposes
+    # decisively.
+    oblivion_entries = _oblivion_sniper_entries(resp, max_leverage)
+
+    if sig.decision != "OK":
+        return oblivion_entries
 
     anchor = float(resp.anchor_price)
     if anchor <= 0:
@@ -1641,7 +1778,7 @@ def build_sniper_signals(resp: ForecastResponse, max_leverage: Optional[int] = N
         leverage = 10 if conf >= 0.7 else (5 if conf >= 0.5 else 3)
     buf = 0.003  # 0.3% stop buffer beyond the predicted band
 
-    signals: List[SniperSignal] = []
+    signals: List[SniperSignal] = list(oblivion_entries)
 
     def _rr(entry: float, sl: float, tp: float) -> float:
         risk = abs(entry - sl)
@@ -1753,7 +1890,13 @@ async def generate_sniper_signals(
     sig = resp.signal
     note = None
     if not signals:
-        if resp.decision == "NO_TRADE":
+        if bool(((resp.oblivion or {}).get("news") or {}).get("blocked")):
+            note = (
+                "NEWS WINDOW — the OBLIVION news filter is active "
+                f"({((resp.oblivion or {}).get('news') or {}).get('window')} "
+                f"{((resp.oblivion or {}).get('news') or {}).get('tz')}); no entries are emitted inside it."
+            )
+        elif resp.decision == "NO_TRADE":
             note = (
                 f"NO_TRADE — volume is a hard precondition for a sniper entry and it "
                 f"is {(resp.volume.status.lower() if resp.volume else 'unavailable')} "

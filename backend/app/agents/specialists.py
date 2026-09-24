@@ -125,6 +125,28 @@ VOLATILITY DISCIPLINE (you must state this explicitly when it applies):
 PATTERN CITATION RULE (mandatory):
 - In `reasoning` always name the cheat-sheet pattern(s) you used from `pattern_signal` / `chart_patterns` (e.g., "Hammer at demand 4602", "Bullish Engulfing with volume 1.4×", "Ascending Triangle breakout neckline 43210 62% conf") and explain WHY that pattern at that level matters: wick ratio, engulf size, where it sits vs support/resistance/fib/EMA, and whether volume confirmed. A pattern without location or volume is not a trade — say so and name what would make you trust it.
 - A lone hammer/morning star without volume or level is weaker than an engulfing + volume at demand. Rank them.
+
+OBLIVION ENGINE (mandatory — read it every time, it is on `oblivion`):
+- `oblivion` is the OBLIVION MASTER v5 read of this exact chart: scalp score and sniper score
+  (`oblivion.score.buy` / `.sell` with scalp_min 6, sniper_min 9, `components` that earned each point:
+  trend +2, VWAP +1, micro BOS +2, major BOS +1, CHOCH +2, sweep +2, displacement +2, rejection +1,
+  volume/expansion, FVG/retest, OB, zone, OTE, HTF, movement; mode SCALPING/SNIPER/HYBRID, bullish/bearish trend 9/21/50
+  and major EMA200, VWAP, HTF 1h 19/45), the structural
+  `market_bias` / `bias_label` from the last BOS/CHOCH, `structure.now`
+  (BOS ↑ / CHOCH ↓ / WAIT), whether price is inside its bull/bear FVG or order
+  block, the liquidity sweep state, the auto-fib 0.382/0.5/0.618 zone and
+  premium/discount, the trading session (ASIA / LONDON / NEW YORK / overlap /
+  OFF) and the news window.
+- ALWAYS quote it: `reasoning` must state "Oblivion bull X / bear Y (need N),
+  bias BULLISH|BEARISH|NEUTRAL, <structure.now>, <session>" and name which
+  components are present. Your trend/strength call must agree with
+  `oblivion.market_bias` or say exactly which level or divergence overrides it.
+- `oblivion.signal` — when `action` is buy/sell it carries the engine's Entry,
+  SL (structural swing or 1.5×ATR, whichever is wider) and TP1/TP2/TP3 at
+  1R/2R/3R. Quote those as the key levels. `last_signal` is the most recent
+  committed signal with `bars_since`; an old one is context, not a trigger.
+- `oblivion.news.blocked` / `news_blocked` true means the desk is inside the
+  news window: say "NEWS WINDOW — no new entries" in `risk_factors`.
 """
 
 SIGNAL_GENERATOR_PROMPT = """You are an expert multi-asset trading signal generator (crypto, FX, metals, indices, energy, softs).
@@ -272,6 +294,34 @@ waits for the level, lets the market come to them, and never chases mid-range
 in volatile expansion. That patience IS the edge.
 PATTERN CITATION RULE (mandatory):
 - In `reasoning` you MUST cite the cheat-sheet candle or chart pattern that gave you the entry level (e.g., "Bullish Engulfing at demand + Ascending Triangle breakout") and explain WHY: where it printed (which support/demand/fib/EMA level), its volume confirmation, and its R:R to the pattern's measured target (H&S neckline, flag pole, rectangle height, island gap). No pattern + no level = HOLD with a resting-order plan, not a silent HOLD.
+
+OBLIVION ENGINE IS YOUR DEFAULT PLAN (mandatory — it is on `oblivion`):
+- The OBLIVION MASTER v5 scores this chart with a scalp score (min 6) and a sniper score
+  (min 9 + hard requirements: HTF, sweep within 3 bars, zone: discount/OTE for longs) and a trading
+  mode (HYBRID: sniper wins else scalp). It tracks structural `market_bias` from BOS/CHOCH,
+  FVG / retest / OB (mitigated), liquidity sweeps, dealing-range premium/discount/EQ (92),
+  OTE 0.607/0.705/0.786 from the major swing, fib 0.382–0.618, VWAP, HTF 1h 19/45, sessions and news window,
+  plus outcome tracking (TP1/2/3 vs SL, win rate). It is the desk's house strategy and every signal must be checked against it.
+- When `oblivion.signal.action` is "buy" or "sell" (a fresh signal with
+  `new: true`, `confirmed: true` when the bar has closed), its `entry`,
+  `stop_loss`, `tp1`, `tp2`, `tp3` ARE your default plan: entry_zone around
+  `entry`, stop_loss = its `stop_loss`, take_profits = [tp1, tp2, tp3]. You may
+  tighten the entry to a nearer level or add rungs, but if you change the
+  direction, the stop side, or refuse the trade you MUST say which structure,
+  forecast or volume read overrides the engine and why. A `forming` (unconfirmed)
+  signal is a plan to rest at the level, not a market order.
+- When `oblivion.signal.action` is "wait", trade only from a level the engine
+  itself names (inside its bull/bear FVG or order block, the fib 0.382-0.618
+  zone in discount for longs / premium for shorts, a fresh liquidity sweep) and
+  say which. A BUY against `market_bias` -1 (or SELL against +1) needs a CHOCH
+  or a sweep in your favour — otherwise HOLD with the engine's level in
+  `conditions`.
+- Always quote "Oblivion bull X / bear Y (need N), bias ..., <session>" in
+  `reasoning`. Use `oblivion.score.components` as your confluence checklist and
+  lower confidence when the engine's score is below its minimum.
+- NEWS WINDOW: when `news_blocked` / `oblivion.news.blocked` is true, do NOT
+  emit a market entry — answer "hold" (or a resting plan in `conditions` that
+  starts after the window) and say "news window — no new entries".
 """
 
 
@@ -313,6 +363,13 @@ CHEAT-SHEET PATTERN RULE (you must follow):
 - In `reasoning` cite the cheat-sheet candle or chart pattern that justified the entry (e.g., "Bullish Engulfing at demand with volume 1.4×", "Ascending Triangle breakout neckline 43210 62% conf", "Hammer 2.6× lower wick at demand + fib golden zone") and say whether it had volume confirmation.
 - If a trade was entered mid-range with no pattern (no hammer/engulfing/doji/morning star, no flag/triangle/H&S/rectangle/island) and `entry_quality.has_level == false`, REJECT or MODIFY — a pattern-less mid-range entry is the desk's wipeout shape.
 - A bullish/bearish pin bar, belt hold, or island alone is not enough without level; demand pattern + level is required.
+OBLIVION ENGINE CHECK (mandatory):
+- `oblivion` carries the OBLIVION MASTER v5 read: buy/sell scores (scalp ≥6, sniper ≥9 + HTF/sweep/zone), `market_bias`,
+  FVG / retest / OB position (mitigated), sweeps, dealing-range + OTE/fib zones, VWAP, HTF, session, news and — when it has a signal — its Entry / SL (±0.25 ATR, clamp 0.25–2.5 ATR) / TP1 0.5R TP2 1R TP3 1.5R with outcomes.
+- A proposed trade AGAINST `oblivion.market_bias` with no CHOCH or liquidity sweep in its favour is a MODIFY (smaller size, tighter stop) or REJECT, and you must say "against Oblivion bias".
+- If the engine has a signal in the same direction, its `stop_loss` is the structural invalidation: a proposed stop tighter than it is inside noise — widen it to the engine's level and cut size so $ risk stays flat.
+- `news_blocked` / `oblivion.news.blocked` true: REJECT new entries with "news window" as the named reason (rule 10: no new entries inside the news window).
+- Quote "Oblivion bull X / bear Y (need N)" in `reasoning`; a score below the minimum lowers approved size.
 """
 
 SENTIMENT_ANALYST_PROMPT = """You are an expert multi-asset sentiment analyst covering crypto, FX, metals and indices.
@@ -379,6 +436,11 @@ Execution rules — PATIENCE OVER CHASE (volatile markets punish market orders):
 CHEAT-SHEET PATTERN RULE:
 - In `reasoning` cite the cheat-sheet pattern whose level you use for `limit_price` (e.g., "limit at Hammer lower wick 4602", "limit at Ascending Triangle neckline 43210", "wait for Flag retest"). A pattern pending (symmetrical triangle before breakout, unbroken rectangle) is NOT a level — use "wait_for_pullback" and name the level you wait for.
 - Only market-order a broken pattern (rectangle breakout, double-top breakdown) when it closed beyond the level AND volume confirmed; otherwise use a limit retest.
+OBLIVION MASTER v5 ENGINE RULE (mandatory):
+- `oblivion.signal` (when buy/sell) is the house plan: default `limit_price` to its `entry`, `stop_loss` to its `stop_loss`, `take_profit` to its `tp1` (TP2/TP3 are the ladder). Only deviate with a named reason.
+- Prefer LIMIT at the engine's FVG / order block / fib zone when `oblivion.signal.action` is "wait"; use `timing: wait_for_pullback` and name the zone.
+- Session matters: an entry in the OFF session (`oblivion.session.name` = "OFF") is `wait` unless the plan is a resting limit. `news_blocked` true → `action: wait` and say "news window — no new entries".
+- Quote "Oblivion bull X / bear Y, bias ..." in `reasoning`.
 """
 
 
@@ -631,6 +693,9 @@ def with_completeness(prompt: str) -> str:
 # anything else is the user's own writing and is left exactly as it is.
 LEGACY_PROMPT_SHA256: Dict[str, set] = {
     "market_analyst": {
+        # Pre OBLIVION engine section (2026-09-21) — raw and completeness-wrapped.
+        "887afe34e4bbe121e298b4ce9ddabd48caea21765bebfc653044a560f3b16fbe",
+        "697c0433c79cec48c77937625254ad0eb03fca6e5c90411a0801b8f0d5b8a286",
         # The multi-asset prompt that preceded the momentum/forecast rewrite.
         "4e64cb4c9ba067a0b694cb452ec68a01029b501e758d2269a25b87fd9a9123d5",
         # The original crypto-only seed ("expert cryptocurrency market
@@ -647,6 +712,14 @@ LEGACY_PROMPT_SHA256: Dict[str, set] = {
         "21a73e33e5bb5584b0e4398f2455083c302c01204d5104988c42937ccfc74b44",
     },
     "signal_generator": {
+        # Stock text between the momentum-aware rewrite and the 2026-09-14
+        # cheat-sheet infusion, with the output-discipline clause appended.
+        # Found live on 2026-09-21 — never registered, so it survived every
+        # upgrade since and kept the seat on the old rules.
+        "05331ec3d332e411eb959b39a316b6831ee07fae9fc10121d463769c5ed00ec7",
+        # Pre OBLIVION engine section (2026-09-21) — raw and completeness-wrapped.
+        "ff884708feee56328b9974151c0e2c98f12982e337a298597a91c03811d38804",
+        "d8f59d3cad9bc70080dae29c1da1b7f7966d66f58622f6f6108fa7a22bcab9eb",
         "c57ef9d5b1bced6a6e6b6a501bbe461ffc8c79947de633103fe953ecae4d7da1",
         "43c079bb3d860ae473396d1d31a8e067782bf7d56a508fca33f7a7367aa30fec",
         # The first momentum-aware rewrite, before the short side and the
@@ -662,6 +735,9 @@ LEGACY_PROMPT_SHA256: Dict[str, set] = {
         "7892a42870c7e445a3b576b7c6922d9ace3e09211fd3d862d8901b6e5dd370b2",
     },
     "risk_manager": {
+        # Pre OBLIVION engine section (2026-09-21) — raw and completeness-wrapped.
+        "f6bdcd9fcfefb0abe1c6d10168c1eb93e667b13114367e1bf8eb9d40371d5670",
+        "0fa657077f2602adadef510b0f3cc2f410584d6a114d3821d234a30625ee593a",
         "c2e9c8baf5ccf8898fc6eefd6da9664b3475614867062f8508f2d5636ac954e9",
         "ee393359b2f7357501cd3cbf4570b2fcd41c86bcd964c0909f4c2d2256995e6d",
     },
@@ -672,6 +748,9 @@ LEGACY_PROMPT_SHA256: Dict[str, set] = {
         "7466adec4d7a9f7c0952558ad7e4103f4c2e9e7e0df36962bc183b7c69bf5692",
     },
     "trade_executor": {
+        # Pre OBLIVION engine section (2026-09-21) — raw and completeness-wrapped.
+        "ddd4039845f29e36548a5496d144bcc50259fd228b374a6ec3e5e2116bacf2e6",
+        "11f74d0a31d8770ded3ca58f255482f4f903a8ac58ba2624bee5861b6a3c05c5",
         "40fcad6a68bd8b9ceb11fd2298b1a777e1b826d5885ba55c66fe8d7637afef2e",
         "1773c334e27f96be34f8856bd33b94d243e5d3a03021aab4b4b9f4fa5448b39e",
     },
@@ -704,6 +783,32 @@ def is_stock_prompt(role: str, prompt: str) -> bool:
         return True
     if current and "WAIT FOR THE RIGHT MOMENT" in prompt and "PATTERN CITATION" not in prompt:
         return True
+    # 2026-09-21: every stock prompt now carries the OBLIVION ENGINE section.
+    # A prompt that has the pattern-citation clause (so it is the 09-14 stock
+    # text) but no OBLIVION mention was seeded before the engine landed.
+    if current and "OBLIVION" in current and "OBLIVION" not in prompt and (
+        "PATTERN CITATION" in prompt or "CHEAT-SHEET" in prompt
+    ):
+        return True
+    # A prompt carrying the seat's own stock section headers (the desk wrote
+    # these; nobody customising a prompt keeps three of them verbatim) but no
+    # OBLIVION section is a stock text from before the engine landed.
+    _stock_headers = {
+        "market_analyst": ("READ THE CANDLES", "Read STRUCTURE", "VOLATILITY DISCIPLINE"),
+        "signal_generator": ("A SHORT IS A TRADE", "NO ENTRY HERE IS NOT NO TRADE", "YOUR OWN CONFIDENCE IS NOT A REASON"),
+        "risk_manager": ("Risk rules", "last line of defense", "CHEAT-SHEET PATTERN RULE"),
+        "trade_executor": ("Execution rules", "DEFAULT TO LIMIT", "CHEAT-SHEET PATTERN RULE"),
+    }.get(role)
+    if current and "OBLIVION" in current and "OBLIVION" not in prompt and _stock_headers:
+        if sum(1 for h in _stock_headers if h in prompt) >= 3:
+            return True
+    # 2026-09-22: every stock prompt now describes OBLIVION MASTER v5 (two
+    # scores, sniper requirements, outcomes). A prompt carrying the older
+    # single-score OBLIVION wording *and* the seat's own stock headers is the
+    # 09-21 text — a hand-written prompt that merely mentions OBLIVION is not.
+    if current and "OBLIVION MASTER v5" in current and "OBLIVION MASTER v5" not in prompt and _stock_headers:
+        if sum(1 for h in _stock_headers if h in prompt) >= 3:
+            return True
     if current and "CHEAT-SHEET" not in prompt and "cheat-sheet" in current.lower():
         # Any stock prompt that predates the first cheat-sheet infusion
         # contains none of the new pattern language at all.

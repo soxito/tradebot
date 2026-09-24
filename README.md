@@ -107,6 +107,8 @@ The sidebar (`frontend/src/components/Layout.tsx`) contains every page below. A 
 | **Pump Monitor** | `/pump-monitor` | Deep pump detection using 8 indicators (volume spike, price acceleration, social, order flow, momentum, BTC-relative, volatility, ATH breakout). Start/Stop auto-scanner, status pipeline cards (Watchlist → Detected → Confirmed → Signalled → Traded → Pumped/Faded) and expandable token score breakdowns. |
 | **Rug Pulled** | `/rug-pulled` | Rug-pull/dump tracker: lists tokens that pumped ≥30 % with buying-power-decline analysis, AI short-entry recommendations (entry/SL/TP with Fibonacci levels), sniper loop controls and Survived/Dumped marking. |
 | **Delistings** | `/delistings` | Exchange delisting warnings so you can exit affected pairs before removal dates. |
+| **Oblivion AI** | `/oblivion` | OBLIVION MASTER v5 — the house strategy (a port of the Pine v6 "Scalper + Sniper" script) and the trading room's main engine. Chart with the full overlay (order blocks, labels, fib and entry/SL/TP lines, session bands, dashboard), a multi-timeframe read panel, one-click room analysis, and a global settings popup (Pine input groups 01–20) whose save changes every consumer at once: room agents, MT5 bots, Kronos, Telegram and chart overlays. |
+| **Backtest** (under Oblivion AI) | `/backtest` | OBLIVION backtesting. **Pair backtests:** pick pairs, timeframe (4h/2h/1h/30m/15m/5m), start balance and risk; replays signals bar by bar with the room's own profile, costs, the high-impact news gate and trade management (pullback limit entry, stop locked at TP1, trail from TP2 past TP3), plus the agents' confirm/veto book. Shows every trade on a chart, the **traded book** (pairs that pass the approval bar) beside all pairs tested, and total profit / total losses / net P&L. **Backtest my accounts:** replays the pairs the room trades on every MT5 and crypto account you have set up, on each one's real equity, with the live risk band, the portfolio day target and cap, and the daily win-rate floor — an honest walk-forward book (pairs chosen only on data before the window) next to today's approved book. Every run is stored in the AI brain and sent to Telegram as a PDF. |
 | **Kronos Forecast** | `/kronos-forecast` | Kronos foundation-model candle forecasting studio: crypto + forex/metals pair search, horizon/samples/temperature sliders, hot-swappable model chips, predicted path with p10–p90 confidence bands, forecast signal panel with NO_TRADE gating, JARVIS analysis, executable Sniper Entries (paper/live), and a Fine-tune panel to train Kronos on your own OHLCV (tokenizer → predictor) with live job logs and one-click model load. |
 | **Sentiment** | `/sentiment` | Sentiment dashboard: news/social/on-chain sentiment feeds plus an AI sentiment-agents status strip. |
 
@@ -137,8 +139,8 @@ The sidebar (`frontend/src/components/Layout.tsx`) contains every page below. A 
 
 | Tab | URL | What it does |
 | --- | --- | --- |
-| **Trading Room** | `/trading-room` | 3D agent boardroom (Three.js): each AI agent has a seat/avatar wired into the orchestrator SSE pipeline, JARVIS chairs meetings as CEO, live debate speech bubbles, consensus verdict tallies, back-wall OHLCV chart and wall screens with live prices/news/calendar. Voice announcements toggle and worker start/stop. |
-| **Room Settings** | `/trading-room-settings` | Roster + execution policy editor: danger-gated "let agents execute trades" and dry-run toggles, venue selection (Simulation / Bitget / MT5 accounts), risk limits, cadence, Bitcoin 1064-day-cycle risk multiplier card, and editable agent roster (rename, recolor, role/model/pairs/system prompt) with a recommended-models preset button. |
+| **Trading Room** | `/trading-room` | 3D agent boardroom (Three.js): each AI agent has a seat/avatar wired into the orchestrator SSE pipeline, JARVIS chairs meetings as CEO, live debate speech bubbles, consensus verdict tallies, back-wall OHLCV chart and wall screens with live prices/news/calendar. Voice announcements toggle and worker start/stop. **OBLIVION leads the room:** it scans the pinned pairs and the trading universe on 4h/2h/1h/30m/15m/5m, a fresh confirmed signal convenes the board, and the agents can only confirm or veto — never flip the side. Every OBLIVION read, decision and order is stored in the AI brain; a real-time trade manager (every 5 s) runs break-even, trailing stops, margin protection and take-profit when the market turns. |
+| **Room Settings** | `/trading-room-settings` | Roster + execution policy editor: danger-gated "let agents execute trades" and dry-run toggles, venue selection (Simulation / Bitget / MT5 accounts), risk limits, cadence, Bitcoin 1064-day-cycle risk multiplier card, and editable agent roster (rename, recolor, role/model/pairs/system prompt) with a recommended-models preset button. **Trading accounts:** every MT5 and crypto account — demo accounts always trade, each live account has its own switch under the master "Live trading" switch. **Profit targets:** weekly minimum per pair, the portfolio day band (default 10% minimum / 20% cap — no new entries after the cap), risk band per trade (default 1–5%), high-impact news window. **OBLIVION universe & approvals:** extra instruments to scan, the per-pair backtest approval bar (default 95%), the daily win-rate floor, and which pair/timeframes are currently tradeable. |
 
 ### 🧪 Labs, Tools & System
 
@@ -167,6 +169,11 @@ The sidebar (`frontend/src/components/Layout.tsx`) contains every page below. A 
 - ✅ **X (Twitter) whale monitor** — tracks 19 market-moving accounts, OAuth 1.0a free-tier home-timeline polling, Breaking tweets injected into sentiment pipeline in real time
 - ✅ **X AI Scraper** — extracts social media links from whale profiles (basic stdlib mode always active; ScrapeGraphAI AI mode optional upgrade)
 - ✅ Multi-agent AI orchestrator: Market+Sentiment → Signal → Risk → Executor pipeline with persisted decision history and per-agent learning stats
+- ✅ **OBLIVION MASTER v5 engine** — the house strategy, one causal implementation (`backend/app/signals/oblivion.py`) shared by the trading room, MT5 scalp/sniper bots, Kronos, Telegram (`/forecast`, `/room`, `/analyze`) and every chart overlay; global settings editable from the UI
+- ✅ **OBLIVION-led trading room** — per-timeframe tuned profiles, per-pair backtest approval, high-impact news gate (30 min before → 120 min after), daily win-rate floor, portfolio day target with a cap, risk band sizing, pullback limit entries with TP1 floor and trailing past TP3, and a 5-second trade manager (break-even, trailing, margin protection, take-profit on a market shift)
+- ✅ **Multi-account execution** — every demo MT5/crypto account always trades; live accounts are switched on one by one; MT5 passwords and exchange keys are encrypted at rest (Fernet)
+- ✅ **Backtesting** — OBLIVION pair backtests on every timeframe with PDF reports to Telegram, and portfolio backtests on your real accounts with an honest walk-forward book
+- ✅ **AI brain logging** — every OBLIVION read, agent decision, order, block and backtest is stored and mirrored to the brain
 - ✅ **Local LLM fallback (Ollama)** — when all configured cloud AI providers fail, agents fall back to a tier-appropriate local model served by Ollama; `start.py` auto-installs Ollama and pulls the best model for the machine (0.5B → 14B by resource tier), and a scheduler periodically fine-tunes `tradebot-local` from Brain data + executed trades via Soup
 - ✅ Signal & strategy engine: technical signals, Pine Script strategies, Smart Money Concepts (order blocks, FVGs, premium/discount zones), classic chart-pattern detectors (double/triple tops & bottoms, head & shoulders, wedges, flags, pennants, triangles), Strategy Lab
 - ✅ Risk management (position sizing, SL/TP, exposure limits) across simulated (paper) and live engines
@@ -379,6 +386,18 @@ SCRAPEGRAPH_AI_API_KEY=
 SCRAPEGRAPH_AI_BASE_URL=
 SCRAPEGRAPH_AI_MODEL=
 
+# Credential encryption for stored MT5 passwords / exchange keys (optional —
+# generated into backend/data/.credentials_key on first run; keep it: losing
+# it makes every stored credential undecryptable)
+CREDENTIALS_KEY=
+
+# OBLIVION engine defaults (optional — the UI settings popup overrides these)
+OBLIVION_MIN_SCORE=6          # scalp minimum score
+OBLIVION_SNIPER_MIN_SCORE=9
+OBLIVION_NEWS_WINDOW=1330-1430  # no-trade window, local to OBLIVION_NEWS_TZ
+OBLIVION_NEWS_TZ=America/New_York
+OBLIVION_BLOCK_NEWS=true
+
 # Alerts (optional)
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
@@ -536,7 +555,8 @@ More help: open a [GitHub issue](https://github.com/soxito/tradebot/issues) with
 - [x] Telegram & WhatsApp channel signal ingestion
 - [x] Full plugin ecosystem + Strategy Lab + Electron desktop app + CI/CD releases
 - [ ] Fully automated trade execution across all plugins
-- [ ] Expanded backtesting engine coverage
+- [x] OBLIVION backtesting engine: pair backtests on every timeframe + portfolio backtests on real accounts
+- [x] Multi-account room trading (demo always on, live per account) with encrypted credentials
 
 See [CHANGELOG.md](CHANGELOG.md) for detailed history.
 

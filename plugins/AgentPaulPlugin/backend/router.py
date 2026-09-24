@@ -232,6 +232,8 @@ class JarvisChatRequest(BaseModel):
     #: URI (what a browser FileReader and the extension's captureVisibleTab both
     #: hand back, so neither caller has to re-encode).
     image: Optional[str] = None
+    #: The reply will be spoken aloud by the voice assistant.
+    voice: bool = False
 
 
 @router.post("/chat")
@@ -248,7 +250,7 @@ async def jarvis_chat(payload: JarvisChatRequest, db: AsyncSession = Depends(get
     async def event_generator():
         async for chunk in stream_jarvis_chat(
             db, payload.messages, payload.pathname or "/", session_key,
-            image=payload.image,
+            image=payload.image, voice=payload.voice,
         ):
             yield chunk
 

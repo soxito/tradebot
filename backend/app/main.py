@@ -59,6 +59,20 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to initialize database: {e}")
 
+    # Multi-account trading: carry the single-account settings over once and
+    # encrypt any credential still stored as plaintext.
+    try:
+        from app.services.crypto_accounts import backfill as _accounts_backfill
+        await _accounts_backfill()
+    except Exception as e:
+        logger.warning(f"Trading-account backfill skipped: {e}")
+    try:
+        from app.backtest.service import mark_interrupted as _bt_interrupted
+        if (n := await _bt_interrupted()):
+            logger.info(f"Backtests interrupted by the last shutdown marked as errors: {n}")
+    except Exception as e:
+        logger.warning(f"Backtest run cleanup skipped: {e}")
+
     # Persona + prompt upgrades run in parallel — both are independent DB reads
     # (cuts ~2x sequential DB wait on cold boot; plan Phase 5)
     async def _persona_upgrade():
@@ -77,8 +91,19 @@ async def lifespan(app: FastAPI):
                 await upgrade_stock_prompts(db)
         except Exception as e:
             logger.debug(f"Agent prompt upgrade skipped: {e}")
+    async def _oblivion_settings():
+        # The engine's global config: loaded once so the sync hot paths (scalp
+        # bot, chart overlays) never touch the DB; refreshed on every write.
+        try:
+            from app.core.database import AsyncSessionLocal
+            from app.services import oblivion_settings
+            async with AsyncSessionLocal() as db:
+                doc = await oblivion_settings.load(db)
+            logger.info(f"[Oblivion] settings v{doc['version']} loaded ({doc['settings']['trade_mode']})")
+        except Exception as e:
+            logger.warning(f"Oblivion settings not loaded — engine runs on env defaults: {e}")
     try:
-        await asyncio.gather(_persona_upgrade(), _prompt_upgrade())
+        await asyncio.gather(_persona_upgrade(), _prompt_upgrade(), _oblivion_settings())
     except Exception:
         pass
 

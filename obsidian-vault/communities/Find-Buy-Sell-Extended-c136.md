@@ -2,7 +2,7 @@
 type: community
 name: Find Buy Sell Extended (c136)
 node_count: 6
-synced: 2026-09-14
+synced: 2026-09-24
 tags:
   - community
   - Find-Buy-Sell-Extended-c136
@@ -10,7 +10,7 @@ tags:
 
             # Find Buy Sell Extended (c136)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-24.
 
 
             ## Key Nodes (6 total)

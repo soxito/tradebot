@@ -19,6 +19,9 @@ from app.api.jarvis import router as jarvis_router
 from app.api.provider_relay import router as provider_relay_router
 from app.api.vision import router as vision_router
 from app.api.market import router as market_router
+from app.api.oblivion import router as oblivion_router
+from app.api.room_trading import router as room_trading_router
+from app.api.backtest import router as backtest_router
 from app.api.stream import router as stream_router
 from app.api.ngrok import router as ngrok_router
 from app.api.research import router as research_router
@@ -65,6 +68,9 @@ api_router.include_router(voice_router)
 api_router.include_router(provider_relay_router)
 api_router.include_router(vision_router)
 api_router.include_router(market_router)
+api_router.include_router(oblivion_router)
+api_router.include_router(room_trading_router)
+api_router.include_router(backtest_router)
 api_router.include_router(stream_router)
 api_router.include_router(ngrok_router)
 api_router.include_router(research_router)

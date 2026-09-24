@@ -2,7 +2,7 @@
 type: community
 name: Sentiment Analysis Service
 node_count: 41
-synced: 2026-09-14
+synced: 2026-09-24
 tags:
   - community
   - Sentiment-Analysis-Service
@@ -10,7 +10,7 @@ tags:
 
             # Sentiment Analysis Service
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-24.
 
 
             ## Key Nodes (41 total)

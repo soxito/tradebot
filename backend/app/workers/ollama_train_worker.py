@@ -47,9 +47,9 @@ async def maybe_train_ollama(force: bool = False) -> dict:
         if not ok:
             return {"ok": False, "reason": reason}
 
-    # Build dataset (async variant so trade rows are included)
+    # Build dataset (async variant so trade rows are included) — always include vault + web + pair catalog for self-improvement
     try:
-        dataset_path, n_rows = await build_sharegpt_dataset_async()
+        dataset_path, n_rows = await build_sharegpt_dataset_async(include_pair_catalog=True)
     except Exception as exc:
         return {"ok": False, "reason": f"dataset build failed: {exc}"}
 

@@ -12,6 +12,7 @@ import { AlertTriangle, ArrowLeft, Cpu, Loader2, Save, ShieldCheck, Sparkles } f
 
 import { apiClient } from '@/services/api'
 import { useRoomSettings, type ExecutionPolicy, type RoomProfile } from '@/hooks/useRoomSettings'
+import { OblivionCoveragePanel, PairApprovalPanel, TradingAccountsPanel, UniversePanel, WeeklyTargetPanel } from '@/components/TradingAccountsPanel'
 import { useBtcCycleState } from '@/hooks/useBtcCycle'
 
 // A connected AI provider (from the AI Market Analyst plugin) and its models.
@@ -68,7 +69,7 @@ const FOCUS_INTERVALS = [
 // This is the timeframe the agents analyse on AND the one the room's wall chart
 // draws — one setting, so the board's argument and the picture behind it are
 // never two different reads of the same pair.
-const FOCUS_TIMEFRAMES = ['5m', '15m', '30m', '1h', '4h', '1d'] as const
+const FOCUS_TIMEFRAMES = ['5m', '15m', '30m', '1h', '2h', '4h', '1d'] as const
 
 function Toggle({
   label, hint, checked, onChange, tone = 'normal', disabled = false,
@@ -392,6 +393,7 @@ export default function TradingRoomSettingsPage() {
   const [saving, setSaving] = useState(false)
   const [savedAt, setSavedAt] = useState<string | null>(null)
   const [policyError, setPolicyError] = useState<string | null>(null)
+  const [confirmLive, setConfirmLive] = useState(false)
 
   // Connected AI providers + presets → the Model dropdown and Recommended Setup.
   const [providers, setProviders] = useState<AiProvider[]>([])
@@ -536,7 +538,7 @@ export default function TradingRoomSettingsPage() {
                 <span className={`ml-auto rounded-full px-2.5 py-1 text-[10px] font-medium ${
                   policy.dry_run ? 'bg-amber-500/20 text-amber-300' : 'bg-red-500/20 text-red-300'
                 }`}>
-                  {policy.dry_run ? 'ARMED — DEMO ONLY' : 'ARMED — DEMO + LIVE'}
+                  {policy.dry_run ? 'ARMED — DEMO ACCOUNTS ONLY' : 'ARMED — DEMO + LIVE ACCOUNTS'}
                 </span>
               )}
             </div>
@@ -545,9 +547,9 @@ export default function TradingRoomSettingsPage() {
               <div className="flex gap-2 rounded-lg border border-red-500/50 bg-red-500/10 p-3">
                 <AlertTriangle className="h-4 w-4 shrink-0 text-red-400" />
                 <p className="text-[12px] leading-snug text-red-200">
-                  Agents are placing <strong>real orders on the live account</strong> without asking, including
-                  while this page is closed. The demo account takes every trade alongside it. Turn dry run
-                  back on to keep trading on the demo only.
+                  Agents are placing <strong>real orders on every switched-on live account</strong> without asking,
+                  including while this page is closed. Demo accounts take every trade alongside them. Turn live
+                  trading off to keep trading on the demo accounts only.
                 </p>
               </div>
             )}
@@ -564,17 +566,32 @@ export default function TradingRoomSettingsPage() {
                 checked={policy.execution_enabled}
                 onChange={(v) => setPolicy({ execution_enabled: v })}
               />
-              <Toggle
-                label="Dry run — demo only"
-                hint={
-                  policy.global_auto_trading_enabled
-                    ? 'On: the demo account takes every trade for real; the live account is never touched, not even to manage a position. Off: demo and live trade together.'
-                    : 'Locked on until ENABLE_AUTO_TRADING=true is set in your .env.'
-                }
-                tone={policy.dry_run ? 'normal' : 'danger'}
-                checked={policy.dry_run}
-                onChange={(v) => setPolicy({ dry_run: v })}
-              />
+              <div>
+                <Toggle
+                  label="Live trading"
+                  hint={
+                    policy.global_auto_trading_enabled
+                      ? 'Off: only demo accounts trade — they are always on. On: every live account switched on below trades too.'
+                      : 'Locked off until ENABLE_AUTO_TRADING=true is set in your .env.'
+                  }
+                  tone="danger"
+                  checked={!policy.dry_run}
+                  onChange={(on) => (on ? setConfirmLive(true) : setPolicy({ dry_run: true }))}
+                />
+                {confirmLive && policy.dry_run && (
+                  <div className="mt-2 flex flex-wrap items-center gap-2 rounded-lg border border-red-500/50 bg-red-500/10 p-2 text-[12px] text-red-200">
+                    <span className="flex-1">Real money: every switched-on live account will take the room&apos;s trades.</span>
+                    <button type="button" className="rounded bg-red-600 px-2 py-1 font-medium text-white"
+                      onClick={() => { setConfirmLive(false); void setPolicy({ dry_run: false }) }}>
+                      Turn live trading on
+                    </button>
+                    <button type="button" className="rounded border border-slate-600 px-2 py-1 text-slate-300"
+                      onClick={() => setConfirmLive(false)}>
+                      Cancel
+                    </button>
+                  </div>
+                )}
+              </div>
             </div>
 
             <div>
@@ -597,23 +614,7 @@ export default function TradingRoomSettingsPage() {
             {policy.allow_mt5 && (
               <div className="space-y-3">
                 <label className="block">
-                  <span className="text-[11px] font-medium uppercase tracking-wide text-slate-400">MT5 live account (trades only when dry run is off)</span>
-                  <select
-                    value={policy.mt5_account_id ?? ''}
-                    onChange={(e) => setPolicy({ mt5_account_id: e.target.value ? Number(e.target.value) : null })}
-                    className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-900/70 px-3 py-2 text-sm text-slate-100 focus:border-cyan-500 focus:outline-none"
-                  >
-                    <option value="">— none selected —</option>
-                    {(policy.mt5_accounts ?? []).map((a) => (
-                      <option key={a.id} value={a.id}>
-                        {a.name} · {a.login} · {a.equity?.toFixed?.(2)} {a.currency}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-
-                <label className="block">
-                  <span className="text-[11px] font-medium uppercase tracking-wide text-slate-400">MT5 demo account (always trades)</span>
+                  <span className="text-[11px] font-medium uppercase tracking-wide text-slate-400">Primary MT5 demo account</span>
                   <select
                     value={policy.mt5_demo_account_id ?? ''}
                     onChange={(e) => setPolicy({ mt5_demo_account_id: e.target.value ? Number(e.target.value) : null })}
@@ -627,30 +628,67 @@ export default function TradingRoomSettingsPage() {
                     ))}
                   </select>
                   <p className="mt-1 text-[10px] text-slate-500">
-                    The demo takes every signal the agents publish, in both modes — so there is always a live
-                    record to watch, whether or not real money is moving.
+                    Every demo account trades every OBLIVION-confirmed signal in both modes. This one is also
+                    where the desk&apos;s daily-loss limit is measured.
                   </p>
                 </label>
 
-                <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
-                  <p className="text-sm font-medium text-amber-300">Where orders go</p>
-                  <ul className="mt-1 space-y-1 text-[11px] text-slate-300">
-                    <li>
-                      🧪 <strong>Demo</strong> — takes every published signal now
-                      {policy.mt5_demo_account_id ? '' : ' (no demo account selected — nothing will trade in dry run)'}
-                    </li>
-                    <li>
-                      {policy.dry_run
-                        ? '🔒 Live — not traded and not managed while dry run is on'
-                        : '⚡ Live — takes the same trade at the same moment as the demo'}
-                    </li>
-                  </ul>
-                  <p className="mt-2 text-[10px] text-slate-500">
-                    Each account is sized on its own equity, so the demo mirrors the decision, not the lot size.
-                  </p>
-                </div>
               </div>
             )}
+
+            <WeeklyTargetPanel
+              target={policy.weekly_target_usd ?? 3000}
+              pacing={policy.target_pacing ?? true}
+              maxMult={policy.target_max_multiplier ?? 2}
+              dayMin={policy.daily_target_min_pct ?? 10}
+              dayMax={policy.daily_target_max_pct ?? 20}
+              perPair={policy.target_per_pair ?? true}
+              minRisk={policy.min_risk_pct ?? 1}
+              maxRisk={policy.max_risk_pct ?? 5}
+              newsPre={policy.news_pre_min ?? 30}
+              newsCool={policy.news_cooloff_min ?? 120}
+              onSave={(patch) => void setPolicy(patch as Partial<ExecutionPolicy>)}
+            />
+
+            <TradingAccountsPanel liveTrading={!policy.dry_run} />
+
+            <UniversePanel
+              enabled={policy.universe_enabled ?? false}
+              symbols={policy.universe_symbols ?? ''}
+              minWinRate={policy.pair_min_win_rate ?? 0.95}
+              dailyFloor={policy.daily_min_win_rate ?? 0.9}
+              recoveryBar={policy.daily_recovery_min_wr ?? 0.97}
+              onSave={(patch) => void setPolicy(patch as Partial<ExecutionPolicy>)}
+            />
+
+            <PairApprovalPanel />
+
+            <OblivionCoveragePanel timeframe="2h" />
+            <OblivionCoveragePanel timeframe="15m" />
+
+            <div>
+              <h3 className="mb-2 text-[11px] font-medium uppercase tracking-wide text-slate-400">Trade management — real time</h3>
+              <div className="grid gap-3 md:grid-cols-3">
+                <NumberField label="Check every" suffix="s" value={policy.manage_tick_s ?? 5} min={3} max={60}
+                  hint="Break-even, trailing and margin checks on every open room trade."
+                  onChange={(v) => setPolicy({ manage_tick_s: v })} />
+                <NumberField label="Margin warning" suffix="%" value={policy.margin_warn_pct ?? 300} min={50} max={2000} step={10}
+                  hint="Below this, the account takes no new entries."
+                  onChange={(v) => setPolicy({ margin_warn_pct: v })} />
+                <NumberField label="Margin critical" suffix="%" value={policy.margin_critical_pct ?? 150} min={50} max={1000} step={10}
+                  hint="Below this, the worst-losing room trade is cut in half until margin recovers."
+                  onChange={(v) => setPolicy({ margin_critical_pct: v })} />
+                <NumberField label="Account drawdown cap" suffix="%" value={policy.max_account_drawdown_pct ?? 5} min={0.5} max={50} step={0.5}
+                  hint="Room trades down more than this share of balance are all closed."
+                  onChange={(v) => setPolicy({ max_account_drawdown_pct: v })} />
+                <NumberField label="Sudden move" suffix="× ATR" value={policy.shift_atr_mult ?? 1.5} min={0.3} max={10} step={0.1}
+                  hint="A run against the trade this big triggers an immediate re-check."
+                  onChange={(v) => setPolicy({ shift_atr_mult: v })} />
+                <NumberField label="Bank on a turn" suffix="%" value={Math.round((policy.shift_take_profit_fraction ?? 0.5) * 100)} min={10} max={100} step={5}
+                  hint="Share of a winning trade closed when the market turns against it; the rest is locked at break-even."
+                  onChange={(v) => setPolicy({ shift_take_profit_fraction: v / 100 })} />
+              </div>
+            </div>
 
             <div>
               <h3 className="mb-2 text-[11px] font-medium uppercase tracking-wide text-slate-400">Copy-trading supervision</h3>

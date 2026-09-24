@@ -2,7 +2,7 @@
 type: community
 name: Bitget (c85)
 node_count: 14
-synced: 2026-09-14
+synced: 2026-09-24
 tags:
   - community
   - Bitget-c85
@@ -10,7 +10,7 @@ tags:
 
             # Bitget (c85)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-24.
 
 
             ## Key Nodes (14 total)

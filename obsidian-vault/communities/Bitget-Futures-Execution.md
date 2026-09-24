@@ -2,7 +2,7 @@
 type: community
 name: Bitget Futures Execution
 node_count: 48
-synced: 2026-09-14
+synced: 2026-09-24
 tags:
   - community
   - Bitget-Futures-Execution
@@ -10,7 +10,7 @@ tags:
 
             # Bitget Futures Execution
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-24.
 
 
             ## Key Nodes (48 total)

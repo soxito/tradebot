@@ -2,7 +2,7 @@
 type: community
 name: Exchange (c134)
 node_count: 6
-synced: 2026-09-14
+synced: 2026-09-24
 tags:
   - community
   - Exchange-c134
@@ -10,7 +10,7 @@ tags:
 
             # Exchange (c134)
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-24.
 
 
             ## Key Nodes (6 total)

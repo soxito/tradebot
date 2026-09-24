@@ -2,7 +2,7 @@
 type: community
 name: Telegram Channel Management
 node_count: 43
-synced: 2026-09-14
+synced: 2026-09-24
 tags:
   - community
   - Telegram-Channel-Management
@@ -10,7 +10,7 @@ tags:
 
             # Telegram Channel Management
 
-            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-14.
+            > Auto-generated from graphify knowledge graph. Last synced: 2026-09-24.
 
 
             ## Key Nodes (43 total)

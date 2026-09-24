@@ -87,6 +87,19 @@ export interface VoiceTurnOptions {
   isSelfEcho?: () => boolean;
   /** True when the current mic frame matches the calibrated user (accept-all when voice-match is off). Gates barge-in so JARVIS's own echo can never interrupt him. */
   isUserVoice?: () => boolean;
+  /**
+   * Two-step barge-in. Loud sound during SPEAKING only PAUSES the reply; the
+   * caller must then confirm it with a transcript that is really the user
+   * (`bargeIn('voice')`), or the reply resumes after `bargeInHoldMs`. Energy
+   * alone cannot tell the user from JARVIS's own voice through laptop
+   * speakers — that is what made him cut himself off and then answer his own
+   * echo. Off by default (energy alone cancels, as before).
+   */
+  confirmBargeIn?: boolean;
+  /** How long a paused reply waits for a confirming transcript. */
+  bargeInHoldMs?: number;
+  /** A reply was paused (true) or resumed after an unconfirmed hold (false). */
+  onBargeInHold?: (holding: boolean) => void;
   /** Confirmed user speech during SPEAKING/THINKING — after cancellation. */
   onBargeIn?: (reason: BargeInReason) => void;
   /** Every state transition (for visuals / logging). */
@@ -127,6 +140,8 @@ export interface UseVoiceTurnReturn {
   endSpeaking: () => void;
   /** Cancel the current turn (playback + requests) and return to LISTENING. */
   bargeIn: (reason?: BargeInReason) => void;
+  /** True while a reply is paused waiting for a barge-in to be confirmed. */
+  isHolding: () => boolean;
 }
 
 const TURN_DEFAULTS = {
@@ -138,6 +153,7 @@ const TURN_DEFAULTS = {
   graceMs: 400,
   refSuppress: 0.55,
   thinkingTimeoutMs: 45_000,
+  bargeInHoldMs: 1600,
 };
 
 // Ceiling on the reference-derived part of the speaking gate (RMS). Raised so a
@@ -182,6 +198,10 @@ export function useVoiceTurn(options: VoiceTurnOptions = {}): UseVoiceTurnReturn
   const thinkStartRef   = useRef(0);
   const handlesRef     = useRef<SpeakingHandles>({});
   const audioQueueRef  = useRef<HTMLAudioElement[]>([]);
+  // When the current reply was paused for a possible barge-in (0 = not held),
+  // and the clips that pause stopped, so an unconfirmed hold resumes exactly them.
+  const holdSinceRef   = useRef(0);
+  const heldAudioRef   = useRef<HTMLAudioElement[]>([]);
 
   const cfg = useCallback(<K extends keyof typeof TURN_DEFAULTS>(key: K): number => {
     const v = (optsRef.current as Record<string, unknown>)[key];
@@ -227,16 +247,52 @@ export function useVoiceTurn(options: VoiceTurnOptions = {}): UseVoiceTurnReturn
     }
   }, [flushPlayback]);
 
+  /** Pause the reply while we find out whether that sound was the user. */
+  const holdPlayback = useCallback(() => {
+    holdSinceRef.current = Date.now();
+    const h = handlesRef.current;
+    const els = [h.audio, ...audioQueueRef.current].filter(
+      (el): el is HTMLAudioElement => !!el && !el.paused && !el.ended,
+    );
+    heldAudioRef.current = els;
+    for (const el of els) { try { el.pause(); } catch { /* detached */ } }
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      try { if (window.speechSynthesis.speaking) window.speechSynthesis.pause(); } catch { /* unsupported */ }
+    }
+    try { optsRef.current.onBargeInHold?.(true); } catch { /* consumer's problem */ }
+  }, []);
+
+  /** Forget a hold; `resume` restarts the paused reply (it was not the user). */
+  const releaseHold = useCallback((resume: boolean) => {
+    if (!holdSinceRef.current) return;
+    holdSinceRef.current = 0;
+    const els = heldAudioRef.current;
+    heldAudioRef.current = [];
+    if (!resume) return;
+    for (const el of els) { try { void el.play(); } catch { /* detached */ } }
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      try { window.speechSynthesis.resume(); } catch { /* unsupported */ }
+    }
+    // Restart the grace window: resuming playback has the same ramp-up
+    // transient as starting it.
+    speakStartRef.current = Date.now();
+    voicedRef.current = 0;
+    try { optsRef.current.onBargeInHold?.(false); } catch { /* consumer's problem */ }
+  }, []);
+
+  const isHolding = useCallback(() => holdSinceRef.current > 0, []);
+
   const bargeIn = useCallback((reason: BargeInReason = 'manual') => {
     const cur = stateRef.current;
     if (cur !== 'SPEAKING' && cur !== 'THINKING') return;
+    releaseHold(false);
     cancelTurn();
     // Straight back to LISTENING — the user is mid-sentence and the next words
     // must land somewhere. No blackout, no intermediate "gated" limbo.
     transition('LISTENING');
     voicedRef.current = 0;
     try { optsRef.current.onBargeIn?.(reason); } catch { /* consumer's problem */ }
-  }, [cancelTurn, transition]);
+  }, [cancelTurn, releaseHold, transition]);
 
   // ── The monitor frame ─────────────────────────────────────────────────────
   const frame = useCallback(() => {
@@ -283,6 +339,13 @@ export function useVoiceTurn(options: VoiceTurnOptions = {}): UseVoiceTurnReturn
 
     voicedRef.current = voiced ? voicedRef.current + 1 : 0;
 
+    if (speaking && holdSinceRef.current) {
+      // Paused, waiting for the caller to confirm with a transcript. Nothing to
+      // detect meanwhile; if no confirmation comes, it was not the user.
+      if (Date.now() - holdSinceRef.current > cfg('bargeInHoldMs')) releaseHold(true);
+      return;
+    }
+
     if (speaking) {
       const needed = Math.max(1, Math.round(cfg('bargeInFrames')));
       const grace = Date.now() - speakStartRef.current < cfg('graceMs');
@@ -293,7 +356,8 @@ export function useVoiceTurn(options: VoiceTurnOptions = {}): UseVoiceTurnReturn
       let isUser = true;
       try { isUser = optsRef.current.isUserVoice?.() ?? true; } catch { isUser = true; }
       if (!grace && isUser && voicedRef.current >= needed) {
-        bargeIn('voice');
+        if (optsRef.current.confirmBargeIn) holdPlayback();
+        else bargeIn('voice');
         return;
       }
     } else if (cur === 'LISTENING') {
@@ -327,7 +391,7 @@ export function useVoiceTurn(options: VoiceTurnOptions = {}): UseVoiceTurnReturn
         transition('LISTENING');
       }
     }
-  }, [bargeIn, cfg, transition]);
+  }, [bargeIn, cfg, holdPlayback, releaseHold, transition]);
 
   // ── Capture lifecycle ─────────────────────────────────────────────────────
   const start = useCallback(async (): Promise<boolean> => {
@@ -399,9 +463,10 @@ export function useVoiceTurn(options: VoiceTurnOptions = {}): UseVoiceTurnReturn
     voicedRef.current = 0;
     setCaptureLive(false);
     setUserSpeaking(false);
+    releaseHold(false);
     cancelTurn();
     transition('IDLE');
-  }, [cancelTurn, transition]);
+  }, [cancelTurn, releaseHold, transition]);
 
   const beginThinking = useCallback((handles: SpeakingHandles = {}) => {
     handlesRef.current = { ...handlesRef.current, ...handles };
@@ -415,11 +480,13 @@ export function useVoiceTurn(options: VoiceTurnOptions = {}): UseVoiceTurnReturn
       const q = audioQueueRef.current;
       if (!q.includes(handles.audio)) q.push(handles.audio);
     }
+    // A new clip supersedes whatever a hold had paused.
+    releaseHold(false);
     speakStartRef.current = Date.now();
     thinkStartRef.current = 0;
     voicedRef.current = 0;
     transition('SPEAKING');
-  }, [transition]);
+  }, [releaseHold, transition]);
 
   const enqueueAudio = useCallback((el: HTMLAudioElement) => {
     if (!audioQueueRef.current.includes(el)) audioQueueRef.current.push(el);
@@ -427,18 +494,20 @@ export function useVoiceTurn(options: VoiceTurnOptions = {}): UseVoiceTurnReturn
 
   const cancelSpeech = useCallback(() => {
     if (stateRef.current !== 'SPEAKING' && stateRef.current !== 'THINKING') return;
+    releaseHold(false);
     cancelTurn();
     speakStartRef.current = Date.now();  // don't let the watchdog fire mid-handover
-  }, [cancelTurn]);
+  }, [cancelTurn, releaseHold]);
 
   const endSpeaking = useCallback(() => {
+    releaseHold(false);
     handlesRef.current = {};
     audioQueueRef.current = [];
     thinkStartRef.current = 0;
     // Requirement: after a reply JARVIS is listening again, with nothing to
     // re-enable. IDLE is only for "capture not running at all".
     transition(streamRef.current ? 'LISTENING' : 'IDLE');
-  }, [transition]);
+  }, [releaseHold, transition]);
 
   const getLevel = useCallback(() => levelRef.current, []);
 
@@ -458,6 +527,7 @@ export function useVoiceTurn(options: VoiceTurnOptions = {}): UseVoiceTurnReturn
     cancelSpeech,
     endSpeaking,
     bargeIn,
+    isHolding,
   };
 }
 
